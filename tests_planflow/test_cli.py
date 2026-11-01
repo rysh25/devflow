@@ -117,7 +117,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("requires explicit", json.loads(out)["message"])
 
     def test_real_entrypoint_help_and_version(self):
-        for arguments, expected in ((["--help"], "PlanFlow"), (["--version"], "planflow 0.1.1")):
+        for arguments, expected in ((["--help"], "PlanFlow"), (["--version"], "planflow 0.1.2")):
             with self.subTest(arguments=arguments):
                 result = subprocess.run([sys.executable, "-B", str(SCRIPT), *arguments], cwd=str(self.project), capture_output=True, text=True, timeout=20)
                 self.assertEqual(result.returncode, 0, result.stderr)

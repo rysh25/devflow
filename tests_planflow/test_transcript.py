@@ -161,15 +161,77 @@ class TranscriptTests(unittest.TestCase):
                 "tool_response": {"answers": {"Q?": "Changed answer"}}, "is_error": True,
             }])
 
-    def test_unanswered_or_error_question_fails(self):
-        for error in (False, True):
-            with self.subTest(error=error):
+    def test_unanswered_or_empty_question_fails(self):
+        for questions, message in (([{"question": "Q?"}], "unanswered"), ([], "no supported nonempty questions")):
+            with self.subTest(questions=questions):
                 self.path.unlink(missing_ok=True)
                 marker = transcript_marker(str(self.path))
-                self.write(entry("assistant", [{"type": "tool_use", "id": "q", "name": "AskUserQuestion", "input": {"questions": []}}]))
-                if error:
-                    self.write(entry("user", [{"type": "tool_result", "tool_use_id": "q", "content": "cancelled", "is_error": True}]))
-                with self.assertRaises(CaptureError):
+                self.write(entry("user", "request"),
+                           entry("assistant", [{"type": "tool_use", "id": "q", "name": "AskUserQuestion", "input": {"questions": questions}}]))
+                with self.assertRaisesRegex(CaptureError, message):
+                    capture_interview(marker, [self.prompt("request")])
+
+    def cancelled_question(self, **record_extra):
+        question = {"questions": [{"question": "Q?"}]}
+        cancel = ("The user doesn't want to proceed with this tool use. To tell you how to proceed, the user said:\n"
+                  "The user wants to clarify these questions.")
+        self.write(entry("user", "request"),
+                   entry("assistant", [{"type": "tool_use", "id": "q", "name": "AskUserQuestion", "input": question}]),
+                   entry("user", [{"type": "tool_result", "tool_use_id": "q", "content": cancel, "is_error": True}],
+                         **record_extra),
+                   entry("assistant", "What would you like to clarify?"),
+                   entry("user", "What does Q mean?"))
+        return question, cancel
+
+    def test_cancelled_question_is_kept_verbatim_but_not_counted_as_answer(self):
+        marker = transcript_marker(str(self.path))
+        _, cancel = self.cancelled_question(toolDenialKind="user-rejected")
+        out = capture_interview(marker, [self.prompt("request"), self.prompt("What does Q mean?")])
+        cancelled = [m for m in out["messages"] if m["source"].get("kind") == "questionnaire_unanswered"]
+        self.assertEqual([m["content"] for m in cancelled], [cancel])
+        self.assertEqual(cancelled[0]["source"]["denial_kind"], "user-rejected")
+        self.assertFalse(any(m["source"].get("kind") == "questionnaire_answer" for m in out["messages"]))
+        self.assertEqual(out["coverage"]["answered_questions"], 0)
+        self.assertEqual(out["coverage"]["unanswered_questions"], 1)
+        # Only the follow-up chat message is human evidence.
+        self.assertEqual(out["coverage"]["human_response_count"], 1)
+
+    def test_cancelled_question_cannot_gain_an_answer_from_a_hook(self):
+        marker = transcript_marker(str(self.path))
+        question, _ = self.cancelled_question()
+        with self.assertRaisesRegex(CaptureError, "cancelled or failed"):
+            capture_interview(marker, [self.prompt("request"), self.prompt("What does Q mean?"), {
+                "hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_use_id": "q",
+                "tool_input": {**question, "answers": {"Q?": "Yes"}}, "tool_response": {"answers": {"Q?": "Yes"}},
+            }])
+
+    def test_session_metadata_and_harness_attachments_are_ignored(self):
+        marker = transcript_marker(str(self.path))
+        metadata = [{"type": "mode", "mode": "normal"}, {"type": "permission-mode", "permissionMode": "auto"},
+                    {"type": "atis-latch", "atis": ""}, {"type": "ai-title", "aiTitle": "Plan"},
+                    {"type": "tools-used", "tools": ["Read"]},
+                    {"type": "api-request-blob", "hash": "h", "message": {"role": "user", "content": "COPY OF REQUEST"}},
+                    {"type": "attachment", "attachment": {"type": "hook_success", "stdout": "{}"}},
+                    {"type": "attachment", "attachment": {"type": "instructions", "files": [{"content": "PROJECT RULES"}]}}]
+        self.write(entry("user", "request"), *metadata, entry("assistant", "Question?"), entry("user", "Answer"))
+        out = capture_interview(marker, [self.prompt("request"), self.prompt("Answer")])
+        self.assertEqual([m["content"] for m in out["messages"]], ["request", "Question?", "Answer"])
+        self.assertEqual(out["coverage"]["ignored_records"], len(metadata))
+        self.assertNotIn("COPY OF REQUEST", json.dumps(out))
+        self.assertNotIn("PROJECT RULES", json.dumps(out))
+
+    def test_human_text_attachments_and_unknown_records_fail_closed(self):
+        for extra, message in (
+            ({"type": "attachment", "attachment": {"type": "queued_command", "prompt": "Typed while busy"}}, "queued_command"),
+            ({"type": "attachment", "attachment": {"type": "file", "content": "attached file"}}, "'file'"),
+            ({"type": "attachment", "attachment": "malformed"}, "None"),
+            ({"type": "brand-new-record", "text": "?"}, "brand-new-record"),
+        ):
+            with self.subTest(extra=extra):
+                self.path.unlink(missing_ok=True)
+                marker = transcript_marker(str(self.path))
+                self.write(entry("user", "request"), extra, entry("assistant", "Question?"))
+                with self.assertRaisesRegex(CaptureError, message):
                     capture_interview(marker, [self.prompt("request")])
 
     def test_compaction_fails(self):

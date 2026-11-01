@@ -20,6 +20,25 @@ _IGNORED_RECORDS = {
     "last-prompt", "custom-title", "agent-name", "agent-color",
     "agent-setting", "session-name", "session-end", "notification",
     "hook_progress",
+    # Session settings, titles, bookkeeping and cached API request copies.  The
+    # visible conversation itself is only in user/assistant records.
+    "mode", "permission-mode", "atis-latch", "bridge-session", "ai-title",
+    "tools-used", "file-history-delta", "cost-state", "relocated",
+    "worktree-state", "api-request", "api-request-shape", "api-request-blob",
+}
+# Harness-generated attachments: hook results, reminders and session context.
+# Attachments carrying human text (queued_command) or files the human attached
+# (file, directory, pdf_reference, ...) are deliberately absent and fail closed.
+_IGNORED_ATTACHMENTS = {
+    "hook_success", "hook_additional_context", "hook_blocking_error",
+    "total_tokens_reminder", "silent_turn_reminder", "task_reminder", "task_status",
+    "deferred_tools_record", "deferred_tools_delta", "agent_listing_delta",
+    "mcp_instructions_delta", "skill_listing", "invoked_skills", "command_permissions",
+    "environment", "prompt_snapshot", "date", "model", "credential_org",
+    "session_context", "remote_session_change", "instructions", "nested_memory",
+    "sandbox_instructions", "auto_mode", "auto_mode_exit", "ultrathink_effort",
+    "plan_mode", "plan_mode_exit", "plan_mode_reentry", "thinking_drop",
+    "read_truncation_notice", "edited_text_file",
 }
 # Claude Code's question screen writes the human's choices and notes into these
 # AskUserQuestion input fields.  PostToolUse sees them; the transcript keeps the
@@ -164,6 +183,18 @@ def _answer_content(value: Any) -> str:
     raise CaptureError("Unsupported AskUserQuestion answer type")
 
 
+def _unanswered_content(value: Any) -> str:
+    """Exact text of a cancelled or failed question result; never a human answer."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list) and all(
+        isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)
+        for block in value
+    ):
+        return _json(value)
+    raise CaptureError("Unsupported content in a cancelled or failed AskUserQuestion result")
+
+
 def human_answer_text(value: Any) -> str:
     """Validated exact answer representation used by the escalation ledger."""
     _answer_content(value)
@@ -226,6 +257,13 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
         if kind == "summary" or record.get("subtype") in {"compact_boundary", "compaction"}:
             raise CaptureError("Compaction occurred during the interview; do not substitute a summary for the original exchange")
         if record.get("isSidechain"):
+            ignored_records += 1
+            continue
+        if kind == "attachment":
+            attachment = record.get("attachment")
+            attachment_type = attachment.get("type") if isinstance(attachment, dict) else None
+            if attachment_type not in _IGNORED_ATTACHMENTS:
+                raise CaptureError(f"Unsupported transcript attachment at line {number}: {attachment_type!r}")
             ignored_records += 1
             continue
         if kind in _IGNORED_RECORDS or kind == "system":
@@ -299,10 +337,22 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
                 if tool_id not in questions:
                     # Unrelated command output, files, Skill expansion, etc.
                     continue
-                if block.get("is_error"):
-                    raise CaptureError("An AskUserQuestion call failed or was cancelled")
                 if questions[tool_id]["answer"] is not None:
                     raise CaptureError("Multiple answers for one AskUserQuestion call")
+                if block.get("is_error"):
+                    # The human cancelled the screen (e.g. to clarify in chat) or
+                    # the call failed.  Keep the result verbatim but never as a
+                    # human answer; any follow-up arrives as an ordinary prompt.
+                    unanswered_source = {
+                        **block_source, "kind": "questionnaire_unanswered", "tool_use_id": tool_id,
+                        "encoding": "string" if isinstance(block.get("content"), str) else "json-values",
+                    }
+                    if isinstance(record.get("toolDenialKind"), str):
+                        unanswered_source["denial_kind"] = record["toolDenialKind"]
+                    questions[tool_id]["answer"] = add(
+                        "user", _unanswered_content(block.get("content")), unanswered_source)
+                    questions[tool_id]["unanswered"] = True
+                    continue
                 answer = add("user", _answer_content(block.get("content")), {
                     **block_source, "kind": "questionnaire_answer", "tool_use_id": tool_id,
                     "encoding": "string" if isinstance(block.get("content"), str) else "json-values",
@@ -350,6 +400,8 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
         if tool_id not in questions or _asked_input(questions[tool_id]["input"]) != _asked_input(event["tool_input"]):
             raise CaptureError("AskUserQuestion hook and transcript disagree about the question")
         item = questions[tool_id]
+        if item.get("unanswered"):
+            raise CaptureError("AskUserQuestion hook answers a question the transcript records as cancelled or failed")
         if item.get("hook_answer_seen"):
             raise CaptureError("Duplicate AskUserQuestion answer hooks are ambiguous")
         item["hook_answer_seen"] = True
@@ -377,7 +429,8 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
         raise CaptureError("No assistant interview exchange was found after activation")
     if not any(m["role"] == "user" for m in messages):
         raise CaptureError("No human input was captured")
-    answered = len(questions)
+    unanswered_questions = sum(1 for item in questions.values() if item.get("unanswered"))
+    answered = len(questions) - unanswered_questions
     user_responses = max(0, transcript_human_prompts - 1)
     return {
         "schema_version": 1,
@@ -389,6 +442,7 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
             "visible_records": visible_records,
             "ignored_records": ignored_records,
             "answered_questions": answered,
+            "unanswered_questions": unanswered_questions,
             "user_responses": user_responses,
             "human_response_count": answered + user_responses,
             "structured_values_encoding": "JSON; string values unchanged, not original JSON whitespace",
