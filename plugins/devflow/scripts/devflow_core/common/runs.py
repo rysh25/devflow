@@ -1,0 +1,437 @@
+"""Run records for every workflow: one envelope and one transaction model.
+
+The run state's ``owner_session`` is the only authority on which Claude session
+owns a run. Runs appear by an atomic directory rename, so a run directory is
+never half-created. Locked loads roll forward a committed transaction; reads
+for display never change a file.
+"""
+from __future__ import annotations
+
+import base64
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import os
+from pathlib import Path
+import re
+import shutil
+from uuid import uuid4
+
+from .. import __version__
+from .errors import DevFlowError
+from .storage import (atomic_json, digest, file_lock, json_bytes, no_symlinks, now,
+                      read_json, within, write_new)
+
+SCHEMA_VERSION = 2
+TERMINAL = frozenset({"completed", "exhausted", "cancelled"})
+RUN_ID = re.compile(r"[0-9]{8}T[0-9]{6}Z-[a-f0-9]{12}\Z")
+SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}\Z")
+EVENT_ID = re.compile(r"[a-f0-9]{32}\Z")
+EVENT_KINDS = frozenset({"prompt", "question", "stop"})
+MAX_EVENT_BYTES = 4 * 1024 * 1024
+MAX_EVENTS = 5000
+CREATING = ".creating-"
+RUNNER_WAIT = 10.0
+HOOK_WAIT = 5.0
+ENVELOPE = frozenset({
+    "schema_version", "plugin_version", "flow", "run_id", "project", "status", "owner_session", "created_at",
+    "updated_at", "state_revision", "artifacts", "event_ids", "inflight", "escalation",
+})
+ESCALATION = frozenset({"id", "reason", "questions", "boundary", "session_id", "return_status", "detail"})
+
+
+def validate_run_id(run_id: object) -> str:
+    if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
+        raise DevFlowError("Use exactly the run ID shown by DevFlow")
+    return run_id
+
+
+def new_run_id() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid4().hex[:12]
+
+
+def data_root(project: Path) -> Path:
+    return Path(project) / ".devflow"
+
+
+def ensure_data_root(project: Path) -> Path:
+    """Create the private record directory; only starts and resumes call this."""
+    root = data_root(project)
+    no_symlinks(root)
+    root.mkdir(mode=0o700, exist_ok=True)
+    ignore = root / ".gitignore"
+    no_symlinks(ignore)
+    if not ignore.exists():
+        # Runs can contain private requirements and conversation.
+        write_new(ignore, b"# Private DevFlow records; never publish them.\n*\n")
+    return root
+
+
+def make_event(payload: dict, kind: str) -> dict:
+    if kind not in EVENT_KINDS or not isinstance(payload, dict):
+        raise DevFlowError("Unsupported human event")
+    return {"event_id": uuid4().hex, "recorded_at": now(), "kind": kind, "payload": payload}
+
+
+def validate_event(value: object) -> dict:
+    if (not isinstance(value, dict) or set(value) != {"event_id", "recorded_at", "kind", "payload"}
+            or not isinstance(value["event_id"], str) or not EVENT_ID.fullmatch(value["event_id"])
+            or not isinstance(value["recorded_at"], str) or value["kind"] not in EVENT_KINDS
+            or not isinstance(value["payload"], dict)):
+        raise DevFlowError("Invalid human event record")
+    return value
+
+
+def open_escalation(state: dict, identifier: str, reason: str, questions: list, return_status: str,
+                    detail: dict | None = None) -> dict:
+    """Pause for a human; only answers recorded after this point may resolve it."""
+    value = {"id": identifier, "reason": reason, "questions": questions, "boundary": len(state["event_ids"]),
+             "session_id": state["owner_session"], "return_status": return_status, "detail": detail or {}}
+    state["escalation"] = value
+    return value
+
+
+@dataclass(frozen=True)
+class RunInfo:
+    flow: str
+    run_id: str
+    format: str  # current | unsupported | invalid
+    state: dict | None
+    error: str | None
+    recovery_required: bool
+
+    def public(self) -> dict:
+        value = {"flow": self.flow, "run_id": self.run_id, "format": self.format,
+                 "recovery_required": self.recovery_required}
+        if self.error:
+            value["error"] = self.error
+        if self.format == "unsupported":
+            value["status"] = self.state.get("status")
+            value["message"] = "Started with DevFlow 0.1.x; this version cannot continue it"
+        return value
+
+
+class RunStore:
+    """All file access for one workflow's runs in one project."""
+
+    def __init__(self, project: Path, workflow, lock_wait: float = RUNNER_WAIT):
+        self.project = Path(project)
+        self.workflow = workflow
+        self.flow = workflow.name
+        self.lock_wait = lock_wait
+        self.root = data_root(self.project) / "runs" / self.flow
+        self._held: set[str] = set()
+
+    # -- paths and locks ------------------------------------------------------------------
+    def run_dir(self, run_id: str) -> Path:
+        path = self.root / validate_run_id(run_id)
+        no_symlinks(path)
+        return path
+
+    @contextmanager
+    def lock(self, run_id: str, wait: float | None = None):
+        if run_id in self._held:
+            raise DevFlowError("Run lock is not reentrant")
+        with file_lock(self.run_dir(run_id) / "state.lock", self.lock_wait if wait is None else wait):
+            self._held.add(run_id)
+            try:
+                yield
+            finally:
+                self._held.discard(run_id)
+
+    def holds(self, run_id: str) -> bool:
+        return run_id in self._held
+
+    def _require_lock(self, run_id: str) -> None:
+        if run_id not in self._held:
+            raise DevFlowError("Changing a run requires its lock")
+
+    # -- validation -------------------------------------------------------------------------
+    def validate(self, state: object, run_id: str) -> dict:
+        workflow = self.workflow
+        if not isinstance(state, dict):
+            raise DevFlowError("Run state must be an object")
+        version = state.get("schema_version")
+        if type(version) is not int or version != SCHEMA_VERSION:
+            raise DevFlowError("Unsupported run state schema_version")
+        unknown = set(state) - ENVELOPE - workflow.state_fields
+        missing = ENVELOPE - set(state)
+        if unknown or missing:
+            raise DevFlowError("Run state fields do not match the workflow: " + ", ".join(sorted(unknown | missing)))
+        if (state["flow"] != self.flow or state["run_id"] != run_id or state["project"] != str(self.project)
+                or state["status"] not in workflow.statuses
+                or not isinstance(state["owner_session"], str) or not SESSION_ID.fullmatch(state["owner_session"])
+                or not isinstance(state["created_at"], str) or not isinstance(state["updated_at"], str)
+                or type(state["state_revision"]) is not int or state["state_revision"] < 0
+                or not isinstance(state["artifacts"], dict)
+                or any(not isinstance(k, str) or not isinstance(v, str) for k, v in state["artifacts"].items())
+                or not isinstance(state["event_ids"], list)
+                or any(not isinstance(i, str) or not EVENT_ID.fullmatch(i) for i in state["event_ids"])
+                or len(set(state["event_ids"])) != len(state["event_ids"])
+                or len(state["event_ids"]) > MAX_EVENTS):
+            raise DevFlowError("Invalid or mismatched run state: " + run_id)
+        workflow.check_state(state)
+        if (state["status"] in workflow.inflight_statuses) != (state["inflight"] is not None):
+            raise DevFlowError("Run state has an in-flight status without its reservation (or the reverse)")
+        if state["inflight"] is not None and not isinstance(state["inflight"], dict):
+            raise DevFlowError("Invalid in-flight reservation")
+        escalation = state["escalation"]
+        if escalation is not None and (
+                not isinstance(escalation, dict) or set(escalation) != ESCALATION
+                or type(escalation["boundary"]) is not int
+                or not 0 <= escalation["boundary"] <= len(state["event_ids"])
+                or not isinstance(escalation["questions"], list)):
+            raise DevFlowError("Invalid pending human escalation")
+        return state
+
+    # -- reading ----------------------------------------------------------------------------
+    def _transaction(self, run_id: str) -> dict:
+        journal = read_json(self.run_dir(run_id) / "transaction.json", limit=256 * 1024 * 1024)
+        desired = journal.get("state")
+        if (journal.get("schema_version") != SCHEMA_VERSION or not isinstance(desired, dict)
+                or type(journal.get("base_revision")) is not int
+                or desired.get("state_revision") != journal["base_revision"] + 1
+                or not isinstance(journal.get("writes"), dict)):
+            raise DevFlowError("Invalid pending transaction; preserve it for human recovery")
+        self.validate(desired, run_id)
+        return journal
+
+    def _finish_transaction(self, run_id: str) -> None:
+        """Replay a committed journal: only file and state writes, never a dispatch."""
+        run = self.run_dir(run_id)
+        path = run / "transaction.json"
+        if not path.exists():
+            return
+        journal = self._transaction(run_id)
+        desired = journal["state"]
+        current = read_json(run / "state.json") if (run / "state.json").exists() else None
+        if current is not None:
+            revision = current.get("state_revision")
+            if revision not in {journal["base_revision"], desired["state_revision"]}:
+                raise DevFlowError("Pending transaction is stale; refusing to replace newer state")
+            if revision == desired["state_revision"] and current != desired:
+                raise DevFlowError("Conflicting committed transaction state")
+        for relative, encoded in journal["writes"].items():
+            target = within(run / relative, run)
+            try:
+                data = base64.b64decode(encoded, validate=True)
+            except (ValueError, TypeError) as exc:
+                raise DevFlowError("Corrupt pending artifact bytes") from exc
+            if digest(data) != desired["artifacts"].get(relative):
+                raise DevFlowError("Pending artifact does not match its committed hash")
+            if target.exists():
+                if not target.is_file() or target.read_bytes() != data:
+                    raise DevFlowError(f"Divergent artifact blocks recovery: {relative}; never overwrite it")
+            else:
+                write_new(target, data)
+        atomic_json(run / "state.json", desired)
+        path.unlink()
+
+    def load(self, run_id: str) -> dict:
+        """Locked read for a change: completes a leftover transaction first."""
+        self._require_lock(run_id)
+        self._finish_transaction(run_id)
+        return self.validate(read_json(self.run_dir(run_id) / "state.json"), run_id)
+
+    def read(self, run_id: str) -> dict:
+        """Display read: never writes; a pending transaction is reported, not replayed."""
+        run = self.run_dir(run_id)
+        if (run / "state.json").exists():
+            return self.validate(read_json(run / "state.json"), run_id)
+        if (run / "transaction.json").exists():
+            return self._transaction(run_id)["state"]
+        raise DevFlowError("Run has no committed state; preserve it for human recovery: " + run_id)
+
+    def inspect(self, run_id: str) -> RunInfo:
+        """Classify a run without raising or changing anything."""
+        recovery = False
+        try:
+            run = self.run_dir(run_id)
+            if not run.is_dir():
+                raise DevFlowError("Run path is not a directory")
+            recovery = (run / "transaction.json").exists()
+            if (run / "state.json").exists():
+                raw = read_json(run / "state.json")
+            elif recovery:
+                raw = read_json(run / "transaction.json", limit=256 * 1024 * 1024).get("state")
+            else:
+                raise DevFlowError("Run has no committed state")
+            if not isinstance(raw, dict):
+                raise DevFlowError("Run state must be an object")
+            version = raw.get("schema_version")
+            if type(version) is int and version == 1:
+                if (raw.get("run_id") == run_id and raw.get("flow", self.flow) == self.flow
+                        and raw.get("project") == str(self.project) and isinstance(raw.get("status"), str)):
+                    return RunInfo(self.flow, run_id, "unsupported", raw, None, recovery)
+                raise DevFlowError("Run state from DevFlow 0.1.x has mismatched basic information")
+            state = self.read(run_id)
+            return RunInfo(self.flow, run_id, "current", state, None, recovery)
+        except (DevFlowError, OSError) as exc:
+            return RunInfo(self.flow, run_id, "invalid", None, str(exc), recovery)
+
+    def scan(self) -> tuple[list[RunInfo], list[str]]:
+        """Every run directory (bounded) plus leftover ``.creating-*`` directories."""
+        no_symlinks(self.root)
+        if not self.root.exists():
+            return [], []
+        if not self.root.is_dir():
+            raise DevFlowError("Workflow runs path is not a directory")
+        runs, creating = [], []
+        for index, path in enumerate(sorted(self.root.iterdir())):
+            if index >= 10000:
+                raise DevFlowError("Run history exceeds the bounded scan limit; archive it explicitly")
+            if path.name.startswith(CREATING):
+                creating.append(path.name)
+            elif RUN_ID.fullmatch(path.name):
+                runs.append(self.inspect(path.name))
+            else:
+                runs.append(RunInfo(self.flow, path.name, "invalid", None, "Not a run directory name", False))
+        return runs, creating
+
+    # -- writing ----------------------------------------------------------------------------
+    def stage(self, state: dict, relative: str, data: bytes) -> Path:
+        """Stage an immutable artifact for the next save; never overwrite one."""
+        run = self.run_dir(state["run_id"])
+        target = within(run / relative, run)
+        if target.exists() and (not target.is_file() or target.read_bytes() != data):
+            raise DevFlowError(f"Refusing to overwrite a different immutable artifact: {relative}")
+        state.setdefault("_pending_writes", {})[relative] = base64.b64encode(data).decode("ascii")
+        state["artifacts"][relative] = digest(data)
+        return target
+
+    def save(self, state: dict) -> None:
+        run_id = state["run_id"]
+        self._require_lock(run_id)
+        self.workflow.before_save(self, state)
+        writes = state.pop("_pending_writes", {})
+        base_revision = state["state_revision"]
+        desired = dict(state, updated_at=now(), state_revision=base_revision + 1)
+        self.validate(desired, run_id)
+        path = self.run_dir(run_id) / "transaction.json"
+        if path.exists():
+            raise DevFlowError("A prior transaction must recover before another change")
+        atomic_json(path, {"schema_version": SCHEMA_VERSION, "base_revision": base_revision,
+                           "state": desired, "writes": writes})
+        self._finish_transaction(run_id)
+        state.clear()
+        state.update(desired)
+
+    def verify_artifacts(self, state: dict) -> None:
+        run = self.run_dir(state["run_id"])
+        for relative, expected in state["artifacts"].items():
+            path = within(run / relative, run)
+            if not path.is_file() or digest(path.read_bytes()) != expected:
+                raise DevFlowError(f"Immutable artifact changed or is missing: {relative}; stop and investigate")
+
+    def create(self, fields: dict, artifacts: dict[str, bytes], *, run_id: str, owner: str, first_event: dict,
+               directories: tuple[str, ...] = ()) -> dict:
+        """Build a complete run in a private directory, then publish it by rename."""
+        ensure_data_root(self.project)
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        final = self.run_dir(run_id)
+        if final.exists():
+            raise DevFlowError("Run ID already exists: " + run_id)
+        validate_event(first_event)
+        staging = self.root / (CREATING + run_id)
+        no_symlinks(staging)
+        staging.mkdir(mode=0o700)
+        try:
+            for name in ("draft", "events", *directories):
+                (staging / name).mkdir(mode=0o700, exist_ok=True)
+            files = dict(artifacts)
+            files[f"events/{first_event['event_id']}.json"] = json_bytes(first_event)
+            hashes = {}
+            for relative, data in files.items():
+                target = within(staging / relative, staging)
+                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                write_new(target, data)
+                hashes[relative] = digest(data)
+            created = now()
+            state = {**fields, "schema_version": SCHEMA_VERSION, "plugin_version": __version__, "flow": self.flow, "run_id": run_id,
+                     "project": str(self.project), "owner_session": owner, "created_at": created,
+                     "updated_at": created, "state_revision": 0, "artifacts": hashes,
+                     "event_ids": [first_event["event_id"]], "inflight": None,
+                     "escalation": fields.get("escalation")}
+            if state["escalation"] is not None:
+                state["escalation"] = dict(state["escalation"], boundary=1, session_id=owner)
+            self.validate(state, run_id)
+            atomic_json(staging / "state.json", state)
+            os.rename(staging, final)
+        except BaseException:
+            if staging.exists() and not final.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            raise
+        return state
+
+    # -- human events -----------------------------------------------------------------------
+    def events(self, state: dict) -> list[dict]:
+        run = self.run_dir(state["run_id"])
+        result = []
+        for identifier in state["event_ids"]:
+            value = validate_event(read_json(run / "events" / (identifier + ".json"), limit=MAX_EVENT_BYTES + 4096))
+            if value["event_id"] != identifier:
+                raise DevFlowError("Human event record does not match its ID")
+            result.append(value)
+        return result
+
+    def append_event(self, run_id: str, payload: dict, kind: str) -> str | None:
+        """Record one hook payload from the owning session; terminal runs are frozen."""
+        with self.lock(run_id):
+            state = self.load(run_id)
+            if state["status"] in TERMINAL:
+                return None
+            if payload.get("session_id") != state["owner_session"]:
+                raise DevFlowError("This run is owned by another session; stale-session events cannot become human evidence")
+            if kind == "question":
+                use_id = payload.get("tool_use_id")
+                if (not isinstance(use_id, str) or not use_id.strip() or len(use_id) > 512
+                        or not isinstance(payload.get("tool_input"), dict) or "tool_response" not in payload):
+                    raise DevFlowError("Question capture requires its actual tool identity, input and result")
+                for old in self.events(state):
+                    earlier = old["payload"]
+                    if (old["kind"] == "question" and earlier.get("session_id") == payload["session_id"]
+                            and earlier.get("tool_use_id") == use_id):
+                        if (earlier.get("tool_input") != payload["tool_input"]
+                                or earlier.get("tool_response") != payload["tool_response"]
+                                or bool(earlier.get("is_error")) != bool(payload.get("is_error"))):
+                            raise DevFlowError("A captured question ID was replayed with different content")
+                        return old["event_id"]  # A hook retry, not a new answer.
+            if len(state["event_ids"]) >= MAX_EVENTS:
+                raise DevFlowError("This run reached its human event limit; start a new run")
+            event = make_event(payload, kind)
+            data = json_bytes(event)
+            if len(data) > MAX_EVENT_BYTES:
+                raise DevFlowError("A single human event exceeds 4 MiB; shorten the message")
+            self.stage(state, f"events/{event['event_id']}.json", data)
+            state["event_ids"].append(event["event_id"])
+            self.save(state)
+            return event["event_id"]
+
+    def transfer_refusal(self, state: dict, session: str) -> str | None:
+        """Why ownership cannot move now (checked on a freshly loaded state)."""
+        if state["status"] in self.workflow.inflight_statuses or state["inflight"] is not None:
+            return "A process may still be running; a human must confirm it stopped and use recover"
+        return self.workflow.can_transfer(state, session)
+
+    def transfer(self, state: dict, session: str, payload: dict) -> dict:
+        """Move ownership and record the resume request in one commit (lock held)."""
+        self._require_lock(state["run_id"])
+        reason = self.transfer_refusal(state, session)
+        if reason:
+            raise DevFlowError(reason)
+        previous = state["owner_session"]
+        state["owner_session"] = session
+        if state["status"] not in TERMINAL:
+            event = make_event(payload, "prompt")
+            data = json_bytes(event)
+            if len(data) > MAX_EVENT_BYTES or len(state["event_ids"]) >= MAX_EVENTS:
+                raise DevFlowError("The resume request cannot be recorded within the event limits")
+            self.stage(state, f"events/{event['event_id']}.json", data)
+            state["event_ids"].append(event["event_id"])
+        if previous != session and state["escalation"] is not None:
+            # Answers given before the move, and the resume command itself,
+            # can no longer resolve the pending decision.
+            state["escalation"] = dict(state["escalation"], boundary=len(state["event_ids"]), session_id=session)
+        self.workflow.on_transfer(state)
+        self.save(state)
+        return state

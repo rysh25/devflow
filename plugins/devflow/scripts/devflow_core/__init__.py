@@ -1,2 +1,2 @@
-"""Unified entry points; the workflow engines are independent components."""
-__version__ = "0.1.3"
+"""DevFlow: planning and implementation workflows with bounded independent reviews."""
+__version__ = "0.2.0"

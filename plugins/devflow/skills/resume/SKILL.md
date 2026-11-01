@@ -10,7 +10,7 @@ allowed-tools: Bash(uv run --offline --no-project --no-config --no-python-downlo
 
 Selected run ID: $ARGUMENTS
 
-The user must provide exactly one existing ID. The unified hook selects its workflow from the stored run, not from the conversation. Never create a replacement run to obtain more review attempts. Do not manually edit session bindings, counters, locks, or audit records.
+The user must provide exactly one existing ID. The prompt hook has already handled `/devflow:resume RUN_ID`: it selected the workflow from the stored run, made this session the run's owner, and recorded the request (which is never an answer to a pending question). If the hook refused (for example a run started with DevFlow 0.1.x, a damaged or ambiguous run, another unfinished run, a process that may still be running, or an unsealed plan interview from another conversation), report that message and stop. Never create a replacement run to obtain more review attempts. Do not manually edit session records, counters, locks, or audit records.
 
 1. Run the following status command with the exact ID. Read the returned `flow` field; do not guess from filenames.
 
@@ -18,7 +18,7 @@ The user must provide exactly one existing ID. The unified hook selects its work
 uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" --project "${CLAUDE_PROJECT_DIR}" --session "${CLAUDE_SESSION_ID}" --run RUN_ID status
 ```
 
-2. Run the same prefix/global selectors followed by `plan resume` or `implement resume`, according to that field. Do not invoke another Skill tool: read its workflow reference with Read instead.
+2. There is no separate resume action to run. Do not invoke another Skill tool: read the workflow reference with Read instead.
 3. For `plan`, read `${CLAUDE_PLUGIN_ROOT}/references/plan-workflow.md` in full. For `implement`, read `${CLAUDE_PLUGIN_ROOT}/references/implement-workflow.md` in full. The runner uses `plan ACTION` or `implement ACTION`, with every global option before that selector.
 4. Continue from the saved state. For `awaiting_human`, ask the pending questions: invoking resume is not an answer or approval. An interview not yet sealed must resume in its original Claude conversation.
 5. For an in-flight/recovery error, stop and ask the human to inspect associated processes. Do not remove locks or run the operator-only recovery action yourself.

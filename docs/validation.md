@@ -1,16 +1,15 @@
-# DevFlow 0.1.3 の検証範囲
+# DevFlow 0.2.0 の検証範囲
 
 ## 再実行方法
 
 互換 Python 3.11 以降を使い、配布ルートで実行します。Python の第三者パッケージ、モデルのログイン、API キーは不要です。
 
 ```text
-python tools/sync_shared.py --check
 python tools/test_all.py --quiet
 python tools/package.py --validate-only
 ```
 
-各テスト群は別々の Python プロセスで実行し、モジュール名の衝突を避けます。`tests_planflow`、`tests_buildflow`、`tests_unified`、`tests` がそれぞれ計画、実装、統合ルーター、共通コード・統合・配布を扱います。テスト件数は追加に伴って変わるため、実行出力を正としてください。
+すべてのテストを1つの Python プロセスで `unittest discover -s tests -t .` により実行します。`tests/common`、`tests/plan`、`tests/implement`、`tests/router` と、`tests` 直下の統合・配布テストはパッケージとして読み込まれ、実行順序に依存しません。テスト件数は追加に伴って変わるため、実行出力を正としてください。
 
 本作成環境は Linux / Python 3.12.14 です。実際の uv 0.13.4 で、Python の版固定なし・offline・自動ダウンロード禁止の統合 runner 起動を確認しています。各 OS や他の Python 版の動作確認とは区別してください。
 
@@ -20,7 +19,9 @@ python tools/package.py --validate-only
 
 - 人間の質問・回答の記録と、要約・決定事項を原文と分けて扱うこと。
 - Plan と Implement の独立性、明示した Markdown のみを入力にすること。
-- `.devflow/runs/{plan,implement}/` とフロー別セッション、統合設定。
+- `.devflow/runs/{plan,implement}/` と、1セッション1ファイルのセッション記録、統合設定。
+- 保存形式の版（`schema_version` 2）と、0.1.x の run・破損した run・復旧待ちの run の区別。
+- 開始・resume の途中で止まった場合の完了と取り消し、外部処理中の発言の記録。
 - `/devflow:*` コマンド、Python の厳密な版固定を含まない runner/guard 契約。
 - 設定された面接スキルの限定的なローカル診断、モデル呼び出し禁止・不足・曖昧さ・未検証の区別、Implement からの独立性。
 - Codex / OpenCode を模擬するローカル CLI の別プロセス起動、引数、JSON/JSONL 結果の照合。

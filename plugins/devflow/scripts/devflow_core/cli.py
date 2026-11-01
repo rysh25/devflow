@@ -1,4 +1,9 @@
-"""One public runner for both independent workflows; standard library only."""
+"""The single DevFlow runner: one argparse tree built from the workflow registry.
+
+Every runner error, including a malformed invocation, is one JSON object on
+stdout with exit status 2. ``--help`` and ``--version`` print text. Hook
+failures go to stderr; a failed Stop hook exits 0 so it never loops.
+"""
 from __future__ import annotations
 
 import argparse
@@ -9,36 +14,48 @@ import shutil
 import subprocess
 import sys
 
-from . import __version__, runtime
+from . import __version__, router
+from .common import paths
+from .common.errors import DevFlowError, UsageError
+from .common.reviewers import preflight
+from .workflows import WORKFLOWS
 
-
-PLUGIN_ROOT = Path(__file__).resolve().parents[2]
+PLUGIN_ROOT = paths.PLUGIN_ROOT
 MINIMUM_CLAUDE_CODE = "2.1.295"
-ACTIONS = {
-    "plan": {"status", "doctor", "seal", "plan", "review", "apply", "pause", "resolve",
-             "resume", "cancel", "report", "recover", "publish"},
-    "implement": {"doctor", "status", "start", "resume", "checkpoint", "check", "review",
-                  "reflect", "escalate", "resolve", "cancel", "recover"},
-}
+MAX_HOOK_BYTES = 16 * 1024 * 1024
 
 
-def parser():
-    result = argparse.ArgumentParser(description="DevFlow: independent planning and implementation with bounded reviews.")
+class Parser(argparse.ArgumentParser):
+    def error(self, message):  # argparse would print usage text and exit
+        raise UsageError(f"{self.prog}: {message}")
+
+
+def parser() -> Parser:
+    result = Parser(prog="devflow", description="DevFlow: planning and implementation workflows with bounded independent reviews.")
     result.add_argument("--version", action="version", version="devflow " + __version__)
-    result.add_argument("--project", type=Path, default=Path.cwd(), help="Project/worktree; global options precede the workflow")
+    result.add_argument("--project", type=Path, default=Path.cwd(), help="Project/worktree; global options precede the command")
     result.add_argument("--session", help="Actual Claude Code session ID")
-    result.add_argument("--run", help="Existing run ID; required to resume or inspect a particular run")
-    result.add_argument("command", choices=["plan", "implement", "status", "doctor", "hook"])
-    result.add_argument("arguments", nargs=argparse.REMAINDER, help="Workflow-specific action and its options")
+    result.add_argument("--run", help="Existing run ID; required to inspect or act on a particular run")
+    commands = result.add_subparsers(dest="command", required=True, parser_class=Parser)
+    commands.add_parser("status", help="Read-only overview, or the bound/selected run")
+    commands.add_parser("doctor", help="Offline prerequisites for every workflow; never calls a model")
+    commands.add_parser("hook", help="Claude Code hook entry; reads one JSON object from stdin")
+    for name, workflow in WORKFLOWS.items():
+        actions = commands.add_parser(name, help=f"The {name} workflow").add_subparsers(
+            dest="action", required=True, parser_class=Parser)
+        workflow.register_commands(actions)
+        if workflow.start_option:
+            start = actions.add_parser("start", help="Create the run requested by the user's pending command")
+            start.add_argument(workflow.start_option, dest="start_value", required=True)
     return result
 
 
-def emit(value):
+def emit(value) -> None:
     if value is not None:
         print(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False))
 
 
-def claude_version():
+def claude_version() -> dict:
     executable = shutil.which("claude")
     report = {"minimum_version": MINIMUM_CLAUDE_CODE, "path": executable,
               "version": None, "supported": False, "reason": "Claude Code executable not found"}
@@ -54,119 +71,84 @@ def claude_version():
             report["reason"] = "Claude Code version could not be established"
         else:
             value = tuple(int(part) for part in match.groups())
-            report.update(version=".".join(match.groups()), supported=value >= (2, 1, 295),
+            minimum = tuple(int(part) for part in MINIMUM_CLAUDE_CODE.split("."))
+            report.update(version=".".join(match.groups()), supported=value >= minimum,
                           reason="Required fail-closed hook behavior is version-gated; real hook execution is not verified")
     except (OSError, subprocess.SubprocessError) as exc:
         report["reason"] = str(exc)
     return report
 
 
-def doctor(project: Path, plugin_root: Path = PLUGIN_ROOT):
-    probe = runtime.component(plugin_root, "implement", "adapters").preflight
-    reports = {}
-    cache = {}
-    for flow in runtime.FLOWS:
-        root = runtime.component_root(plugin_root, flow)
-        config = runtime.component(plugin_root, flow, "config").load_config(project, root)
+def doctor(project: Path) -> dict:
+    """Offline project-settings readiness for every workflow; changes nothing."""
+    reports, cache, warnings = {}, {}, []
+    for name, workflow in WORKFLOWS.items():
+        config = workflow.load_config(project)
         reviewers = []
         for provider in config["reviewers"]:
             key = json.dumps({k: v for k, v in provider.items() if k != "timeout_seconds"}, sort_keys=True)
             if key not in cache:
                 try:
-                    cache[key] = {"ready": True, "details": probe(provider)}
-                except Exception as exc:
+                    cache[key] = {"ready": True, "details": preflight(provider)}
+                except Exception as exc:  # noqa: BLE001 - diagnostics report every failure
                     cache[key] = {"ready": False, "error": str(exc)}
             reviewers.append({"id": provider["id"], **cache[key]})
-        reviewers_ready = all(item["ready"] for item in reviewers)
-        reports[flow] = {"config": config, "configuration_source": "project_settings",
-                         "reviewers": reviewers, "reviewers_ready": reviewers_ready,
-                         "ready": reviewers_ready}
-        if flow == "plan":
-            inspection = runtime.component(plugin_root, "plan", "interview").inspect_interview_skill(project, config["grill_skill"])
-            reports[flow]["interview_skill"] = inspection
-            reports[flow]["ready"] = reviewers_ready and inspection["static_ready"]
+        extra = workflow.doctor(project, config)
+        warnings.extend(extra.get("warnings", []))
+        ready = all(item["ready"] for item in reviewers) and extra.get("ready", True)
+        reports[name] = {"config": config, "configuration_source": "project_settings", "reviewers": reviewers,
+                         "reviewers_ready": all(item["ready"] for item in reviewers), "ready": ready,
+                         **{key: value for key, value in extra.items() if key not in {"warnings", "ready"}}}
+    warnings.extend(router.blocking_warnings(project))
     version = claude_version()
     executables = {name: shutil.which(name) for name in ("uv", "claude", "git")}
-    warnings = []
-    if not reports["implement"]["config"]["checks"]:
-        warnings.append("No implementation checks configured; every revised snapshot requires actual human validation")
-    inspection = reports["plan"]["interview_skill"]
-    if not inspection["static_ready"]:
-        warnings.append("Planning interview skill " + inspection["configured_name"] + ": " + inspection["reason"])
-    warnings.append("Interview skill callability is not runtime-verified; static metadata cannot establish effective permissions or skillOverrides")
     return {"plugin": "devflow", "version": __version__, "project": str(project),
             "minimum_claude_code": MINIMUM_CLAUDE_CODE, "claude_code": version,
             "python": {"version": sys.version.split()[0], "requires": ">=3.11", "fixed_minor": False},
-            "executables": executables,
-            "workflows": reports, "warnings": warnings,
+            "executables": executables, "workflows": reports, "warnings": warnings,
             "ready": bool(executables["uv"]) and version["supported"] and all(item["ready"] for item in reports.values()),
-            "readiness_scope": "Offline project-settings prerequisites only; use plan doctor with the active session/run to inspect frozen run configuration.",
+            "readiness_scope": "Offline project-settings prerequisites only; use a workflow's doctor with the active session/run to inspect frozen run configuration.",
             "not_verified": ["CLI authentication and model access", "Effective model and reasoning settings",
                              "Real Claude Code hook and interview skill execution", "Native Windows/macOS execution"],
             "note": "Offline help/version probes only; no model calls, authentication, installation, or implicit fallback"}
 
 
-def _forward(args, project: Path):
-    forwarded = ["--project", str(project)]
-    if args.session:
-        forwarded += ["--session", args.session]
-    if args.run:
-        forwarded += ["--run", args.run]
-    return forwarded + args.arguments
+def _hook() -> dict | None:
+    raw = sys.stdin.read(MAX_HOOK_BYTES + 1)
+    if len(raw.encode("utf-8")) > MAX_HOOK_BYTES:
+        raise DevFlowError("Hook payload exceeds 16 MiB")
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise DevFlowError("Hook input must be a JSON object")
+    return payload
 
 
-def _workflow(args, project: Path, plugin_root: Path):
-    flow = args.command
-    if not args.arguments:
-        raise runtime.DevFlowError("Select an action after the workflow, such as plan status or implement start")
-    action = args.arguments[0]
-    if action in {"--help", "--version"} and len(args.arguments) == 1:
-        return runtime.component(plugin_root, flow, "cli").main(args.arguments)
-    if action not in ACTIONS[flow]:
-        raise runtime.DevFlowError("Unknown or unsafe workflow action; component hook entry points are not exposed")
-    if action in {"start", "resume"}:
-        if not args.session or not runtime.SESSION_ID.fullmatch(args.session):
-            raise runtime.DevFlowError("Start/resume requires the actual current Claude session ID")
-        selected = None
-        if action == "resume":
-            selected_flow = runtime.resolve_run(project, args.run, plugin_root)
-            if selected_flow != flow:
-                raise runtime.DevFlowError("The selected run belongs to another workflow")
-            selected = (flow, args.run)
-        with runtime.dispatch_lock(project, plugin_root):
-            runtime.assert_no_legacy_active(project, args.session, plugin_root)
-            runtime.assert_available(project, args.session, plugin_root, selected)
-            return runtime.component(plugin_root, flow, "cli").main(_forward(args, project))
-    return runtime.component(plugin_root, flow, "cli").main(_forward(args, project))
-
-
-def main(argv=None):
-    args = parser().parse_args(argv)
-    payload = None
+def main(argv=None) -> int:
+    command, payload = None, None
     try:
-        if args.command == "hook":
-            if args.arguments or args.session or args.run:
-                raise runtime.DevFlowError("Hook context comes only from the actual stdin hook payload")
-            raw = sys.stdin.read(16 * 1024 * 1024 + 1)
-            if len(raw.encode("utf-8")) > 16 * 1024 * 1024:
-                raise runtime.DevFlowError("Hook payload exceeds 16 MiB")
-            payload = json.loads(raw)
-            if not isinstance(payload, dict):
-                raise runtime.DevFlowError("Hook input must be a JSON object")
-            emit(runtime.handle_hook(payload, PLUGIN_ROOT))
+        args = parser().parse_args(argv)
+        command = args.command
+        if command == "hook":
+            if args.session or args.run:
+                raise DevFlowError("Hook context comes only from the actual stdin hook payload")
+            payload = _hook()
+            emit(router.handle_hook(payload, PLUGIN_ROOT))
             return 0
-        project = runtime.project_root(args.project)
-        if args.command in runtime.FLOWS:
-            return _workflow(args, project, PLUGIN_ROOT)
-        if args.arguments:
-            raise runtime.DevFlowError("Global status/doctor accept no action arguments; use global --run before the command")
-        if args.command == "status":
-            emit(runtime.status(project, args.session, args.run, PLUGIN_ROOT))
-        else:
+        project = router.project_root(args.project)
+        if command == "status":
+            emit(router.status(project, args.session, args.run))
+        elif command == "doctor":
             emit(doctor(project))
+        elif args.action == "start":
+            if args.run:
+                raise DevFlowError("A new start cannot target an existing run")
+            emit(router.runner_start(project, args.session, command, args.start_value))
+        else:
+            run_id = router.selected_run(project, args.session, command, args.run)
+            emit(WORKFLOWS[command].run_command(args, project, run_id, args.session))
         return 0
-    except Exception as exc:
-        if args.command == "hook":
+    except Exception as exc:  # noqa: BLE001 - every failure is reported, never retried
+        if command == "hook":
             print("DevFlow hook failed: " + str(exc), file=sys.stderr)
             return 0 if isinstance(payload, dict) and payload.get("hook_event_name") == "Stop" else 2
         emit({"error": type(exc).__name__, "message": str(exc), "automatic_retry": False})

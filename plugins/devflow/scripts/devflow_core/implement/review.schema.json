@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DevFlow independent code review",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "snapshot_id", "verdict", "summary", "findings", "questions"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "snapshot_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "verdict": {"type": "string", "enum": ["pass", "changes_required", "human_required"]},
+    "summary": {"type": "string", "minLength": 1, "maxLength": 32768},
+    "findings": {
+      "type": "array", "maxItems": 128,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["id", "severity", "category", "file", "line_start", "line_end", "evidence", "recommendation", "requires_human"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "maxLength": 128},
+          "severity": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
+          "category": {"type": "string", "minLength": 1, "maxLength": 32768},
+          "file": {"type": "string", "minLength": 1, "maxLength": 32768},
+          "line_start": {"type": "integer", "minimum": 0},
+          "line_end": {"type": "integer", "minimum": 0},
+          "evidence": {"type": "string", "minLength": 1, "maxLength": 32768},
+          "recommendation": {"type": "string", "minLength": 1, "maxLength": 32768},
+          "requires_human": {"type": "boolean"}
+        }
+      }
+    },
+    "questions": {"type": "array", "maxItems": 64, "items": {"type": "string", "minLength": 1, "maxLength": 32768}}
+  }
+}

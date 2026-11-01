@@ -22,19 +22,21 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / "plugins" / "devflow"
-BUILD_PLUGIN = PLUGIN / "components" / "buildflow"
-PLAN_PLUGIN = PLUGIN / "components" / "planflow"
-for plugin in (BUILD_PLUGIN, PLAN_PLUGIN):
-    sys.path.insert(0, str(plugin / "scripts"))
+SCRIPTS = PLUGIN / "scripts"
+BUILD_PLUGIN = SCRIPTS / "devflow_core" / "implement"
+PLAN_PLUGIN = SCRIPTS / "devflow_core" / "plan"
 
-from buildflow_core import cli as build_cli  # noqa: E402
-from buildflow_core.config import validate_config, load_config as load_build_config  # noqa: E402
-from buildflow_core.engine import Engine as BuildEngine  # noqa: E402
-from buildflow_core.hooks import handle_hook as build_hook  # noqa: E402
-from buildflow_core.storage import BuildFlowError, read_json, session_path  # noqa: E402
-from planflow_core.engine import Engine as PlanEngine  # noqa: E402
-from planflow_core.config import load_config as load_plan_config  # noqa: E402
-from planflow_core.hooks import handle_hook as plan_hook  # noqa: E402
+from devflow_core import cli, router  # noqa: E402
+from devflow_core.common import sessions  # noqa: E402
+from devflow_core.common.errors import DevFlowError  # noqa: E402
+from devflow_core.common.storage import read_json  # noqa: E402
+from devflow_core.implement.config import validate_config, load_config as load_build_config  # noqa: E402
+from devflow_core.implement.engine import Engine as BuildEngine  # noqa: E402
+from devflow_core.plan.config import load_config as load_plan_config  # noqa: E402
+from devflow_core.plan.engine import Engine as PlanEngine  # noqa: E402
+from devflow_core.workflows import WORKFLOWS  # noqa: E402
+
+hook = router.handle_hook
 
 
 def write_json(path: Path, value):
@@ -65,37 +67,30 @@ class BundleContractTests(unittest.TestCase):
         meta = read_json(ROOT / "plugins" / "devflow" / ".claude-plugin" / "plugin.json")
         self.assertFalse(meta.get("dependencies"))
         for plugin in (BUILD_PLUGIN, PLAN_PLUGIN):
-            self.assertTrue((plugin / "scripts").is_dir())
+            self.assertTrue((plugin / "__init__.py").is_file())
             self.assertFalse((plugin / ".claude-plugin" / "plugin.json").exists())
 
     def test_plugins_do_not_import_each_other_or_build_time_shared_package(self):
-        for plugin, forbidden in ((BUILD_PLUGIN, "planflow_core"), (PLAN_PLUGIN, "buildflow_core")):
-            for source in (plugin / "scripts").rglob("*.py"):
+        for plugin, forbidden in ((BUILD_PLUGIN, "plan"), (PLAN_PLUGIN, "implement")):
+            for source in plugin.rglob("*.py"):
                 tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
                 for node in ast.walk(tree):
                     if isinstance(node, ast.Import):
                         names = [alias.name for alias in node.names]
                     elif isinstance(node, ast.ImportFrom):
-                        names = [node.module or ""]
+                        module = node.module or ""
+                        names = [module if not node.level else ("devflow_core." + module if node.level == 2 else "devflow_core.<self>." + module)]
                     else:
                         continue
                     for name in names:
                         with self.subTest(source=source, module=name):
-                            self.assertNotEqual(name.split(".")[0], forbidden)
-                            self.assertFalse(name.startswith("shared."))
-
-    def test_shared_source_is_identically_vendored_into_each_plugin(self):
-        for source in (ROOT / "shared" / "flow_common").glob("*.py"):
-            for plugin in (BUILD_PLUGIN, PLAN_PLUGIN):
-                target = plugin / "scripts" / (plugin.name + "_core") / "_vendor" / "flow_common" / source.name
-                with self.subTest(target=target):
-                    self.assertEqual(target.read_bytes(), source.read_bytes())
+                            self.assertFalse(name == "devflow_core." + forbidden or name.startswith("devflow_core." + forbidden + "."))
 
     def test_standalone_import_has_no_sibling_plugin_dependency(self):
-        for plugin, own, other in ((BUILD_PLUGIN, "buildflow_core", "planflow_core"), (PLAN_PLUGIN, "planflow_core", "buildflow_core")):
+        for plugin, own, other in ((BUILD_PLUGIN, "devflow_core.implement", "devflow_core.plan"), (PLAN_PLUGIN, "devflow_core.plan", "devflow_core.implement")):
             code = (
-                "import sys; sys.path.insert(0, " + repr(str(plugin / "scripts")) + "); "
-                "import " + own + ".engine, " + own + ".hooks; "
+                "import sys; sys.path.insert(0, " + repr(str(SCRIPTS)) + "); "
+                "import " + own + ".engine, " + own + ".workflow, " + own + ".commands; "
                 "assert not any(x == " + repr(other) + " or x.startswith(" + repr(other + ".") + ") for x in sys.modules)"
             )
             execution = subprocess.run([sys.executable, "-I", "-c", code], cwd=ROOT,
@@ -103,7 +98,6 @@ class BundleContractTests(unittest.TestCase):
             self.assertEqual(execution.returncode, 0, execution.stderr)
 
     def test_root_commands_are_manual_and_use_unified_runner(self):
-        self.assertTrue((BUILD_PLUGIN / "references" / "workflow.md").is_file())
         for name in ("plan", "implement", "resume", "status", "doctor"):
             source = (PLUGIN / "skills" / name / "SKILL.md").read_text(encoding="utf-8")
             frontmatter = source.split("---", 2)[1]
@@ -114,13 +108,13 @@ class BundleContractTests(unittest.TestCase):
             self.assertNotIn("--python 3.11", source)
 
     def test_configuration_rejects_advisory_only_validation(self):
-        value = read_json(BUILD_PLUGIN / "config" / "defaults.json")
+        value = read_json(BUILD_PLUGIN / "defaults.json")
         value["checks"] = [{"id": "advisory", "argv": [sys.executable, "-c", "raise SystemExit(1)"], "required": False}]
-        with self.assertRaises(BuildFlowError):
+        with self.assertRaises(DevFlowError):
             validate_config(value)
 
     def test_check_validation_agrees_before_start(self):
-        base = read_json(BUILD_PLUGIN / "config" / "defaults.json")
+        base = read_json(BUILD_PLUGIN / "defaults.json")
         for check in (
             {"id": "UnitTests", "argv": [sys.executable]},
             {"id": "unit", "argv": [sys.executable], "cwd": "../outside"},
@@ -129,7 +123,7 @@ class BundleContractTests(unittest.TestCase):
         ):
             value = copy.deepcopy(base)
             value["checks"] = [check]
-            with self.subTest(check=check), self.assertRaises(BuildFlowError):
+            with self.subTest(check=check), self.assertRaises(DevFlowError):
                 validate_config(value)
 
     def test_every_project_example_is_valid_for_both_independent_workflows(self):
@@ -171,16 +165,21 @@ class FlowFixture(unittest.TestCase):
         self.plan_engine = PlanEngine(self.project, PLAN_PLUGIN)
         self.run_id = None
         self.draft = None
-        self.preflight = patch("buildflow_core.adapters.preflight", return_value={"ready": True, "kind": "synthetic"})
-        self.preflight.start()
-        self.addCleanup(self.preflight.stop)
+        for target in ("devflow_core.implement.engine.preflight", "devflow_core.plan.engine.preflight",
+                       "devflow_core.cli.preflight", "devflow_core.implement.commands.preflight"):
+            patcher = patch(target, return_value={"ready": True, "kind": "synthetic"})
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def event(self, name="UserPromptSubmit", session=None, **extra):
         return {"hook_event_name": name, "cwd": str(self.project), "session_id": session or self.session,
                 "transcript_path": str(self.transcript), **extra}
 
     def submit(self, prompt, session=None):
-        return build_hook(self.event(session=session, prompt=prompt), BUILD_PLUGIN)
+        return hook(self.event(session=session, prompt=prompt), PLUGIN)
+
+    def record(self, session=None):
+        return sessions.read_record(self.project, session or self.session, WORKFLOWS)
 
     def invoke(self, action, *options, session=None, run=True, expect=0):
         session = session or self.session
@@ -188,19 +187,19 @@ class FlowFixture(unittest.TestCase):
         if run:
             self.assertIsNotNone(self.run_id)
             arguments += ["--run", self.run_id]
-        context = arguments.copy()
-        arguments += [action, *map(str, options)]
+        arguments += ["implement", action, *map(str, options)]
         command = shlex.join([
             "uv", "run", "--offline", "--no-project", "--no-config", "--no-python-downloads",
-            str(PLUGIN / "scripts" / "devflow.py"), *context, "implement", action, *map(str, options),
+            str(PLUGIN / "scripts" / "devflow.py"), *arguments,
         ])
-        decision = build_hook(self.event("PreToolUse", session=session, tool_name="Bash", tool_input={"command": command}), BUILD_PLUGIN)
-        self.assertFalse((decision.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny", decision)
+        decision = hook(self.event("PreToolUse", session=session, tool_name="Bash", tool_input={"command": command}), PLUGIN)
+        self.assertFalse(((decision or {}).get("hookSpecificOutput") or {}).get("permissionDecision") == "deny", decision)
         stdout, stderr = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            result = build_cli.main(arguments)
-        self.assertEqual(result, expect, stderr.getvalue())
-        return json.loads(stdout.getvalue()) if result == 0 else stderr.getvalue()
+            result = cli.main(arguments)
+        self.assertEqual(result, expect, stdout.getvalue() + stderr.getvalue())
+        value = json.loads(stdout.getvalue())
+        return value if result == 0 else value["message"]
 
     def start(self, plan=None):
         self.plan = plan or self.plan
@@ -212,8 +211,8 @@ class FlowFixture(unittest.TestCase):
         return state
 
     def edit(self, path, text, session=None):
-        result = build_hook(self.event("PreToolUse", session=session, tool_name="Write", tool_input={"file_path": str(path)}), BUILD_PLUGIN)
-        self.assertEqual(result, {})
+        result = hook(self.event("PreToolUse", session=session, tool_name="Write", tool_input={"file_path": str(path)}), PLUGIN)
+        self.assertIsNone(result)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
 
@@ -234,18 +233,15 @@ class FlowFixture(unittest.TestCase):
 
     def plan_start(self):
         request = "/devflow:plan Make a tested pure function; do not implement."
-        event = self.event(prompt=request)
-        self.assertEqual(build_hook(event, BUILD_PLUGIN), {})
-        plan_hook(event, PLAN_PLUGIN)
+        hook(self.event(prompt=request), PLUGIN)
         self.plan_append("user", request)
-        run_id = self.plan_engine.session_run(self.session)
-        return run_id
+        return self.record()["run"]["run_id"]
 
     def plan_complete(self):
         run_id = self.plan_start()
         self.plan_append("assistant", "grill-me: Must the old API remain compatible?")
         answer = "Yes. Keep the API compatible and add a regression test."
-        plan_hook(self.event(prompt=answer), PLAN_PLUGIN)
+        hook(self.event(prompt=answer), PLUGIN)
         self.plan_append("user", answer)
         draft = Path(self.plan_engine.status(run_id)["draft_dir"])
         decisions = draft / "decisions.json"
@@ -256,7 +252,7 @@ class FlowFixture(unittest.TestCase):
         plan.write_text("# Feature\nImplement a pure function. Preserve its API. Add a regression test.\n", encoding="utf-8")
         self.plan_engine.plan(run_id, plan)
         reviewed = {"schema_version": 1, "verdict": "pass", "summary": "Synthetic planning review passed.", "findings": [], "questions": []}
-        with patch("planflow_core.adapters.run_review", return_value=reviewed):
+        with patch("devflow_core.plan.engine.run_review", return_value=reviewed):
             self.plan_engine.review(run_id)
             state = self.plan_engine.review(run_id)
         self.assertEqual(state["status"], "completed")
@@ -267,13 +263,13 @@ class HookCliEngineTests(FlowFixture):
     def test_documented_command_loop_reaches_two_reviewer_completion(self):
         state = self.ready_review()
         self.assertEqual(state["status"], "ready_review")
-        with patch("buildflow_core.adapters.run_review", side_effect=review_pass) as dispatch:
+        with patch("devflow_core.implement.engine.run_review", side_effect=review_pass) as dispatch:
             first = self.invoke("review")
             second = self.invoke("review")
         self.assertEqual(first["status"], "ready_review")
         self.assertEqual(second["status"], "completed")
         self.assertEqual(second["review_count"], 2)
-        self.assertTrue(second["report"]["both_reviewers_approved"])
+        self.assertTrue(second["report"]["all_reviewers_approved"])
         report = second["report"]
         self.assertEqual(report["workspace_snapshot_id_at_report"], second["candidate"]["snapshot_id"])
         self.assertTrue(report["workspace_matches_checkpoint_at_report"])
@@ -283,7 +279,7 @@ class HookCliEngineTests(FlowFixture):
         self.assertIsNone(report["workspace_capture_error"])
         self.assertEqual([call.args[0]["id"] for call in dispatch.call_args_list], ["codex", "opencode"])
         self.assertEqual(first["candidate"]["snapshot_id"], second["candidate"]["snapshot_id"])
-        blocked = build_hook(self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(self.source)}), BUILD_PLUGIN)
+        blocked = hook(self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(self.source)}), PLUGIN)
         self.assertEqual(blocked["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_status_command_is_usable_in_its_documented_form(self):
@@ -309,7 +305,7 @@ class HookCliEngineTests(FlowFixture):
                 }])
             return review
 
-        with patch("buildflow_core.adapters.run_review", side_effect=review_with_one_correction):
+        with patch("devflow_core.implement.engine.run_review", side_effect=review_with_one_correction):
             required = self.invoke("review")
             self.assertEqual(required["status"], "needs_revision")
             decisions = self.draft / "decisions.json"
@@ -329,7 +325,7 @@ class HookCliEngineTests(FlowFixture):
         self.assertNotEqual(first_snapshot, second["candidate"]["snapshot_id"])
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(completed["review_count"], 3)
-        self.assertTrue(completed["report"]["both_reviewers_approved"])
+        self.assertTrue(completed["report"]["all_reviewers_approved"])
         self.assertEqual(len(packets[1]["previous_reviews"]), 1)
         self.assertEqual(packets[1]["reflections"][0]["decisions"][0]["finding_id"], "F1")
         self.assertEqual(packets[1]["validation"]["snapshot_id"], packets[1]["snapshot_id"])
@@ -339,7 +335,7 @@ class HookCliEngineTests(FlowFixture):
         write_json(self.project / "devflow.config.json", {"schema_version": 1, "implement": self.config})
         self.start()
         self.checkpoint()
-        with patch("buildflow_core.adapters.run_review") as dispatch:
+        with patch("devflow_core.implement.engine.run_review") as dispatch:
             result = self.invoke("check")
         self.assertEqual(result["status"], "paused_error")
         self.assertEqual(result["approvals"], {})
@@ -354,17 +350,17 @@ class HookCliEngineTests(FlowFixture):
         self.edit(questions, json.dumps({"reason": "Existing API conflicts with requested change.", "questions": ["Keep compatibility?"]}))
         waiting = self.invoke("escalate", "--questions-file", questions)
         self.assertEqual(waiting["status"], "awaiting_human")
-        self.invoke("resolve", "--event-id", "evt-" + "b" * 32, "--decision", "continue", "--reason", "Claimed approval", expect=2)
+        self.invoke("resolve", "--event-id", "b" * 32, "--decision", "continue", "--reason", "Claimed approval", expect=2)
         actual = "Keep the existing API and continue with a compatible implementation."
-        build_hook(self.event("PostToolUse", tool_name="AskUserQuestion", tool_use_id="human-resolution-1",
+        hook(self.event("PostToolUse", tool_name="AskUserQuestion", tool_use_id="human-resolution-1",
                              tool_input={"questions": [{"question": "Keep compatibility?"}]},
-                             tool_response={"answers": {"Keep compatibility?": actual}}), BUILD_PLUGIN)
+                             tool_response={"answers": {"Keep compatibility?": actual}}), PLUGIN)
         after_answer = self.invoke("status")
         event = after_answer["human_events"][-1]
         resolved = self.invoke("resolve", "--event-id", event["event_id"], "--decision", "continue", "--reason", "Preserve the existing API")
         self.assertEqual(resolved["status"], "implementing")
         saved = read_json(Path(resolved["run_dir"]) / resolved["resolutions"][-1])
-        self.assertEqual(json.loads(saved["human_event"]["text"])["answers"]["Keep compatibility?"], actual)
+        self.assertEqual(json.loads(saved["human_event"]["answer_text"])["answers"]["Keep compatibility?"], actual)
 
     def test_resume_command_cannot_be_reused_as_human_answer(self):
         self.start()
@@ -372,26 +368,26 @@ class HookCliEngineTests(FlowFixture):
         self.edit(questions, json.dumps({"reason": "Need a decision.", "questions": ["May the API change?"]}))
         self.invoke("escalate", "--questions-file", questions)
         self.submit("/devflow:resume " + self.run_id)
-        self.invoke("resume")
-        record = read_json(session_path(self.project, self.session))
-        event_id = record["events"][-1]["event_id"]
+        event_id = read_json(Path(self.engine.status(self.run_id)["run_dir"]) / "state.json")["event_ids"][-1]
         self.invoke("resolve", "--event-id", event_id, "--decision", "continue", "--reason", "Resume is not an approval", expect=2)
         self.assertEqual(self.engine.status(self.run_id)["status"], "awaiting_human")
 
     def test_new_session_resume_clears_old_guard_without_resetting_count(self):
         self.ready_review()
-        with patch("buildflow_core.adapters.run_review", side_effect=review_pass):
+        with patch("devflow_core.implement.engine.run_review", side_effect=review_pass):
             self.invoke("review")
         new_session = "integration-session-2"
         self.submit("/devflow:resume " + self.run_id, session=new_session)
-        resumed = self.invoke("resume", session=new_session)
+        resumed = self.invoke("status", session=new_session)
         self.assertEqual(resumed["review_count"], 1)
         self.assertEqual(resumed["next_reviewer"], "opencode")
-        old = read_json(session_path(self.project, self.session))
-        self.assertIsNone(old["active_run"])
-        self.assertIsNone(old["intent"])
-        self.assertEqual(build_hook(self.event("PreToolUse", tool_name="Bash", tool_input={"command": "normal user work"}), BUILD_PLUGIN), {})
-        with patch("buildflow_core.adapters.run_review", side_effect=review_pass):
+        # The previous session no longer owns the run: it is stopped until it
+        # explicitly resumes again (or the run ends), never silently freed.
+        stale = hook(self.event("PreToolUse", tool_name="Bash", tool_input={"command": "normal user work"}), PLUGIN)
+        self.assertEqual(stale["hookSpecificOutput"]["permissionDecision"], "deny")
+        with self.assertRaisesRegex(DevFlowError, "/devflow:resume"):
+            self.submit("Keep going here")
+        with patch("devflow_core.implement.engine.run_review", side_effect=review_pass):
             result = self.invoke("review", session=new_session)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["review_count"], 2)
@@ -399,7 +395,7 @@ class HookCliEngineTests(FlowFixture):
     def test_cancel_before_checkpoint_reports_actual_unreviewed_workspace(self):
         self.start()
         self.edit(self.source, "VALUE = 12\n")
-        self.submit("Cancel this BuildFlow run; keep my current files without declaring them reviewed.")
+        self.submit("Cancel this implementation run; keep my current files without declaring them reviewed.")
         cancelled = self.invoke("cancel", "--reason", "Human requested cancellation")
         report = cancelled["report"]
         self.assertEqual(cancelled["status"], "cancelled")
@@ -409,19 +405,18 @@ class HookCliEngineTests(FlowFixture):
         self.assertFalse(report["workspace_matches_checkpoint_at_report"])
         self.assertFalse(report["final_workspace_verified"])
         self.assertFalse(report["final_snapshot_reviewed"])
-        self.assertFalse(report["both_reviewers_approved"])
+        self.assertFalse(report["all_reviewers_approved"])
         self.assertTrue(report["unreviewed_final_changes"])
         self.assertEqual(self.source.read_text(encoding="utf-8"), "VALUE = 12\n")
 
     def test_terminal_report_is_frozen_when_next_real_prompt_releases_guard(self):
         self.ready_review()
-        with patch("buildflow_core.adapters.run_review", side_effect=review_pass):
+        with patch("devflow_core.implement.engine.run_review", side_effect=review_pass):
             self.invoke("review")
             completed = self.invoke("review")
         captured_report = copy.deepcopy(completed["report"])
         self.submit("The workflow is finished. I will now make an unrelated local change.")
-        session = read_json(session_path(self.project, self.session))
-        self.assertIsNone(session["active_run"])
+        self.assertIsNone(self.record())
         self.edit(self.source, "VALUE = 29\n")
         recorded = self.invoke("status")
         self.assertEqual(recorded["report"], captured_report)
@@ -431,43 +426,40 @@ class HookCliEngineTests(FlowFixture):
         self.start()
         cancelled = self.invoke("cancel", "--reason", "No implementation requested")
         report_path = Path(cancelled["run_dir"]) / cancelled["report_path"]
-        decision = build_hook(self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(report_path)}), BUILD_PLUGIN)
+        decision = hook(self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(report_path)}), PLUGIN)
         self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
         # External tampering is not a simulated model tool operation. A recorded
         # report must still fail its integrity check when read by the engine.
-        forged = dict(cancelled["report"], both_reviewers_approved=True)
+        forged = dict(cancelled["report"], all_reviewers_approved=True)
         write_json(report_path, forged)
         message = self.invoke("status", expect=2)
         self.assertIn("terminal report was modified", message)
 
 
 class WorkflowIndependenceTests(FlowFixture):
-    def test_neither_inactive_plugin_creates_runtime_state(self):
+    def test_no_workflow_creates_runtime_state_for_an_unrelated_session(self):
         payload = self.event("PreToolUse", tool_name="Bash", tool_input={"command": "normal project work"})
-        self.assertEqual(build_hook(payload, BUILD_PLUGIN), {})
-        self.assertIsNone(plan_hook(payload, PLAN_PLUGIN))
+        self.assertIsNone(hook(payload, PLUGIN))
         self.assertFalse((self.project / ".devflow").exists())
 
-    def test_planflow_start_does_not_activate_buildflow(self):
+    def test_plan_start_does_not_create_an_implementation_run(self):
         self.plan_start()
         self.assertFalse((self.project / ".devflow" / "runs" / "implement").exists())
-        payload = self.event("PreToolUse", tool_name="Bash", tool_input={"command": "something PlanFlow will inspect"})
-        self.assertEqual(build_hook(payload, BUILD_PLUGIN), {})
+        payload = self.event("PreToolUse", tool_name="Bash", tool_input={"command": "rm -rf build"})
+        self.assertEqual(hook(payload, PLUGIN)["hookSpecificOutput"]["permissionDecision"], "deny")
 
-    def test_buildflow_start_does_not_activate_planflow(self):
+    def test_implementation_start_does_not_create_a_plan_run(self):
         self.start()
         payload = self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(self.source)})
-        self.assertIsNone(plan_hook(payload, PLAN_PLUGIN))
+        self.assertIsNone(hook(payload, PLUGIN))
         self.assertFalse((self.project / ".devflow" / "runs" / "plan").exists())
 
-    def test_completed_planflow_next_prompt_starts_independent_buildflow(self):
+    def test_completed_plan_next_prompt_starts_independent_implementation(self):
         plan_run, plan_file = self.plan_complete()
-        prompt = self.event(prompt="/devflow:implement " + str(plan_file))
-        # The root dispatcher releases the terminal plan guard before passing
-        # an explicitly requested implementation start to its own component.
-        self.assertIsNone(plan_hook(prompt, PLAN_PLUGIN))
-        self.assertIsNone(self.plan_engine.find_active(self.session))
-        build_hook(prompt, BUILD_PLUGIN)
+        # The finished plan stays guarded until the next real prompt, which
+        # releases it and then starts the explicitly requested implementation.
+        self.submit("/devflow:implement " + str(plan_file))
+        self.assertEqual(self.record()["pending_start"]["flow"], "implement")
         self.invoke("doctor", run=False)
         state = self.invoke("start", "--plan", plan_file, run=False)
         self.run_id = state["run_id"]
@@ -476,16 +468,8 @@ class WorkflowIndependenceTests(FlowFixture):
         self.assertEqual(state["plan_source"], str(plan_file))
         self.assertEqual(self.plan_engine.status(plan_run)["status"], "completed")
         payload = self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(self.source)})
-        self.assertIsNone(plan_hook(payload, PLAN_PLUGIN))
-        self.assertEqual(build_hook(payload, BUILD_PLUGIN), {})
+        self.assertIsNone(hook(payload, PLUGIN))
 
-    def test_completed_planflow_transition_also_works_with_reverse_hook_order(self):
-        _, plan_file = self.plan_complete()
-        prompt = self.event(prompt="/devflow:implement " + str(plan_file))
-        build_hook(prompt, BUILD_PLUGIN)
-        self.assertIsNone(plan_hook(prompt, PLAN_PLUGIN))
-        state = self.invoke("start", "--plan", plan_file, run=False)
-        self.assertEqual(state["status"], "implementing")
 
 if __name__ == "__main__":
     unittest.main()

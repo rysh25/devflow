@@ -22,8 +22,10 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGINS = ("devflow",)
-COMPONENTS = ("planflow", "buildflow")
-SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv", "node_modules", "dist", ".devflow", ".buildflow", ".planflow"}
+PACKAGE = "plugins/devflow/scripts/devflow_core"
+WORKFLOW_RESOURCES = ("defaults.json", "reviewer.md", "review.schema.json")
+COORDINATORS = ("router", "cli", "workflows")
+SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv", "node_modules", "dist", ".devflow"}
 SKIP_SUFFIXES = {".pyc", ".pyo", ".zip", ".log", ".tmp"}
 MAX_BYTES = 64 * 1024 * 1024
 
@@ -121,8 +123,8 @@ def _validate_files(files: dict[str, bytes]) -> dict:
         _require(isinstance(manifest.get("version"), str) and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?", manifest["version"]), f"A semantic version is required for {name}")
         manifests[name] = manifest
     _require(not manifests["devflow"].get("dependencies"), "Unified devflow must not install sibling plugins")
-    _require(not any(path.startswith(("plugins/planflow/", "plugins/buildflow/")) for path in files),
-             "Legacy standalone plugins must not be included in the unified distribution")
+    _require(all(path.startswith("plugins/devflow/") for path in files if path.startswith("plugins/")),
+             "Only the single devflow plugin may be distributed")
     plugin = "plugins/devflow"
     runner = plugin + "/scripts/devflow.py"
     _require(runner in files, "Missing unified DevFlow runner")
@@ -158,31 +160,73 @@ def _validate_files(files: dict[str, bytes]) -> dict:
         _require(re.search(r"(?m)^disable-model-invocation:\s*true\s*$", frontmatter), f"Skill must require manual invocation: {path}")
         _require("--python 3.11" not in text, f"Obsolete exact Python pin in {path}")
         _require("${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" in text, f"Skill bypasses unified runner: {path}")
-    for name in COMPONENTS:
-        component = plugin + f"/components/{name}"
-        _require(f"{component}/scripts/{name}.py" in files, f"Missing component runner: {name}")
-        for required in ("config/defaults.json", "schemas/review.schema.json", "prompts/reviewer.md"):
-            _require(f"{component}/{required}" in files, f"Missing {name}/{required}")
-        other = "buildflow_core" if name == "planflow" else "planflow_core"
-        for path, data in files.items():
-            if not path.startswith(component + "/scripts/") or not path.endswith(".py"):
-                continue
-            tree = ast.parse(data.decode("utf-8"), filename=path, feature_version=(3, 11))
-            for node in ast.walk(tree):
-                modules = [alias.name for alias in node.names] if isinstance(node, ast.Import) else [node.module or ""] if isinstance(node, ast.ImportFrom) else []
-                _require(all(other not in module.split(".") for module in modules), f"Forbidden sibling runtime import: {path}")
-    canonical = {path.removeprefix("shared/flow_common/"): data for path, data in files.items() if path.startswith("shared/flow_common/") and path.endswith(".py")}
-    _require(bool(canonical), "Missing canonical shared Python code")
-    for name in COMPONENTS:
-        prefix = f"{plugin}/components/{name}/scripts/{name}_core/_vendor/flow_common/"
-        generated = {path.removeprefix(prefix): data for path, data in files.items() if path.startswith(prefix) and path.endswith(".py")}
-        _require(generated == canonical, f"Generated shared code differs for {name}; run tools/sync_shared.py")
+    _validate_package(files)
     for path, data in files.items():
         if path.endswith(".py"):
             ast.parse(data.decode("utf-8"), filename=path, feature_version=(3, 11))
         elif path.endswith(".json"):
             _json(data, path)
     return {"marketplace": marketplace["name"], "version": manifests["devflow"]["version"], "plugins": {name: manifests[name]["version"] for name in PLUGINS}, "source_files": len(files), "source_bytes": sum(map(len, files.values()))}
+
+
+def _module_name(path: str) -> str:
+    relative = path.removeprefix(PACKAGE.rsplit("/", 1)[0] + "/").removesuffix(".py").split("/")
+    return ".".join(relative[:-1] if relative[-1] == "__init__" else relative)
+
+
+def _imports(path: str, data: bytes) -> set[str]:
+    """Absolute module names imported by one package source file."""
+    module = _module_name(path)
+    package = module if path.endswith("/__init__.py") else module.rsplit(".", 1)[0]
+    result = set()
+    tree = ast.parse(data.decode("utf-8"), filename=path, feature_version=(3, 11))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            result.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                base = package.split(".")
+                _require(node.level <= len(base), f"Relative import escapes the package: {path}")
+                base = base[:len(base) - node.level + 1]
+                prefix = ".".join(base + ([node.module] if node.module else []))
+            else:
+                prefix = node.module or ""
+            result.add(prefix)
+            result.update(prefix + "." + alias.name for alias in node.names)
+    return result
+
+
+def _validate_package(files: dict[str, bytes]) -> list[str]:
+    """Each workflow ships its resources; imports only flow toward shared code."""
+    root = PACKAGE.rsplit("/", 1)[1]
+    sources = {path: data for path, data in files.items() if path.startswith(PACKAGE + "/") and path.endswith(".py")}
+    workflows = sorted({path.split("/")[4] for path in sources if path.count("/") == 5 and path.endswith("/__init__.py")} - {"common"})
+    _require(workflows, "No workflow packages found")
+    for name in workflows:
+        for resource in WORKFLOW_RESOURCES:
+            _require(f"{PACKAGE}/{name}/{resource}" in files, f"Missing {name}/{resource}")
+    def area(module: str) -> str | None:
+        parts = module.split(".")
+        return parts[1] if len(parts) > 1 and parts[0] == root else None
+    registry = files.get(f"{PACKAGE}/workflows.py")
+    _require(registry is not None, "Missing workflow registry")
+    registered = {node.module for node in ast.walk(ast.parse(registry.decode("utf-8")))
+                  if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module}
+    _require(registered == set(workflows), f"Workflow registry {sorted(registered)} does not match packages {workflows}")
+    for path, data in sources.items():
+        own = area(_module_name(path))
+        for imported in _imports(path, data):
+            target = area(imported)
+            if target is None:
+                continue
+            if own in workflows:
+                _require(target not in workflows or target == own, f"Workflow imports another workflow: {path} -> {imported}")
+                _require(target not in COORDINATORS, f"Workflow imports a coordinator: {path} -> {imported}")
+            elif own == "common":
+                _require(target not in workflows and target not in COORDINATORS, f"Shared code depends on a workflow or coordinator: {path} -> {imported}")
+            elif own != "workflows":
+                _require(target not in workflows, f"Only the workflow registry may import a workflow: {path} -> {imported}")
+    return workflows
 
 
 def validate(root: Path = ROOT) -> dict:

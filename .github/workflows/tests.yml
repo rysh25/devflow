@@ -23,8 +23,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - name: Check generated shared code
-        run: python tools/sync_shared.py --check
       - name: Test without external models
         run: python tools/test_all.py --quiet
       - name: Validate source distribution

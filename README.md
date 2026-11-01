@@ -1,4 +1,4 @@
-# DevFlow 0.1.3 — Claude Code Plugin
+# DevFlow 0.2.0 — Claude Code Plugin
 
 人間との要件整理から計画作成、実装、独立レビューまでを支援する **単一の Claude Code Plugin** です。インストールするプラグインは `devflow` だけです。
 
@@ -165,12 +165,33 @@ run-id は一回の作業を識別する自動生成 ID です。レビューご
 
 詳しくは [設計](docs/architecture.md)、[安全性](docs/security.md)、[検証範囲](docs/validation.md) を参照してください。
 
+## 0.2.0 への更新
+
+0.2.0 は内部の構成と保存形式を整理した版です。利用者が使うコマンドと設定ファイルの名前は変わりません。
+
+- 0.1.x で始めた run は 0.2.0 では続けられません。続ける場合は、更新前に 0.1.3 のまま終えてください。更新後は `status` に `unsupported` として表示されるだけで、新しい run の開始は止めません。
+- 別プラグインとして配布していた時代の記録ディレクトリと設定ファイルは読みません。
+- `reviewers` の規則が両フロー共通になりました。2人以上かつ `max_reviews` 以下で、異なる種類（codex / opencode）を2つ以上含む必要があります。同じ種類だけの構成は拒否され、Implement でも3人以上を設定できます。
+- OpenCode の `protocol_version` を省略した場合の既定は 2 です。v1 を使う場合は `1` と明記してください。
+- レビュアーの `command` は、引数のどこかにシェル（bash、sh、cmd、powershell など）や `--yolo`、`--dangerously-*` を含むと拒否されます。設定は人間が書く信頼済みのもので、この検査は事故を防ぐための多層の防御です。
+- 終了レポートの `both_reviewers_approved` は `all_reviewers_approved` になりました。
+- `status` の `human_events` は、保留中の質問に使える回答（質問の後に、所有するセッションで記録された AskUserQuestion の回答）だけを返します。
+- ランナーの `resume` 動作はありません。再開は `/devflow:resume RUN_ID` だけで、入力したセッションへの引き継ぎまでフックが行います。引き継がれた元のセッションは、もう一度 resume するか run が終わるまで止まります。
+- Implement の開始時には、レビュアー CLI を確認しません。確認は `doctor` と各レビューの直前に行い、CLI が無くてもレビュー回数は減りません。
+- `/devflow:implement` の後、`implement start` までの間は、読み取り専用のツール・`status`・`doctor`・その開始だけを使えます。AskUserQuestion も使えず、この間の発言は記録しません。
+- `status` は、開始待ち（`pending_start`）、所有者でない紐付け（`stale`）、他のセッションの開始待ちや壊れたセッション記録（`sessions`）、作成途中のディレクトリ（`incomplete_creations`）、中断した書き込み（`recovery_required`）を表示します。
+
+### 復旧の手順
+
+- `recovery_required` の run は、`/devflow:resume RUN_ID` か cancel で書き込みを完了できます。
+- 外部処理（チェック・レビュー）の中断は、関係するプロセスが止まったことを確認してから、人間が自分の端末で `recover` を実行します。
+- `.devflow/runs/<flow>/.creating-*` や、失ったセッションの開始待ち・壊れたセッション記録（`.devflow/sessions/<ハッシュ>.json`）が新しい開始を止める場合は、`status` と `doctor` が示すファイルを、人間が `.devflow` の外へ移してください。run の記録そのものは消さないでください。
+
 ## 開発・配布
 
 Python の第三者パッケージは不要です。互換 Python を使って以下を実行できます。
 
 ```text
-python tools/sync_shared.py --check
 python tools/test_all.py --quiet
 python tools/package.py --validate-only
 python tools/package.py
