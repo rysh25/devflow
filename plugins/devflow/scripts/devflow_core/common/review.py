@@ -40,8 +40,20 @@ def check_verdict(verdict: str, findings: list, questions: list) -> None:
         raise ReviewerError("human_required needs at least one explicit human question")
 
 
+def check_review_config(config: object) -> None:
+    """The review settings a run's frozen configuration must keep (for any workflow)."""
+    if not isinstance(config, dict):
+        raise DevFlowError("Frozen run configuration must be an object")
+    validate_limit(config.get("max_reviews"))
+    reviewers = config.get("reviewers")
+    if (not isinstance(reviewers, list) or not reviewers
+            or any(not isinstance(item, dict) or not isinstance(item.get("id"), str) for item in reviewers)):
+        raise DevFlowError("Frozen run configuration has no valid reviewers")
+
+
 def review_budget(used: int, config: dict, status: str) -> dict:
     """Attempts used and remaining, and who reviews next (none once finished)."""
-    limit, reviewers = config["max_reviews"], config["reviewers"]
+    limit = config["max_reviews"]
+    upcoming = next_reviewer(config["reviewers"], used, limit) if used < limit and status not in TERMINAL else None
     return {"review_count": used, "remaining_reviews": limit - used,
-            "next_reviewer": reviewers[used % len(reviewers)]["id"] if used < limit and status not in TERMINAL else None}
+            "next_reviewer": upcoming["id"] if upcoming else None}

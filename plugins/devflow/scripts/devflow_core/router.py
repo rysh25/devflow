@@ -293,8 +293,11 @@ def _overview(project: Path, all_stores: dict[str, RunStore], session: str | Non
         for info in infos:
             item = info.public()
             if info.format == "current":
-                item.update(status=info.state["status"], updated_at=info.state["updated_at"],
-                            **WORKFLOWS[flow].summary(info.state))
+                try:
+                    item.update(status=info.state["status"], updated_at=info.state["updated_at"],
+                                **WORKFLOWS[flow].summary(info.state))
+                except Exception as exc:  # noqa: BLE001 - one unreadable run must not hide the others
+                    item.update(format="invalid", error=f"Cannot summarize run: {type(exc).__name__}: {exc}")
             runs.append(item)
     blocking, invalid = [], []
     for name, record, error in sessions.scan_records(project, WORKFLOWS):

@@ -457,10 +457,17 @@ class DispatchTests(PlanHookFixture):
                        {"grill_skill": "../grilling"}, {"grill_skill": "grilling\n"}):
             with self.subTest(config=config):
                 state = self.state()
-                state["config"] = config
+                frozen = {key: value for key, value in state["config"].items() if key != "grill_skill"}
+                state["config"] = {**frozen, **config}
                 atomic_json(self.run / "state.json", state)
                 result = self.hook(self.payload("PreToolUse", tool_name="Skill", tool_input={"skill": "grilling"}))
                 self.assertIn("configured interview skill", self.assertDenied(result))
+        # A frozen configuration that is not even an object makes the run unreadable: the hook fails closed.
+        state = self.state()
+        state["config"] = "broken"
+        atomic_json(self.run / "state.json", state)
+        with self.assertRaisesRegex(DevFlowError, "cannot be read"):
+            self.hook(self.payload("PreToolUse", tool_name="Skill", tool_input={"skill": "grilling"}))
 
     def test_terminal_releases_only_after_next_human_prompt(self):
         for status in ("completed", "exhausted", "cancelled"):

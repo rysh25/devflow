@@ -374,6 +374,26 @@ class RunFormatTests(RuntimeFixture):
             self.prompt("/devflow:resume " + identifier)
         self.plan_start()  # An unsupported run never blocks a new one.
 
+    def test_broken_frozen_configuration_is_listed_as_invalid_without_breaking_status(self):
+        identifier = self.plan_start()
+        self.engine("plan").cancel(identifier)
+        path = self.run_dir("plan", identifier) / "state.json"
+        good = read_json(path)
+        for config in ("broken", {}, {"max_reviews": 6}, dict(good["config"], reviewers=[]),
+                       dict(good["config"], max_reviews=True)):
+            with self.subTest(config=config):
+                atomic_json(path, dict(good, config=config))
+                listed = runtime.status(self.project, "other-session", None)["runs"]
+                self.assertEqual(listed[0]["format"], "invalid")
+                self.assertIn("cannot be read", " ".join(runtime.blocking_warnings(self.project)))
+
+    def test_a_summary_failure_marks_only_that_run_invalid(self):
+        identifier = self.plan_start()
+        with patch.object(WORKFLOWS["plan"], "summary", side_effect=KeyError("missing")):
+            listed = runtime.status(self.project, "other-session", None)["runs"]
+        self.assertEqual((listed[0]["run_id"], listed[0]["format"]), (identifier, "invalid"))
+        self.assertIn("Cannot summarize run", listed[0]["error"])
+
     def test_old_run_with_a_leftover_transaction_does_not_block(self):
         identifier = self.raw_run("plan", status="reviewing")
         atomic_json(self.run_dir("plan", identifier) / "transaction.json",

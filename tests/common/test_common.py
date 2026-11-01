@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 from devflow_core.common.storage import (DevFlowError, atomic_json, checked_text, digest,
     file_lock, json_bytes, no_symlinks, read_json, within, write_new)
-from devflow_core.common.review import all_approved, next_reviewer, validate_limit
+from devflow_core.common.review import all_approved, next_reviewer, review_budget, validate_limit
 from devflow_core.common.settings import validate_document, workflow_overlay
 from devflow_core.common.shell import READ_ONLY_COMMANDS, ShellPolicyError, read_only_tokens, shell_tokens
 
@@ -190,6 +190,18 @@ class SharedSettingsTests(unittest.TestCase):
             self.skipTest("Creating symlinks requires OS permission")
         with self.assertRaises(DevFlowError):
             workflow_overlay(self.project, "implement")
+
+
+class ReviewBudgetTests(unittest.TestCase):
+    def test_the_listed_next_reviewer_is_the_one_that_will_be_dispatched(self):
+        config = {"max_reviews": 6, "reviewers": [{"id": "codex"}, {"id": "opencode"}, {"id": "second"}]}
+        for used in range(6):
+            with self.subTest(used=used):
+                budget = review_budget(used, config, "ready")
+                self.assertEqual(budget["next_reviewer"], next_reviewer(config["reviewers"], used, 6)["id"])
+                self.assertEqual((budget["review_count"], budget["remaining_reviews"]), (used, 6 - used))
+        self.assertIsNone(review_budget(6, config, "ready")["next_reviewer"])
+        self.assertIsNone(review_budget(2, config, "completed")["next_reviewer"])
 
 
 class SharedShellTests(unittest.TestCase):

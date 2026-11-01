@@ -7,7 +7,7 @@ import subprocess
 
 from ..common.errors import DevFlowError, GuardError
 from ..common.guard import as_path, draft_path, safe_relative, same_path
-from ..common.review import HARD_MAX_REVIEWS, review_budget
+from ..common.review import HARD_MAX_REVIEWS, check_review_config, review_budget
 from ..common.storage import digest, json_bytes, no_symlinks, now
 from ..common.workflow import Workflow
 from .commands import COMMANDS
@@ -90,6 +90,7 @@ class ImplementWorkflow(Workflow):
         return fields, artifacts
 
     def check_state(self, state: dict) -> None:
+        check_review_config(state["config"])
         if not isinstance(state["attempts"], list) or len(state["attempts"]) > HARD_MAX_REVIEWS:
             raise DevFlowError("Incompatible/corrupt run state; never reset the review count")
 

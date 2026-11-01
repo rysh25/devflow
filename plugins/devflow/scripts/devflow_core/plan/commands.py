@@ -9,7 +9,7 @@ def doctor(engine, args, run_id, session) -> dict:
     """Offline checks of the frozen (selected) or project configuration; repairs nothing."""
     if not run_id:
         return {**diagnose(engine.project, engine.workflow), "run_id": None}
-    frozen = engine.frozen_config(run_id)
+    frozen = engine.read_frozen_config(run_id)
     return {**diagnose(engine.project, engine.workflow, effective_config=frozen), "run_id": run_id}
 
 

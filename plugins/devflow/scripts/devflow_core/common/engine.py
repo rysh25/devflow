@@ -73,8 +73,8 @@ class RunEngine:
         self.store.verify_artifacts(state)
         self._check_frozen_config(state)
 
-    def frozen_config(self, run_id: str) -> dict:
-        """The run's frozen configuration, read without repairing anything."""
+    def read_frozen_config(self, run_id: str) -> dict | None:
+        """The run's frozen configuration (None if its workflow has none); repairs nothing."""
         if (self._run(run_id) / "transaction.json").exists():
             raise DevFlowError("Diagnosis is read-only; complete the pending run transaction with /devflow:resume "
                                "or cancel first.")

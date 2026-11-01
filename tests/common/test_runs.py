@@ -161,7 +161,7 @@ class RunStoreTests(unittest.TestCase):
         status = engine.status(self.run_id)  # The toy has no config, budget or summary values.
         self.assertEqual((status["status"], status["human_events"]), ("working", []))
         engine._verify(engine.store.read(self.run_id))
-        self.assertIsNone(engine.frozen_config(self.run_id))
+        self.assertIsNone(engine.read_frozen_config(self.run_id))
 
     def test_transfer_refuses_an_inflight_run(self):
         with self.store.lock(self.run_id):

@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 
 from ..common.errors import DevFlowError, GuardError
-from ..common.review import HARD_MAX_REVIEWS, review_budget
+from ..common.review import HARD_MAX_REVIEWS, check_review_config, review_budget
 from ..common.runs import TERMINAL
 from ..common.guard import draft_path
 from ..common.storage import json_bytes
@@ -60,6 +60,7 @@ class PlanWorkflow(Workflow):
         return fields, artifacts
 
     def check_state(self, state: dict) -> None:
+        check_review_config(state["config"])
         count = state["review_count"]
         if type(count) is not int or not 0 <= count <= HARD_MAX_REVIEWS:
             raise DevFlowError("Incompatible/corrupt run state; never reset the review count")

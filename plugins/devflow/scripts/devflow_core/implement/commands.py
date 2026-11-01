@@ -12,7 +12,7 @@ from ..common.workflow import Command, Option
 def doctor(engine, args, run_id, session) -> dict:
     """Offline diagnostics of the frozen (or project) configuration; never calls a model."""
     workflow = engine.workflow
-    config = engine.frozen_config(run_id) if run_id else workflow.load_config(engine.project)
+    config = engine.read_frozen_config(run_id) if run_id else workflow.load_config(engine.project)
     results = []
     for provider in config["reviewers"]:
         try:
