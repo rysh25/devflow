@@ -7,7 +7,7 @@ import subprocess
 
 from ..common.errors import DevFlowError, GuardError
 from ..common.guard import as_path, draft_path, safe_relative, same_path
-from ..common.review import HARD_MAX_REVIEWS
+from ..common.review import HARD_MAX_REVIEWS, review_budget
 from ..common.storage import digest, json_bytes, no_symlinks, now
 from ..common.workflow import Workflow
 from .commands import COMMANDS
@@ -38,7 +38,7 @@ class ImplementWorkflow(Workflow):
     statuses = frozenset({"implementing", "needs_revision", "ready_check", "checking", "ready_review",
                           "reviewing", "awaiting_human", "paused_error", "completed", "exhausted", "cancelled"})
     inflight_statuses = frozenset({"checking", "reviewing"})
-    state_fields = frozenset({"plan_source", "source_digest", "attempts", "approvals", "revision",
+    state_fields = frozenset({"config", "plan_source", "source_digest", "attempts", "approvals", "revision",
                               "checkpoint_count", "check_attempts", "check_dispatch_count", "check_history",
                               "escalations", "resolutions", "reflections", "candidate", "validation",
                               "binary_attestation", "last_error", "baseline_id", "report_path", "resume_status"})
@@ -88,9 +88,6 @@ class ImplementWorkflow(Workflow):
             artifacts["escalations/001.json"] = json_bytes({**escalation, "boundary": 1, "created_at": now()})
             fields.update(status="awaiting_human", escalation=escalation, escalations=["escalations/001.json"])
         return fields, artifacts
-
-    def reviews_used(self, state: dict) -> int:
-        return len(state["attempts"])
 
     def check_state(self, state: dict) -> None:
         if not isinstance(state["attempts"], list) or len(state["attempts"]) > HARD_MAX_REVIEWS:
@@ -148,13 +145,15 @@ class ImplementWorkflow(Workflow):
                 raise GuardError("Cannot establish whether this write is in the Git snapshot scope.")
 
     def context_fields(self, state: dict, run_dir: Path) -> dict:
-        reviewers = state["config"]["reviewers"]
-        return {"review_count": len(state["attempts"]),
-                "candidate_snapshot_id": (state.get("candidate") or {}).get("snapshot_id"),
-                "next_reviewer": reviewers[len(state["attempts"]) % len(reviewers)]["id"]}
+        budget = self.summary(state)
+        return {"review_count": budget["review_count"], "next_reviewer": budget["next_reviewer"],
+                "candidate_snapshot_id": (state.get("candidate") or {}).get("snapshot_id")}
 
     def summary(self, state: dict) -> dict:
-        return {"review_count": len(state["attempts"])}
+        return review_budget(len(state["attempts"]), state["config"], state["status"])
+
+    def frozen_config(self, state: dict) -> dict:
+        return state["config"]
 
     def load_config(self, project: Path) -> dict:
         from .config import load_config

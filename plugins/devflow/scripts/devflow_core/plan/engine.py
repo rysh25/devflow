@@ -24,6 +24,9 @@ class Engine(RunEngine):
         from .workflow import WORKFLOW
         super().__init__(project, WORKFLOW, resources, lock_wait, session)
 
+    def _before_dispatch(self, state):
+        state["last_error"] = None
+
     def _status_details(self, state: dict, result: dict) -> None:
         result.pop("transcript_marker", None)
         run = self._run(state["run_id"])
@@ -131,7 +134,7 @@ class Engine(RunEngine):
             number = state["review_count"] + 1
             relative_dir = f"reviews/{number:02d}"
             packet_path = self._artifact(state, f"{relative_dir}/packet.md", self._packet(state, number, provider))
-            state.update(review_count=number, last_error=None)
+            state["review_count"] = number
             return number, state["plan_hash"], provider["id"], {"packet": packet_path, "dir": relative_dir}
 
         def execute(work):
@@ -265,11 +268,13 @@ class Engine(RunEngine):
             self._save(state)
         return self.status(run_id)
 
-    def recover(self, run_id: str, expected_review: int, confirmed: bool = False) -> dict:
-        """Explicit operator recovery; the hook guard never allows this command."""
+    def recover(self, run_id: str, confirmed: bool = False, expect=None, *, expected_review: int | None = None) -> dict:
+        """Explicit operator recovery of the exact interrupted review (human only)."""
         def exact(state: dict) -> None:
-            if state["review_count"] != expected_review:
+            if expected_review is None or state["review_count"] != expected_review:
                 raise DevFlowError("Recovery requires the exact interrupted review number.")
+            if expect is not None:
+                expect(state)
 
         return super().recover(run_id, confirmed, exact)
 

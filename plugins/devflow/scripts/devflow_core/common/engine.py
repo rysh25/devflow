@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .errors import DevFlowError
-from .runs import RUNNER_WAIT, TERMINAL, RunStore
+from .runs import RUNNER_WAIT, RunStore
 from .sessions import approval_candidates
 from .storage import read_json
 
@@ -63,9 +63,11 @@ class RunEngine:
     def _events(self, state: dict) -> list[dict]:
         return self.store.events(state)
 
-    def _check_frozen_config(self, state: dict) -> None:
-        if read_json(self._run(state["run_id"]) / "config.json") != state["config"]:
+    def _check_frozen_config(self, state: dict) -> dict | None:
+        config = self.workflow.frozen_config(state)
+        if config is not None and read_json(self._run(state["run_id"]) / "config.json") != config:
             raise DevFlowError("Run configuration changed; never replace frozen configuration during a run.")
+        return config
 
     def _verify(self, state: dict) -> None:
         self.store.verify_artifacts(state)
@@ -76,9 +78,7 @@ class RunEngine:
         if (self._run(run_id) / "transaction.json").exists():
             raise DevFlowError("Diagnosis is read-only; complete the pending run transaction with /devflow:resume "
                                "or cancel first.")
-        state = self.store.read(run_id)
-        self._check_frozen_config(state)
-        return state["config"]
+        return self._check_frozen_config(self.store.read(run_id))
 
     # -- external processes -----------------------------------------------------------------
     def _dispatch(self, run_id: str, status: str, kind: str,
@@ -96,6 +96,8 @@ class RunEngine:
         with self._lock(run_id):
             state = self._state(run_id)
             prepared = prepare(state)
+            if prepared is not None:
+                self._before_dispatch(state)
             if prepared is None:
                 self._save(state)
                 return self.status(run_id)
@@ -112,6 +114,9 @@ class RunEngine:
             self._save(state)
         return self.status(run_id)
 
+    def _before_dispatch(self, state: dict) -> None:
+        """Workflow-specific changes made with every reservation (optional)."""
+
     def recover(self, run_id: str, confirmed: bool = False, expect: Callable[[dict], None] | None = None) -> dict:
         """Human-only: end an interrupted process after confirming it stopped."""
         if not confirmed:
@@ -124,13 +129,7 @@ class RunEngine:
         state = self._state(run_id)
         result = {key: value for key, value in state.items() if key not in {"artifacts", "event_ids"}}
         run = self._run(run_id)
-        used = self.workflow.reviews_used(state)
-        limit = state["config"]["max_reviews"]
-        reviewers = state["config"]["reviewers"]
-        result.update(run_dir=str(run), draft_dir=str(run / "draft"), review_count=used,
-                      remaining_reviews=limit - used,
-                      next_reviewer=(reviewers[used % len(reviewers)]["id"]
-                                     if used < limit and state["status"] not in TERMINAL else None),
+        result.update(run_dir=str(run), draft_dir=str(run / "draft"), **self.workflow.summary(state),
                       human_events=approval_candidates(state, self._events(state)))
         self._status_details(state, result)
         return result

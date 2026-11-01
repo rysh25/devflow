@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 
 from ..common.errors import DevFlowError, GuardError
-from ..common.review import HARD_MAX_REVIEWS
+from ..common.review import HARD_MAX_REVIEWS, review_budget
 from ..common.runs import TERMINAL
 from ..common.guard import draft_path
 from ..common.storage import json_bytes
@@ -22,7 +22,7 @@ class PlanWorkflow(Workflow):
     statuses = frozenset({"interview", "planning", "ready", "reviewing", "awaiting_revision",
                           "awaiting_human", "paused_error", "completed", "exhausted", "cancelled"})
     inflight_statuses = frozenset({"reviewing"})
-    state_fields = frozenset({"review_count", "plan_version", "plan_hash", "current_plan", "passes",
+    state_fields = frozenset({"config", "review_count", "plan_version", "plan_hash", "current_plan", "passes",
                               "transcript_marker", "resolved_escalations", "last_error", "last_review",
                               "final_plan_reviewed", "publication"})
     guidance = "Write only to the current run's draft directory; do not implement source changes."
@@ -58,9 +58,6 @@ class PlanWorkflow(Workflow):
             "config.json": json_bytes(config),
         }
         return fields, artifacts
-
-    def reviews_used(self, state: dict) -> int:
-        return state["review_count"]
 
     def check_state(self, state: dict) -> None:
         count = state["review_count"]
@@ -101,14 +98,18 @@ class PlanWorkflow(Workflow):
                          "An allowed name does not override Claude Code's skill permissions.")
 
     def context_fields(self, state: dict, run_dir: Path) -> dict:
-        providers = state["config"]["reviewers"]
-        return {"review_count": state["review_count"], "plan_hash": state["plan_hash"],
+        budget = self.summary(state)
+        return {"review_count": budget["review_count"], "next_reviewer": budget["next_reviewer"],
+                "plan_hash": state["plan_hash"],
                 "current_plan": str(run_dir / state["current_plan"]) if state["current_plan"] else None,
-                "next_reviewer": providers[state["review_count"] % len(providers)]["id"],
                 "interview_skill": state["config"]["grill_skill"]}
 
     def summary(self, state: dict) -> dict:
-        return {"review_count": state["review_count"], "publication": state["publication"]}
+        return {**review_budget(state["review_count"], state["config"], state["status"]),
+                "publication": state["publication"]}
+
+    def frozen_config(self, state: dict) -> dict:
+        return state["config"]
 
     def load_config(self, project: Path) -> dict:
         from .config import load_config

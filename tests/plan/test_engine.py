@@ -365,8 +365,8 @@ class EngineTests(unittest.TestCase):
             self.resume("new-session")
         self.assertEqual(self.engine.status(self.run_id)["owner_session"], self.session)
         with self.assertRaises(DevFlowError):
-            self.engine.recover(self.run_id, 2, confirmed=True)
-        recovered = self.engine.recover(self.run_id, 1, confirmed=True)
+            self.engine.recover(self.run_id, confirmed=True, expected_review=2)
+        recovered = self.engine.recover(self.run_id, confirmed=True, expected_review=1)
         self.assertEqual(recovered["status"], "paused_error")
         self.assertIsNone(recovered["inflight"])
         resumed = self.resume("new-session")
@@ -384,7 +384,7 @@ class EngineTests(unittest.TestCase):
         interrupted = self.engine.status(self.run_id)
         self.assertEqual((interrupted["status"], interrupted["review_count"]), ("reviewing", 2))
         self.assertEqual(interrupted["inflight"]["number"], 2)
-        recovered = self.engine.recover(self.run_id, 2, confirmed=True)
+        recovered = self.engine.recover(self.run_id, confirmed=True, expected_review=2)
         self.assertEqual(recovered["status"], "exhausted")
         self.assertIsNone(recovered["inflight"])
         self.assertEqual(recovered["review_count"], 2)  # The interrupted attempt stays consumed.
@@ -1106,7 +1106,7 @@ class EngineTests(unittest.TestCase):
             with self.assertRaises(DevFlowError):
                 self.resume(self.session)
             provider.assert_not_called()
-        self.engine.recover(self.run_id, 1, confirmed=True)
+        self.engine.recover(self.run_id, confirmed=True, expected_review=1)
         self.resume(self.session)
         with patch(RUN_REVIEW, return_value=review_value()) as provider:
             next_review = self.engine.review(self.run_id)
@@ -1142,7 +1142,7 @@ class EngineTests(unittest.TestCase):
                 # A separate newer dispatch is now durably reserved. It remains
                 # in-flight while the obsolete first invocation fails late.
                 raise KeyboardInterrupt
-            self.engine.recover(self.run_id, 1, confirmed=True)
+            self.engine.recover(self.run_id, confirmed=True, expected_review=1)
             self.resume(self.session)
             try:
                 self.engine.review(self.run_id)
@@ -1167,6 +1167,16 @@ class EngineTests(unittest.TestCase):
         self.assertFalse((self.run / "reviews" / "01" / "error.json").exists())
         self.assertFalse((self.run / "reviews" / "02" / "error.json").exists())
 
+    def test_recover_keeps_the_base_signature(self):
+        self.ready()
+        with self.engine.store.lock(self.run_id):
+            state = self.engine.store.load(self.run_id)
+            state["review_count"] = 1
+            self.engine.store.reserve(state, "reviewing", "review", 1, state["plan_hash"], "codex")
+        with self.assertRaisesRegex(DevFlowError, "exact interrupted review number"):
+            self.engine.recover(self.run_id, True)  # Positional confirmation, as in the base class.
+        self.assertEqual(self.engine.recover(self.run_id, True, expected_review=1)["status"], "paused_error")
+
     def test_recover_compares_the_expected_review_with_the_locked_state(self):
         self.ready()
         with self.engine.store.lock(self.run_id):
@@ -1178,7 +1188,7 @@ class EngineTests(unittest.TestCase):
         stale = dict(self.engine.store.read(self.run_id), review_count=1)
         with patch.object(self.engine.store, "read", return_value=stale):
             with self.assertRaisesRegex(DevFlowError, "exact interrupted review number"):
-                self.engine.recover(self.run_id, 1, confirmed=True)
+                self.engine.recover(self.run_id, confirmed=True, expected_review=1)
         after = read_json(self.run / "state.json")
         self.assertEqual((after["status"], after["inflight"]["number"]), ("reviewing", 2))
 
@@ -1187,7 +1197,7 @@ class EngineTests(unittest.TestCase):
         after_recover = {}
         def reviewer(provider, *args):
             # A human confirmed the process stopped, but its result still arrives.
-            self.engine.recover(self.run_id, 1, confirmed=True)
+            self.engine.recover(self.run_id, confirmed=True, expected_review=1)
             after_recover.update(read_json(self.run / "state.json"))
             return review_value()
         with patch(RUN_REVIEW, side_effect=reviewer):

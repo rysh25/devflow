@@ -119,7 +119,6 @@ class Engine(RunEngine):
                 return None
             state["check_attempts"] += 1
             state["check_dispatch_count"] += 1
-            state["last_error"] = None
             index = state["check_dispatch_count"]
             # No lock is held while project code runs.
             return index, state["candidate"]["snapshot_id"], None, {"index": index, "checks": state["config"]["checks"]}
@@ -203,7 +202,6 @@ class Engine(RunEngine):
             self._artifact(state,packet_relative,packet)
             state["attempts"].append({"number":number,"reviewer_id":provider["id"],"snapshot_id":current["snapshot_id"],
                 "packet_path":packet_relative,"packet_sha256":digest(packet),"status":"dispatched","started_at":now()})
-            state["last_error"] = None
             # Reserved BEFORE dispatch, including unknown-outcome failures.
             return number, current["snapshot_id"], provider["id"], {"number": number, "packet": packet_relative}
 
@@ -340,6 +338,9 @@ class Engine(RunEngine):
             state.update(status="cancelled",last_error=reason,approvals={})
             self._save(state)
         return self.status(run_id)
+
+    def _before_dispatch(self, state):
+        state["last_error"] = None
 
     def _status_details(self, state, result):
         if state["status"] in TERMINAL:

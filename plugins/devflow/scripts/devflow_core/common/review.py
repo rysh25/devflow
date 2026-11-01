@@ -1,5 +1,6 @@
 """Shared budget, approval and verdict mechanics; domain policy remains in each flow."""
 from .errors import DevFlowError, ReviewerError
+from .runs import TERMINAL
 
 HARD_MAX_REVIEWS = 6
 
@@ -37,3 +38,10 @@ def check_verdict(verdict: str, findings: list, questions: list) -> None:
         raise ReviewerError("changes_required needs findings and cannot include human decisions")
     if verdict == "human_required" and not questions:
         raise ReviewerError("human_required needs at least one explicit human question")
+
+
+def review_budget(used: int, config: dict, status: str) -> dict:
+    """Attempts used and remaining, and who reviews next (none once finished)."""
+    limit, reviewers = config["max_reviews"], config["reviewers"]
+    return {"review_count": used, "remaining_reviews": limit - used,
+            "next_reviewer": reviewers[used % len(reviewers)]["id"] if used < limit and status not in TERMINAL else None}

@@ -17,6 +17,7 @@ from .errors import DevFlowError, GuardError
 from .runs import EVENT_ID, SESSION_ID
 from .shell import READ_ONLY_SUMMARY, read_only_tokens, shell_tokens
 from .storage import no_symlinks
+from .workflow import CLAUDE_KINDS
 
 READ_ONLY_TOOLS = frozenset({
     "Read", "Grep", "Glob", "LS", "List", "TodoWrite",
@@ -200,7 +201,7 @@ def check_option(kind: str, value: str, cwd: Path, run_dir: Path) -> None:
         raise GuardError("Unsupported resolution decision.")
     if kind == "text" and (not value.strip() or len(value) > MAX_TEXT):
         raise GuardError("Provide a bounded, nonempty reason.")
-    if kind not in {"draft", "hash", "event", "decision", "text"}:
+    if kind not in CLAUDE_KINDS:
         raise GuardError(f"Runner option kind {kind!r} cannot be checked.")
 
 

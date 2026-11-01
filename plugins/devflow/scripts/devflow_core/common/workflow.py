@@ -106,10 +106,6 @@ class Workflow:
     def on_transfer(self, state: dict) -> None:
         """Adjust workflow fields when a run is resumed (e.g. leave paused_error)."""
 
-    def reviews_used(self, state: dict) -> int:
-        """Review attempts consumed so far (the budget is never reset)."""
-        raise NotImplementedError
-
     def check_state(self, state: dict) -> None:
         """Reject workflow fields that violate an invariant (raise DevFlowError)."""
 
@@ -133,8 +129,12 @@ class Workflow:
 
     # -- presentation and commands --------------------------------------------------------
     def summary(self, state: dict) -> dict:
-        """Small listing values for the global status (never the whole state)."""
+        """Small values shown in run listings and merged into a run's status."""
         return {}
+
+    def frozen_config(self, state: dict) -> dict | None:
+        """The configuration frozen at start (compared with ``config.json``), if any."""
+        return None
 
     def load_config(self, project: Path) -> dict:
         raise NotImplementedError

@@ -34,7 +34,7 @@ RUNNER_WAIT = 10.0
 HOOK_WAIT = 5.0
 ENVELOPE = frozenset({
     "schema_version", "flow", "run_id", "project", "status", "owner_session", "created_at",
-    "updated_at", "state_revision", "artifacts", "event_ids", "inflight", "escalation", "config",
+    "updated_at", "state_revision", "artifacts", "event_ids", "inflight", "escalation",
 })
 ESCALATION = frozenset({"id", "reason", "questions", "boundary", "session_id", "return_status", "detail"})
 
@@ -178,7 +178,7 @@ class RunStore:
                 or not isinstance(state["owner_session"], str) or not SESSION_ID.fullmatch(state["owner_session"])
                 or not isinstance(state["created_at"], str) or not isinstance(state["updated_at"], str)
                 or type(state["state_revision"]) is not int or state["state_revision"] < 0
-                or not isinstance(state["config"], dict) or not isinstance(state["artifacts"], dict)
+                or not isinstance(state["artifacts"], dict)
                 or any(not isinstance(k, str) or not isinstance(v, str) for k, v in state["artifacts"].items())
                 or not isinstance(state["event_ids"], list)
                 or any(not isinstance(i, str) or not EVENT_ID.fullmatch(i) for i in state["event_ids"])
