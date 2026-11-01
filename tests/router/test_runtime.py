@@ -396,6 +396,41 @@ class RunFormatTests(RuntimeFixture):
             self.prompt("/devflow:resume " + identifier)
         self.assertTrue((self.run_dir("plan", identifier) / "transaction.json").exists())
 
+    def test_old_per_workflow_session_directories_do_not_block_starts(self):
+        old = self.project / ".devflow" / "sessions"
+        (old / "plan").mkdir(parents=True)
+        atomic_json(old / "plan" / ("a" * 64 + ".json"), {"run_id": "x", "guard_active": True})
+        (old / "implement").mkdir()
+        self.assertEqual(runtime.status(self.project, self.session, None)["sessions"]["invalid_records"], [])
+        self.plan_start()
+        self.assertTrue((old / "plan" / ("a" * 64 + ".json")).exists())  # Never read, never removed.
+
+    def test_damaged_created_run_of_a_pending_start_is_shown_without_failing_status(self):
+        original = sessions.write_record
+
+        def fail_on_binding(project, record, workflows):
+            if record["run"] is not None:
+                raise OSError("simulated stop after creation")
+            return original(project, record, workflows)
+
+        with patch.object(sessions, "write_record", side_effect=fail_on_binding), self.assertRaises(OSError):
+            self.prompt("/devflow:plan Interrupted request")
+        identifier = self.record()["pending_start"]["run_id"]
+        atomic_json(self.run_dir("plan", identifier) / "state.json", {"schema_version": 2, "status": []})
+        overview = runtime.status(self.project, "other-session", None)
+        self.assertEqual(overview["runs"][0]["format"], "invalid")
+        self.assertEqual(overview["sessions"]["pending_starts"], [])
+        self.assertIn(f"Run plan/{identifier} cannot be read", " ".join(runtime.blocking_warnings(self.project)))
+        probe, interview, claude, which = UnifiedCliTests.doctor_patches(self)
+        with probe, interview, claude, which:
+            code, output, _ = self.invoke("doctor")
+        self.assertEqual(code, 0, output)
+
+    def test_oversized_start_prompt_is_rejected_before_anything_is_written(self):
+        with self.assertRaisesRegex(DevFlowError, "4 MiB"):
+            self.prompt("/devflow:plan " + "x" * (4 * 1024 * 1024))
+        self.assertFalse((self.project / ".devflow").exists())
+
     def test_incomplete_creation_is_listed_but_not_a_run(self):
         leftover = self.project / ".devflow" / "runs" / "plan" / ".creating-20261101T123456Z-123456abcdef"
         leftover.mkdir(parents=True)

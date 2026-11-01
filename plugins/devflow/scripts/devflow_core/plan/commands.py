@@ -55,7 +55,7 @@ def _doctor(engine: Engine, run_id: str | None) -> dict:
 
 
 def run(args, project: Path, run_id: str | None, session: str | None):
-    engine = Engine(project)
+    engine = Engine(project, session=session)
     action = args.action
     if action == "doctor":
         if run_id and session is not None:

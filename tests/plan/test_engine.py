@@ -284,6 +284,22 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(next_state["review_count"], 2)
         self.assertEqual(next_state["status"], "ready")
 
+    def test_ownership_moving_during_preflight_stops_the_old_owner_from_reviewing(self):
+        self.ready()
+        caller = Engine(self.project, session=self.session)
+
+        def move_ownership(provider):
+            self.resume("session-that-took-over")
+            return PROBE
+
+        with patch(PREFLIGHT, side_effect=move_ownership), patch(RUN_REVIEW) as call:
+            with self.assertRaisesRegex(DevFlowError, "no longer owns"):
+                caller.review(self.run_id)
+        call.assert_not_called()
+        after = self.engine.status(self.run_id)
+        self.assertEqual((after["status"], after["review_count"], after["owner_session"]),
+                         ("ready", 0, "session-that-took-over"))
+
     def test_reviewer_preflight_failure_does_not_consume_attempt(self):
         self.ready()
         before = read_json(self.run / "state.json")

@@ -14,7 +14,7 @@ from . import __version__
 from .common import guard, sessions
 from .common.errors import DevFlowError
 from .common.runs import (HOOK_WAIT, RUNNER_WAIT, TERMINAL, RunStore, data_root, ensure_data_root,
-                          make_event, new_run_id, validate_run_id)
+                          event_bytes, make_event, new_run_id, validate_run_id)
 from .common.storage import file_lock, now
 from .workflows import WORKFLOWS
 
@@ -88,7 +88,7 @@ def assert_available(project: Path, session: str, all_stores: dict[str, RunStore
         pending = record["pending_start"]
         if record["session_id"] == session or not pending:
             continue
-        if sessions.pending_applied(pending, record["session_id"], all_stores[pending["flow"]]) is False:
+        if not sessions.pending_created(pending, all_stores[pending["flow"]]):
             raise DevFlowError(f"Another session has a pending {pending['flow']} start (session record {name}); "
                                "finish it in that session, or have a human move the record away")
 
@@ -239,6 +239,7 @@ def handle_hook(payload: dict, plugin_root: Path) -> dict | None:
             validate_run_id(argument)
         elif command in WORKFLOWS:
             WORKFLOWS[command].normalize_args(argument, project)
+            event_bytes(make_event(payload, "prompt"))
         with dispatch_lock(project, HOOK_WAIT):
             record = sessions.read_record(project, session, WORKFLOWS) or sessions.empty_record(session)
             record = _settle(project, record, all_stores)
@@ -301,8 +302,8 @@ def _overview(project: Path, all_stores: dict[str, RunStore]) -> dict:
     for name, record, error in sessions.scan_records(project, WORKFLOWS):
         if error:
             invalid.append({"record": name, "error": error})
-        elif record["pending_start"] and sessions.pending_applied(
-                record["pending_start"], record["session_id"], all_stores[record["pending_start"]["flow"]]) is False:
+        elif record["pending_start"] and not sessions.pending_created(
+                record["pending_start"], all_stores[record["pending_start"]["flow"]]):
             pending = record["pending_start"]
             blocking.append({"record": name, "flow": pending["flow"], "args": pending["args"],
                              "created_at": pending["created_at"]})
@@ -357,4 +358,6 @@ def blocking_warnings(project: Path) -> list[str]:
     warnings += [f"Incomplete run creation {name}; a human may move it away" for name in overview["incomplete_creations"]]
     warnings += [f"Run {item['flow']}/{item['run_id']} needs recovery (interrupted transaction)"
                  for item in overview["runs"] if item.get("recovery_required")]
+    warnings += [f"Run {item['flow']}/{item['run_id']} cannot be read and blocks new starts: {item.get('error')}"
+                 for item in overview["runs"] if item["format"] == "invalid"]
     return warnings

@@ -18,8 +18,12 @@ from .transcript import capture_interview
 
 
 class Engine:
-    def __init__(self, project: Path, resources: Path | None = None, lock_wait: float = RUNNER_WAIT):
+    def __init__(self, project: Path, resources: Path | None = None, lock_wait: float = RUNNER_WAIT,
+                 session: str | None = None):
         from .workflow import WORKFLOW
+        # When set, every locked change verifies this session still owns the run:
+        # ownership can move while the lock is not held (e.g. during preflight).
+        self.session = session
         self.project = Path(project).resolve()
         if not self.project.is_dir():
             raise DevFlowError("Project must be an existing directory")
@@ -33,7 +37,12 @@ class Engine:
         return self.store.lock(run_id)
 
     def _state(self, run_id: str) -> dict:
-        return self.store.load(run_id) if self.store.holds(run_id) else self.store.read(run_id)
+        if not self.store.holds(run_id):
+            return self.store.read(run_id)
+        state = self.store.load(run_id)
+        if self.session is not None and state["owner_session"] != self.session:
+            raise DevFlowError("This session no longer owns the run; use /devflow:resume RUN_ID first.")
+        return state
 
     def _save(self, state: dict) -> None:
         self.store.save(state)

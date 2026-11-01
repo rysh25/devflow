@@ -100,6 +100,8 @@ def scan_records(project: Path, workflows: Mapping[str, Any]) -> list[tuple[str,
             raise DevFlowError("Session history exceeds the bounded scan limit")
         if path.name.endswith(".lock") or path.name.startswith("."):
             continue
+        if path.name in workflows and path.is_dir() and not path.is_symlink():
+            continue  # The 0.1.x layout kept one directory per workflow; it is never read.
         try:
             no_symlinks(path)
             if not path.is_file():
@@ -132,6 +134,13 @@ def binding(project: Path, record: dict | None, stores: Mapping[str, RunStore]) 
     if info.format != "current":
         raise DevFlowError(f"The bound {flow} run {run_id} cannot be read: {info.error or info.format}")
     return Binding(record["session_id"], flow, run_id, info.state, info.state["owner_session"] == record["session_id"])
+
+
+def pending_created(pending: dict, store: RunStore) -> bool:
+    """Whether the pending start's run directory exists (its contents are judged elsewhere)."""
+    run = store.root / pending["run_id"]
+    no_symlinks(run)
+    return run.exists()
 
 
 def pending_applied(pending: dict, session_id: str, store: RunStore) -> bool | None:

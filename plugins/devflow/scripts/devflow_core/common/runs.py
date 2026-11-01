@@ -73,6 +73,14 @@ def make_event(payload: dict, kind: str) -> dict:
     return {"event_id": uuid4().hex, "recorded_at": now(), "kind": kind, "payload": payload}
 
 
+def event_bytes(event: dict) -> bytes:
+    """Serialized event, refusing one larger than the per-event limit."""
+    data = json_bytes(event)
+    if len(data) > MAX_EVENT_BYTES:
+        raise DevFlowError("A single human event exceeds 4 MiB; shorten the message")
+    return data
+
+
 def validate_event(value: object) -> dict:
     if (not isinstance(value, dict) or set(value) != {"event_id", "recorded_at", "kind", "payload"}
             or not isinstance(value["event_id"], str) or not EVENT_ID.fullmatch(value["event_id"])
@@ -148,6 +156,13 @@ class RunStore:
 
     # -- validation -------------------------------------------------------------------------
     def validate(self, state: object, run_id: str) -> dict:
+        """Check the envelope and the workflow's fields; malformed values become DevFlowError."""
+        try:
+            return self._validate(state, run_id)
+        except (TypeError, KeyError, ValueError, AttributeError, IndexError) as exc:
+            raise DevFlowError(f"Malformed run state: {type(exc).__name__}: {exc}") from exc
+
+    def _validate(self, state: object, run_id: str) -> dict:
         workflow = self.workflow
         if not isinstance(state, dict):
             raise DevFlowError("Run state must be an object")
@@ -155,11 +170,11 @@ class RunStore:
         if type(version) is not int or version != SCHEMA_VERSION:
             raise DevFlowError("Unsupported run state schema_version")
         unknown = set(state) - ENVELOPE - workflow.state_fields
-        missing = ENVELOPE - set(state)
+        missing = (ENVELOPE | workflow.state_fields) - set(state)
         if unknown or missing:
             raise DevFlowError("Run state fields do not match the workflow: " + ", ".join(sorted(unknown | missing)))
         if (state["flow"] != self.flow or state["run_id"] != run_id or state["project"] != str(self.project)
-                or state["status"] not in workflow.statuses
+                or not isinstance(state["status"], str) or state["status"] not in workflow.statuses
                 or not isinstance(state["owner_session"], str) or not SESSION_ID.fullmatch(state["owner_session"])
                 or not isinstance(state["created_at"], str) or not isinstance(state["updated_at"], str)
                 or type(state["state_revision"]) is not int or state["state_revision"] < 0
@@ -266,7 +281,7 @@ class RunStore:
                 raise DevFlowError("Run state from DevFlow 0.1.x has mismatched basic information")
             state = self.read(run_id)
             return RunInfo(self.flow, run_id, "current", state, None, recovery)
-        except (DevFlowError, OSError) as exc:
+        except (DevFlowError, OSError, TypeError, KeyError, ValueError, AttributeError) as exc:
             return RunInfo(self.flow, run_id, "invalid", None, str(exc), recovery)
 
     def scan(self) -> tuple[list[RunInfo], list[str]]:
@@ -332,6 +347,7 @@ class RunStore:
         if final.exists():
             raise DevFlowError("Run ID already exists: " + run_id)
         validate_event(first_event)
+        event_bytes(first_event)
         staging = self.root / (CREATING + run_id)
         no_symlinks(staging)
         staging.mkdir(mode=0o700)
@@ -339,7 +355,7 @@ class RunStore:
             for name in ("draft", "events", *directories):
                 (staging / name).mkdir(mode=0o700, exist_ok=True)
             files = dict(artifacts)
-            files[f"events/{first_event['event_id']}.json"] = json_bytes(first_event)
+            files[f"events/{first_event['event_id']}.json"] = event_bytes(first_event)
             hashes = {}
             for relative, data in files.items():
                 target = within(staging / relative, staging)
@@ -399,9 +415,7 @@ class RunStore:
             if len(state["event_ids"]) >= MAX_EVENTS:
                 raise DevFlowError("This run reached its human event limit; start a new run")
             event = make_event(payload, kind)
-            data = json_bytes(event)
-            if len(data) > MAX_EVENT_BYTES:
-                raise DevFlowError("A single human event exceeds 4 MiB; shorten the message")
+            data = event_bytes(event)
             self.stage(state, f"events/{event['event_id']}.json", data)
             state["event_ids"].append(event["event_id"])
             self.save(state)
@@ -423,8 +437,8 @@ class RunStore:
         state["owner_session"] = session
         if state["status"] not in TERMINAL:
             event = make_event(payload, "prompt")
-            data = json_bytes(event)
-            if len(data) > MAX_EVENT_BYTES or len(state["event_ids"]) >= MAX_EVENTS:
+            data = event_bytes(event)
+            if len(state["event_ids"]) >= MAX_EVENTS:
                 raise DevFlowError("The resume request cannot be recorded within the event limits")
             self.stage(state, f"events/{event['event_id']}.json", data)
             state["event_ids"].append(event["event_id"])

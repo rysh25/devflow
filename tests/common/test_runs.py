@@ -154,6 +154,26 @@ class RunStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(DevFlowError, "recover"):
                 self.store.transfer(self.store.load(self.run_id), "new-owner", prompt("new-owner"))
 
+    def test_malformed_types_and_missing_fields_are_invalid_not_exceptions(self):
+        for change in ({"status": []}, {"status": {"x": 1}}, {"artifacts": []}, {"event_ids": None},
+                       {"escalation": {"boundary": "1"}}, {"state_revision": "1"}):
+            with self.subTest(change=change):
+                state = dict(self.state, **change)
+                atomic_json(self.store.run_dir(self.run_id) / "state.json", state)
+                info = self.store.inspect(self.run_id)
+                self.assertEqual(info.format, "invalid", info)
+        missing = {key: value for key, value in self.state.items() if key != "note"}
+        atomic_json(self.store.run_dir(self.run_id) / "state.json", missing)
+        self.assertEqual(self.store.inspect(self.run_id).format, "invalid")
+        self.assertEqual([info.format for info in self.store.scan()[0]], ["invalid"])
+
+    def test_the_first_event_obeys_the_event_size_limit(self):
+        identifier = runs.new_run_id()
+        with self.assertRaisesRegex(DevFlowError, "4 MiB"):
+            self.store.create({"status": "working", "note": "n", "escalation": None}, {}, run_id=identifier,
+                              owner="owner", first_event=make_event(prompt(text="x" * runs.MAX_EVENT_BYTES), "prompt"))
+        self.assertFalse((self.store.root / identifier).exists())
+
     def test_inspect_classifies_old_damaged_and_current_runs(self):
         self.assertEqual(self.store.inspect(self.run_id).format, "current")
         old = runs.new_run_id()
