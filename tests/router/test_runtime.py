@@ -229,8 +229,9 @@ class UnifiedDispatchTests(RuntimeFixture):
         value = runtime.status(self.project, self.session, None)
         self.assertEqual((value["status"], value["run"], value["owner_matches"], value["pending_start"]),
                          ("bound", {"flow": "plan", "run_id": identifier}, True, None))
-        self.assertEqual((value["run_status"]["status"], value["run_status"]["review_count"]), ("interview", 0))
-        self.assertEqual(value["runs"][0]["run_id"], identifier)
+        self.assertNotIn("run_status", value)
+        listed = value["runs"][0]
+        self.assertEqual((listed["run_id"], listed["status"], listed["review_count"]), (identifier, "interview", 0))
         self.assertIsNone(self.tool("Bash", command=self.command("status", identifier)))
 
     def test_idle_status_is_nonmutating_and_pending_status_is_explicit(self):
@@ -323,6 +324,7 @@ class PendingStartGuardTests(RuntimeFixture):
         for name, data in (("Read", {"file_path": str(self.plan_file)}), ("Bash", {"command": "grep -rn 'a|b' ."}),
                            ("Bash", {"command": self.command("status")}), ("Bash", {"command": self.command("doctor")}),
                            ("Bash", {"command": self.command("start --help", flow="implement")}),
+                           ("Bash", {"command": self.command("hook --help")}),
                            ("Bash", {"command": self.command("start --plan feature.md", flow="implement")}),
                            ("Bash", {"command": self.command("start --plan ./feature.md", flow="implement")}),
                            ("Bash", {"command": self.command("start", flow="implement") + " --plan " + shlex.quote(str(self.plan_file))})):
@@ -367,6 +369,7 @@ class RunFormatTests(RuntimeFixture):
         selected = runtime.status(self.project, None, identifier)
         self.assertEqual(selected["format"], "unsupported")
         self.assertIn("0.1.x", selected["message"])
+        self.assertEqual(selected["project"], str(self.project))
         with self.assertRaisesRegex(DevFlowError, "0.1.x"):
             self.prompt("/devflow:resume " + identifier)
         self.plan_start()  # An unsupported run never blocks a new one.

@@ -35,6 +35,6 @@ COMMANDS = (
     Command("publish", "Export the exact approved plan without overwriting any existing file",
             lambda e, a, run, s: e.publish(run)),
     Command("recover", "HUMAN ONLY: mark a stopped interrupted review as failed; consumes its attempt",
-            lambda e, a, run, s: e.recover(run, a.expected_review),
+            lambda e, a, run, s: e.recover(run, a.expected_review, a.confirm_process_stopped),
             (Option("--expected-review", "int"), Option("--confirm-process-stopped", "confirm")), claude=False),
 )

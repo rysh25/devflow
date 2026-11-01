@@ -459,6 +459,17 @@ class ReviewerSettingsTests(unittest.TestCase):
             settings.validate_reviewers(entries, 6)
 
 
+class OutputLimitTests(unittest.TestCase):
+    def test_each_stream_has_its_own_limit_so_stderr_logs_do_not_use_up_stdout(self):
+        code = "import sys; sys.stdout.write('o' * 3000); sys.stdout.flush(); sys.stderr.write('e' * 3000)"
+        exit_code, stdout, stderr = reviewers._capture([sys.executable, "-c", code], limit=4096)
+        self.assertEqual((exit_code, len(stdout), len(stderr)), (0, 3000, 3000))
+
+    def test_a_single_stream_over_its_limit_is_a_failure(self):
+        with self.assertRaisesRegex(ReviewerError, "exceeded the size limit"):
+            reviewers._capture([sys.executable, "-c", "import sys; sys.stderr.write('e' * 9000)"], limit=4096)
+
+
 class ProcessTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="devflow reviewers ")

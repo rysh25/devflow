@@ -52,8 +52,11 @@ def stop_tree(process: subprocess.Popen) -> None:
 
 
 def run_bounded(argv: list[str], *, cwd: Path | None, timeout: float, limit: int,
-                env: dict | None = None, data: bytes | None = None) -> Completed:
-    """Run argv (never a shell) with combined stdout+stderr capped at ``limit`` bytes.
+                env: dict | None = None, data: bytes | None = None, per_stream: bool = False) -> Completed:
+    """Run argv (never a shell), capping output at ``limit`` bytes.
+
+    The limit covers stdout and stderr together, or each stream separately
+    when ``per_stream`` is set.
 
     The process tree is stopped on timeout, on overflow, or when a descendant
     keeps the output pipes open after the command exits.
@@ -75,7 +78,8 @@ def run_bounded(argv: list[str], *, cwd: Path | None, timeout: float, limit: int
         try:
             while chunk := os.read(pipe.fileno(), 65536):
                 with lock:
-                    available = limit - sum(len(value) for value in buffers.values())
+                    used = len(buffers[name]) if per_stream else sum(len(value) for value in buffers.values())
+                    available = limit - used
                     buffers[name].extend(chunk[:max(0, available)])
                     if len(chunk) > available:
                         overflow.set()

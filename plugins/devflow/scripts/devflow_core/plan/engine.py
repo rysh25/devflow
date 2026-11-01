@@ -24,22 +24,12 @@ class Engine(RunEngine):
         from .workflow import WORKFLOW
         super().__init__(project, WORKFLOW, resources, lock_wait, session)
 
-    def status(self, run_id: str) -> dict:
-        state = self._state(run_id)
-        result = dict(state)
+    def _status_details(self, state: dict, result: dict) -> None:
         result.pop("transcript_marker", None)
-        result.pop("artifacts", None)
-        result.pop("event_ids", None)
-        run = self._run(run_id)
-        result["run_dir"] = str(run)
-        result["draft_dir"] = str(run / "draft")
+        run = self._run(state["run_id"])
         result["current_plan"] = str(run / state["current_plan"]) if state["current_plan"] else None
-        providers = state["config"]["reviewers"]
-        result["next_reviewer"] = providers[state["review_count"] % len(providers)]["id"] if state["review_count"] < state["config"]["max_reviews"] and state["status"] not in TERMINAL else None
-        result["human_events"] = approval_candidates(state, self._events(state))
         if state["last_review"]:
             result["review"] = read_json(run / state["last_review"])
-        return result
 
     def _draft(self, run_id: str, path: Path) -> Path:
         if not path.is_absolute():
@@ -129,67 +119,61 @@ class Engine(RunEngine):
         provider = next_reviewer(state["config"]["reviewers"], state["review_count"], state["config"]["max_reviews"])
         # A missing or unsupported reviewer CLI must not consume an attempt.
         probe = preflight(provider)
-        with self._lock(run_id):
-            state = self._state(run_id)
+
+        def prepare(state: dict):
             self._verify(state)
             if state["status"] != "ready":
                 raise DevFlowError(f"Review requires status ready, not {state['status']}.")
             if state["review_count"] >= state["config"]["max_reviews"]:
                 raise DevFlowError("Review budget exhausted. A resume never resets this counter.")
-            number = state["review_count"] + 1
             if next_reviewer(state["config"]["reviewers"], state["review_count"], state["config"]["max_reviews"]) != provider:
                 raise DevFlowError("The run changed during the reviewer check; inspect status and retry.")
-            packet = self._packet(state, number, provider)
+            number = state["review_count"] + 1
             relative_dir = f"reviews/{number:02d}"
-            packet_path = self._artifact(state, f"{relative_dir}/packet.md", packet)
-            state["review_count"] = number
-            # Reserved BEFORE dispatch; a crash cannot refund the attempt.
-            reservation = self.store.reserve(state, "reviewing", "review", number, state["plan_hash"], provider["id"])
-        output_dir = self._run(run_id) / relative_dir
-        try:
-            review = run_review(provider, packet_path, output_dir, self.resources / "review.schema.json",
-                                self.resources / "reviewer.md", validate_review, probe)
-        except Exception as exc:  # noqa: BLE001 - every failure is recorded, never retried
-            return self._finish_review(run_id, reservation, provider, error=exc)
-        return self._finish_review(run_id, reservation, provider, review=review)
+            packet_path = self._artifact(state, f"{relative_dir}/packet.md", self._packet(state, number, provider))
+            state.update(review_count=number, last_error=None)
+            return number, state["plan_hash"], provider["id"], {"packet": packet_path, "dir": relative_dir}
 
-    def _finish_review(self, run_id: str, reservation: dict, provider: dict, review: dict | None = None,
-                       error: BaseException | None = None) -> dict:
+        def execute(work):
+            return run_review(provider, work["packet"], self._run(run_id) / work["dir"],
+                              self.resources / "review.schema.json", self.resources / "reviewer.md",
+                              validate_review, probe)
+
+        return self._dispatch(run_id, "reviewing", "review", prepare, execute,
+                              lambda state, reservation, work, review, error:
+                              self._finish_review(state, reservation, work["dir"], provider, review, error))
+
+    def _finish_review(self, state: dict, reservation: dict, relative_dir: str, provider: dict,
+                       review: dict | None, error: BaseException | None) -> None:
         number = reservation["number"]
-        relative_dir = f"reviews/{number:02d}"
-        with self._lock(run_id):
-            state = self.store.claim(run_id, reservation, "reviewing",
-                                     {"result": review, "error": None if error is None else str(error)})
-            self._verify(state)
-            if error is None and state["plan_hash"] != reservation["target"]:
-                error = DevFlowError("The plan changed while it was being reviewed.")
-            if error is not None:
-                state["last_error"] = {"review_number": number, "provider": provider["id"], "message": str(error),
-                                       "retry_consumes_another_attempt": True}
-                state["status"] = "paused_error" if number < state["config"]["max_reviews"] else "exhausted"
-                self._artifact(state, f"{relative_dir}/error.json", json_bytes(state["last_error"]))
-                self._save(state)
-                return self.status(run_id)
-            providers = state["config"]["reviewers"]
-            wrapper = {"schema_version": 1, "number": number, "provider": provider["id"], "plan_hash": state["plan_hash"], "requested_model": provider["model"], "requested_effort": provider["effort"], "result": review}
-            relative = f"{relative_dir}/review.json"
-            self._artifact(state, relative, json_bytes(wrapper))
-            state["last_review"] = relative
-            state["final_plan_reviewed"] = True
-            if review["verdict"] == "pass":
-                state["passes"].append({"provider": provider["id"], "plan_hash": state["plan_hash"], "number": number})
-                approved = {item["provider"]: item["plan_hash"] for item in state["passes"] if item["plan_hash"] == state["plan_hash"]}
-                if all_approved(providers, approved, state["plan_hash"]):
-                    state["status"] = "completed"
-                else:
-                    state["status"] = "ready" if number < state["config"]["max_reviews"] else "exhausted"
-                self._artifact(state, f"{relative_dir}/reflection.json", json_bytes({"review_number": number, "summary": "No findings; plan unchanged.", "decisions": [], "plan_hash": state["plan_hash"]}))
-            elif review["verdict"] == "human_required":
-                self._escalate(state, {"reason": review["summary"], "questions": [q["question"] for q in review["questions"]]}, "awaiting_revision")
+        self._verify(state)
+        if error is None and state["plan_hash"] != reservation["target"]:
+            error = DevFlowError("The plan changed while it was being reviewed.")
+        if error is not None:
+            state["last_error"] = {"review_number": number, "provider": provider["id"], "message": str(error),
+                                   "retry_consumes_another_attempt": True}
+            state["status"] = "paused_error" if number < state["config"]["max_reviews"] else "exhausted"
+            self._artifact(state, f"{relative_dir}/error.json", json_bytes(state["last_error"]))
+            return
+        providers = state["config"]["reviewers"]
+        wrapper = {"schema_version": 1, "number": number, "provider": provider["id"], "plan_hash": state["plan_hash"],
+                   "requested_model": provider["model"], "requested_effort": provider["effort"], "result": review}
+        relative = f"{relative_dir}/review.json"
+        self._artifact(state, relative, json_bytes(wrapper))
+        state["last_review"] = relative
+        state["final_plan_reviewed"] = True
+        if review["verdict"] == "pass":
+            state["passes"].append({"provider": provider["id"], "plan_hash": state["plan_hash"], "number": number})
+            approved = {item["provider"]: item["plan_hash"] for item in state["passes"] if item["plan_hash"] == state["plan_hash"]}
+            if all_approved(providers, approved, state["plan_hash"]):
+                state["status"] = "completed"
             else:
-                state["status"] = "awaiting_revision"
-            self._save(state)
-        return self.status(run_id)
+                state["status"] = "ready" if number < state["config"]["max_reviews"] else "exhausted"
+            self._artifact(state, f"{relative_dir}/reflection.json", json_bytes({"review_number": number, "summary": "No findings; plan unchanged.", "decisions": [], "plan_hash": state["plan_hash"]}))
+        elif review["verdict"] == "human_required":
+            self._escalate(state, {"reason": review["summary"], "questions": [q["question"] for q in review["questions"]]}, "awaiting_revision")
+        else:
+            state["status"] = "awaiting_revision"
 
     def apply(self, run_id: str, plan_file: Path, decisions_file: Path, expected_hash: str) -> dict:
         with self._lock(run_id):
@@ -281,14 +265,13 @@ class Engine(RunEngine):
             self._save(state)
         return self.status(run_id)
 
-    def recover(self, run_id: str, expected_review: int) -> dict:
+    def recover(self, run_id: str, expected_review: int, confirmed: bool = False) -> dict:
         """Explicit operator recovery; the hook guard never allows this command."""
         def exact(state: dict) -> None:
             if state["review_count"] != expected_review:
                 raise DevFlowError("Recovery requires the exact interrupted review number.")
 
-        self.store.recover(run_id, exact)
-        return self.status(run_id)
+        return super().recover(run_id, confirmed, exact)
 
     def cancel(self, run_id: str) -> dict:
         with self._lock(run_id):

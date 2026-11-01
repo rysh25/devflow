@@ -2,7 +2,6 @@
 from __future__ import annotations
 import copy
 from pathlib import Path
-import re
 from ..common.errors import DevFlowError
 from ..common.storage import read_json
 from ..common.review import validate_limit

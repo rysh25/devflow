@@ -200,6 +200,8 @@ def check_option(kind: str, value: str, cwd: Path, run_dir: Path) -> None:
         raise GuardError("Unsupported resolution decision.")
     if kind == "text" and (not value.strip() or len(value) > MAX_TEXT):
         raise GuardError("Provide a bounded, nonempty reason.")
+    if kind not in {"draft", "hash", "event", "decision", "text"}:
+        raise GuardError(f"Runner option kind {kind!r} cannot be checked.")
 
 
 def _shell(data: dict) -> None:
@@ -211,7 +213,7 @@ def _global_or_help(call: RunnerCall, run_id: str | None, workflows) -> bool:
     """Diagnostics and help never act on a run, so they are always available."""
     if "--run" in call.selectors and call.selectors["--run"] != run_id:
         raise GuardError("The runner cannot target another run.")
-    if call.command == "--help" and call.action is None and not call.args:
+    if (call.command == "--help" and call.action is None and not call.args) or call.help:
         return True
     if call.command in GLOBAL_COMMANDS:
         if call.args and not call.help:

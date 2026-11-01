@@ -38,7 +38,7 @@ class RunStoreTests(unittest.TestCase):
         self.project = Path(temporary.name).resolve()
         self.store = RunStore(self.project, Toy(), lock_wait=0.2)
         self.run_id = runs.new_run_id()
-        self.state = self.store.create({"status": "working", "note": "n", "escalation": None},
+        self.state = self.store.create({"status": "working", "note": "n", "escalation": None, "config": {}},
                                        {"input.txt": b"data\n"}, run_id=self.run_id, owner="owner",
                                        first_event=make_event(prompt(), "prompt"))
 
@@ -54,7 +54,7 @@ class RunStoreTests(unittest.TestCase):
     def test_failed_creation_leaves_no_run_directory(self):
         identifier = runs.new_run_id()
         with patch.object(runs.os, "rename", side_effect=OSError("simulated stop")), self.assertRaises(OSError):
-            self.store.create({"status": "working", "note": "n", "escalation": None}, {}, run_id=identifier,
+            self.store.create({"status": "working", "note": "n", "escalation": None, "config": {}}, {}, run_id=identifier,
                               owner="owner", first_event=make_event(prompt(), "prompt"))
         self.assertFalse((self.store.root / identifier).exists())
         self.assertFalse(any(path.name.startswith(runs.CREATING) for path in self.store.root.iterdir()))
@@ -146,6 +146,15 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(moved["escalation"]["boundary"], len(moved["event_ids"]))
         self.assertEqual(moved["escalation"]["session_id"], "new-owner")
 
+    def test_reserve_and_claim_touch_only_envelope_fields(self):
+        with self.store.lock(self.run_id):
+            state = self.store.load(self.run_id)
+            reservation = self.store.reserve(state, "running", "job", 1, "target")
+            state = self.store.claim(self.run_id, reservation, "running", {"result": "ok", "error": None})
+            state["status"] = "working"
+            self.store.save(state)
+        self.assertNotIn("last_error", self.store.read(self.run_id))  # The toy workflow has no such field.
+
     def test_transfer_refuses_an_inflight_run(self):
         with self.store.lock(self.run_id):
             state = self.store.load(self.run_id)
@@ -170,7 +179,7 @@ class RunStoreTests(unittest.TestCase):
     def test_the_first_event_obeys_the_event_size_limit(self):
         identifier = runs.new_run_id()
         with self.assertRaisesRegex(DevFlowError, "4 MiB"):
-            self.store.create({"status": "working", "note": "n", "escalation": None}, {}, run_id=identifier,
+            self.store.create({"status": "working", "note": "n", "escalation": None, "config": {}}, {}, run_id=identifier,
                               owner="owner", first_event=make_event(prompt(text="x" * runs.MAX_EVENT_BYTES), "prompt"))
         self.assertFalse((self.store.root / identifier).exists())
 

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from uuid import uuid4
 
 from . import checks, snapshot
 from .review import validate_review
@@ -12,7 +11,7 @@ from ..common.reviewers import preflight, run_review
 from ..common.engine import RunEngine
 from ..common.runs import RUNNER_WAIT, TERMINAL, open_escalation
 from ..common.sessions import approval_candidates
-from ..common.storage import checked_text, digest, json_bytes, no_symlinks, now, read_json, within, write_new
+from ..common.storage import checked_text, digest, json_bytes, no_symlinks, now, read_json, within
 
 EDIT_STATUSES = frozenset({"implementing", "needs_revision"})
 
@@ -111,55 +110,46 @@ class Engine(RunEngine):
         return current
 
     def check(self, run_id, session_id):
-        with self._lock(run_id):
-            state = self._state(run_id)
-            self._owner(state,session_id)
-            self._require(state,{"ready_check"})
+        def prepare(state):
+            self._owner(state, session_id)
+            self._require(state, {"ready_check"})
             self._current(state)
             if state["check_attempts"] >= state["config"]["max_check_attempts"]:
                 self._escalate(state,"check_budget",["Repeated checks did not converge. Review the failures before authorizing another bounded attempt."],"implementing","Check attempt limit reached")
-                self._save(state)
-                return self.status(run_id)
+                return None
             state["check_attempts"] += 1
             state["check_dispatch_count"] += 1
+            state["last_error"] = None
             index = state["check_dispatch_count"]
-            # Reserved before running project code; no lock is held while it runs.
-            reservation = self.store.reserve(state, "checking", "check", index, state["candidate"]["snapshot_id"])
-            check_config = state["config"]["checks"]
-        try:
-            result = checks.run_checks(self.project, check_config, self._run(run_id) / "check-processes" / f"{index:03}")
-        except (DevFlowError, OSError) as exc:
-            return self._finish_check(run_id, reservation, error=exc)
-        return self._finish_check(run_id, reservation, result=result)
+            # No lock is held while project code runs.
+            return index, state["candidate"]["snapshot_id"], None, {"index": index, "checks": state["config"]["checks"]}
 
-    def _finish_check(self, run_id, reservation, result=None, error=None):
-        with self._lock(run_id):
-            state = self.store.claim(run_id, reservation, "checking",
-                                     {"result": result, "error": None if error is None else str(error)})
-            if error is None:
-                try:
-                    self._current(state)
-                except DevFlowError as exc:  # e.g. the check itself rewrote source
-                    error = exc
-            if error is not None:
-                state.update(status="paused_error",resume_status="implementing",last_error=str(error),approvals={})
-                self._save(state)
-                return self.status(run_id)
-            index = reservation["number"]
-            path = f"checks/{index:03}.json"
-            self._artifact(state,path,json_bytes(result))
-            state["check_history"].append(path)
-            state["validation"] = {"snapshot_id":state["candidate"]["snapshot_id"],"kind":"automated","status":result["status"],"path":path}
-            if result["status"] == "not_configured":
-                self._escalate(state,"manual_validation",["No project checks are configured. Provide actual manual validation evidence for this exact code version, or cancel and configure checks for a new run."],"ready_review","No checks configured")
-            elif result["status"] == "passed":
-                state["status"] = "exhausted" if len(state["attempts"]) >= state["config"]["max_reviews"] else "ready_review"
-            else:
-                state.update(status="implementing",approvals={})
-                if state["check_attempts"] >= state["config"]["max_check_attempts"]:
-                    self._escalate(state,"check_budget",["Checks continue to fail. Determine the cause and authorize another bounded attempt, or cancel."],"implementing","Check attempt limit reached")
-            self._save(state)
-        return self.status(run_id)
+        def execute(work):
+            return checks.run_checks(self.project, work["checks"], self._run(run_id) / "check-processes" / f"{work['index']:03}")
+
+        return self._dispatch(run_id, "checking", "check", prepare, execute, self._finish_check)
+
+    def _finish_check(self, state, reservation, work, result, error):
+        if error is None:
+            try:
+                self._current(state)
+            except DevFlowError as exc:  # e.g. the check itself rewrote source
+                error = exc
+        if error is not None:
+            state.update(status="paused_error",resume_status="implementing",last_error=str(error),approvals={})
+            return
+        path = f"checks/{reservation['number']:03}.json"
+        self._artifact(state,path,json_bytes(result))
+        state["check_history"].append(path)
+        state["validation"] = {"snapshot_id":state["candidate"]["snapshot_id"],"kind":"automated","status":result["status"],"path":path}
+        if result["status"] == "not_configured":
+            self._escalate(state,"manual_validation",["No project checks are configured. Provide actual manual validation evidence for this exact code version, or cancel and configure checks for a new run."],"ready_review","No checks configured")
+        elif result["status"] == "passed":
+            state["status"] = "exhausted" if len(state["attempts"]) >= state["config"]["max_reviews"] else "ready_review"
+        else:
+            state.update(status="implementing",approvals={})
+            if state["check_attempts"] >= state["config"]["max_check_attempts"]:
+                self._escalate(state,"check_budget",["Checks continue to fail. Determine the cause and authorize another bounded attempt, or cancel."],"implementing","Check attempt limit reached")
 
     def _packet(self,state,current):
         run = self._run(state["run_id"])
@@ -197,8 +187,8 @@ class Engine(RunEngine):
         provider = next_reviewer(state["config"]["reviewers"],len(state["attempts"]),state["config"]["max_reviews"])
         # A missing or unsupported reviewer CLI must not consume an attempt.
         probe = preflight(provider)
-        with self._lock(run_id):
-            state = self._state(run_id)
+
+        def prepare(state):
             self._owner(state,session_id)
             self._require(state,{"ready_review"})
             current = self._current(state)
@@ -211,54 +201,52 @@ class Engine(RunEngine):
             number = len(state["attempts"]) + 1
             packet_relative = f"reviews/{number:02}/packet.json"
             self._artifact(state,packet_relative,packet)
-            attempt = {"number":number,"reviewer_id":provider["id"],"snapshot_id":current["snapshot_id"],
-                "packet_path":packet_relative,"packet_sha256":digest(packet),"status":"dispatched","started_at":now()}
-            state["attempts"].append(attempt)
+            state["attempts"].append({"number":number,"reviewer_id":provider["id"],"snapshot_id":current["snapshot_id"],
+                "packet_path":packet_relative,"packet_sha256":digest(packet),"status":"dispatched","started_at":now()})
+            state["last_error"] = None
             # Reserved BEFORE dispatch, including unknown-outcome failures.
-            reservation = self.store.reserve(state, "reviewing", "review", number, current["snapshot_id"], provider["id"])
-        try:
-            review = run_review(provider,self._run(run_id)/packet_relative,
-                self._run(run_id)/"review-processes"/f"{number:02}",self.resources/"review.schema.json",
-                self.resources/"reviewer.md",validate_review,probe)
-            if review["snapshot_id"] != reservation["target"]:
-                raise DevFlowError("Reviewer response is for a different snapshot")
-        except (DevFlowError,OSError) as exc:
-            return self._finish_review(run_id,reservation,provider,error=exc)
-        return self._finish_review(run_id,reservation,provider,review=review)
+            return number, current["snapshot_id"], provider["id"], {"number": number, "packet": packet_relative}
 
-    def _finish_review(self,run_id,reservation,provider,review=None,error=None):
+        def execute(work):
+            review = run_review(provider,self._run(run_id)/work["packet"],
+                self._run(run_id)/"review-processes"/f"{work['number']:02}",self.resources/"review.schema.json",
+                self.resources/"reviewer.md",validate_review,probe)
+            return review
+
+        def finish(state, reservation, work, review, error):
+            if error is None and review["snapshot_id"] != reservation["target"]:
+                error = DevFlowError("Reviewer response is for a different snapshot")
+            self._finish_review(state, reservation, provider, review, error)
+
+        return self._dispatch(run_id, "reviewing", "review", prepare, execute, finish)
+
+    def _finish_review(self,state,reservation,provider,review,error):
         number = reservation["number"]
-        with self._lock(run_id):
-            state = self.store.claim(run_id, reservation, "reviewing",
-                                     {"result": review, "error": None if error is None else str(error)})
-            current = None
-            if error is None:
-                try:
-                    current = self._current(state)
-                except DevFlowError as exc:
-                    error = exc
-            if error is not None:
-                state["attempts"][-1].update(status="failed",error=str(error),finished_at=now())
-                state.update(status="paused_error" if number < state["config"]["max_reviews"] else "exhausted",resume_status="ready_review",last_error=str(error),approvals={})
-                self._save(state)
-                return self.status(run_id)
-            review_path = f"reviews/{number:02}/review.json"
-            self._artifact(state,review_path,json_bytes(review))
-            state["attempts"][-1].update(status="succeeded",review_path=review_path,finished_at=now())
-            critical = any(f["severity"] == "critical" for f in review["findings"])
-            if review["verdict"] == "human_required" or critical:
-                questions = review["questions"] or ["A critical issue was reported. Confirm the safe scope and remediation before continuing."]
-                self._escalate(state,"review_decision",questions,"needs_revision","Independent review requires a human decision")
-            elif review["verdict"] == "changes_required":
-                state.update(status="needs_revision",approvals={})
+        current = None
+        if error is None:
+            try:
+                current = self._current(state)
+            except DevFlowError as exc:
+                error = exc
+        if error is not None:
+            state["attempts"][-1].update(status="failed",error=str(error),finished_at=now())
+            state.update(status="paused_error" if number < state["config"]["max_reviews"] else "exhausted",resume_status="ready_review",last_error=str(error),approvals={})
+            return
+        review_path = f"reviews/{number:02}/review.json"
+        self._artifact(state,review_path,json_bytes(review))
+        state["attempts"][-1].update(status="succeeded",review_path=review_path,finished_at=now())
+        critical = any(f["severity"] == "critical" for f in review["findings"])
+        if review["verdict"] == "human_required" or critical:
+            questions = review["questions"] or ["A critical issue was reported. Confirm the safe scope and remediation before continuing."]
+            self._escalate(state,"review_decision",questions,"needs_revision","Independent review requires a human decision")
+        elif review["verdict"] == "changes_required":
+            state.update(status="needs_revision",approvals={})
+        else:
+            state["approvals"][provider["id"]] = current["snapshot_id"]
+            if all_approved(state["config"]["reviewers"],state["approvals"],current["snapshot_id"]):
+                state["status"] = "completed"
             else:
-                state["approvals"][provider["id"]] = current["snapshot_id"]
-                if all_approved(state["config"]["reviewers"],state["approvals"],current["snapshot_id"]):
-                    state["status"] = "completed"
-                else:
-                    state["status"] = "exhausted" if number >= state["config"]["max_reviews"] else "ready_review"
-            self._save(state)
-        return self.status(run_id)
+                state["status"] = "exhausted" if number >= state["config"]["max_reviews"] else "ready_review"
 
     def reflect(self,run_id,session_id,decisions_file):
         with self._lock(run_id):
@@ -353,31 +341,13 @@ class Engine(RunEngine):
             self._save(state)
         return self.status(run_id)
 
-    def recover(self,run_id,confirmed=False):
-        if not confirmed:
-            raise DevFlowError("Human must confirm all associated processes stopped")
-        self.store.recover(run_id)
-        return self.status(run_id)
-
-    def status(self,run_id):
-        state = self._state(run_id)
-        result = dict(state)
-        result.pop("artifacts",None)
-        result.pop("event_ids",None)
-        result["run_dir"] = str(self._run(run_id))
-        result["draft_dir"] = str(self._run(run_id)/"draft")
-        result["review_count"] = len(state["attempts"])
-        result["remaining_reviews"] = state["config"]["max_reviews"] - len(state["attempts"])
-        reviewers = state["config"]["reviewers"]
-        result["next_reviewer"] = reviewers[len(state["attempts"]) % len(reviewers)]["id"] if result["remaining_reviews"] and state["status"] not in TERMINAL else None
-        result["human_events"] = approval_candidates(state, self.store.events(state))
+    def _status_details(self, state, result):
         if state["status"] in TERMINAL:
-            report_path = within(self._run(run_id) / state["report_path"], self._run(run_id))
+            run = self._run(state["run_id"])
+            report_path = within(run / state["report_path"], run)
             if digest(report_path.read_bytes()) != state["artifacts"][state["report_path"]]:
                 raise DevFlowError("The recorded terminal report was modified")
             result["report"] = read_json(report_path)
-        return result
-
 
 def verify_source(state):
     """The original plan file must still be exactly the one this run started from."""

@@ -330,21 +330,19 @@ def status(project: Path, session: str | None, run_id: str | None) -> dict:
             value.update(recovery_required=True,
                          recovery="An interrupted transaction is pending; /devflow:resume or cancel completes it")
         return value
-    record, record_error, current, run_status = None, None, None, None
+    record, record_error, current = None, None, None
     if session:
         try:
             record = sessions.read_record(project, session, WORKFLOWS)
             current = sessions.binding(project, record, all_stores)
         except DevFlowError as exc:
             record_error = str(exc)
-    if current is not None:
-        run_status = WORKFLOWS[current.flow].engine(project).status(current.run_id)
     pending = record["pending_start"] if record else None
     caller = ("bound" if current.owner else "stale") if current else "pending_start" if pending else "idle"
     return {"plugin": "devflow", "version": __version__, "project": str(project), "status": caller,
             "run": record["run"] if current else None, "owner_matches": current.owner if current else None,
             "pending_start": pending and {key: pending[key] for key in ("flow", "run_id", "args", "created_at")},
-            "session_record_error": record_error, "run_status": run_status,
+            "session_record_error": record_error,
             **_overview(project, all_stores, session)}
 
 

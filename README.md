@@ -179,7 +179,7 @@ run-id は一回の作業を識別する自動生成 ID です。レビューご
 - ランナーの `resume` 動作はありません。再開は `/devflow:resume RUN_ID` だけで、入力したセッションへの引き継ぎまでフックが行います。引き継がれた元のセッションは、もう一度 resume するか run が終わるまで止まります。
 - Implement の開始時には、レビュアー CLI を確認しません。確認は `doctor` と各レビューの直前に行い、CLI が無くてもレビュー回数は減りません。
 - `/devflow:implement` の後、`implement start` までの間は、読み取り専用のツール・`status`・`doctor`・その開始だけを使えます。AskUserQuestion も使えず、この間の発言は記録しません。
-- `status`（`--run` なし）は、呼び出し元の状態を `idle` / `pending_start` / `bound` / `stale` のどれかで返し、`run`・`pending_start`・`owner_matches` と、紐付いた run の詳細（`run_status`）を添えます。あわせて、全 run の一覧（壊れた run・中断した書き込み `recovery_required` を含む）、他のセッションの開始待ちや壊れたセッション記録（`sessions`）、作成途中のディレクトリ（`incomplete_creations`）を表示します。
+- `status`（`--run` なし）は、呼び出し元の状態を `idle` / `pending_start` / `bound` / `stale` のどれかで返し、`run`・`pending_start`・`owner_matches` を添えます（run の詳細は `--run RUN_ID status` で読みます）。あわせて、全 run の一覧（壊れた run・中断した書き込み `recovery_required` を含む）、他のセッションの開始待ちや壊れたセッション記録（`sessions`）、作成途中のディレクトリ（`incomplete_creations`）を表示します。
 - 読み取りだけの `status` と `doctor` は、どのセッションからも使えます。run を変える操作は、所有するセッションだけが使えます。人間専用の `recover` は、両フローとも `--confirm-process-stopped` が必須です。
 
 ### 復旧の手順

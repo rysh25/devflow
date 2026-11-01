@@ -44,7 +44,9 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
         value = json.loads(out)
         self.assertEqual((value["status"], value["owner_matches"], value["run"]["flow"]), ("bound", True, "plan"))
-        return value["run_status"]
+        code, out, err = self.cli("--session", "cli-session", "--run", value["run"]["run_id"], "status")
+        self.assertEqual(code, 0, err)
+        return json.loads(out)
 
     def assertJsonError(self, out, error="DevFlowError"):
         value = json.loads(out)

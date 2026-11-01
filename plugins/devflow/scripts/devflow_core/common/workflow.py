@@ -10,13 +10,15 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 import sys
-from typing import Any, Callable, Mapping
+from typing import Any, Callable
 
 from .errors import DevFlowError, GuardError
 
 RESOURCES = ("defaults.json", "reviewer.md", "review.schema.json")
-#: Option kinds Claude may pass to a runner action (checked by the guard).
+#: Option kinds Claude may pass to a runner action (each is checked by the guard).
 CLAUDE_KINDS = frozenset({"draft", "hash", "event", "decision", "text"})
+#: Option kinds only a human uses (actions the guard never permits).
+HUMAN_KINDS = frozenset({"int", "confirm"})
 READ_ONLY_COMMANDS = frozenset({"status", "doctor"})
 
 
@@ -31,6 +33,10 @@ class Option:
     kind: str
     required: bool = True
 
+    def __post_init__(self):
+        if self.kind not in CLAUDE_KINDS | HUMAN_KINDS:
+            raise ValueError(f"Unknown option kind {self.kind!r} for {self.flag}")
+
 
 @dataclass(frozen=True)
 class Command:
@@ -41,6 +47,10 @@ class Command:
     options: tuple[Option, ...] = ()
     claude: bool = True       # False: only a human, from their own terminal (the guard refuses it).
     needs_run: bool = True
+
+    def __post_init__(self):
+        if self.claude and any(option.kind not in CLAUDE_KINDS for option in self.options):
+            raise ValueError(f"Action {self.name!r} available to Claude has an option the guard cannot check")
 
 
 class Workflow:
@@ -95,6 +105,10 @@ class Workflow:
 
     def on_transfer(self, state: dict) -> None:
         """Adjust workflow fields when a run is resumed (e.g. leave paused_error)."""
+
+    def reviews_used(self, state: dict) -> int:
+        """Review attempts consumed so far (the budget is never reset)."""
+        raise NotImplementedError
 
     def check_state(self, state: dict) -> None:
         """Reject workflow fields that violate an invariant (raise DevFlowError)."""

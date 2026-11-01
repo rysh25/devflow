@@ -38,7 +38,7 @@ class ImplementWorkflow(Workflow):
     statuses = frozenset({"implementing", "needs_revision", "ready_check", "checking", "ready_review",
                           "reviewing", "awaiting_human", "paused_error", "completed", "exhausted", "cancelled"})
     inflight_statuses = frozenset({"checking", "reviewing"})
-    state_fields = frozenset({"plan_source", "source_digest", "config", "attempts", "approvals", "revision",
+    state_fields = frozenset({"plan_source", "source_digest", "attempts", "approvals", "revision",
                               "checkpoint_count", "check_attempts", "check_dispatch_count", "check_history",
                               "escalations", "resolutions", "reflections", "candidate", "validation",
                               "binary_attestation", "last_error", "baseline_id", "report_path", "resume_status"})
@@ -88,6 +88,9 @@ class ImplementWorkflow(Workflow):
             artifacts["escalations/001.json"] = json_bytes({**escalation, "boundary": 1, "created_at": now()})
             fields.update(status="awaiting_human", escalation=escalation, escalations=["escalations/001.json"])
         return fields, artifacts
+
+    def reviews_used(self, state: dict) -> int:
+        return len(state["attempts"])
 
     def check_state(self, state: dict) -> None:
         if not isinstance(state["attempts"], list) or len(state["attempts"]) > HARD_MAX_REVIEWS:

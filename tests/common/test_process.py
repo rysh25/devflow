@@ -29,6 +29,12 @@ class RunBoundedTests(unittest.TestCase):
         self.assertTrue(result.output_limit_exceeded)
         self.assertLessEqual(len(result.stdout) + len(result.stderr), 4096)
 
+    def test_a_per_stream_limit_counts_each_stream_separately(self):
+        code = "import sys; sys.stdout.write('a' * 3000); sys.stdout.flush(); sys.stderr.write('b' * 3000)"
+        result = self.python(code, timeout=20, limit=4096, per_stream=True)
+        self.assertFalse(result.output_limit_exceeded)
+        self.assertEqual((len(result.stdout), len(result.stderr)), (3000, 3000))
+
     def test_timeout_stops_the_process(self):
         result = self.python("import time; time.sleep(30)", timeout=0.3, limit=4096)
         self.assertTrue(result.timed_out)

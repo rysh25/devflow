@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 import shutil
 from typing import Any, Callable
@@ -153,7 +153,8 @@ def _capture(argv: list[str], *, cwd: Path | None = None, env: dict | None = Non
              log_dir: Path | None = None) -> tuple[int, bytes, bytes]:
     """Run one reviewer process; any timeout, overflow or stuck descendant is a failure."""
     try:
-        result = run_bounded(argv, cwd=cwd, env=env, data=data, timeout=timeout, limit=limit)
+        # Each stream has its own limit: stderr diagnostics do not use up stdout's room.
+        result = run_bounded(argv, cwd=cwd, env=env, data=data, timeout=timeout, limit=limit, per_stream=True)
     except DevFlowError as exc:
         raise ReviewerError(f"Cannot run reviewer: {exc}") from exc
     if log_dir is not None:

@@ -1,13 +1,17 @@
-"""What every workflow engine shares: its run store, owner checks and frozen inputs.
+"""What every workflow engine shares: storage, ownership, status and external processes.
 
-A workflow engine subclasses ``RunEngine`` and only adds its own transitions.
+A workflow engine subclasses ``RunEngine`` and supplies only its transitions:
+``_dispatch`` runs the reserve -> external process -> claim -> finish lifecycle,
+``status`` builds the common view and asks ``_status_details`` for the rest.
 """
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, Callable
 
 from .errors import DevFlowError
-from .runs import RUNNER_WAIT, RunStore
+from .runs import RUNNER_WAIT, TERMINAL, RunStore
+from .sessions import approval_candidates
 from .storage import read_json
 
 
@@ -59,10 +63,13 @@ class RunEngine:
     def _events(self, state: dict) -> list[dict]:
         return self.store.events(state)
 
-    def _verify(self, state: dict) -> None:
-        self.store.verify_artifacts(state)
+    def _check_frozen_config(self, state: dict) -> None:
         if read_json(self._run(state["run_id"]) / "config.json") != state["config"]:
             raise DevFlowError("Run configuration changed; never replace frozen configuration during a run.")
+
+    def _verify(self, state: dict) -> None:
+        self.store.verify_artifacts(state)
+        self._check_frozen_config(state)
 
     def frozen_config(self, run_id: str) -> dict:
         """The run's frozen configuration, read without repairing anything."""
@@ -70,6 +77,63 @@ class RunEngine:
             raise DevFlowError("Diagnosis is read-only; complete the pending run transaction with /devflow:resume "
                                "or cancel first.")
         state = self.store.read(run_id)
-        if read_json(self._run(run_id) / "config.json") != state["config"]:
-            raise DevFlowError("Run configuration changed; never replace frozen configuration during a run.")
+        self._check_frozen_config(state)
         return state["config"]
+
+    # -- external processes -----------------------------------------------------------------
+    def _dispatch(self, run_id: str, status: str, kind: str,
+                  prepare: Callable[[dict], tuple[int, str | None, str | None, Any] | None],
+                  execute: Callable[[Any], Any],
+                  finish: Callable[[dict, dict, Any, Any, BaseException | None], None]) -> dict:
+        """Reserve under the lock, run outside it, then finish the still-current reservation.
+
+        ``prepare(state)`` returns ``(number, target, reviewer_id, work)``, or
+        ``None`` when it handled the request without a process (the state is
+        saved). Every failure of ``execute(work)`` is recorded, never retried.
+        A result for a reservation that cancel or recover replaced is kept
+        under ``late/`` and the run is left unchanged.
+        """
+        with self._lock(run_id):
+            state = self._state(run_id)
+            prepared = prepare(state)
+            if prepared is None:
+                self._save(state)
+                return self.status(run_id)
+            number, target, reviewer_id, work = prepared
+            reservation = self.store.reserve(state, status, kind, number, target, reviewer_id)
+        try:
+            result, error = execute(work), None
+        except Exception as exc:  # noqa: BLE001 - recorded on the run, never retried
+            result, error = None, exc
+        with self._lock(run_id):
+            state = self.store.claim(run_id, reservation, status,
+                                     {"result": result, "error": None if error is None else str(error)})
+            finish(state, reservation, work, result, error)
+            self._save(state)
+        return self.status(run_id)
+
+    def recover(self, run_id: str, confirmed: bool = False, expect: Callable[[dict], None] | None = None) -> dict:
+        """Human-only: end an interrupted process after confirming it stopped."""
+        if not confirmed:
+            raise DevFlowError("Human must confirm all associated processes stopped")
+        self.store.recover(run_id, expect)
+        return self.status(run_id)
+
+    # -- status ---------------------------------------------------------------------------
+    def status(self, run_id: str) -> dict:
+        state = self._state(run_id)
+        result = {key: value for key, value in state.items() if key not in {"artifacts", "event_ids"}}
+        run = self._run(run_id)
+        used = self.workflow.reviews_used(state)
+        limit = state["config"]["max_reviews"]
+        reviewers = state["config"]["reviewers"]
+        result.update(run_dir=str(run), draft_dir=str(run / "draft"), review_count=used,
+                      remaining_reviews=limit - used,
+                      next_reviewer=(reviewers[used % len(reviewers)]["id"]
+                                     if used < limit and state["status"] not in TERMINAL else None),
+                      human_events=approval_candidates(state, self._events(state)))
+        self._status_details(state, result)
+        return result
+
+    def _status_details(self, state: dict, result: dict) -> None:
+        """Workflow-specific additions to ``status`` (optional)."""

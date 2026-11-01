@@ -22,7 +22,7 @@ class PlanWorkflow(Workflow):
     statuses = frozenset({"interview", "planning", "ready", "reviewing", "awaiting_revision",
                           "awaiting_human", "paused_error", "completed", "exhausted", "cancelled"})
     inflight_statuses = frozenset({"reviewing"})
-    state_fields = frozenset({"review_count", "plan_version", "plan_hash", "current_plan", "passes", "config",
+    state_fields = frozenset({"review_count", "plan_version", "plan_hash", "current_plan", "passes",
                               "transcript_marker", "resolved_escalations", "last_error", "last_review",
                               "final_plan_reviewed", "publication"})
     guidance = "Write only to the current run's draft directory; do not implement source changes."
@@ -58,6 +58,9 @@ class PlanWorkflow(Workflow):
             "config.json": json_bytes(config),
         }
         return fields, artifacts
+
+    def reviews_used(self, state: dict) -> int:
+        return state["review_count"]
 
     def check_state(self, state: dict) -> None:
         count = state["review_count"]
