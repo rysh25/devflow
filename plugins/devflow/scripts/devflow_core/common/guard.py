@@ -219,12 +219,9 @@ def _global_or_help(call: RunnerCall, run_id: str | None, workflows) -> bool:
         return True
     if call.command not in workflows:
         raise GuardError(f"Unknown runner command {call.command!r}.")
-    workflow = workflows[call.command]
-    known = (set(workflow.actions) | set(workflow.human_actions) | set(GLOBAL_COMMANDS)
-             | ({"start"} if workflow.start_option else set()))
     if call.action in GLOBAL_COMMANDS and not call.args:
         return True
-    return call.help and (call.action is None or call.action in known)
+    return call.help
 
 
 def pending_decision(payload: dict, project: Path, plugin_root: Path, pending: dict, workflow, workflows) -> dict | None:

@@ -193,7 +193,7 @@ class InterviewInspectionTests(InterviewFixture):
 
     def test_missing_skill_makes_component_doctor_not_ready(self):
         with patch("devflow_core.plan.config.shutil.which", return_value="/fixture/tool"):
-            report = diagnose(self.project, RESOURCES)
+            report = diagnose(self.project, WORKFLOWS["plan"])
         self.assertEqual(report["configuration_source"], "project_settings")
         self.assertFalse(report["ready"])
         self.assertEqual(report["interview_skill"]["status"], "missing")
@@ -240,11 +240,11 @@ class FrozenDoctorTests(InterviewFixture):
         self.assertEqual(report["interview_skill"]["configured_name"], "grilling")
         self.assertTrue(report["ready"])
 
-    def test_selected_run_doctor_checks_owner(self):
+    def test_selected_run_doctor_is_read_only_for_any_session(self):
         _, run_id = self.start_frozen_wrapper()
         code, report = self.doctor("--session", "other-session", "--run", run_id)
-        self.assertEqual(code, 2)
-        self.assertIn("does not own", report["message"])
+        self.assertEqual(code, 0, report)
+        self.assertEqual(report["run_id"], run_id)
 
     def test_released_session_uses_project_settings_unless_run_explicitly_selected(self):
         engine, run_id = self.start_frozen_wrapper()

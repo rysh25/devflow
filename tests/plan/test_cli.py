@@ -42,7 +42,9 @@ class CliTests(unittest.TestCase):
         self.assertEqual(json.loads(out)["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit")
         code, out, err = self.cli("--session", "cli-session", "status")
         self.assertEqual(code, 0, err)
-        return json.loads(out)
+        value = json.loads(out)
+        self.assertEqual((value["status"], value["owner_matches"], value["run"]["flow"]), ("bound", True, "plan"))
+        return value["run_status"]
 
     def assertJsonError(self, out, error="DevFlowError"):
         value = json.loads(out)
@@ -54,7 +56,7 @@ class CliTests(unittest.TestCase):
     def test_runtime_error_is_structured_and_nonretryable(self):
         code, out, err = self.cli("plan", "status")
         self.assertEqual(code, 2)
-        self.assertIn("No recorded plan run", self.assertJsonError(out))
+        self.assertIn("No plan run is bound", self.assertJsonError(out))
         self.assertEqual(err, "")
 
     def test_traversal_run_id_error_is_structured(self):
@@ -118,11 +120,13 @@ class CliTests(unittest.TestCase):
         self.assertEqual(state["flow"], "plan")
         self.assertEqual(state["status"], "interview")
         self.assertEqual(state["review_count"], 0)
-        self.assertEqual(state["session"], {"status": "bound", "owner_matches": True})
         code, out, err = self.cli("--session", "cli-session", "plan", "status")
         self.assertEqual(code, 0, out)
         self.assertEqual(json.loads(out)["run_id"], state["run_id"])
+        # Reading is open to any session; changing the run requires ownership.
         code, out, err = self.cli("--session", "wrong-session", "--run", state["run_id"], "plan", "status")
+        self.assertEqual(code, 0, out)
+        code, out, err = self.cli("--session", "wrong-session", "--run", state["run_id"], "plan", "cancel")
         self.assertEqual(code, 2)
         self.assertIn("does not own", self.assertJsonError(out))
 

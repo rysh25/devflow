@@ -10,59 +10,19 @@ from uuid import uuid4
 from ..common.errors import CaptureError, DevFlowError
 from ..common.review import all_approved, next_reviewer
 from ..common.reviewers import preflight, run_review
-from ..common.runs import RUNNER_WAIT, TERMINAL, RunStore, open_escalation
+from ..common.engine import RunEngine
+from ..common.runs import RUNNER_WAIT, TERMINAL, open_escalation
 from ..common.sessions import approval_candidates
 from ..common.storage import atomic_json, checked_text, digest, json_bytes, no_symlinks, now, read_json, within, write_new
 from .review import validate_review
 from .transcript import capture_interview
 
 
-class Engine:
+class Engine(RunEngine):
     def __init__(self, project: Path, resources: Path | None = None, lock_wait: float = RUNNER_WAIT,
                  session: str | None = None):
         from .workflow import WORKFLOW
-        # When set, every locked change verifies this session still owns the run:
-        # ownership can move while the lock is not held (e.g. during preflight).
-        self.session = session
-        self.project = Path(project).resolve()
-        if not self.project.is_dir():
-            raise DevFlowError("Project must be an existing directory")
-        self.resources = Path(resources).resolve() if resources else WORKFLOW.resource_dir
-        self.store = RunStore(self.project, WORKFLOW, lock_wait)
-
-    def _run(self, run_id: str) -> Path:
-        return self.store.run_dir(run_id)
-
-    def _lock(self, run_id: str):
-        return self.store.lock(run_id)
-
-    def _state(self, run_id: str) -> dict:
-        if not self.store.holds(run_id):
-            return self.store.read(run_id)
-        state = self.store.load(run_id)
-        if self.session is not None and state["owner_session"] != self.session:
-            raise DevFlowError("This session no longer owns the run; use /devflow:resume RUN_ID first.")
-        return state
-
-    def _save(self, state: dict) -> None:
-        self.store.save(state)
-
-    def _artifact(self, state: dict, relative: str, data: bytes) -> Path:
-        return self.store.stage(state, relative, data)
-
-    def _verify(self, state: dict) -> None:
-        self.store.verify_artifacts(state)
-        if read_json(self._run(state["run_id"]) / "config.json") != state["config"]:
-            raise DevFlowError("Run configuration changed; never replace frozen configuration during a run.")
-
-    def _events(self, state: dict) -> list[dict]:
-        return self.store.events(state)
-
-    def require_owner(self, run_id: str, session: str | None) -> dict:
-        state = self._state(run_id)
-        if session is None or state["owner_session"] != session:
-            raise DevFlowError("This session does not own the run; use /devflow:resume RUN_ID first.")
-        return state
+        super().__init__(project, WORKFLOW, resources, lock_wait, session)
 
     def status(self, run_id: str) -> dict:
         state = self._state(run_id)
@@ -182,10 +142,9 @@ class Engine:
             packet = self._packet(state, number, provider)
             relative_dir = f"reviews/{number:02d}"
             packet_path = self._artifact(state, f"{relative_dir}/packet.md", packet)
-            reservation = {"kind": "review", "number": number, "reviewer_id": provider["id"],
-                           "target": state["plan_hash"], "started_at": now()}
-            state.update(status="reviewing", review_count=number, last_error=None, inflight=reservation)
-            self._save(state)  # Reserve BEFORE dispatch; a crash cannot refund the attempt.
+            state["review_count"] = number
+            # Reserved BEFORE dispatch; a crash cannot refund the attempt.
+            reservation = self.store.reserve(state, "reviewing", "review", number, state["plan_hash"], provider["id"])
         output_dir = self._run(run_id) / relative_dir
         try:
             review = run_review(provider, packet_path, output_dir, self.resources / "review.schema.json",
@@ -199,17 +158,11 @@ class Engine:
         number = reservation["number"]
         relative_dir = f"reviews/{number:02d}"
         with self._lock(run_id):
-            state = self._state(run_id)
-            if state["status"] != "reviewing" or state["inflight"] != reservation:
-                # A late result after cancel/recover cannot change a newer state.
-                late = self._run(run_id) / "late" / f"review-{number:02d}-{uuid4().hex}.json"
-                write_new(late, json_bytes({"review_number": number, "provider": provider["id"],
-                                            "result": review, "error": None if error is None else str(error)}))
-                raise DevFlowError("A stale review finished after recovery; the current run state was left unchanged.")
+            state = self.store.claim(run_id, reservation, "reviewing",
+                                     {"result": review, "error": None if error is None else str(error)})
             self._verify(state)
             if error is None and state["plan_hash"] != reservation["target"]:
                 error = DevFlowError("The plan changed while it was being reviewed.")
-            state["inflight"] = None
             if error is not None:
                 state["last_error"] = {"review_number": number, "provider": provider["id"], "message": str(error),
                                        "retry_consumes_another_attempt": True}
@@ -330,16 +283,9 @@ class Engine:
 
     def recover(self, run_id: str, expected_review: int) -> dict:
         """Explicit operator recovery; the hook guard never allows this command."""
-        with self._lock(run_id):
-            state = self._state(run_id)
-            self._verify(state)
-            if state["status"] != "reviewing" or state["review_count"] != expected_review:
-                raise DevFlowError("Recovery requires the exact interrupted review number.")
-            state["inflight"] = None
-            state["status"] = "paused_error" if expected_review < state["config"]["max_reviews"] else "exhausted"
-            state["last_error"] = {"review_number": expected_review, "message": "Operator confirmed the interrupted reviewer process is stopped; attempt remains consumed."}
-            self._artifact(state, f"reviews/{expected_review:02d}/recovery.json", json_bytes(state["last_error"]))
-            self._save(state)
+        if self.store.read(run_id)["review_count"] != expected_review:
+            raise DevFlowError("Recovery requires the exact interrupted review number.")
+        self.store.recover(run_id)
         return self.status(run_id)
 
     def cancel(self, run_id: str) -> dict:

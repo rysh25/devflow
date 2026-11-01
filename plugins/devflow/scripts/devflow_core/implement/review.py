@@ -7,6 +7,7 @@ from typing import Any
 
 from ..common.errors import ReviewerError
 from ..common.reviewers import text
+from ..common.review import check_verdict
 
 REVIEW_KEYS = {"schema_version", "snapshot_id", "verdict", "summary", "findings", "questions"}
 FINDING_KEYS = {"id", "severity", "category", "file", "line_start", "line_end",
@@ -22,8 +23,6 @@ def validate_review(value: Any) -> dict:
     text(value["snapshot_id"], "snapshot_id", 128)
     if not re.fullmatch(r"[A-Za-z0-9._:-]+", value["snapshot_id"]):
         raise ReviewerError("snapshot_id must be a plain identifier")
-    if value["verdict"] not in ("pass", "changes_required", "human_required"):
-        raise ReviewerError("Unsupported review verdict")
     text(value["summary"], "summary")
     findings, questions = value["findings"], value["questions"]
     if not isinstance(findings, list) or len(findings) > 128:
@@ -53,11 +52,5 @@ def validate_review(value: Any) -> dict:
             raise ReviewerError("requires_human must be a boolean")
     for question in questions:
         text(question, "question")
-    human = bool(questions) or any(f["requires_human"] for f in findings)
-    if value["verdict"] == "pass" and (findings or questions):
-        raise ReviewerError("A pass cannot contain findings or questions")
-    if value["verdict"] == "changes_required" and (not findings or human):
-        raise ReviewerError("changes_required needs findings and cannot include human decisions")
-    if value["verdict"] == "human_required" and not questions:
-        raise ReviewerError("human_required needs at least one explicit human question")
+    check_verdict(value["verdict"], findings, questions)
     return value

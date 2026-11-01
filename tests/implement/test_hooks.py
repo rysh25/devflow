@@ -372,11 +372,12 @@ class RunnerGuardTests(Fixture):
         self.assertDenied(self.guard("Bash", command=safe, run_in_background=True))
         self.assertDenied(self.guard("Bash", command=safe, dangerouslyDisableSandbox=True))
 
-    def test_help_only_for_documented_commands(self):
-        self.assertIsNone(self.guard("Bash", command=self.runner("check", "--help")))
-        self.assertIsNone(self.guard("Bash", command=self.runner("review", "--help")))
-        self.assertDenied(self.guard("Bash", command=self.runner("hook", "--help")))
-        self.assertDenied(self.guard("Bash", command=self.runner("arbitrary", "--help")))
+    def test_help_never_runs_anything_so_any_help_is_allowed(self):
+        for action in ("check", "review", "hook", "arbitrary"):
+            with self.subTest(action=action):
+                self.assertIsNone(self.guard("Bash", command=self.runner(action, "--help")))
+        self.assertDenied(self.guard("Bash", command=self.runner("hook")))
+        self.assertDenied(self.guard("Bash", command=self.runner("arbitrary")))
 
     def test_help_for_status_and_doctor_actions_is_permitted(self):
         # --help never executes anything, for any documented action, bound or pending.

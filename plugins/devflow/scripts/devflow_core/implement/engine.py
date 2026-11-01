@@ -9,7 +9,8 @@ from .review import validate_review
 from ..common.errors import DevFlowError
 from ..common.review import all_approved, next_reviewer
 from ..common.reviewers import preflight, run_review
-from ..common.runs import RUNNER_WAIT, TERMINAL, RunStore, open_escalation
+from ..common.engine import RunEngine
+from ..common.runs import RUNNER_WAIT, TERMINAL, open_escalation
 from ..common.sessions import approval_candidates
 from ..common.storage import checked_text, digest, json_bytes, no_symlinks, now, read_json, within, write_new
 
@@ -39,41 +40,19 @@ def _plan_bytes(path: Path, limit: int) -> bytes:
     return data
 
 
-class Engine:
-    def __init__(self, project: Path, resources: Path | None = None, lock_wait: float = RUNNER_WAIT):
+class Engine(RunEngine):
+    def __init__(self, project: Path, resources: Path | None = None, lock_wait: float = RUNNER_WAIT,
+                 session: str | None = None):
         from .workflow import WORKFLOW
-        self.project = Path(project).resolve()
-        if not self.project.is_dir():
-            raise DevFlowError("Project must be an existing explicit directory")
-        self.resources = Path(resources).resolve() if resources else WORKFLOW.resource_dir
-        self.store = RunStore(self.project, WORKFLOW, lock_wait)
-
-    def _run(self, run_id):
-        return self.store.run_dir(run_id)
-
-    def _lock(self, run_id):
-        return self.store.lock(run_id)
-
-    def _state(self, run_id):
-        return self.store.load(run_id) if self.store.holds(run_id) else self.store.read(run_id)
-
-    def _save(self, state):
-        self.store.save(state)
-
-    def _artifact(self, state, relative, data):
-        return self.store.stage(state, relative, data)
+        super().__init__(project, WORKFLOW, resources, lock_wait, session)
 
     def _verify(self, state, source=True):
-        self.store.verify_artifacts(state)
-        run = self._run(state["run_id"])
-        if read_json(run / "config.json") != state["config"]:
-            raise DevFlowError("Run configuration changed; start a new run for new configuration")
+        super()._verify(state)
         if source:
             verify_source(state)
 
     def _owner(self, state, session_id):
-        if not session_id or state["owner_session"] != session_id:
-            raise DevFlowError("This session does not own the run; use /devflow:resume RUN_ID in this session first")
+        self._require_owner(state, session_id)
 
     def _draft(self, state, path):
         path = Path(path)
@@ -144,10 +123,8 @@ class Engine:
             state["check_attempts"] += 1
             state["check_dispatch_count"] += 1
             index = state["check_dispatch_count"]
-            reservation = {"kind": "check", "number": index, "reviewer_id": None,
-                           "target": state["candidate"]["snapshot_id"], "started_at": now()}
-            state.update(status="checking", last_error=None, inflight=reservation)
-            self._save(state)  # Reserve before running project code; no lock is held while it runs.
+            # Reserved before running project code; no lock is held while it runs.
+            reservation = self.store.reserve(state, "checking", "check", index, state["candidate"]["snapshot_id"])
             check_config = state["config"]["checks"]
         try:
             result = checks.run_checks(self.project, check_config, self._run(run_id) / "check-processes" / f"{index:03}")
@@ -155,17 +132,10 @@ class Engine:
             return self._finish_check(run_id, reservation, error=exc)
         return self._finish_check(run_id, reservation, result=result)
 
-    def _late(self, run_id, kind, reservation, value):
-        late = self._run(run_id) / "late" / f"{kind}-{reservation['number']:03}-{uuid4().hex}.json"
-        write_new(late, json_bytes({"reservation": reservation, **value}))
-        raise DevFlowError(f"A stale {kind} finished after cancel or recover; the current run state was left unchanged")
-
     def _finish_check(self, run_id, reservation, result=None, error=None):
         with self._lock(run_id):
-            state = self._state(run_id)
-            if state["status"] != "checking" or state["inflight"] != reservation:
-                self._late(run_id, "check", reservation, {"result": result, "error": None if error is None else str(error)})
-            state["inflight"] = None
+            state = self.store.claim(run_id, reservation, "checking",
+                                     {"result": result, "error": None if error is None else str(error)})
             if error is None:
                 try:
                     self._current(state)
@@ -244,10 +214,8 @@ class Engine:
             attempt = {"number":number,"reviewer_id":provider["id"],"snapshot_id":current["snapshot_id"],
                 "packet_path":packet_relative,"packet_sha256":digest(packet),"status":"dispatched","started_at":now()}
             state["attempts"].append(attempt)
-            reservation = {"kind": "review", "number": number, "reviewer_id": provider["id"],
-                           "target": current["snapshot_id"], "started_at": attempt["started_at"]}
-            state.update(status="reviewing",last_error=None,inflight=reservation)
-            self._save(state)  # Reserve BEFORE dispatch, including unknown-outcome failures.
+            # Reserved BEFORE dispatch, including unknown-outcome failures.
+            reservation = self.store.reserve(state, "reviewing", "review", number, current["snapshot_id"], provider["id"])
         try:
             review = run_review(provider,self._run(run_id)/packet_relative,
                 self._run(run_id)/"review-processes"/f"{number:02}",self.resources/"review.schema.json",
@@ -261,10 +229,8 @@ class Engine:
     def _finish_review(self,run_id,reservation,provider,review=None,error=None):
         number = reservation["number"]
         with self._lock(run_id):
-            state = self._state(run_id)
-            if state["status"] != "reviewing" or state["inflight"] != reservation:
-                self._late(run_id, "review", reservation, {"result": review, "error": None if error is None else str(error)})
-            state["inflight"] = None
+            state = self.store.claim(run_id, reservation, "reviewing",
+                                     {"result": review, "error": None if error is None else str(error)})
             current = None
             if error is None:
                 try:
@@ -390,18 +356,7 @@ class Engine:
     def recover(self,run_id,confirmed=False):
         if not confirmed:
             raise DevFlowError("Human must confirm all associated processes stopped")
-        with self._lock(run_id):
-            state = self._state(run_id)
-            self._require(state,{"reviewing","checking"})
-            if state["status"] == "reviewing":
-                state["attempts"][-1].update(status="failed",error="Human-confirmed interrupted dispatch; outcome unknown",finished_at=now())
-                resume = "ready_review"
-            else:
-                resume = "implementing"
-            state.update(status="paused_error" if len(state["attempts"]) < state["config"]["max_reviews"] else "exhausted",
-                         resume_status=resume,approvals={},inflight=None,
-                         last_error="Recovered interrupted operation after human process confirmation")
-            self._save(state)
+        self.store.recover(run_id)
         return self.status(run_id)
 
     def status(self,run_id):

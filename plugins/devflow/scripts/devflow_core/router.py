@@ -15,6 +15,7 @@ from .common import guard, sessions
 from .common.errors import DevFlowError
 from .common.runs import (HOOK_WAIT, RUNNER_WAIT, TERMINAL, RunStore, data_root, ensure_data_root,
                           event_bytes, make_event, new_run_id, validate_run_id)
+from .common.settings import validate_document
 from .common.storage import file_lock, now
 from .workflows import WORKFLOWS
 
@@ -110,10 +111,7 @@ def _settle(project: Path, record: dict, all_stores: dict[str, RunStore]) -> dic
     Only an actual next prompt reaches this point, so a finished run stays
     guarded for the rest of the turn that finished it.
     """
-    pending = record["pending_start"]
-    if pending:
-        applied = sessions.pending_applied(pending, record["session_id"], all_stores[pending["flow"]])
-        record = _bound(record, pending["flow"], pending["run_id"]) if applied else dict(record, pending_start=None)
+    record = sessions.settle_pending_start(record, all_stores)
     if record["run"]:
         info = all_stores[record["run"]["flow"]].inspect(record["run"]["run_id"])
         if info.format == "current" and info.state["status"] in TERMINAL:
@@ -133,6 +131,7 @@ def _start(project: Path, session: str, flow: str, argument: str, payload: dict,
     if current is not None and not current.terminal:
         raise DevFlowError("Finish or cancel this session's active workflow before starting another")
     args = workflow.normalize_args(argument, project)
+    validate_document(project, WORKFLOWS)
     assert_available(project, session, all_stores)
     pending = {"flow": flow, "run_id": new_run_id(), "args": args, "event": make_event(payload, "prompt"),
                "created_at": now()}
@@ -166,7 +165,6 @@ def _resume(project: Path, session: str, argument: str, payload: dict, record: d
     store = all_stores[flow]
     with store.lock(run_id):
         state = store.load(run_id)  # Completes an interrupted transaction first.
-        store.verify_artifacts(state)
         reason = store.transfer_refusal(state, session)
         if reason:
             raise DevFlowError(reason)
@@ -175,8 +173,7 @@ def _resume(project: Path, session: str, argument: str, payload: dict, record: d
         # leaves only a non-owning binding, which asks for /devflow:resume again.
         sessions.write_record(project, _bound(record, flow, run_id), WORKFLOWS)
         state = store.transfer(state, session, payload)
-    event_id = state["event_ids"][-1] if state["status"] not in TERMINAL else None
-    return _context("UserPromptSubmit", flow, state, store, plugin_root, event_id)
+    return _context("UserPromptSubmit", flow, state, store, plugin_root, state["event_ids"][-1])
 
 
 def runner_start(project: Path, session: str | None, flow: str, raw: str) -> dict:
@@ -190,6 +187,7 @@ def runner_start(project: Path, session: str | None, flow: str, raw: str) -> dic
         pending = record and record["pending_start"]
         if not pending or pending["flow"] != flow:
             raise DevFlowError(f"Start only from an explicit /devflow:{flow} command in this session")
+        validate_document(project, WORKFLOWS)
         if workflow.normalize_args(raw, project) != pending["args"]:
             raise DevFlowError(f"The {workflow.start_option} value does not match the user's explicit start command")
         assert_available(project, session, all_stores)
@@ -287,7 +285,7 @@ def handle_hook(payload: dict, plugin_root: Path) -> dict | None:
     return None
 
 
-def _overview(project: Path, all_stores: dict[str, RunStore]) -> dict:
+def _overview(project: Path, all_stores: dict[str, RunStore], session: str | None = None) -> dict:
     runs, creating = [], []
     for flow, store in all_stores.items():
         infos, leftovers = store.scan()
@@ -302,7 +300,7 @@ def _overview(project: Path, all_stores: dict[str, RunStore]) -> dict:
     for name, record, error in sessions.scan_records(project, WORKFLOWS):
         if error:
             invalid.append({"record": name, "error": error})
-        elif record["pending_start"] and not sessions.pending_created(
+        elif record["session_id"] != session and record["pending_start"] and not sessions.pending_created(
                 record["pending_start"], all_stores[record["pending_start"]["flow"]]):
             pending = record["pending_start"]
             blocking.append({"record": name, "flow": pending["flow"], "args": pending["args"],
@@ -325,26 +323,22 @@ def status(project: Path, session: str | None, run_id: str | None) -> dict:
             value.update(recovery_required=True,
                          recovery="An interrupted transaction is pending; /devflow:resume or cancel completes it")
         return value
-    record, record_error = None, None
+    record, record_error, current, run_status = None, None, None, None
     if session:
         try:
             record = sessions.read_record(project, session, WORKFLOWS)
-        except DevFlowError as exc:
-            record_error = str(exc)
-    if record and record["run"]:
-        try:
             current = sessions.binding(project, record, all_stores)
         except DevFlowError as exc:
             record_error = str(exc)
-        else:
-            value = status(project, session, current.run_id)
-            value["session"] = {"status": "bound" if current.owner else "stale", "owner_matches": current.owner}
-            return value
+    if current is not None:
+        run_status = WORKFLOWS[current.flow].engine(project).status(current.run_id)
     pending = record["pending_start"] if record else None
-    return {"plugin": "devflow", "version": __version__, "project": str(project),
-            "status": "pending_start" if pending else "idle",
+    caller = ("bound" if current.owner else "stale") if current else "pending_start" if pending else "idle"
+    return {"plugin": "devflow", "version": __version__, "project": str(project), "status": caller,
+            "run": record["run"] if current else None, "owner_matches": current.owner if current else None,
             "pending_start": pending and {key: pending[key] for key in ("flow", "run_id", "args", "created_at")},
-            "session_record_error": record_error, **_overview(project, all_stores)}
+            "session_record_error": record_error, "run_status": run_status,
+            **_overview(project, all_stores, session)}
 
 
 def blocking_warnings(project: Path) -> list[str]:

@@ -53,11 +53,11 @@ class CheckTests(unittest.TestCase):
         self.assertTrue(result["results"][0]["timed_out"])
 
     def test_stdout_overflow_is_error_even_if_process_exits_zero(self):
-        result = run_checks(self.project, [self.check("print('x' * 200000)", max_output_bytes=100)], self.logs)
+        result = run_checks(self.project, [self.check("print('x' * 200000)", max_output_bytes=1024)], self.logs)
         record = result["results"][0]
         self.assertEqual(result["status"], "error")
         self.assertTrue(record["output_limit_exceeded"])
-        self.assertLessEqual(len(record["stdout"].encode()) + len(record["stderr"].encode()), 100)
+        self.assertLessEqual(len(record["stdout"].encode()) + len(record["stderr"].encode()), 1024)
 
     def test_missing_executable_is_error_not_pass(self):
         result = run_checks(self.project, [{"id": "missing", "argv": ["devflow-nonexistent-executable-92841"]}], self.logs)

@@ -6,7 +6,6 @@ from pathlib import Path
 import re
 
 from .errors import DevFlowError
-from .paths import workflow_names
 from .storage import no_symlinks, read_json
 
 
@@ -18,25 +17,31 @@ DEFAULT_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 
 
-def workflow_overlay(project: Path, workflow: str) -> dict:
-    """Return only the requested workflow's settings and shared reviewer policy."""
-    names = workflow_names()
-    if workflow not in names:
-        raise DevFlowError("Unknown DevFlow workflow")
+def _document(project: Path) -> dict:
     path = Path(project) / "devflow.config.json"
     no_symlinks(path)
     if not path.exists():
         return {}
     document = read_json(path)
-    allowed = {"schema_version", "reviewers", "max_reviews", *names}
-    if set(document) - allowed:
-        raise DevFlowError("Unknown devflow.config.json keys: " + ", ".join(sorted(set(document) - allowed)))
     version = document.get("schema_version", 1)
     if type(version) is not int or version != 1:
         raise DevFlowError("Unsupported devflow.config.json schema_version; expected 1")
-    for name in names:
-        if name in document and not isinstance(document[name], dict):
-            raise DevFlowError("devflow.config.json " + name + " must contain an object")
+    return document
+
+
+def validate_document(project: Path, workflows) -> None:
+    """Reject unknown top-level keys; the caller passes the registered workflow names."""
+    document = _document(project)
+    allowed = {"schema_version", "reviewers", "max_reviews", *workflows}
+    if set(document) - allowed:
+        raise DevFlowError("Unknown devflow.config.json keys: " + ", ".join(sorted(set(document) - allowed)))
+
+
+def workflow_overlay(project: Path, workflow: str) -> dict:
+    """Only the requested workflow's section plus the shared reviewer policy."""
+    document = _document(project)
+    if workflow in document and not isinstance(document[workflow], dict):
+        raise DevFlowError("devflow.config.json " + workflow + " must contain an object")
     result = {name: copy.deepcopy(document[name]) for name in ("reviewers", "max_reviews") if name in document}
     result.update(copy.deepcopy(document.get(workflow, {})))
     return result

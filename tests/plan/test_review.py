@@ -54,7 +54,7 @@ class ValidationTests(unittest.TestCase):
         validate_review({**PASS, "verdict": "human_required", "questions": [QUESTION]})
 
     def test_human_required_finding_without_question_is_rejected(self):
-        with self.assertRaisesRegex(ReviewerError, "at least one explicit question"):
+        with self.assertRaisesRegex(ReviewerError, "at least one explicit human question"):
             validate_review({
                 **PASS, "verdict": "human_required",
                 "findings": [{**FINDING, "requires_human": True}], "questions": [],

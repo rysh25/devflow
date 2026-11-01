@@ -36,38 +36,15 @@ def validate_config(value: dict) -> dict:
     for field, low, high in (("max_files", 1, 100000), ("max_file_bytes", 1024, 32*1024*1024), ("max_total_bytes", 1024, 64*1024*1024), ("max_packet_bytes", 1024, 16*1024*1024)):
         _integer(snapshot[field], low, high, "snapshot." + field)
     validate_reviewers(value["reviewers"], value["max_reviews"])
-    if not isinstance(value["checks"], list) or len(value["checks"]) > 32:
-        raise DevFlowError("checks must be an array of at most 32 approved commands")
-    seen = set()
-    for check in value["checks"]:
-        cf = {"id", "argv", "timeout_seconds", "required", "cwd", "max_output_bytes"}
-        if not isinstance(check, dict) or set(check) - cf or not {"id", "argv"} <= set(check):
-            raise DevFlowError("Invalid check fields")
-        if not isinstance(check["id"], str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", check["id"]) or check["id"] in seen:
-            raise DevFlowError("Check IDs must be unique safe names")
-        seen.add(check["id"])
-        _argv(check["argv"])
-        _integer(check.get("timeout_seconds",600), 1, 3600, "check timeout")
-        if type(check.get("required", True)) is not bool:
-            raise DevFlowError("check.required must be boolean")
-        if not isinstance(check.get("cwd", "."), str) or "\x00" in check.get("cwd", "."):
-            raise DevFlowError("check.cwd must be a relative path")
-        if "max_output_bytes" in check:
-            _integer(check["max_output_bytes"],1024,16*1024*1024,"check.max_output_bytes")
     validate_checks(value["checks"])
     if value["checks"] and not any(check.get("required", True) for check in value["checks"]):
         raise DevFlowError("Configure at least one required check; optional-only diagnostics are not a validation gate")
     return copy.deepcopy(value)
 
 
-def _argv(value):
-    if not isinstance(value, list) or not value or len(value) > 128 or any(not isinstance(x,str) or not x or "\x00" in x for x in value):
-        raise DevFlowError("Commands must be nonempty argv arrays, never shell strings")
-
-
-def load_config(project: Path, plugin_root: Path) -> dict:
-    value = read_json(plugin_root / "defaults.json")
-    overlay = workflow_overlay(project, "implement")
+def load_config(project: Path, workflow) -> dict:
+    value = read_json(workflow.resource("defaults.json"))
+    overlay = workflow_overlay(project, workflow.name)
     if overlay:
         # Lists replace completely. Only the snapshot object merges named fields.
         if "snapshot" in overlay and isinstance(overlay["snapshot"], dict):

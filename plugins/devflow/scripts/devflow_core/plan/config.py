@@ -48,9 +48,9 @@ def validate_config(config: dict) -> dict:
     return copy.deepcopy(config)
 
 
-def load_config(project: Path, plugin_root: Path) -> dict:
-    value = read_json(plugin_root / "defaults.json")
-    overlay = workflow_overlay(project, "plan")
+def load_config(project: Path, workflow) -> dict:
+    value = read_json(workflow.resource("defaults.json"))
+    overlay = workflow_overlay(project, workflow.name)
     if "publish" in overlay and isinstance(overlay["publish"], dict):
         overlay["publish"] = {**value["publish"], **overlay["publish"]}
     # Lists replace in full. Review order is an explicit, immutable contract.
@@ -58,8 +58,8 @@ def load_config(project: Path, plugin_root: Path) -> dict:
     return validate_config(value)
 
 
-def diagnose(project: Path, plugin_root: Path, effective_config: dict | None = None) -> dict:
-    config = load_config(project, plugin_root) if effective_config is None else validate_config(effective_config)
+def diagnose(project: Path, workflow, effective_config: dict | None = None) -> dict:
+    config = load_config(project, workflow) if effective_config is None else validate_config(effective_config)
     interview = inspect_interview_skill(project, config["grill_skill"])
     binaries = {}
     for name in ("uv", "claude", *[p["command"][0] for p in config["reviewers"]]):

@@ -284,9 +284,12 @@ class GuardTests(PlanHookFixture):
             with self.subTest(args=args):
                 self.assertDenied(self.check("Bash", command=self.runner(*args)))
 
-    def test_help_allowed_only_for_known_command(self):
-        self.assertIsNone(self.check("Bash", command=self.runner("apply", "--help")))
-        self.assertDenied(self.check("Bash", command=self.runner("hook", "--help")))
+    def test_help_never_runs_anything_so_any_help_is_allowed(self):
+        for action in ("apply", "hook", "arbitrary"):
+            with self.subTest(action=action):
+                self.assertIsNone(self.check("Bash", command=self.runner(action, "--help")))
+        self.assertDenied(self.check("Bash", command=self.runner("hook")))
+        self.assertDenied(self.check("Bash", command=self.runner("apply", "--help", "--plan-file", "x")))
 
     def test_other_workflow_runner_actions_denied(self):
         command = self.runner("status").replace(" plan status", " implement check")

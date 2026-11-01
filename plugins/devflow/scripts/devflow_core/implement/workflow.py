@@ -10,6 +10,7 @@ from ..common.guard import as_path, draft_path, safe_relative, same_path
 from ..common.review import HARD_MAX_REVIEWS
 from ..common.storage import digest, json_bytes, no_symlinks, now
 from ..common.workflow import Workflow
+from .commands import COMMANDS
 
 EDIT_STATUSES = frozenset({"implementing", "needs_revision"})
 PROTECTED_COMPONENTS = frozenset({".git", ".devflow", ".claude", ".codex", ".opencode", ".agents"})
@@ -32,6 +33,7 @@ def plan_argument(argument: str) -> str:
 
 
 class ImplementWorkflow(Workflow):
+    commands = COMMANDS
     name = "implement"
     statuses = frozenset({"implementing", "needs_revision", "ready_check", "checking", "ready_review",
                           "reviewing", "awaiting_human", "paused_error", "completed", "exhausted", "cancelled"})
@@ -40,16 +42,6 @@ class ImplementWorkflow(Workflow):
                               "checkpoint_count", "check_attempts", "check_dispatch_count", "check_history",
                               "escalations", "resolutions", "reflections", "candidate", "validation",
                               "binary_attestation", "last_error", "baseline_id", "report_path", "resume_status"})
-    # File-bearing arguments are drafts, never arbitrary scripts or audit paths.
-    actions = {
-        "checkpoint": {"--summary-file": "draft"},
-        "check": {},
-        "review": {},
-        "reflect": {"--decisions-file": "draft"},
-        "escalate": {"--questions-file": "draft"},
-        "resolve": {"--event-id": "event", "--decision": "decision", "--reason": "text"},
-        "cancel": {"--reason": "text"},
-    }
     start_option = "--plan"
     guidance = ("Edit project source only while the run permits it and write runner inputs to the run's "
                 "draft directory; preserve pre-existing changes.")
@@ -69,7 +61,7 @@ class ImplementWorkflow(Workflow):
         from .engine import _plan_bytes
         plan = Path(pending["args"])
         no_symlinks(plan)
-        config = load_config(project, self.resource_dir)
+        config = load_config(project, self)
         if plan.suffix.lower() not in {".md", ".markdown"}:
             raise DevFlowError("The input plan must be a UTF-8 Markdown file")
         data = _plan_bytes(plan, config["max_plan_bytes"])
@@ -101,13 +93,16 @@ class ImplementWorkflow(Workflow):
         if not isinstance(state["attempts"], list) or len(state["attempts"]) > HARD_MAX_REVIEWS:
             raise DevFlowError("Incompatible/corrupt run state; never reset the review count")
 
-    def can_transfer(self, state: dict, session: str) -> str | None:
-        from .engine import verify_source
-        try:
-            verify_source(state)
-        except DevFlowError as exc:
-            return str(exc)
-        return None
+    def on_recover(self, store, state: dict) -> None:
+        if state["status"] == "checking":
+            # A check never consumes a review, so it always returns to implementing.
+            state.update(status="paused_error", resume_status="implementing")
+        else:
+            state["attempts"][-1].update(status="failed", error="Human-confirmed interrupted dispatch; outcome unknown",
+                                         finished_at=now())
+            state.update(status="paused_error" if len(state["attempts"]) < state["config"]["max_reviews"] else "exhausted",
+                         resume_status="ready_review")
+        state.update(approvals={}, last_error="Recovered interrupted operation after human process confirmation")
 
     def on_transfer(self, state: dict) -> None:
         if state["status"] == "paused_error":
@@ -160,23 +155,15 @@ class ImplementWorkflow(Workflow):
 
     def load_config(self, project: Path) -> dict:
         from .config import load_config
-        return load_config(project, self.resource_dir)
+        return load_config(project, self)
 
     def doctor(self, project: Path, config: dict) -> dict:
         return {"warnings": [] if config["checks"] else
                 ["No implementation checks configured; every revised snapshot requires actual human validation"]}
 
-    def engine(self, project: Path):
+    def engine(self, project: Path, session: str | None = None):
         from .engine import Engine
-        return Engine(project)
-
-    def register_commands(self, commands) -> None:
-        from .commands import register
-        register(commands)
-
-    def run_command(self, args, project: Path, run_id: str | None, session: str | None):
-        from .commands import run
-        return run(args, project, run_id, session)
+        return Engine(project, session=session)
 
 
 WORKFLOW = ImplementWorkflow()

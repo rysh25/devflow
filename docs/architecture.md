@@ -32,15 +32,17 @@ Python コードは `plugins/devflow/scripts/devflow_core/` の1つのパッケ�
 
 | `common/` のモジュール | 役割 |
 |---|---|
-| `runs.py` | run の記録（RunStore）：共通の state の枠、ロック、transaction、作成、検査、人間の発言の記録、所有者の移譲 |
+| `runs.py` | run の記録（RunStore）：共通の state の枠、ロック、transaction、作成、検査、人間の発言の記録、所有者の移譲、外部処理の予約・確定（`reserve` / `claim`）と `recover` |
+| `engine.py` | 各フローのエンジンの基底クラス（RunEngine）：RunStore の利用、所有者の確認、凍結した設定の読み取り |
+| `process.py` | チェックとレビュアー CLI で共通の、出力上限・時間切れ・プロセスツリー停止付きの子プロセス実行 |
 | `sessions.py` | セッション記録、承認に使える回答の規則、回答文の取り出し |
 | `guard.py` | PreToolUse の判定の骨組み：読み取り専用ツール、Bash の検査、ランナー呼び出しの解析、パス検査、プラグイン保護 |
 | `reviewers.py` | Codex / OpenCode の事前確認・起動・分離・出力検査 |
 | `settings.py` | `devflow.config.json` の重ね合わせと、レビュアー設定の共通規則 |
-| `workflow.py` | 各フローが実装する契約（`Workflow` クラス） |
+| `workflow.py` | 各フローが実装する契約（`Workflow` クラス）と、動作の表（`Command` / `Option`）。ガードの許可、CLI の登録、振り分けはこの表から導く |
 | `errors.py`、`storage.py`、`shell.py`、`review.py`、`paths.py` | エラーの系統、原子的な保存とロック、シェルの方針、回数と承認の判定、インストール先 |
 
-import の向きは一方向です。`common` はフローや router を import せず、フロー同士も互いを import しません。フローを import するのは登録表だけです。`tools/package.py` がこの向きと、各フローのリソースが揃っていることと、登録表がフローのパッケージと一致することを静的に検査します。
+import の向きは一方向です。`common` はフローや router を import せず、フロー同士も互いを import しません。フローを import するのは登録表だけです。`tools/package.py` がこの向きと、各フローのリソースが揃っていることと、登録表がフローのパッケージと一致することを静的に検査します。ワークフロー名の正本は登録表だけで、設定ファイルの最上位のキーも、登録表を持つ CLI と router が検査します。
 
 ワークフローを増やすときは、`Workflow` を実装したサブパッケージ（リソースを含む）を追加し、登録表に1行足します。CLI、router、status、配布の検査はそれに追従します。
 

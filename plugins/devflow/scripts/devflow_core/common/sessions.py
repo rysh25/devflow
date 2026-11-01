@@ -155,6 +155,19 @@ def pending_applied(pending: dict, session_id: str, store: RunStore) -> bool | N
     return True if info.state["owner_session"] == session_id else None
 
 
+def settle_pending_start(record: dict, stores: Mapping[str, RunStore]) -> dict:
+    """Finish a start whose run exists and is owned here; otherwise drop it.
+
+    The run side never changes here: an unapplied start simply did not happen.
+    """
+    pending = record["pending_start"]
+    if not pending:
+        return record
+    if pending_applied(pending, record["session_id"], stores[pending["flow"]]):
+        return dict(record, run={"flow": pending["flow"], "run_id": pending["run_id"]}, pending_start=None)
+    return dict(record, pending_start=None)
+
+
 # -- human answers --------------------------------------------------------------------------
 
 def _json(value: Any) -> str:

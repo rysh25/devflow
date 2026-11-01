@@ -114,7 +114,7 @@ class EngineTests(unittest.TestCase):
         self.raw_request = request or "/devflow:plan 実装せず、移行計画を作る。\nKeep exact wording."
         result = self.hook(self.event(prompt=self.raw_request))
         self.assertIn("additionalContext", result["hookSpecificOutput"])
-        self.run_id = router.status(self.project, self.session, None)["run_id"]
+        self.run_id = router.status(self.project, self.session, None)["run"]["run_id"]
         self.assertEqual(self.bound_run(), self.run_id)
         self.run = Path(self.engine.status(self.run_id)["run_dir"])
         self.draft_dir = self.run / "draft"
@@ -293,7 +293,7 @@ class EngineTests(unittest.TestCase):
             return PROBE
 
         with patch(PREFLIGHT, side_effect=move_ownership), patch(RUN_REVIEW) as call:
-            with self.assertRaisesRegex(DevFlowError, "no longer owns"):
+            with self.assertRaisesRegex(DevFlowError, "does not own"):
                 caller.review(self.run_id)
         call.assert_not_called()
         after = self.engine.status(self.run_id)
@@ -476,7 +476,7 @@ class EngineTests(unittest.TestCase):
         state = self.engine.status(self.run_id)
         self.assertIsNone(state["escalation"])
         self.assertEqual(state["human_events"], [])
-        self.assertEqual(router.status(self.project, self.session, None)["human_events"], [])
+        self.assertEqual(router.status(self.project, self.session, None)["run_status"]["human_events"], [])
 
     def test_resolve_requires_the_owning_session(self):
         self.ready()
@@ -1158,10 +1158,10 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(newer_state["status"], "reviewing")
         self.assertEqual(newer_state["review_count"], 2)
         self.assertEqual(newer_state["inflight"]["number"], 2)
-        late = list((self.run / "late").glob("review-01-*.json"))
+        late = list((self.run / "late").glob("review-001-*.json"))
         self.assertEqual(len(late), 1)
         value = read_json(late[0])
-        self.assertEqual(value["review_number"], 1)
+        self.assertEqual(value["reservation"]["number"], 1)
         self.assertIsNone(value["result"])
         self.assertIn("failed late", value["error"])
         self.assertFalse((self.run / "reviews" / "01" / "error.json").exists())
@@ -1185,12 +1185,12 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(state["passes"], [])
         self.assertIsNone(state["last_review"])
         self.assertFalse((self.run / "reviews" / "01" / "review.json").exists())
-        late = list((self.run / "late").glob("review-01-*.json"))
+        late = list((self.run / "late").glob("review-001-*.json"))
         self.assertEqual(len(late), 1)
         value = read_json(late[0])
         self.assertEqual(value["result"], review_value())
         self.assertIsNone(value["error"])
-        self.assertEqual(value["provider"], "codex")
+        self.assertEqual(value["reservation"]["reviewer_id"], "codex")
 
     def test_stale_owner_cannot_record_human_evidence_after_handover(self):
         self.ready()

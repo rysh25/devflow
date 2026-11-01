@@ -16,6 +16,7 @@ from devflow_core.cli import main
 from devflow_core.common.errors import DevFlowError
 from devflow_core.common.storage import atomic_write_json, read_json
 from devflow_core.implement import WORKFLOW
+from devflow_core.implement import WORKFLOW
 from devflow_core.implement.config import load_config, validate_config
 
 
@@ -95,7 +96,7 @@ class ConfigCliTests(unittest.TestCase):
             {"id": "tests", "argv": [sys.executable, "-m", "unittest"]}]}
         atomic_write_json(self.project / "devflow.config.json", {"schema_version": 1, "implement": overlay})
         with patch("subprocess.Popen") as processes:
-            config = load_config(self.project, PLUGIN)
+            config = load_config(self.project, WORKFLOW)
         processes.assert_not_called()
         self.assertEqual(config["snapshot"]["mode"], "files")
         self.assertEqual(config["snapshot"]["max_files"], self.config["snapshot"]["max_files"])
@@ -121,7 +122,7 @@ class ConfigCliTests(unittest.TestCase):
             "plan": {"grill_skill": "some-independent-interview", "publish": {"enabled": False}},
             "implement": {"snapshot": {"mode": "files"}, "max_check_attempts": 2},
         })
-        result = load_config(self.project, PLUGIN)
+        result = load_config(self.project, WORKFLOW)
         self.assertEqual(result["reviewers"], reviewers)
         self.assertEqual(result["max_reviews"], 4)
         self.assertEqual(result["max_check_attempts"], 2)
@@ -132,19 +133,21 @@ class ConfigCliTests(unittest.TestCase):
         atomic_write_json(self.project / ("build" + "flow.config.json"), {
             "snapshot": {"mode": "files"}, "max_reviews": 1,
         })
-        self.assertEqual(load_config(self.project, PLUGIN), self.config)
+        self.assertEqual(load_config(self.project, WORKFLOW), self.config)
 
     def test_unknown_top_level_unified_config_field_is_rejected(self):
         atomic_write_json(self.project / "devflow.config.json", {
             "schema_version": 1, "implment": {"snapshot": {"mode": "files"}},
         })
-        with self.assertRaisesRegex(DevFlowError, "Unknown devflow.config.json keys"):
-            load_config(self.project, PLUGIN)
+        # The registry owner (CLI/router) validates top-level keys for every command.
+        code, output, _ = self.invoke("implement", "doctor")
+        self.assertEqual(code, 2)
+        self.assertIn("Unknown devflow.config.json keys", output)
 
     def test_workflow_review_budget_stays_bounded_when_inherited(self):
         atomic_write_json(self.project / "devflow.config.json", {"schema_version": 1, "max_reviews": 7})
         with self.assertRaises(DevFlowError):
-            load_config(self.project, PLUGIN)
+            load_config(self.project, WORKFLOW)
 
     def test_doctor_reports_missing_cli_not_a_false_ready(self):
         with patch("devflow_core.implement.commands.preflight", side_effect=DevFlowError("CLI missing")):
@@ -161,7 +164,7 @@ class ConfigCliTests(unittest.TestCase):
                 self.assertEqual((code, error), (2, ""))
                 result = json.loads(output)
                 self.assertEqual(result["error"], "DevFlowError")
-                self.assertIn("No implementation run is bound", result["message"])
+                self.assertIn("No implement run is bound", result["message"])
                 self.assertIn("/devflow:resume RUN_ID", result["message"])
                 self.assertFalse(result["automatic_retry"])
         code, output, error = self.invoke("--run", "20261101T123456Z-123456abcdef", "implement", "status")

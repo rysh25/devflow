@@ -9,12 +9,14 @@ from ..common.review import HARD_MAX_REVIEWS
 from ..common.guard import draft_path
 from ..common.storage import json_bytes
 from ..common.workflow import Workflow
+from .commands import COMMANDS
 
 STACKED_COMMAND = re.compile(r"(?:\A|\n)\s*/[A-Za-z][A-Za-z0-9_:-]*(?:\s|\Z)")
 SKILL_NAME = re.compile(r"[a-zA-Z0-9_.:-]+\Z")
 
 
 class PlanWorkflow(Workflow):
+    commands = COMMANDS
     name = "plan"
     statuses = frozenset({"interview", "planning", "ready", "reviewing", "awaiting_revision",
                           "awaiting_human", "paused_error", "completed", "exhausted", "cancelled"})
@@ -22,18 +24,6 @@ class PlanWorkflow(Workflow):
     state_fields = frozenset({"review_count", "plan_version", "plan_hash", "current_plan", "passes", "config",
                               "transcript_marker", "resolved_escalations", "last_error", "last_review",
                               "final_plan_reviewed", "publication"})
-    # File-bearing arguments are drafts, never mutable state paths.
-    actions = {
-        "seal": {"--decisions-file": "draft", "--context-file": "draft?"},
-        "plan": {"--file": "draft"},
-        "review": {},
-        "apply": {"--plan-file": "draft", "--decisions-file": "draft", "--expected-hash": "hash"},
-        "pause": {"--reason-file": "draft"},
-        "resolve": {"--answer-file": "draft"},
-        "cancel": {},
-        "report": {},
-        "publish": {},
-    }
     guidance = "Write only to the current run's draft directory; do not implement source changes."
 
     def normalize_args(self, raw: str, project: Path | None = None) -> str:
@@ -52,7 +42,7 @@ class PlanWorkflow(Workflow):
         prompt = payload["prompt"]
         # Keep the request byte-exact apart from the command itself.
         request = re.sub(r"^/devflow:plan(?:\s+|$)", "", prompt, count=1)
-        config = load_config(project, self.resource_dir)
+        config = load_config(project, self)
         fields = {
             "status": "interview", "review_count": 0, "plan_version": None, "plan_hash": None,
             "current_plan": None, "passes": [], "config": config,
@@ -82,6 +72,13 @@ class PlanWorkflow(Workflow):
         if state["status"] == "paused_error":
             state["status"] = "ready" if state["review_count"] < state["config"]["max_reviews"] else "exhausted"
 
+    def on_recover(self, store, state: dict) -> None:
+        number = state["review_count"]
+        state["status"] = "paused_error" if number < state["config"]["max_reviews"] else "exhausted"
+        state["last_error"] = {"review_number": number, "message": "Operator confirmed the interrupted reviewer "
+                               "process is stopped; attempt remains consumed."}
+        store.stage(state, f"reviews/{number:02d}/recovery.json", json_bytes(state["last_error"]))
+
     def check_write(self, state: dict, project: Path, path: str, cwd: Path, plugin_root: Path) -> None:
         if not draft_path(path, cwd, project / ".devflow" / "runs" / self.name / state["run_id"]):
             raise GuardError("Write only to the current run's draft directory; source and audit files are read-only.")
@@ -110,7 +107,7 @@ class PlanWorkflow(Workflow):
 
     def load_config(self, project: Path) -> dict:
         from .config import load_config
-        return load_config(project, self.resource_dir)
+        return load_config(project, self)
 
     def doctor(self, project: Path, config: dict) -> dict:
         from .interview import inspect_interview_skill
@@ -121,17 +118,9 @@ class PlanWorkflow(Workflow):
                             + ["Interview skill callability is not runtime-verified; static metadata cannot "
                                "establish effective permissions or skillOverrides"]}
 
-    def engine(self, project: Path):
+    def engine(self, project: Path, session: str | None = None):
         from .engine import Engine
-        return Engine(project)
-
-    def register_commands(self, commands) -> None:
-        from .commands import register
-        register(commands)
-
-    def run_command(self, args, project: Path, run_id: str | None, session: str | None):
-        from .commands import run
-        return run(args, project, run_id, session)
+        return Engine(project, session=session)
 
 
 WORKFLOW = PlanWorkflow()

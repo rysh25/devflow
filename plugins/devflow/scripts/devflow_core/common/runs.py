@@ -17,7 +17,6 @@ import re
 import shutil
 from uuid import uuid4
 
-from .. import __version__
 from .errors import DevFlowError
 from .storage import (atomic_json, digest, file_lock, json_bytes, no_symlinks, now,
                       read_json, within, write_new)
@@ -34,7 +33,7 @@ CREATING = ".creating-"
 RUNNER_WAIT = 10.0
 HOOK_WAIT = 5.0
 ENVELOPE = frozenset({
-    "schema_version", "plugin_version", "flow", "run_id", "project", "status", "owner_session", "created_at",
+    "schema_version", "flow", "run_id", "project", "status", "owner_session", "created_at",
     "updated_at", "state_revision", "artifacts", "event_ids", "inflight", "escalation",
 })
 ESCALATION = frozenset({"id", "reason", "questions", "boundary", "session_id", "return_status", "detail"})
@@ -275,7 +274,7 @@ class RunStore:
                 raise DevFlowError("Run state must be an object")
             version = raw.get("schema_version")
             if type(version) is int and version == 1:
-                if (raw.get("run_id") == run_id and raw.get("flow", self.flow) == self.flow
+                if (raw.get("run_id") == run_id and raw.get("flow") == self.flow
                         and raw.get("project") == str(self.project) and isinstance(raw.get("status"), str)):
                     return RunInfo(self.flow, run_id, "unsupported", raw, None, recovery)
                 raise DevFlowError("Run state from DevFlow 0.1.x has mismatched basic information")
@@ -363,7 +362,7 @@ class RunStore:
                 write_new(target, data)
                 hashes[relative] = digest(data)
             created = now()
-            state = {**fields, "schema_version": SCHEMA_VERSION, "plugin_version": __version__, "flow": self.flow, "run_id": run_id,
+            state = {**fields, "schema_version": SCHEMA_VERSION, "flow": self.flow, "run_id": run_id,
                      "project": str(self.project), "owner_session": owner, "created_at": created,
                      "updated_at": created, "state_revision": 0, "artifacts": hashes,
                      "event_ids": [first_event["event_id"]], "inflight": None,
@@ -378,6 +377,48 @@ class RunStore:
                 shutil.rmtree(staging, ignore_errors=True)
             raise
         return state
+
+    # -- external processes -----------------------------------------------------------------
+    def reserve(self, state: dict, status: str, kind: str, number: int, target: str | None,
+                reviewer_id: str | None = None) -> dict:
+        """Record an in-flight external process before it starts (lock held).
+
+        The attempt is consumed even if the process never reports back.
+        """
+        if status not in self.workflow.inflight_statuses:
+            raise DevFlowError("Not an in-flight status: " + status)
+        reservation = {"kind": kind, "number": number, "reviewer_id": reviewer_id, "target": target,
+                       "started_at": now()}
+        state.update(status=status, inflight=reservation, last_error=None)
+        self.save(state)
+        return reservation
+
+    def claim(self, run_id: str, reservation: dict, status: str, outcome: dict) -> dict:
+        """Reload after the process and take the result only for a still-current reservation.
+
+        Returns the state with ``inflight`` cleared (the caller finalizes and
+        saves). A result for an outdated reservation, after cancel or recover,
+        is kept under ``late/`` and the run is left unchanged.
+        """
+        state = self.load(run_id)
+        if state["status"] != status or state["inflight"] != reservation:
+            late = self.run_dir(run_id) / "late" / f"{reservation['kind']}-{reservation['number']:03}-{uuid4().hex}.json"
+            write_new(late, json_bytes({"reservation": reservation, **outcome}))
+            raise DevFlowError(f"A stale {reservation['kind']} finished after cancel or recover; "
+                               "the current run state was left unchanged")
+        state["inflight"] = None
+        return state
+
+    def recover(self, run_id: str) -> dict:
+        """Human-confirmed end of an interrupted process; the attempt stays consumed."""
+        with self.lock(run_id):
+            state = self.load(run_id)
+            if state["status"] not in self.workflow.inflight_statuses:
+                raise DevFlowError("Recovery applies only to an interrupted check or review")
+            self.workflow.on_recover(self, state)
+            state["inflight"] = None
+            self.save(state)
+            return state
 
     # -- human events -----------------------------------------------------------------------
     def events(self, state: dict) -> list[dict]:
@@ -435,13 +476,12 @@ class RunStore:
             raise DevFlowError(reason)
         previous = state["owner_session"]
         state["owner_session"] = session
-        if state["status"] not in TERMINAL:
-            event = make_event(payload, "prompt")
-            data = event_bytes(event)
-            if len(state["event_ids"]) >= MAX_EVENTS:
-                raise DevFlowError("The resume request cannot be recorded within the event limits")
-            self.stage(state, f"events/{event['event_id']}.json", data)
-            state["event_ids"].append(event["event_id"])
+        event = make_event(payload, "prompt")
+        data = event_bytes(event)
+        if len(state["event_ids"]) >= MAX_EVENTS:
+            raise DevFlowError("The resume request cannot be recorded within the event limits")
+        self.stage(state, f"events/{event['event_id']}.json", data)
+        state["event_ids"].append(event["event_id"])
         if previous != session and state["escalation"] is not None:
             # Answers given before the move, and the resume command itself,
             # can no longer resolve the pending decision.

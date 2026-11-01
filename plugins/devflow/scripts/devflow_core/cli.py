@@ -18,6 +18,7 @@ from . import __version__, router
 from .common import paths
 from .common.errors import DevFlowError, UsageError
 from .common.reviewers import preflight
+from .common.settings import validate_document
 from .workflows import WORKFLOWS
 
 PLUGIN_ROOT = paths.PLUGIN_ROOT
@@ -44,9 +45,6 @@ def parser() -> Parser:
         actions = commands.add_parser(name, help=f"The {name} workflow").add_subparsers(
             dest="action", required=True, parser_class=Parser)
         workflow.register_commands(actions)
-        if workflow.start_option:
-            start = actions.add_parser("start", help="Create the run requested by the user's pending command")
-            start.add_argument(workflow.start_option, dest="start_value", required=True)
     return result
 
 
@@ -82,6 +80,7 @@ def claude_version() -> dict:
 def doctor(project: Path) -> dict:
     """Offline project-settings readiness for every workflow; changes nothing."""
     reports, cache, warnings = {}, {}, []
+    validate_document(project, WORKFLOWS)
     for name, workflow in WORKFLOWS.items():
         config = workflow.load_config(project)
         reviewers = []
@@ -144,6 +143,7 @@ def main(argv=None) -> int:
                 raise DevFlowError("A new start cannot target an existing run")
             emit(router.runner_start(project, args.session, command, args.start_value))
         else:
+            validate_document(project, WORKFLOWS)
             run_id = router.selected_run(project, args.session, command, args.run)
             emit(WORKFLOWS[command].run_command(args, project, run_id, args.session))
         return 0

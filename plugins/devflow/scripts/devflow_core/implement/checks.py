@@ -10,35 +10,10 @@ import os
 from pathlib import Path
 import re
 import shutil
-import signal
 import stat
-import subprocess
-import threading
-import time
 
 from ..common.errors import DevFlowError
-
-
-def _terminate_tree(process: subprocess.Popen) -> None:
-    """Best-effort cleanup of the new process group; not an OS security boundary."""
-    if os.name == "nt":
-        # A separate process group alone does not terminate descendants on Windows.
-        system = os.environ.get("SystemRoot", r"C:\Windows")
-        taskkill = str(Path(system) / "System32" / "taskkill.exe")
-        try:
-            subprocess.run([taskkill, "/PID", str(process.pid), "/T", "/F"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, shell=False)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-    else:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-    if process.poll() is None:
-        try:
-            process.kill()
-        except OSError:
-            pass
+from ..common.process import run_bounded
 
 
 def _resolve_executable(argv: list[str]) -> list[str]:
@@ -56,78 +31,24 @@ def _resolve_executable(argv: list[str]) -> list[str]:
 
 
 def bounded_run(argv: list[str], cwd: Path, timeout_seconds: float, max_output_bytes: int = 1_048_576, env: dict | None = None) -> dict:
-    """Capture bounded stdout/stderr and terminate on timeout or output overflow.
+    """Capture bounded stdout/stderr; a timeout or overflow is a recorded result, not a pass.
 
     Return bytes internally so callers such as Git inventory can decode strictly.
     A child retaining pipes after its parent exits is an error, not a pass.
     """
-    started = time.monotonic()
-    command = _resolve_executable(argv)
-    options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
-    try:
-        process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False, env=env, **options)
-    except OSError as exc:
-        raise DevFlowError(f"Could not launch {argv[0]}: {exc}") from exc
-    buffers = {"stdout": bytearray(), "stderr": bytearray()}
-    lock = threading.Lock()
-    overflow = threading.Event()
-    read_error: list[str] = []
-
-    def drain(pipe, name: str) -> None:
-        try:
-            while True:
-                chunk = os.read(pipe.fileno(), 65536)
-                if not chunk:
-                    return
-                with lock:
-                    available = max_output_bytes - sum(len(value) for value in buffers.values())
-                    if len(chunk) > available:
-                        buffers[name].extend(chunk[:max(0, available)])
-                        overflow.set()
-                    else:
-                        buffers[name].extend(chunk)
-        except (OSError, ValueError) as exc:
-            read_error.append(str(exc))
-        finally:
-            pipe.close()
-
-    readers = [threading.Thread(target=drain, args=(process.stdout, "stdout"), daemon=True), threading.Thread(target=drain, args=(process.stderr, "stderr"), daemon=True)]
-    for thread in readers:
-        thread.start()
-    timed_out = False
-    while process.poll() is None:
-        if overflow.is_set():
-            _terminate_tree(process)
-            break
-        if time.monotonic() - started >= timeout_seconds:
-            timed_out = True
-            _terminate_tree(process)
-            break
-        time.sleep(0.01)
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        _terminate_tree(process)
-        process.wait(timeout=5)
-    for thread in readers:
-        thread.join(timeout=0.3)
-    retained_pipes = any(thread.is_alive() for thread in readers)
-    if retained_pipes:
-        _terminate_tree(process)
-        for thread in readers:
-            thread.join(timeout=1)
-    with lock:
-        output = {name + "_bytes": bytes(value) for name, value in buffers.items()}
+    result = run_bounded(_resolve_executable(argv), cwd=cwd, timeout=timeout_seconds, limit=max_output_bytes, env=env)
     error = None
-    if timed_out:
+    if result.timed_out:
         error = f"Check exceeded {timeout_seconds} seconds; process-tree termination was requested."
-    elif overflow.is_set():
+    elif result.output_limit_exceeded:
         error = f"Combined stdout/stderr exceeded {max_output_bytes} bytes; output is incomplete."
-    elif retained_pipes:
+    elif result.retained_pipes:
         error = "A descendant retained output pipes after the command exited; process-tree termination was requested."
-    elif read_error:
-        error = "Could not capture all command output: " + read_error[0]
-    return {**output, "exit_code": process.returncode, "error": error, "timed_out": timed_out, "output_limit_exceeded": overflow.is_set(), "duration_seconds": round(time.monotonic() - started, 4)}
+    elif result.read_error:
+        error = "Could not capture all command output: " + result.read_error
+    return {"stdout_bytes": result.stdout, "stderr_bytes": result.stderr, "exit_code": result.exit_code,
+            "error": error, "timed_out": result.timed_out, "output_limit_exceeded": result.output_limit_exceeded,
+            "duration_seconds": result.duration_seconds}
 
 
 def _safe_directory(path: Path, root: Path | None = None) -> Path:
@@ -147,8 +68,8 @@ def _safe_directory(path: Path, root: Path | None = None) -> Path:
 
 
 def validate_checks(checks: list[dict], timeout_default: int = 600) -> list[dict]:
-    if not isinstance(checks, list):
-        raise DevFlowError("checks must be an array.")
+    if not isinstance(checks, list) or len(checks) > 32:
+        raise DevFlowError("checks must be an array of at most 32 approved commands.")
     ids = set()
     validated = []
     for value in checks:
@@ -161,15 +82,16 @@ def validate_checks(checks: list[dict], timeout_default: int = 600) -> list[dict
             raise DevFlowError("Each check needs a unique lowercase id.")
         ids.add(identifier)
         argv = check.get("argv")
-        if not isinstance(argv, list) or not argv or any(not isinstance(arg, str) or not arg or "\x00" in arg for arg in argv):
+        if (not isinstance(argv, list) or not argv or len(argv) > 128
+                or any(not isinstance(arg, str) or not arg or "\x00" in arg for arg in argv)):
             raise DevFlowError("Check argv must be a nonempty array of nonempty strings, not a shell string.")
         check["argv"] = list(argv)
         if type(check["required"]) is not bool:
             raise DevFlowError("Check required must be a boolean.")
         if type(check["timeout_seconds"]) is not int or not 1 <= check["timeout_seconds"] <= 3600:
             raise DevFlowError("Check timeout_seconds must be an integer from 1 to 3600.")
-        if type(check["max_output_bytes"]) is not int or not 1 <= check["max_output_bytes"] <= 16 * 1024 * 1024:
-            raise DevFlowError("Check max_output_bytes must be from 1 byte to 16 MiB.")
+        if type(check["max_output_bytes"]) is not int or not 1024 <= check["max_output_bytes"] <= 16 * 1024 * 1024:
+            raise DevFlowError("Check max_output_bytes must be from 1 KiB to 16 MiB.")
         cwd = check["cwd"]
         if not isinstance(cwd, str) or not cwd or "\\" in cwd or ":" in cwd or cwd.startswith("/") or ".." in cwd.split("/") or any(ord(char) < 32 for char in cwd):
             raise DevFlowError("Check cwd must be a project-relative directory without traversal.")

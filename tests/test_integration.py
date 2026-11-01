@@ -36,6 +36,8 @@ from devflow_core.plan.config import load_config as load_plan_config  # noqa: E4
 from devflow_core.plan.engine import Engine as PlanEngine  # noqa: E402
 from devflow_core.workflows import WORKFLOWS  # noqa: E402
 
+PLAN_WORKFLOW, BUILD_WORKFLOW = WORKFLOWS["plan"], WORKFLOWS["implement"]
+
 hook = router.handle_hook
 
 
@@ -134,8 +136,8 @@ class BundleContractTests(unittest.TestCase):
             for path in examples:
                 with self.subTest(example=path.name):
                     write_json(project / "devflow.config.json", read_json(path))
-                    plan = load_plan_config(project, PLAN_PLUGIN)
-                    implement = load_build_config(project, BUILD_PLUGIN)
+                    plan = load_plan_config(project, PLAN_WORKFLOW)
+                    implement = load_build_config(project, BUILD_WORKFLOW)
                     self.assertEqual(plan["max_reviews"], 6)
                     self.assertEqual(implement["max_reviews"], 6)
                     self.assertNotIn("checks", plan)

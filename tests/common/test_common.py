@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 from devflow_core.common.storage import (DevFlowError, atomic_json, checked_text, digest,
     file_lock, json_bytes, no_symlinks, read_json, within, write_new)
 from devflow_core.common.review import all_approved, next_reviewer, validate_limit
-from devflow_core.common.settings import workflow_overlay
+from devflow_core.common.settings import validate_document, workflow_overlay
 from devflow_core.common.shell import READ_ONLY_COMMANDS, ShellPolicyError, read_only_tokens, shell_tokens
 
 
@@ -165,16 +165,21 @@ class SharedSettingsTests(unittest.TestCase):
         self.assertEqual(workflow_overlay(self.project, "plan")["reviewers"][0]["id"], "synthetic")
 
     def test_unknown_top_level_and_schema_versions_fail(self):
+        names = ("plan", "implement")
         for value in ({"unknown": 1}, {"schema_version": True}, {"schema_version": 2},
                       {"schema_version": "1"}, {"plan": []}, {"implement": "other"}):
             with self.subTest(value=value):
                 atomic_json(self.path, value)
                 with self.assertRaises(DevFlowError):
+                    validate_document(self.project, names)
                     workflow_overlay(self.project, "plan")
+                    workflow_overlay(self.project, "implement")
 
-    def test_unknown_workflow_is_rejected_even_without_config(self):
-        with self.assertRaises(DevFlowError):
-            workflow_overlay(self.project, "anything")
+    def test_top_level_keys_come_from_the_caller_registry(self):
+        atomic_json(self.path, {"schema_version": 1, "deploy": {}})
+        with self.assertRaisesRegex(DevFlowError, "deploy"):
+            validate_document(self.project, ("plan", "implement"))
+        validate_document(self.project, ("plan", "implement", "deploy"))
 
     def test_symlink_configuration_is_rejected(self):
         target = self.project / "other.json"

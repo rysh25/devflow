@@ -15,13 +15,10 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
-import signal
-import subprocess
-import threading
-import time
 from typing import Any, Callable
 
 from .errors import DevFlowError, ReviewerError
+from .process import run_bounded
 from .settings import DEFAULT_OUTPUT_BYTES, MAX_OUTPUT_BYTES as HARD_OUTPUT_BYTES, validate_reviewer
 
 MAX_PACKET_BYTES = 32 * 1024 * 1024
@@ -151,92 +148,24 @@ def _resolve(prefix: list[str]) -> list[str]:
     return [executable, *prefix[1:]]
 
 
-def _stop_tree(process: subprocess.Popen) -> None:
-    if os.name == "nt":
-        try:
-            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=5, shell=False)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        if process.poll() is None:
-            process.kill()
-    else:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired as exc:
-        raise ReviewerError("Reviewer cleanup incomplete; stop the process manually before resuming") from exc
-
-
 def _capture(argv: list[str], *, cwd: Path | None = None, env: dict | None = None,
              data: bytes = b"", timeout: float = 15, limit: int = MAX_OUTPUT_BYTES,
              log_dir: Path | None = None) -> tuple[int, bytes, bytes]:
-    """Bound memory/logs and kill this process tree on timeout or interruption."""
-    chunks = [bytearray(), bytearray()]
-    over_limit = threading.Event()
-    failures = []
-    flags = {"start_new_session": True} if os.name != "nt" else {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    """Run one reviewer process; any timeout, overflow or stuck descendant is a failure."""
     try:
-        process = subprocess.Popen(argv, cwd=cwd, env=env, shell=False,
-                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, **flags)
-    except OSError as exc:
-        raise ReviewerError(f"Cannot launch reviewer: {exc}") from exc
-
-    def reader(stream: Any, index: int) -> None:
-        try:
-            while chunk := stream.read(65536):
-                room = limit - len(chunks[index])
-                chunks[index].extend(chunk[:room])
-                if len(chunk) > room:
-                    over_limit.set()
-                    break
-        except OSError as exc:
-            failures.append(str(exc))
-            over_limit.set()
-        finally:
-            stream.close()
-
-    def writer() -> None:
-        try:
-            process.stdin.write(data)
-            process.stdin.flush()
-        except (BrokenPipeError, OSError):
-            pass
-        finally:
-            process.stdin.close()
-
-    threads = [threading.Thread(target=reader, args=(process.stdout, 0), daemon=True),
-               threading.Thread(target=reader, args=(process.stderr, 1), daemon=True),
-               threading.Thread(target=writer, daemon=True)]
-    for thread in threads:
-        thread.start()
-    deadline = time.monotonic() + timeout
-    try:
-        while process.poll() is None or any(t.is_alive() for t in threads):
-            if over_limit.is_set():
-                raise ReviewerError("Reviewer output exceeded the size limit or could not be read")
-            if time.monotonic() >= deadline:
-                raise ReviewerError(f"Reviewer timed out after {timeout:g} seconds; no automatic retry")
-            time.sleep(0.02)
-        if over_limit.is_set() or failures:
-            raise ReviewerError("Reviewer output exceeded the size limit or could not be read")
-        return process.wait(), bytes(chunks[0]), bytes(chunks[1])
-    except BaseException:
-        _stop_tree(process)
-        raise
-    finally:
-        for thread in threads:
-            thread.join(timeout=2)
-        if log_dir is not None:
-            for index, name in enumerate(("stdout.jsonl", "stderr.log")):
-                _write_new(log_dir / name, bytes(chunks[index]))
-        if any(thread.is_alive() for thread in threads):
-            raise ReviewerError("Reviewer descendants kept pipes open; cleanup is incomplete")
+        result = run_bounded(argv, cwd=cwd, env=env, data=data, timeout=timeout, limit=limit)
+    except DevFlowError as exc:
+        raise ReviewerError(f"Cannot run reviewer: {exc}") from exc
+    if log_dir is not None:
+        _write_new(log_dir / "stdout.jsonl", result.stdout)
+        _write_new(log_dir / "stderr.log", result.stderr)
+    if result.timed_out:
+        raise ReviewerError(f"Reviewer timed out after {timeout:g} seconds; no automatic retry")
+    if result.output_limit_exceeded or result.read_error:
+        raise ReviewerError("Reviewer output exceeded the size limit or could not be read")
+    if result.retained_pipes:
+        raise ReviewerError("Reviewer descendants kept pipes open; cleanup is incomplete")
+    return result.exit_code, result.stdout, result.stderr
 
 
 def preflight(config: dict) -> dict:

@@ -226,9 +226,11 @@ class UnifiedDispatchTests(RuntimeFixture):
 
     def test_global_status_during_active_run_reports_selected_workflow(self):
         identifier = self.plan_start()
-        state = runtime.status(self.project, self.session, None)
-        self.assertEqual((state["flow"], state["run_id"], state["review_count"]), ("plan", identifier, 0))
-        self.assertEqual(state["session"], {"status": "bound", "owner_matches": True})
+        value = runtime.status(self.project, self.session, None)
+        self.assertEqual((value["status"], value["run"], value["owner_matches"], value["pending_start"]),
+                         ("bound", {"flow": "plan", "run_id": identifier}, True, None))
+        self.assertEqual((value["run_status"]["status"], value["run_status"]["review_count"]), ("interview", 0))
+        self.assertEqual(value["runs"][0]["run_id"], identifier)
         self.assertIsNone(self.tool("Bash", command=self.command("status", identifier)))
 
     def test_idle_status_is_nonmutating_and_pending_status_is_explicit(self):
@@ -239,6 +241,7 @@ class UnifiedDispatchTests(RuntimeFixture):
         value = runtime.status(self.project, self.session, None)
         self.assertEqual(value["status"], "pending_start")
         self.assertEqual(value["pending_start"]["args"], str(self.plan_file))
+        self.assertEqual(value["sessions"]["pending_starts"], [])  # Not blocking its own session.
         other = runtime.status(self.project, "someone-else", None)
         self.assertEqual(other["sessions"]["pending_starts"][0]["flow"], "implement")
 
@@ -263,6 +266,14 @@ class UnifiedDispatchTests(RuntimeFixture):
         self.assertIsNone(self.tool("PowerShell", command=self.command("status")))
         self.assert_denied(self.tool("Bash", command=self.command("status") + " && other"))
         self.assert_denied(self.tool("Bash", command=self.command("status", OTHER_ID)))
+
+    def test_resume_of_a_finished_run_records_the_request(self):
+        identifier = self.plan_start()
+        self.engine("plan").cancel(identifier)
+        before = len(read_json(self.run_dir("plan", identifier) / "state.json")["event_ids"])
+        self.prompt("/devflow:resume " + identifier, session="reader-session")
+        state = read_json(self.run_dir("plan", identifier) / "state.json")
+        self.assertEqual((len(state["event_ids"]), state["owner_session"]), (before + 1, "reader-session"))
 
     def test_resume_in_fresh_session_binds_immediately_without_runner_resume(self):
         identifier = self.implement_start()
@@ -339,7 +350,8 @@ class RunFormatTests(RuntimeFixture):
 
     def test_damaged_runs_are_shown_individually_and_block_starts(self):
         for index, (version, extra) in enumerate(((None, {}), (True, {}), ("2", {}), (0, {}), (3, {}),
-                                                  (1, {"run_id": OTHER_ID}), (1, {"flow": "implement"}))):
+                                                  (1, {"run_id": OTHER_ID}), (1, {"flow": "implement"}),
+                                                  (1, {"flow": None}))):
             with self.subTest(version=version, extra=extra):
                 identifier = f"20261101T12345{index}Z-123456abcdef"
                 path = self.run_dir("plan", identifier) / "state.json"
@@ -565,7 +577,7 @@ class SessionRecordTests(RuntimeFixture):
         identifier = self.implement_start()
         self.prompt("/devflow:resume " + identifier, session="other-session")
         value = runtime.status(self.project, self.session, None)
-        self.assertEqual(value["session"], {"status": "stale", "owner_matches": False})
+        self.assertEqual((value["status"], value["owner_matches"]), ("stale", False))
         self.assert_denied(self.tool("Read", file_path=str(self.plan_file)))
 
 
