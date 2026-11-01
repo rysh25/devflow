@@ -6,6 +6,7 @@ import re
 
 from ..common.errors import DevFlowError, GuardError
 from ..common.review import HARD_MAX_REVIEWS
+from ..common.runs import TERMINAL
 from ..common.guard import draft_path
 from ..common.storage import json_bytes
 from ..common.workflow import Workflow
@@ -64,7 +65,8 @@ class PlanWorkflow(Workflow):
             raise DevFlowError("Incompatible/corrupt run state; never reset the review count")
 
     def can_transfer(self, state: dict, session: str) -> str | None:
-        if state["status"] == "interview" and state["owner_session"] != session:
+        unsealed = "interview.json" not in state["artifacts"]
+        if unsealed and state["status"] not in TERMINAL and state["owner_session"] != session:
             return "An unsealed interview must resume its original Claude session so its transcript remains complete."
         return None
 

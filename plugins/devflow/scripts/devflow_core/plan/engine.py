@@ -283,9 +283,11 @@ class Engine(RunEngine):
 
     def recover(self, run_id: str, expected_review: int) -> dict:
         """Explicit operator recovery; the hook guard never allows this command."""
-        if self.store.read(run_id)["review_count"] != expected_review:
-            raise DevFlowError("Recovery requires the exact interrupted review number.")
-        self.store.recover(run_id)
+        def exact(state: dict) -> None:
+            if state["review_count"] != expected_review:
+                raise DevFlowError("Recovery requires the exact interrupted review number.")
+
+        self.store.recover(run_id, exact)
         return self.status(run_id)
 
     def cancel(self, run_id: str) -> dict:

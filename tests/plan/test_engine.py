@@ -1167,6 +1167,21 @@ class EngineTests(unittest.TestCase):
         self.assertFalse((self.run / "reviews" / "01" / "error.json").exists())
         self.assertFalse((self.run / "reviews" / "02" / "error.json").exists())
 
+    def test_recover_compares_the_expected_review_with_the_locked_state(self):
+        self.ready()
+        with self.engine.store.lock(self.run_id):
+            state = self.engine.store.load(self.run_id)
+            self.engine.store.reserve(state, "reviewing", "review", 2, state["plan_hash"], "opencode")
+            state = self.engine.store.load(self.run_id)
+            state["review_count"] = 2
+            self.engine.store.save(state)
+        stale = dict(self.engine.store.read(self.run_id), review_count=1)
+        with patch.object(self.engine.store, "read", return_value=stale):
+            with self.assertRaisesRegex(DevFlowError, "exact interrupted review number"):
+                self.engine.recover(self.run_id, 1)
+        after = read_json(self.run / "state.json")
+        self.assertEqual((after["status"], after["inflight"]["number"]), ("reviewing", 2))
+
     def test_stale_success_after_recover_is_kept_late_without_changing_state(self):
         self.ready()
         after_recover = {}

@@ -409,12 +409,17 @@ class RunStore:
         state["inflight"] = None
         return state
 
-    def recover(self, run_id: str) -> dict:
-        """Human-confirmed end of an interrupted process; the attempt stays consumed."""
+    def recover(self, run_id: str, expect=None) -> dict:
+        """Human-confirmed end of an interrupted process; the attempt stays consumed.
+
+        ``expect(state)`` may refuse (raise) after the state is read under the lock.
+        """
         with self.lock(run_id):
             state = self.load(run_id)
             if state["status"] not in self.workflow.inflight_statuses:
                 raise DevFlowError("Recovery applies only to an interrupted check or review")
+            if expect is not None:
+                expect(state)
             self.workflow.on_recover(self, state)
             state["inflight"] = None
             self.save(state)

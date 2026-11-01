@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import os
 import json
 from pathlib import Path
 from typing import Any, Mapping
@@ -33,6 +34,17 @@ def session_path(project: Path, session_id: str) -> Path:
 
 def validate_record(record: object, path: Path, workflows: Mapping[str, Any]) -> dict:
     """Check every invariant; a record that fails is invalid as a whole."""
+    try:
+        return _validate_record(record, path, workflows)
+    except (TypeError, KeyError, ValueError, AttributeError) as exc:
+        raise DevFlowError(f"Malformed session record: {type(exc).__name__}: {exc}") from exc
+
+
+def _known(flow: object, workflows: Mapping[str, Any]) -> bool:
+    return isinstance(flow, str) and flow in workflows
+
+
+def _validate_record(record: object, path: Path, workflows: Mapping[str, Any]) -> dict:
     if not isinstance(record, dict) or set(record) != {"schema_version", "session_id", "run", "pending_start"}:
         raise DevFlowError("Session record fields are not recognized")
     if type(record["schema_version"]) is not int or record["schema_version"] != SCHEMA_VERSION:
@@ -46,12 +58,12 @@ def validate_record(record: object, path: Path, workflows: Mapping[str, Any]) ->
     if run is not None and pending is not None:
         raise DevFlowError("Session record cannot hold a run and a pending start together")
     if run is not None:
-        if (not isinstance(run, dict) or set(run) != {"flow", "run_id"} or run["flow"] not in workflows
+        if (not isinstance(run, dict) or set(run) != {"flow", "run_id"} or not _known(run["flow"], workflows)
                 or not isinstance(run["run_id"], str) or not RUN_ID.fullmatch(run["run_id"])):
             raise DevFlowError("Session record has an invalid run binding")
     if pending is not None:
         if (not isinstance(pending, dict) or set(pending) != {"flow", "run_id", "args", "event", "created_at"}
-                or pending["flow"] not in workflows
+                or not _known(pending["flow"], workflows)
                 or not isinstance(pending["run_id"], str) or not RUN_ID.fullmatch(pending["run_id"])
                 or not isinstance(pending["args"], str) or not isinstance(pending["created_at"], str)):
             raise DevFlowError("Session record has an invalid pending start")
@@ -138,9 +150,7 @@ def binding(project: Path, record: dict | None, stores: Mapping[str, RunStore]) 
 
 def pending_created(pending: dict, store: RunStore) -> bool:
     """Whether the pending start's run directory exists (its contents are judged elsewhere)."""
-    run = store.root / pending["run_id"]
-    no_symlinks(run)
-    return run.exists()
+    return os.path.lexists(store.root / pending["run_id"])
 
 
 def pending_applied(pending: dict, session_id: str, store: RunStore) -> bool | None:

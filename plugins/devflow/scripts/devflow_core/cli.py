@@ -143,8 +143,10 @@ def main(argv=None) -> int:
                 raise DevFlowError("A new start cannot target an existing run")
             emit(router.runner_start(project, args.session, command, args.start_value))
         else:
-            validate_document(project, WORKFLOWS)
             run_id = router.selected_run(project, args.session, command, args.run)
+            if run_id is None:
+                # Without a run, an action reads the current project settings.
+                validate_document(project, WORKFLOWS)
             emit(WORKFLOWS[command].run_command(args, project, run_id, args.session))
         return 0
     except Exception as exc:  # noqa: BLE001 - every failure is reported, never retried

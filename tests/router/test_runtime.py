@@ -267,6 +267,15 @@ class UnifiedDispatchTests(RuntimeFixture):
         self.assert_denied(self.tool("Bash", command=self.command("status") + " && other"))
         self.assert_denied(self.tool("Bash", command=self.command("status", OTHER_ID)))
 
+    def test_unsealed_interview_cannot_move_even_after_a_pause(self):
+        identifier = self.plan_start()
+        reason = self.run_dir("plan", identifier) / "draft" / "pause.json"
+        atomic_json(reason, {"reason": "Need the human first", "questions": ["Which scope?"]})
+        self.assertEqual(self.engine("plan").pause(identifier, reason)["status"], "awaiting_human")
+        with self.assertRaisesRegex(DevFlowError, "unsealed interview"):
+            self.prompt("/devflow:resume " + identifier, session="other-session")
+        self.assertEqual(self.engine("plan").status(identifier)["owner_session"], self.session)
+
     def test_resume_of_a_finished_run_records_the_request(self):
         identifier = self.plan_start()
         self.engine("plan").cancel(identifier)
@@ -289,6 +298,20 @@ class UnifiedDispatchTests(RuntimeFixture):
         self.assert_denied(self.tool("Bash", command=self.command("status", OTHER_ID)))
         code, output, _ = self.invoke("--session", self.session, "--run", identifier, "implement", "resume")
         self.assertEqual((code, json.loads(output)["error"]), (2, "UsageError"))
+
+
+class FrozenConfigurationTests(RuntimeFixture):
+    def test_editing_project_settings_after_start_does_not_break_the_run(self):
+        identifier = self.plan_start()
+        atomic_json(self.project / "devflow.config.json", {"schema_version": 1, "typo": {}})
+        for args in (("plan", "status"), ("plan", "doctor"), ("plan", "cancel")):
+            with self.subTest(args=args):
+                code, output, _ = self.invoke("--session", self.session, *args)
+                self.assertEqual(code, 0, output)
+        self.assertEqual(self.engine("plan").status(identifier)["status"], "cancelled")
+        code, output, _ = self.invoke("--session", "other", "plan", "doctor")  # Reads project settings.
+        self.assertEqual(code, 2)
+        self.assertIn("Unknown devflow.config.json keys", output)
 
 
 class PendingStartGuardTests(RuntimeFixture):
@@ -572,6 +595,36 @@ class SessionRecordTests(RuntimeFixture):
         misplaced = directory / ("0" * 64 + ".json")
         atomic_json(misplaced, good | {"run": {"flow": "plan", "run_id": OTHER_ID}})
         self.assertIn("does not match", runtime.status(self.project, self.session, None)["sessions"]["invalid_records"][0]["error"])
+
+    def test_record_with_non_string_flow_is_listed_as_invalid(self):
+        pending = {"flow": [], "run_id": OTHER_ID, "args": "x", "created_at": "t",
+                   "event": make_event({"prompt": "/devflow:plan x"}, "prompt")}
+        for record in (dict(sessions.empty_record("someone"), run={"flow": [], "run_id": OTHER_ID}),
+                       dict(sessions.empty_record("someone"), run={"flow": {}, "run_id": OTHER_ID}),
+                       dict(sessions.empty_record("someone"), pending_start=pending)):
+            with self.subTest(record=record):
+                path = sessions.session_path(self.project, "someone")
+                atomic_json(path, record)
+                overview = runtime.status(self.project, self.session, None)
+                self.assertEqual(overview["sessions"]["invalid_records"][0]["record"], path.name)
+                path.unlink()
+
+    def test_pending_start_whose_run_path_is_a_link_does_not_break_status(self):
+        target = self.base / "elsewhere"
+        target.mkdir()
+        runs = self.project / ".devflow" / "runs" / "plan"
+        runs.mkdir(parents=True)
+        try:
+            (runs / OTHER_ID).symlink_to(target, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("Creating symlinks requires OS permission")
+        pending = {"flow": "plan", "run_id": OTHER_ID, "args": "x", "created_at": "t",
+                   "event": make_event({"prompt": "/devflow:plan x"}, "prompt")}
+        sessions.write_record(self.project, dict(sessions.empty_record("someone"), pending_start=pending), WORKFLOWS)
+        overview = runtime.status(self.project, self.session, None)
+        self.assertEqual([item["format"] for item in overview["runs"]], ["invalid"])
+        self.assertEqual(overview["sessions"]["pending_starts"], [])
+        runtime.blocking_warnings(self.project)
 
     def test_stale_binding_reports_owner_mismatch(self):
         identifier = self.implement_start()

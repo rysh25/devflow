@@ -300,9 +300,16 @@ def _overview(project: Path, all_stores: dict[str, RunStore], session: str | Non
     for name, record, error in sessions.scan_records(project, WORKFLOWS):
         if error:
             invalid.append({"record": name, "error": error})
-        elif record["session_id"] != session and record["pending_start"] and not sessions.pending_created(
-                record["pending_start"], all_stores[record["pending_start"]["flow"]]):
-            pending = record["pending_start"]
+            continue
+        pending = record["pending_start"]
+        if record["session_id"] == session or not pending:
+            continue
+        try:
+            created = sessions.pending_created(pending, all_stores[pending["flow"]])
+        except (DevFlowError, OSError) as exc:
+            invalid.append({"record": name, "error": str(exc)})
+            continue
+        if not created:
             blocking.append({"record": name, "flow": pending["flow"], "args": pending["args"],
                              "created_at": pending["created_at"]})
     return {"runs": runs, "sessions": {"pending_starts": blocking, "invalid_records": invalid},
