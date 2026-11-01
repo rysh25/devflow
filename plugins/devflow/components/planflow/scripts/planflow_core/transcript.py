@@ -26,9 +26,12 @@ _IGNORED_RECORDS = {
     "tools-used", "file-history-delta", "cost-state", "relocated",
     "worktree-state", "api-request", "api-request-shape", "api-request-blob",
 }
-# Harness-generated attachments: hook results, reminders and session context.
-# Attachments carrying human text (queued_command) or files the human attached
-# (file, directory, pdf_reference, ...) are deliberately absent and fail closed.
+# Every transcript item falls into exactly one class; anything else fails closed:
+# 1. the human's words: user records and queued_command from a human (kept);
+# 2. Claude Code-generated: the record/attachment types and user-role texts
+#    below (skipped and counted);
+# 3. content the human attached: kept as the reference in their text
+#    ("[Image #1]", "@path"), the content itself only counted by type.
 _IGNORED_ATTACHMENTS = {
     "hook_success", "hook_additional_context", "hook_blocking_error",
     "total_tokens_reminder", "silent_turn_reminder", "task_reminder", "task_status",
@@ -40,6 +43,11 @@ _IGNORED_ATTACHMENTS = {
     "plan_mode", "plan_mode_exit", "plan_mode_reentry", "thinking_drop",
     "read_truncation_notice", "edited_text_file",
 }
+# User-role text written by Claude Code, not the human: interrupt markers and
+# the input/output of `!` shell commands (which may hold secrets).
+_CLAUDE_CODE_TEXTS = frozenset({"[Request interrupted by user]", "[Request interrupted by user for tool use]"})
+_CLAUDE_CODE_TEXT_PREFIXES = ("<bash-input>", "<bash-stdout>", "<bash-stderr>")
+_HUMAN_ATTACHMENTS = frozenset({"file", "directory", "pdf_reference", "at_mention_reference"})
 # Claude Code's question screen writes the human's choices and notes into these
 # AskUserQuestion input fields.  PostToolUse sees them; the transcript keeps the
 # model's original call, which must not contain them.
@@ -128,6 +136,43 @@ def _scaffolding(text: str, record: dict) -> bool:
         "<command-message>", "<command-name>", "<local-command-caveat>",
         "<local-command-stdout>", "Base directory for this skill:",
     ))
+
+
+def _claude_code_text(content: Any) -> bool:
+    """User-role content consisting only of Claude Code-generated text."""
+    if isinstance(content, list):
+        if not content or any(
+            not isinstance(block, dict) or block.get("type") != "text" or not isinstance(block.get("text"), str)
+            for block in content
+        ):
+            return False
+        content = "\n".join(block["text"] for block in content)
+    if not isinstance(content, str):
+        return False
+    return content.strip() in _CLAUDE_CODE_TEXTS or content.lstrip().startswith(_CLAUDE_CODE_TEXT_PREFIXES)
+
+
+def _queued_human_prompt(attachment: dict) -> tuple[str, int] | None:
+    """Text and image count of a message the human typed while Claude worked."""
+    origin = attachment.get("origin")
+    if (attachment.get("commandMode") != "prompt" or attachment.get("isMeta")
+            or not isinstance(origin, dict) or origin.get("kind") != "human"):
+        return None
+    prompt = attachment.get("prompt")
+    if isinstance(prompt, str):
+        return prompt, 0
+    if not isinstance(prompt, list):
+        raise CaptureError("Unsupported queued human message")
+    texts: list[str] = []
+    images = 0
+    for block in prompt:
+        if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+            texts.append(block["text"])
+        elif isinstance(block, dict) and block.get("type") == "image":
+            images += 1
+        else:
+            raise CaptureError("Unsupported content in a queued human message")
+    return "\n".join(texts), images
 
 
 def _prompt_matches(prompt: str, parts: list[str], record: dict) -> bool:
@@ -238,11 +283,30 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
     visible_records = 0
     ignored_records = 0
     transcript_human_prompts = 0
+    omitted_attachments: dict[str, int] = {}
 
     def add(role: str, content: str, source: dict) -> dict:
         result = {"role": role, "content": content, "source": source}
         messages.append(result)
         return result
+
+    def omit(kind: str, count: int = 1) -> None:
+        if count:
+            omitted_attachments[kind] = omitted_attachments.get(kind, 0) + count
+
+    def duplicate(record: dict, value: Any) -> bool:
+        uuid = record.get("uuid")
+        if uuid is None:
+            return False
+        if not isinstance(uuid, str):
+            raise CaptureError("Unsupported transcript UUID")
+        fingerprint = _digest(_json(value).encode("utf-8"))
+        if uuid in seen_uuids:
+            if seen_uuids[uuid] != fingerprint:
+                raise CaptureError("Conflicting transcript records share one UUID")
+            return True
+        seen_uuids[uuid] = fingerprint
+        return False
 
     for number, line in enumerate(segment.splitlines(), 1):
         if not line.strip():
@@ -262,7 +326,28 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
         if kind == "attachment":
             attachment = record.get("attachment")
             attachment_type = attachment.get("type") if isinstance(attachment, dict) else None
-            if attachment_type not in _IGNORED_ATTACHMENTS:
+            queued = _queued_human_prompt(attachment) if attachment_type == "queued_command" else None
+            if queued is not None:
+                if duplicate(record, attachment):
+                    continue
+                text, images = queued
+                omit("image", images)
+                if text.strip():
+                    # Claude Code marks the origin; link a matching hook event if any.
+                    matching = next((p for p in prompts if not p["used"] and p["text"] == text), None)
+                    source = {"origin": "claude_transcript", "segment_line": number, "kind": "prompt",
+                              "delivery": "queued_while_claude_was_working"}
+                    if matching:
+                        matching["used"] = True
+                        source.update(origin="UserPromptSubmit", hook_event_index=matching["event_index"])
+                    add("user", text, source)
+                    transcript_human_prompts += 1
+                visible_records += 1
+                continue
+            if attachment_type in _HUMAN_ATTACHMENTS:
+                if not duplicate(record, attachment):
+                    omit(attachment_type)
+            elif attachment_type not in _IGNORED_ATTACHMENTS:
                 raise CaptureError(f"Unsupported transcript attachment at line {number}: {attachment_type!r}")
             ignored_records += 1
             continue
@@ -276,16 +361,12 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
             raise CaptureError(f"Transcript message missing content at line {number}")
         if message.get("role", kind) != kind:
             raise CaptureError(f"Mismatched transcript role at line {number}")
+        if duplicate(record, message):
+            continue
+        if kind == "user" and _claude_code_text(message["content"]):
+            ignored_records += 1
+            continue
         uuid = record.get("uuid")
-        if uuid is not None:
-            if not isinstance(uuid, str):
-                raise CaptureError("Unsupported transcript UUID")
-            fingerprint = _digest(_json(message).encode("utf-8"))
-            if uuid in seen_uuids:
-                if seen_uuids[uuid] != fingerprint:
-                    raise CaptureError("Conflicting transcript records share one UUID")
-                continue
-            seen_uuids[uuid] = fingerprint
         source = {"origin": "claude_transcript", "segment_line": number}
         if uuid:
             source["uuid"] = uuid
@@ -311,6 +392,8 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
                     text_parts.append(block["text"])
             elif block_type in {"thinking", "redacted_thinking"} and kind == "assistant":
                 pass
+            elif block_type == "image" and kind == "user":
+                omit("image")
             elif block_type == "tool_use" and kind == "assistant":
                 if block.get("name") != "AskUserQuestion":
                     continue
@@ -445,7 +528,11 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
             "unanswered_questions": unanswered_questions,
             "user_responses": user_responses,
             "human_response_count": answered + user_responses,
+            "omitted_attachments": dict(sorted(omitted_attachments.items())),
             "structured_values_encoding": "JSON; string values unchanged, not original JSON whitespace",
-            "excluded": ["earlier-session-history", "thinking", "unrelated-tool-output", "known-skill-expansion"],
+            "excluded": [
+                "earlier-session-history", "thinking", "unrelated-tool-output", "known-skill-expansion",
+                "interrupt-markers-and-shell-commands", "attached-image-and-file-content",
+            ],
         },
     }

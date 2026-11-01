@@ -61,7 +61,7 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(result["hookSpecificOutput"]["hookEventName"], "PreToolUse")
 
     def test_read_tools_keep_normal_permissions(self):
-        for tool in ("Read", "Glob", "Grep", "AskUserQuestion", "TaskCreate", "TaskList"):
+        for tool in ("Read", "Glob", "Grep", "AskUserQuestion", "TaskCreate", "TaskList", "ToolSearch"):
             with self.subTest(tool=tool):
                 self.assertIsNone(self.check(tool))
 
@@ -146,7 +146,7 @@ class GuardTests(unittest.TestCase):
         ))
 
     def test_subagent_external_and_unknown_tools_denied(self):
-        for tool in ("Agent", "Task", "mcp__files__write", "WebFetch", "ToolSearch", "Unknown"):
+        for tool in ("Agent", "Task", "mcp__files__write", "WebFetch", "Unknown"):
             with self.subTest(tool=tool):
                 self.assertDenied(self.check(tool))
 
@@ -189,8 +189,35 @@ class GuardTests(unittest.TestCase):
                 result = self.check("Bash", command=command)
                 self.assertDenied(result)
                 reason = result["hookSpecificOutput"]["permissionDecisionReason"]
-                self.assertIn("Read/Grep/Glob", reason)
+                self.assertIn("read-only search commands (grep, rg, find, ls, cat, head, tail, wc)", reason)
                 self.assertIn("doctor", reason)
+
+    def test_read_only_search_commands_keep_normal_permissions(self):
+        for command in (
+            "grep -rn REVIEW-10 docs", "rg -n --glob '*.md' 'foo|bar$' .", "find . -name '*.py' -type f",
+            "ls -la src", "cat README.md", "head -n 20 'file with spaces.md'", "tail -n 5 log.txt", "wc -l a b",
+            "grep -E '^(a|b)[0-9]{2}$' f.txt",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(self.check("Bash", command=command))
+
+    def test_read_only_commands_cannot_run_programs_write_or_chain(self):
+        for command in (
+            "find . -exec rm {} +", "find . -delete", "find . -fprint out.txt", "rg --pre=sh x .", "rg --pre sh x .",
+            "grep -rn x . | head", "grep x . > out.txt", "cat a; rm b", "grep \"$HOME\" .", "cat $(echo a)",
+            "grep x . && rm y", "grep \"a|b\" .", "cat a\nrm b",
+        ):
+            with self.subTest(command=command):
+                self.assertDenied(self.check("Bash", command=command))
+        # PowerShell quotes differently, so it gets the runner only.
+        self.assertDenied(self.check("PowerShell", command="ls"))
+        self.assertDenied(self.check("Bash", command="grep -rn x .", run_in_background=True))
+
+    def test_runner_path_mismatch_names_the_installed_runner(self):
+        stale = self.runner("status").replace(str(self.script), "/old/plugin/0.1.0/scripts/devflow.py")
+        result = self.check("Bash", command=stale)
+        self.assertDenied(result)
+        self.assertIn(str(self.script), result["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_different_context_denied(self):
         good = self.runner("status")
@@ -322,6 +349,8 @@ class DispatchTests(unittest.TestCase):
         self.assertIn("run-1", context)
         self.assertIn("event-1", context)
         self.assertIn('"interview_skill": "grilling"', context)
+        # A resumed conversation may still hold an older plugin path.
+        self.assertIn(json.dumps(str(Path("/plugin/scripts/devflow.py"))), context)
 
     def test_empty_or_stacked_start_blocked(self):
         for prompt in (

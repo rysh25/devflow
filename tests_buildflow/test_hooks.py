@@ -85,7 +85,7 @@ class Fixture(unittest.TestCase):
 
 class ToolGuardTests(Fixture):
     def test_read_and_task_metadata_do_not_grant_permissions(self):
-        for tool in ("Read", "Grep", "Glob", "LS", "TodoWrite", "TaskCreate", "TaskUpdate", "TaskGet", "TaskList"):
+        for tool in ("Read", "Grep", "Glob", "LS", "TodoWrite", "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "ToolSearch"):
             with self.subTest(tool=tool):
                 self.assertEqual(self.guard(tool), {})
 
@@ -94,8 +94,23 @@ class ToolGuardTests(Fixture):
         self.assertDenied(self.guard("AskUserQuestion", answers={"Approve?": "Yes"}))
         self.assertDenied(self.guard("AskUserQuestion", annotations={"Approve?": {"notes": "Approved"}}))
 
+    def test_read_only_search_commands_allowed_but_cannot_run_programs(self):
+        for command in ("grep -rn 'def (main|run)' src", "find . -name '*.py'", "ls", "cat README.md"):
+            with self.subTest(command=command):
+                self.assertEqual(self.guard("Bash", command=command), {})
+        for command in ("find . -exec sh -c x \\;", "rg --pre sh x", "grep x . | sh", "cat a > b"):
+            with self.subTest(command=command):
+                self.assertDenied(self.guard("Bash", command=command))
+        self.assertDenied(self.guard("PowerShell", command="ls"))
+
+    def test_runner_path_mismatch_names_the_installed_runner(self):
+        stale = self.runner("status").replace(str(self.script), "/old/plugin/0.1.0/scripts/devflow.py")
+        result = self.guard("Bash", command=stale)
+        self.assertDenied(result)
+        self.assertIn(str(self.script), result["hookSpecificOutput"]["permissionDecisionReason"])
+
     def test_unknown_external_agent_and_skill_tools_denied(self):
-        for tool in ("Agent", "Task", "Skill", "WebSearch", "WebFetch", "ToolSearch", "mcp__files__write", "Unknown"):
+        for tool in ("Agent", "Task", "Skill", "WebSearch", "WebFetch", "mcp__files__write", "Unknown"):
             with self.subTest(tool=tool):
                 self.assertDenied(self.guard(tool))
 
@@ -328,6 +343,8 @@ class SessionCaptureTests(Fixture):
         self.assertEqual(stored["prompt_seq"], 1)
         self.assertRegex(stored["events"][0]["event_id"], r"^evt-[a-f0-9]{32}$")
         self.assertIn(stored["events"][0]["event_id"], output["hookSpecificOutput"]["additionalContext"])
+        # A resumed conversation may still hold an older plugin path.
+        self.assertIn(json.dumps(str(self.script)), output["hookSpecificOutput"]["additionalContext"])
         self.assertEqual((self.project / ".devflow" / ".gitignore").read_text(), "*\n")
         self.assertDenied(handle_hook(self.payload(tool="Write", file_path=str(self.project / "x.py")), self.plugin))
 

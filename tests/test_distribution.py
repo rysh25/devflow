@@ -31,11 +31,11 @@ class DistributionTests(unittest.TestCase):
     def test_static_validate_current_bundle(self):
         result = package.validate(ROOT)
         self.assertEqual(result["marketplace"], "devflow-marketplace")
-        self.assertEqual(result["plugins"], {"devflow": "0.1.2"})
+        self.assertEqual(result["plugins"], {"devflow": "0.1.3"})
 
     def test_release_versions_are_consistent(self):
         manifest = json.loads((ROOT / "plugins/devflow/.claude-plugin/plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.1.2")
+        self.assertEqual(manifest["version"], "0.1.3")
         paths = (
             "plugins/devflow/scripts/devflow_core/__init__.py",
             "plugins/devflow/components/planflow/scripts/planflow_core/__init__.py",
@@ -126,14 +126,14 @@ class DistributionTests(unittest.TestCase):
             # All paths were generated and checked in this test, not untrusted ZIP input.
             archive.extractall(extracted)
         release = extracted / "devflow"
-        self.assertEqual(package.validate(release)["version"], "0.1.2")
+        self.assertEqual(package.validate(release)["version"], "0.1.3")
         independent = self.base / "devflow-only"
         shutil.copytree(release / "plugins" / "devflow", independent)
         self.assertFalse((independent / "shared").exists())
         result = subprocess.run([sys.executable, "-B", str(independent / "scripts" / "devflow.py"), "--version"],
             cwd=self.base, capture_output=True, encoding="utf-8", timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("0.1.2", result.stdout)
+        self.assertIn("0.1.3", result.stdout)
         for flow in ("plan", "implement"):
             with self.subTest(flow=flow):
                 result = subprocess.run([sys.executable, "-B", str(independent / "scripts" / "devflow.py"), flow, "--help"],

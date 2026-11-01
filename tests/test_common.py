@@ -11,6 +11,7 @@ from flow_common.storage import (FlowError, atomic_json, checked_text, digest,
     file_lock, json_bytes, no_symlinks, read_json, within, write_new)
 from flow_common.review import all_approved, next_reviewer, validate_limit
 from flow_common.settings import workflow_overlay
+from flow_common.shell import READ_ONLY_COMMANDS, ShellPolicyError, read_only_tokens, shell_tokens
 
 
 class SharedStorageTests(unittest.TestCase):
@@ -184,6 +185,30 @@ class SharedSettingsTests(unittest.TestCase):
             self.skipTest("Creating symlinks requires OS permission")
         with self.assertRaises(FlowError):
             workflow_overlay(self.project, "implement")
+
+
+class SharedShellTests(unittest.TestCase):
+    def test_strict_tokens_reject_operators_even_inside_quotes(self):
+        self.assertEqual(shell_tokens("uv run 'a b'"), ["uv", "run", "a b"])
+        for command in ("a 'x|y'", "a; b", "a\nb", "a $(b)", "", None, "a 'unclosed"):
+            with self.subTest(command=command), self.assertRaises(ShellPolicyError):
+                shell_tokens(command)
+
+    def test_read_only_tokens_accept_literal_operators_only_in_single_quotes(self):
+        self.assertEqual(read_only_tokens("grep -E 'a|b$' src"), ["grep", "-E", "a|b$", "src"])
+        self.assertEqual(read_only_tokens("grep -rn \"it's\" ."), ["grep", "-rn", "it's", "."])
+        self.assertIsNone(read_only_tokens("uv run x"))
+        self.assertIsNone(read_only_tokens("/usr/bin/grep x"))
+        for command in ("grep \"a|b\" .", "grep x \\| sh", "grep \\'x|y\\' .", "cat a > b", "ls ; rm x",
+                        "grep \"$(id)\" .", "cat `id`", "find . -exec rm {} +", "rg --pre=sh x"):
+            with self.subTest(command=command), self.assertRaises(ShellPolicyError):
+                read_only_tokens(command)
+
+    def test_every_listed_dangerous_option_is_rejected(self):
+        for name, options in READ_ONLY_COMMANDS.items():
+            for option in options:
+                with self.subTest(command=name, option=option), self.assertRaises(ShellPolicyError):
+                    read_only_tokens(f"{name} . {option} x")
 
 
 if __name__ == "__main__":

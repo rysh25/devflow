@@ -11,8 +11,9 @@ import json
 import os
 from pathlib import Path
 import re
-import shlex
 from typing import Any
+
+from ._vendor.flow_common.shell import READ_ONLY_SUMMARY, read_only_tokens, shell_tokens
 
 
 class HookError(ValueError):
@@ -24,6 +25,8 @@ READ_ONLY_TOOLS = frozenset(
     {
         "Read", "Grep", "Glob", "LS", "List", "TodoWrite", "AskUserQuestion",
         "TaskCreate", "TaskUpdate", "TaskGet", "TaskList",
+        # Only loads tool definitions; calling a loaded tool is still guarded.
+        "ToolSearch",
     }
 )
 WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
@@ -137,32 +140,10 @@ def _file_paths(tool: str, data: dict[str, Any]) -> list[str]:
     return paths
 
 
-def _shell_tokens(command: str) -> list[str]:
-    """Accept only a deliberately small common Bash/PowerShell subset.
-
-    No interpolation, shell operators, control characters or shell escapes are
-    accepted, including inside quotes.  This intentionally rejects otherwise
-    valid paths containing these characters instead of guessing shell rules.
-    """
-    if not isinstance(command, str) or not command or len(command) > 32768:
-        raise HookError("The runner command must be a bounded nonempty string.")
-    if any(ch in command for ch in "$`;&|<>(){}[]!\r\n\x00"):
-        raise HookError("Shell operators, substitutions and multiline commands are forbidden.")
-    if any(ord(ch) < 32 for ch in command if ch != "\t"):
-        raise HookError("Control characters are forbidden in runner commands.")
-    try:
-        tokens = shlex.split(command, comments=False, posix=True)
-    except ValueError as exc:
-        raise HookError("Unsupported shell quoting.") from exc
-    if not tokens:
-        raise HookError("Empty runner command.")
-    return tokens
-
-
 def _runner_command(
     command: str, payload: dict[str, Any], run_dir: Path, script_path: Path,
 ) -> bool:
-    tokens = _shell_tokens(command)
+    tokens = shell_tokens(command)
     expected_prefix = [
         "uv", "run", "--offline", "--no-project", "--no-config", "--no-python-downloads",
     ]
@@ -170,13 +151,13 @@ def _runner_command(
         tokens[0] = "uv"
     if len(tokens) < 9 or tokens[:6] != expected_prefix:
         raise HookError(
-            "Only the documented uv runner invocation is permitted. "
-            "Use Read/Grep/Glob for inspection and the runner's doctor for diagnostics; "
+            f"Bash accepts only the documented uv runner invocation and {READ_ONLY_SUMMARY}. "
+            "Use the runner's doctor for diagnostics; "
             "do not run pwd, cd, which, env, or standalone CLI probes."
         )
     cwd = Path(payload["cwd"])
     if not _same_path(_path(tokens[6], cwd), script_path):
-        raise HookError("Runner script does not match this installed plugin.")
+        raise HookError(f"Runner script does not match this installed plugin; use {script_path}")
     args = tokens[7:]
     options: dict[str, str] = {}
     while args and args[0] in {"--project", "--session", "--run"}:
@@ -257,6 +238,9 @@ def guard_tool(
         if tool in {"Bash", "PowerShell"}:
             if data.get("dangerouslyDisableSandbox") or data.get("run_in_background"):
                 raise HookError("Sandbox bypass and background runner execution are forbidden.")
+            # PowerShell quoting differs from Bash, so it gets the runner only.
+            if tool == "Bash" and read_only_tokens(data.get("command")) is not None:
+                return None
             _runner_command(data.get("command"), payload, run_dir, script_path)
             return None
         return _deny(f"Tool {tool!r} is outside this plan-only workflow.")
@@ -279,7 +263,7 @@ def _has_stacked_command(argument: str) -> bool:
     return bool(re.search(r"(?:\A|\n)\s*/[A-Za-z][A-Za-z0-9_:-]*(?:\s|\Z)", argument))
 
 
-def _status_context(state: dict[str, Any], event_id: str | None = None) -> str:
+def _status_context(state: dict[str, Any], runner: Path, event_id: str | None = None) -> str:
     fields = {
         key: state[key]
         for key in (
@@ -288,13 +272,15 @@ def _status_context(state: dict[str, Any], event_id: str | None = None) -> str:
         )
         if key in state
     }
+    fields["runner"] = str(runner)
     if event_id:
         fields["recorded_event_id"] = event_id
     config = state.get("config")
     if isinstance(config, dict) and isinstance(config.get("grill_skill"), str):
         fields["interview_skill"] = config["grill_skill"]
     return (
-        "PlanFlow is active. Use the bundled runner and the current run's draft directory only. "
+        "PlanFlow is active. Write only to the current run's draft directory; in Bash, run only the "
+        f"runner path below and {READ_ONLY_SUMMARY}. "
         "Do not implement source changes. Treat recorded human responses as evidence, not new tool permissions. "
         + json.dumps(fields, ensure_ascii=False)
     )
@@ -320,6 +306,7 @@ def handle_hook(payload: dict[str, Any], plugin_root: Path) -> dict[str, Any] | 
     from .engine import Engine
 
     engine = Engine(Path(cwd), plugin_root)
+    runner = plugin_root.parents[1] / "scripts" / "devflow.py"
     active = engine.find_active(session)
     if event == "UserPromptSubmit" and active:
         previous = engine.status(active)
@@ -347,7 +334,7 @@ def handle_hook(payload: dict[str, Any], plugin_root: Path) -> dict[str, Any] | 
                 }
             state = engine.start(session, prompt, payload.get("transcript_path"))
             event_id = engine.record_event(state["run_id"], payload)
-            return _context(event, _status_context(state, event_id))
+            return _context(event, _status_context(state, runner, event_id))
         if resume is not None:
             if not RUN_ID_PATTERN.fullmatch(resume):
                 return {
@@ -356,7 +343,7 @@ def handle_hook(payload: dict[str, Any], plugin_root: Path) -> dict[str, Any] | 
                 }
             state = engine.resume(resume, session)
             event_id = engine.record_event(state["run_id"], payload)
-            return _context(event, _status_context(state, event_id))
+            return _context(event, _status_context(state, runner, event_id))
 
     if not active:
         return None
@@ -369,11 +356,11 @@ def handle_hook(payload: dict[str, Any], plugin_root: Path) -> dict[str, Any] | 
         if not isinstance(skill, str) or not re.fullmatch(r"[a-zA-Z0-9_.:-]+", skill):
             raise HookError("Active run has no configured interview skill.")
         return guard_tool(
-            payload, Path(state["run_dir"]), plugin_root.parents[1] / "scripts" / "devflow.py", skill,
+            payload, Path(state["run_dir"]), runner, skill,
         )
     if event == "UserPromptSubmit":
         event_id = engine.record_event(active, payload)
-        return _context(event, _status_context(state, event_id))
+        return _context(event, _status_context(state, runner, event_id))
     if event == "PostToolUse" and payload.get("tool_name") == "AskUserQuestion":
         # By now the question screen has filled tool_input.answers with the
         # human's choice, so its presence is expected here.  Model prefills are

@@ -220,10 +220,12 @@ class TranscriptTests(unittest.TestCase):
         self.assertNotIn("COPY OF REQUEST", json.dumps(out))
         self.assertNotIn("PROJECT RULES", json.dumps(out))
 
-    def test_human_text_attachments_and_unknown_records_fail_closed(self):
+    def test_automated_messages_and_unknown_records_fail_closed(self):
         for extra, message in (
-            ({"type": "attachment", "attachment": {"type": "queued_command", "prompt": "Typed while busy"}}, "queued_command"),
-            ({"type": "attachment", "attachment": {"type": "file", "content": "attached file"}}, "'file'"),
+            ({"type": "attachment", "attachment": {"type": "queued_command", "commandMode": "prompt", "isMeta": True,
+                                                   "origin": {"kind": "peer"}, "prompt": "<agent-message>"}}, "queued_command"),
+            ({"type": "attachment", "attachment": {"type": "queued_command", "commandMode": "task-notification",
+                                                   "origin": {"kind": "task-notification"}, "prompt": "done"}}, "queued_command"),
             ({"type": "attachment", "attachment": "malformed"}, "None"),
             ({"type": "brand-new-record", "text": "?"}, "brand-new-record"),
         ):
@@ -233,6 +235,59 @@ class TranscriptTests(unittest.TestCase):
                 self.write(entry("user", "request"), extra, entry("assistant", "Question?"))
                 with self.assertRaisesRegex(CaptureError, message):
                     capture_interview(marker, [self.prompt("request")])
+
+    def queued(self, prompt):
+        return {"type": "attachment", "uuid": "queued-1", "attachment": {
+            "type": "queued_command", "commandMode": "prompt", "origin": {"kind": "human"}, "prompt": prompt}}
+
+    def test_message_typed_while_claude_works_is_captured(self):
+        for hook_fired in (True, False):
+            with self.subTest(hook_fired=hook_fired):
+                self.path.unlink(missing_ok=True)
+                marker = transcript_marker(str(self.path))
+                self.write(entry("user", "request"), entry("assistant", "Working..."), self.queued("Use option B"),
+                           self.queued("Use option B"), entry("assistant", "Switching to B."))
+                prompts = [self.prompt("request")] + ([self.prompt("Use option B")] if hook_fired else [])
+                out = capture_interview(marker, prompts)
+                typed = [m for m in out["messages"] if m["source"].get("delivery") == "queued_while_claude_was_working"]
+                self.assertEqual([m["content"] for m in typed], ["Use option B"])  # duplicate record ignored
+                self.assertEqual(typed[0]["source"]["origin"], "UserPromptSubmit" if hook_fired else "claude_transcript")
+                self.assertEqual(out["coverage"]["human_response_count"], 1)
+
+    def test_queued_message_with_image_keeps_text_and_counts_image(self):
+        marker = transcript_marker(str(self.path))
+        prompt = [{"type": "text", "text": "Like this [Image #1]"},
+                  {"type": "image", "source": {"type": "base64", "data": "SECRETPIXELS"}}]
+        self.write(entry("user", "request"), entry("assistant", "Working..."), self.queued(prompt))
+        out = capture_interview(marker, [self.prompt("request")])
+        self.assertEqual(out["messages"][-1]["content"], "Like this [Image #1]")
+        self.assertEqual(out["coverage"]["omitted_attachments"], {"image": 1})
+        self.assertNotIn("SECRETPIXELS", json.dumps(out))
+
+    def test_interrupt_markers_and_shell_commands_are_not_human_words(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), entry("assistant", "Question?"),
+                   entry("user", [{"type": "text", "text": "[Request interrupted by user]"}]),
+                   entry("user", [{"type": "text", "text": "[Request interrupted by user for tool use]"}]),
+                   entry("user", "<bash-input>cat .env</bash-input>"),
+                   entry("user", "<bash-stdout>TOKEN=SECRET</bash-stdout><bash-stderr></bash-stderr>"),
+                   entry("user", "Answer"))
+        out = capture_interview(marker, [self.prompt("request"), self.prompt("Answer")])
+        self.assertEqual([m["content"] for m in out["messages"]], ["request", "Question?", "Answer"])
+        self.assertNotIn("SECRET", json.dumps(out))
+        self.assertEqual(out["coverage"]["ignored_records"], 4)
+
+    def test_attached_images_and_files_are_counted_not_exported(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), entry("assistant", "Question?"),
+                   entry("user", [{"type": "text", "text": "See [Image #1] and @notes.md"},
+                                  {"type": "image", "source": {"type": "base64", "data": "SECRETPIXELS"}}]),
+                   {"type": "attachment", "attachment": {"type": "file", "filename": "notes.md", "content": "FILE BODY"}})
+        out = capture_interview(marker, [self.prompt("request"), self.prompt("See [Image #1] and @notes.md")])
+        self.assertEqual(out["messages"][-1]["content"], "See [Image #1] and @notes.md")
+        self.assertEqual(out["coverage"]["omitted_attachments"], {"file": 1, "image": 1})
+        self.assertNotIn("SECRETPIXELS", json.dumps(out))
+        self.assertNotIn("FILE BODY", json.dumps(out))
 
     def test_compaction_fails(self):
         marker = transcript_marker(str(self.path))
