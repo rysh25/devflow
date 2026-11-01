@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "max_reviews": 6,
+  "plan": {
+    "grill_skill": "grilling",
+    "publish": {
+      "enabled": true,
+      "directory": "docs/plans"
+    }
+  },
+  "implement": {
+    "allow_dirty": false,
+    "max_check_attempts": 3,
+    "snapshot": {
+      "mode": "git"
+    },
+    "checks": []
+  }
+}

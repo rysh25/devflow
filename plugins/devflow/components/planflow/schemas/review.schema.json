@@ -1,0 +1,41 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "verdict", "summary", "findings", "questions"],
+  "properties": {
+    "schema_version": { "type": "integer", "enum": [1] },
+    "verdict": { "type": "string", "enum": ["pass", "changes_required", "human_required"] },
+    "summary": { "type": "string" },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "severity", "category", "location", "evidence", "recommendation", "requires_human"],
+        "properties": {
+          "id": { "type": "string" },
+          "severity": { "type": "string", "enum": ["critical", "high", "medium", "low"] },
+          "category": { "type": "string" },
+          "location": { "type": "string" },
+          "evidence": { "type": "string" },
+          "recommendation": { "type": "string" },
+          "requires_human": { "type": "boolean" }
+        }
+      }
+    },
+    "questions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "question", "why_human", "options"],
+        "properties": {
+          "id": { "type": "string" },
+          "question": { "type": "string" },
+          "why_human": { "type": "string" },
+          "options": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  }
+}

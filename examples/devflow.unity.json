@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "implement": {
+  "snapshot": {
+    "mode": "git",
+    "include": ["Assets/**", "Packages/**", "ProjectSettings/**"],
+    "context_paths": ["Packages/manifest.json", "ProjectSettings/ProjectVersion.txt"]
+  },
+  "checks": []
+  }
+}

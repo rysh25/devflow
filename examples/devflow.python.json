@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "implement": {
+  "snapshot": {
+    "mode": "git",
+    "exclude": [".coverage", "htmlcov/", "dist/", "build/", "*.egg-info/"],
+    "context_paths": ["pyproject.toml"]
+  },
+  "checks": [
+    {
+      "id": "pytest",
+      "argv": ["uv", "run", "--offline", "--frozen", "pytest", "-q"],
+      "timeout_seconds": 600,
+      "required": true,
+      "cwd": "."
+    }
+  ]
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "grill_skill": "grilling",
+  "max_reviews": 6,
+  "max_packet_bytes": 2097152,
+  "publish": {"enabled": true, "directory": "docs/plans"},
+  "reviewers": [
+    {
+      "id": "codex",
+      "kind": "codex",
+      "command": ["codex"],
+      "model": "gpt-6.1-sol",
+      "effort": "xhigh",
+      "timeout_seconds": 600
+    },
+    {
+      "id": "opencode",
+      "kind": "opencode",
+      "command": ["opencode"],
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "effort": "high",
+      "protocol_version": 2,
+      "timeout_seconds": 600
+    }
+  ]
+}
+

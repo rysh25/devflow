@@ -1,0 +1,8 @@
+{
+  "name": "devflow-marketplace",
+  "owner": {"name": "DevFlow maintainers"},
+  "metadata": {"description": "One DevFlow plugin with independent plan and implement workflows"},
+  "plugins": [
+    {"name": "devflow", "source": "./plugins/devflow", "description": "Create plans and implement explicit plan files with independent reviews"}
+  ]
+}

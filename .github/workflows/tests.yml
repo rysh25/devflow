@@ -1,0 +1,33 @@
+name: DevFlow tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  portable-tests:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ['3.11', '3.12', '3.13']
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Check generated shared code
+        run: python tools/sync_shared.py --check
+      - name: Test without external models
+        run: python tools/test_all.py --quiet
+      - name: Validate source distribution
+        run: python tools/package.py --validate-only
+      - name: Build source archive
+        run: python tools/package.py --output dist/devflow-ci.zip

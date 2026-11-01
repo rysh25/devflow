@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "max_reviews": 6,
+  "max_check_attempts": 3,
+  "max_plan_bytes": 1048576,
+  "allow_dirty": false,
+  "snapshot": {
+    "mode": "git",
+    "include": ["**"],
+    "exclude": [],
+    "context_paths": [],
+    "max_files": 5000,
+    "max_file_bytes": 1000000,
+    "max_total_bytes": 20000000,
+    "max_packet_bytes": 2000000
+  },
+  "reviewers": [
+    {"id": "codex", "kind": "codex", "command": ["codex"], "model": "gpt-6.1-sol", "effort": "xhigh", "timeout_seconds": 900},
+    {"id": "opencode", "kind": "opencode", "command": ["opencode"], "model": "opencode-go/deepseek-v4.1-flash", "effort": "high", "timeout_seconds": 900, "protocol_version": 2}
+  ],
+  "checks": []
+}

@@ -1,0 +1,8 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "uv", "args": ["run", "--offline", "--no-project", "--no-config", "--no-python-downloads", "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py", "hook"], "timeout": 30, "onFailure": "block"}]}],
+    "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "uv", "args": ["run", "--offline", "--no-project", "--no-config", "--no-python-downloads", "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py", "hook"], "timeout": 30, "onFailure": "block"}]}],
+    "PostToolUse": [{"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": "uv", "args": ["run", "--offline", "--no-project", "--no-config", "--no-python-downloads", "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py", "hook"], "timeout": 30, "onFailure": "block"}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "uv", "args": ["run", "--offline", "--no-project", "--no-config", "--no-python-downloads", "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py", "hook"], "timeout": 15}]}]
+  }
+}

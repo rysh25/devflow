@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "implement": {
+  "snapshot": {
+    "mode": "git",
+    "exclude": ["coverage/", ".turbo/", "dist/", "tsconfig.tsbuildinfo"],
+    "context_paths": ["package.json", "tsconfig.json"]
+  },
+  "checks": [
+    {
+      "id": "typecheck",
+      "argv": ["node", "node_modules/typescript/bin/tsc", "--noEmit"],
+      "timeout_seconds": 600,
+      "required": true,
+      "cwd": "."
+    },
+    {
+      "id": "unit-tests",
+      "argv": ["node", "node_modules/vitest/vitest.mjs", "run"],
+      "timeout_seconds": 600,
+      "required": true,
+      "cwd": "."
+    }
+  ]
+  }
+}
