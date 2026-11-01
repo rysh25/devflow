@@ -72,8 +72,8 @@ def assert_available(project: Path, session: str, all_stores: dict[str, RunStore
     for flow, store in all_stores.items():
         runs, _ = store.scan()
         for info in runs:
-            if selected == (flow, info.run_id):
-                continue
+            if selected == (flow, info.run_id) or info.format == "unsupported":
+                continue  # A 0.1.x run is never continued, so it never blocks (even mid-transaction).
             if info.format == "invalid":
                 raise DevFlowError(f"Run {flow}/{info.run_id} cannot be read ({info.error}); "
                                    "preserve it for human recovery before starting another")
@@ -356,7 +356,7 @@ def blocking_warnings(project: Path) -> list[str]:
     warnings += [f"Invalid session record {item['record']}: {item['error']}" for item in overview["sessions"]["invalid_records"]]
     warnings += [f"Incomplete run creation {name}; a human may move it away" for name in overview["incomplete_creations"]]
     warnings += [f"Run {item['flow']}/{item['run_id']} needs recovery (interrupted transaction)"
-                 for item in overview["runs"] if item.get("recovery_required")]
+                 for item in overview["runs"] if item.get("recovery_required") and item["format"] == "current"]
     warnings += [f"Run {item['flow']}/{item['run_id']} cannot be read and blocks new starts: {item.get('error')}"
                  for item in overview["runs"] if item["format"] == "invalid"]
     return warnings

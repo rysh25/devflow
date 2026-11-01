@@ -374,6 +374,16 @@ class RunFormatTests(RuntimeFixture):
             self.prompt("/devflow:resume " + identifier)
         self.plan_start()  # An unsupported run never blocks a new one.
 
+    def test_old_run_with_a_leftover_transaction_does_not_block(self):
+        identifier = self.raw_run("plan", status="reviewing")
+        atomic_json(self.run_dir("plan", identifier) / "transaction.json",
+                    {"schema_version": 1, "base_revision": 0, "state": {}, "writes": {}})
+        listed = runtime.status(self.project, self.session, None)["runs"][0]
+        self.assertEqual((listed["format"], listed["recovery_required"]), ("unsupported", True))
+        self.assertNotIn(identifier, " ".join(runtime.blocking_warnings(self.project)))
+        self.plan_start()
+        self.assertTrue((self.run_dir("plan", identifier) / "transaction.json").exists())  # Never touched.
+
     def test_damaged_runs_are_shown_individually_and_block_starts(self):
         for index, (version, extra) in enumerate(((None, {}), (True, {}), ("2", {}), (0, {}), (3, {}),
                                                   (1, {"run_id": OTHER_ID}), (1, {"flow": "implement"}),
