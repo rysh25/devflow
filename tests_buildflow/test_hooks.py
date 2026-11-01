@@ -92,6 +92,7 @@ class ToolGuardTests(Fixture):
     def test_question_cannot_be_self_answered(self):
         self.assertEqual(self.guard("AskUserQuestion", questions=[]), {})
         self.assertDenied(self.guard("AskUserQuestion", answers={"Approve?": "Yes"}))
+        self.assertDenied(self.guard("AskUserQuestion", annotations={"Approve?": {"notes": "Approved"}}))
 
     def test_unknown_external_agent_and_skill_tools_denied(self):
         for tool in ("Agent", "Task", "Skill", "WebSearch", "WebFetch", "ToolSearch", "mcp__files__write", "Unknown"):
@@ -428,13 +429,16 @@ class SessionCaptureTests(Fixture):
         with self.assertRaises(HookError):
             handle_hook(payload, self.plugin)
 
-    def test_programmatic_question_answer_not_recorded_as_human(self):
+    def test_answers_filled_in_by_question_screen_are_recorded(self):
+        # Claude Code's question screen writes the human's choice into
+        # tool_input before PostToolUse; model prefills are denied at PreToolUse.
         self.bind()
         payload = self.question()
-        payload["tool_input"]["answers"] = {"Continue?": "Yes"}
-        with self.assertRaises(HookError):
-            handle_hook(payload, self.plugin)
-        self.assertEqual(read_json(session_path(self.project, self.session_id))["seq"], 1)
+        payload["tool_input"].update({"answers": {"Continue?": "Yes, keep compatibility"}, "annotations": {}})
+        handle_hook(payload, self.plugin)
+        stored = read_json(session_path(self.project, self.session_id))
+        self.assertEqual(stored["seq"], 2)
+        self.assertEqual(stored["events"][0]["tool_input"], payload["tool_input"])
 
     def test_empty_cancelled_or_failed_question_is_not_an_answer(self):
         self.bind()

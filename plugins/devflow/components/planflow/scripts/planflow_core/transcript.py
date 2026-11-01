@@ -21,6 +21,10 @@ _IGNORED_RECORDS = {
     "agent-setting", "session-name", "session-end", "notification",
     "hook_progress",
 }
+# Claude Code's question screen writes the human's choices and notes into these
+# AskUserQuestion input fields.  PostToolUse sees them; the transcript keeps the
+# model's original call, which must not contain them.
+_SCREEN_FILLED_QUESTION_FIELDS = ("answers", "annotations")
 
 
 class CaptureError(Exception):
@@ -123,6 +127,11 @@ def _prompt_matches(prompt: str, parts: list[str], record: dict) -> bool:
     return False
 
 
+def _asked_input(question_input: dict) -> dict:
+    """The part of an AskUserQuestion input written by the model, not the screen."""
+    return {key: value for key, value in question_input.items() if key not in _SCREEN_FILLED_QUESTION_FIELDS}
+
+
 def _answer_content(value: Any) -> str:
     # Preserve string values exactly. Structured input/result values are encoded
     # losslessly as JSON, not paraphrased into an alleged verbatim quotation.
@@ -188,8 +197,8 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
         elif event_name == "PostToolUse" and event.get("tool_name") == "AskUserQuestion":
             if not isinstance(event.get("tool_input"), dict) or "tool_response" not in event:
                 raise CaptureError("AskUserQuestion hook is missing question input or answer output")
-            if event["tool_input"].get("answers") or event.get("is_error"):
-                raise CaptureError("An unsuccessful or prefilled AskUserQuestion is not human evidence")
+            if event.get("is_error"):
+                raise CaptureError("An unsuccessful AskUserQuestion is not human evidence")
             post_questions.append((index, event))
 
     messages: list[dict] = []
@@ -271,7 +280,7 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
                 if not isinstance(tool_id, str) or not tool_id or not isinstance(question_input, dict):
                     raise CaptureError("AskUserQuestion tool use lacks an ID or structured input")
                 items = question_input.get("questions")
-                if question_input.get("answers"):
+                if any(question_input.get(field) for field in _SCREEN_FILLED_QUESTION_FIELDS):
                     raise CaptureError("Programmatically prefilled AskUserQuestion answers are not human evidence")
                 if not isinstance(items, list) or not items or any(
                     not isinstance(item, dict) or not isinstance(item.get("question"), str)
@@ -333,11 +342,12 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
     for event_index, event in post_questions:
         tool_id = event.get("tool_use_id")
         if not tool_id:
-            matches = [key for key, q in questions.items() if q["input"] == event["tool_input"]]
+            matches = [key for key, q in questions.items()
+                       if _asked_input(q["input"]) == _asked_input(event["tool_input"])]
             if len(matches) != 1:
                 raise CaptureError("Cannot link an AskUserQuestion hook to one transcript question")
             tool_id = matches[0]
-        if tool_id not in questions or questions[tool_id]["input"] != event["tool_input"]:
+        if tool_id not in questions or _asked_input(questions[tool_id]["input"]) != _asked_input(event["tool_input"]):
             raise CaptureError("AskUserQuestion hook and transcript disagree about the question")
         item = questions[tool_id]
         if item.get("hook_answer_seen"):

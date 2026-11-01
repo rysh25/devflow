@@ -40,6 +40,9 @@ PROTECTED_NAMES = frozenset({
     "devflow.config.json", "buildflow.config.json", "planflow.config.json", "claude.md", "agents.md", ".mcp.json",
     "opencode.json", "opencode.jsonc", ".gitignore", ".gitattributes",
 })
+# Claude Code's question screen writes the human's choices and notes into these
+# AskUserQuestion input fields before the tool runs.
+SCREEN_FILLED_QUESTION_FIELDS = ("answers", "annotations")
 START_COMMAND = "/devflow:implement"
 RESUME_COMMAND = "/devflow:resume"
 EVENT_ID = re.compile(r"evt-[a-f0-9]{32}\Z")
@@ -277,8 +280,10 @@ def guard_tool(payload: dict, project: Path, session: dict, state: dict | None, 
     if tool in READ_TOOLS:
         return {}
     if tool == "AskUserQuestion":
-        if data.get("answers"):
-            return _deny("Human answers must not be prefilled by the model.")
+        # This is the only point that sees the model's own call: the question
+        # screen adds the human's answers/notes afterwards.
+        if any(data.get(field) for field in SCREEN_FILLED_QUESTION_FIELDS):
+            return _deny("Human answers and notes must not be prefilled by the model.")
         return {}
     try:
         cwd = Path(payload["cwd"])
@@ -402,8 +407,9 @@ def _record(session: dict, payload: dict) -> str:
         tool_input = payload.get("tool_input")
         if not isinstance(use_id, str) or not use_id or not isinstance(tool_input, dict) or "tool_response" not in payload:
             raise HookError("Question capture is missing its tool identity, input or actual result.")
-        if tool_input.get("answers"):
-            raise HookError("Programmatically supplied question answers cannot resolve a human escalation.")
+        # By now the question screen has filled tool_input.answers with the
+        # human's choice, so its presence is expected; model prefills are
+        # denied at PreToolUse.
         for old in session["events"]:
             if old.get("kind") == "ask_user_question" and old.get("tool_use_id") == use_id:
                 if old.get("tool_input") != tool_input or old.get("tool_response") != payload["tool_response"]:

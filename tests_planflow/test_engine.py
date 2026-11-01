@@ -379,20 +379,29 @@ class EngineTests(unittest.TestCase):
                 self.engine.review(self.run_id)
         reviewer.assert_not_called()
 
-    def test_ordinary_or_prefilled_prompts_cannot_resolve_escalation(self):
+    def test_ordinary_prompt_cannot_resolve_escalation(self):
         self.ready()
         self.submit(review_value("human_required", human=True))
         ordinary = self.engine.record_event(self.run_id, self.event(prompt="Yes, continue."))
-        prefilled = self.engine.record_event(self.run_id, self.event(
-            "PostToolUse", tool_name="AskUserQuestion", tool_use_id="prefilled-answer",
-            tool_input={"questions": [{"question": "Scope?"}], "answers": {"Scope?": "Yes"}},
-            tool_response={"answers": {"Scope?": "Yes"}}))
         self.assertEqual(self.engine.status(self.run_id)["human_events"], [])
-        for event_id in (ordinary, prefilled):
-            answer = self.draft("answer.json", {"answer": "Yes, continue.", "event_ids": [event_id]})
-            with self.assertRaisesRegex(FlowError, "AskUserQuestion"):
-                self.engine.resolve(self.run_id, answer)
+        answer = self.draft("answer.json", {"answer": "Yes, continue.", "event_ids": [ordinary]})
+        with self.assertRaisesRegex(FlowError, "AskUserQuestion"):
+            self.engine.resolve(self.run_id, answer)
         self.assertEqual(self.engine.status(self.run_id)["status"], "awaiting_human")
+
+    def test_answer_filled_in_by_question_screen_can_resolve_escalation(self):
+        # Claude Code's question screen writes the human's choice into
+        # tool_input before PostToolUse; model prefills are denied at PreToolUse.
+        self.ready()
+        self.submit(review_value("human_required", human=True))
+        answered = {"questions": [{"question": "Scope?"}], "answers": {"Scope?": "Yes"}, "annotations": {}}
+        event_id = self.engine.record_event(self.run_id, self.event(
+            "PostToolUse", tool_name="AskUserQuestion", tool_use_id="screen-answer",
+            tool_input=answered, tool_response=answered))
+        captured = self.engine.status(self.run_id)["human_events"][-1]
+        self.assertEqual(captured["event_id"], event_id)
+        exact = self.draft("answer.json", {"answer": captured["answer_text"], "event_ids": [event_id]})
+        self.assertEqual(self.engine.resolve(self.run_id, exact)["status"], "awaiting_revision")
 
     def test_replayed_question_cannot_cross_a_later_escalation_boundary(self):
         self.ready()

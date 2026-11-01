@@ -1,4 +1,4 @@
-# DevFlow 0.1.0 — Claude Code Plugin
+# DevFlow 0.1.1 — Claude Code Plugin
 
 人間との要件整理から計画作成、実装、独立レビューまでを支援する **単一の Claude Code Plugin** です。インストールするプラグインは `devflow` だけです。
 

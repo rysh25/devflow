@@ -247,7 +247,7 @@ class Engine:
             question = event.get("tool_input")
             use_id = event.get("tool_use_id")
             if (not isinstance(use_id, str) or not use_id.strip() or len(use_id) > 512
-                    or not isinstance(question, dict) or question.get("answers")):
+                    or not isinstance(question, dict)):
                 return None
             value = event.get("tool_response")
             if not event.get("is_error"):

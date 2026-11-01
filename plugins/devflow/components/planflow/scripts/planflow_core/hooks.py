@@ -30,6 +30,9 @@ WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,95}\Z")
 SESSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}\Z")
 HASH_PATTERN = re.compile(r"[a-f0-9]{64}\Z")
+# Claude Code's question screen writes the human's choices and notes into these
+# AskUserQuestion input fields before the tool runs.
+SCREEN_FILLED_QUESTION_FIELDS = ("answers", "annotations")
 START_COMMAND = "/devflow:plan"
 RESUME_COMMAND = "/devflow:resume"
 
@@ -227,8 +230,10 @@ def guard_tool(
     data = payload.get("tool_input")
     if not isinstance(tool, str) or not isinstance(data, dict):
         return _deny("Malformed tool input; no tool has been authorized.")
-    if tool == "AskUserQuestion" and data.get("answers"):
-        return _deny("Human answers must not be prefilled by the model.")
+    # This is the only point that sees the model's own call: Claude Code's
+    # question screen adds the human's answers/notes afterwards.
+    if tool == "AskUserQuestion" and any(data.get(field) for field in SCREEN_FILLED_QUESTION_FIELDS):
+        return _deny("Human answers and notes must not be prefilled by the model.")
     if tool in READ_ONLY_TOOLS:
         return None
     if tool == "Skill":
@@ -370,9 +375,11 @@ def handle_hook(payload: dict[str, Any], plugin_root: Path) -> dict[str, Any] | 
         event_id = engine.record_event(active, payload)
         return _context(event, _status_context(state, event_id))
     if event == "PostToolUse" and payload.get("tool_name") == "AskUserQuestion":
-        tool_input = payload.get("tool_input")
-        if not isinstance(tool_input, dict) or tool_input.get("answers"):
-            raise HookError("Programmatically supplied question answers are not human evidence.")
+        # By now the question screen has filled tool_input.answers with the
+        # human's choice, so its presence is expected here.  Model prefills are
+        # denied at PreToolUse and rechecked against the transcript at seal.
+        if not isinstance(payload.get("tool_input"), dict):
+            raise HookError("Question capture requires its actual tool input.")
         use_id = payload.get("tool_use_id")
         if not isinstance(use_id, str) or not use_id.strip() or len(use_id) > 512 or "tool_response" not in payload:
             raise HookError("Question capture requires its actual tool identity and result.")

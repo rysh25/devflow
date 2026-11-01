@@ -298,7 +298,7 @@ class UnifiedCliTests(RuntimeFixture):
                               input=payload, capture_output=True, encoding="utf-8", timeout=30, shell=False)
 
     def test_help_version_and_component_help_are_available(self):
-        for args, expected in ((("--version",), "devflow 0.1.0"), (("--help",), "bounded reviews"),
+        for args, expected in ((("--version",), "devflow 0.1.1"), (("--help",), "bounded reviews"),
                                (("plan", "--help"), "PlanFlow"), (("implement", "--help"), "bounded independent reviews")):
             with self.subTest(args=args):
                 result = self.process(*args)

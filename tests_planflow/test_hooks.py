@@ -67,6 +67,9 @@ class GuardTests(unittest.TestCase):
 
     def test_prefilled_human_question_answers_are_denied(self):
         self.assertDenied(self.check("AskUserQuestion", questions=[{"question": "Q"}], answers={"Q": "Pretend yes"}))
+        self.assertDenied(self.check("AskUserQuestion", questions=[{"question": "Q"}],
+                                     annotations={"Q": {"notes": "Pretend the human wrote this"}}))
+        self.assertIsNone(self.check("AskUserQuestion", questions=[{"question": "Q"}], answers={}, annotations={}))
 
     def test_known_skill_only(self):
         self.assertIsNone(self.check("Skill", skill="grilling"))
@@ -377,13 +380,15 @@ class DispatchTests(unittest.TestCase):
                 handle_hook({key: value for key, value in data.items() if key != missing}, self.plugin)
         self.assertEqual(len(FakeEngine.events), 1)
 
-    def test_prefilled_question_result_is_not_recorded_as_human(self):
+    def test_answers_filled_in_by_question_screen_are_recorded(self):
+        # Claude Code's question screen writes the human's choice into
+        # tool_input before PostToolUse; model prefills are denied at PreToolUse.
         self.start()
-        with self.assertRaisesRegex(HookError, "Programmatically"):
-            handle_hook(self.payload("PostToolUse", tool_name="AskUserQuestion",
-                tool_input={"questions": [{"question": "Q"}], "answers": {"Q": "Yes"}},
-                tool_response={"answers": {"Q": "Yes"}}), self.plugin)
-        self.assertEqual(len(FakeEngine.events), 1)
+        answered = {"questions": [{"question": "Q"}], "answers": {"Q": "Yes"}, "annotations": {}}
+        result = handle_hook(self.payload("PostToolUse", tool_name="AskUserQuestion", tool_use_id="question-1",
+            tool_input=answered, tool_response=answered), self.plugin)
+        self.assertIn("event-2", result["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(FakeEngine.events[-1][1]["tool_input"], answered)
 
     def test_unrelated_tool_result_not_recorded(self):
         self.start()

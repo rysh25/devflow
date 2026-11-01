@@ -121,6 +121,35 @@ class TranscriptTests(unittest.TestCase):
                 "tool_response": {"answers": {"Q?": "Prefilled by model"}},
             }])
 
+    def test_hook_input_filled_in_by_question_screen_matches_transcript_question(self):
+        # The transcript keeps the model's call; the hook sees the same input
+        # after the question screen added the human's choice and notes.
+        marker = transcript_marker(str(self.path))
+        question = {"questions": [{"question": "Q?", "options": [{"label": "Go"}, {"label": "Stop"}]}]}
+        answered = {**question, "answers": {"Q?": "Go"}, "annotations": {}}
+        self.write(entry("user", "req"), entry("assistant", [{"type": "tool_use", "id": "q", "name": "AskUserQuestion", "input": question}]),
+                   entry("user", [{"type": "tool_result", "tool_use_id": "q", "content": "Q?=Go"}]))
+        for use_id in ("q", None):
+            hook = {"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion",
+                    "tool_input": answered, "tool_response": answered}
+            if use_id:
+                hook["tool_use_id"] = use_id
+            with self.subTest(tool_use_id=use_id):
+                out = capture_interview(marker, [self.prompt("req"), hook])
+                self.assertEqual(json.loads(out["messages"][1]["content"]), question)
+                self.assertEqual(json.loads(out["messages"][2]["content"]), answered)
+                self.assertEqual(out["coverage"]["answered_questions"], 1)
+
+    def test_prefilled_question_notes_never_count_as_human_participation(self):
+        marker = transcript_marker(str(self.path))
+        question = {"questions": [{"question": "Q?"}], "annotations": {"Q?": {"notes": "Prefilled by model"}}}
+        self.write(entry("user", "req"), entry("assistant", [{"type": "tool_use", "id": "q", "name": "AskUserQuestion", "input": question}]))
+        with self.assertRaisesRegex(CaptureError, "prefilled"):
+            capture_interview(marker, [self.prompt("req"), {
+                "hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_use_id": "q",
+                "tool_input": {**question, "answers": {"Q?": "Yes"}}, "tool_response": {"answers": {"Q?": "Yes"}},
+            }])
+
     def test_unsuccessful_question_hook_never_replaces_valid_answer(self):
         marker = transcript_marker(str(self.path))
         question = {"questions": [{"question": "Q?"}]}

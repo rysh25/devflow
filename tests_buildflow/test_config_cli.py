@@ -151,7 +151,7 @@ class ConfigCliTests(unittest.TestCase):
         self.assertFalse((self.project / ".devflow").exists())
 
     def test_real_entrypoint_help_and_version(self):
-        for args, expected in ((["--help"], "bounded independent reviews"), (["--version"], "BuildFlow 0.1.0")):
+        for args, expected in ((["--help"], "bounded independent reviews"), (["--version"], "BuildFlow 0.1.1")):
             with self.subTest(args=args):
                 result = self.process(*args)
                 self.assertEqual(result.returncode, 0, result.stderr)
