@@ -137,7 +137,8 @@ class FullStackTests(unittest.TestCase):
         checked = self.engine.check(self.run_id, self.session)
         self.assertEqual(checked["status"], "ready_review")
         self.assertEqual(checked["validation"]["status"], "passed")
-        self.assertEqual(self.tool(file_path=str(self.source))["hookSpecificOutput"]["permissionDecision"], "deny")
+        # Implement never denies (D1); the post-check snapshot guards the reviewed code.
+        self.assertIsNone(self.tool(file_path=str(self.source)))
 
     def observed(self, number):
         process = self.run / "review-processes" / f"{number:02}"

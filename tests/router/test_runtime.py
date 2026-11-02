@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -15,7 +16,7 @@ from unittest.mock import patch
 from devflow_core import __version__, cli, router as runtime
 from devflow_core.common import guard, sessions
 from devflow_core.common.errors import DevFlowError
-from devflow_core.common.runs import RunStore, make_event
+from devflow_core.common.runs import SCHEMA_VERSION, RunStore, make_event
 from devflow_core.common.storage import atomic_json, read_json, write_new
 from devflow_core.workflows import WORKFLOWS
 
@@ -111,7 +112,7 @@ class UnifiedDispatchTests(RuntimeFixture):
         self.assertEqual(request["request"], "REVIEW-10 の計画を作成して")
         self.assertFalse((self.project / ".devflow" / "runs" / "implement").exists())
         state = read_json(self.run_dir("plan", identifier) / "state.json")
-        self.assertEqual((state["schema_version"], state["owner_session"]), (3, self.session))
+        self.assertEqual((state["schema_version"], state["owner_session"]), (SCHEMA_VERSION, self.session))
         self.assertEqual(len(state["event_ids"]), 1)  # The start prompt itself.
 
     def test_implementation_start_only_captures_pending_start_until_cli_start(self):
@@ -182,7 +183,9 @@ class UnifiedDispatchTests(RuntimeFixture):
     def test_cancelled_implementation_can_switch_to_plan_on_next_prompt(self):
         identifier = self.implement_start()
         self.engine("implement").cancel(identifier, self.session, "Human ended this attempt")
-        self.assert_denied(self.tool(file_path=str(self.project / "source.py")))
+        # Implement never denies (D1); the finished run stays bound until the next prompt.
+        self.assertIsNone(self.tool(file_path=str(self.project / "source.py")))
+        self.assertEqual(self.record()["run"], {"flow": "implement", "run_id": identifier})
         plan = self.plan_start()
         self.assertEqual(self.record()["run"], {"flow": "plan", "run_id": plan})
 
@@ -264,13 +267,18 @@ class UnifiedDispatchTests(RuntimeFixture):
             self.assertIsNone(self.tool("Bash", command=safe.replace(identifier, OTHER_ID)))
         self.assert_denied(self.tool("Bash", command=self.command("cancel", OTHER_ID, flow="plan")))
 
-    def test_global_runner_exemption_does_not_grant_permissions_for_pending_implement(self):
+    def test_pending_implement_never_denies_and_the_runner_still_checks_its_input(self):
         self.prompt("/devflow:implement feature.md")
-        self.assertIsNone(self.tool("PowerShell", command=self.command("status")))
-        self.assert_denied(self.tool("Bash", command=self.command("status") + " && other"))
-        self.assertIsNone(self.tool("Bash", command=self.command("status", OTHER_ID)))
-        self.assert_denied(self.tool("Bash", command=self.command("start --plan feature.md", OTHER_ID,
-                                                                  flow="implement")))
+        for name, command in (("PowerShell", self.command("status")), ("Bash", self.command("status") + " && other"),
+                              ("Bash", self.command("status", OTHER_ID)),
+                              ("Bash", self.command("start --plan feature.md", OTHER_ID, flow="implement"))):
+            with self.subTest(name=name, command=command):
+                self.assertIsNone(self.tool(name, command=command))
+        # The guard no longer checks the start, but the runner itself does.
+        code, output, _ = self.invoke("--session", self.session, "--run", OTHER_ID, "implement", "start",
+                                      "--plan", "feature.md")
+        self.assertEqual(code, 2)
+        self.assertIn("cannot target an existing run", json.loads(output)["message"])
 
     def test_unsealed_interview_cannot_move_even_after_a_pause(self):
         identifier = self.plan_start()
@@ -301,7 +309,7 @@ class UnifiedDispatchTests(RuntimeFixture):
         self.assertEqual((value["flow"], value["owner_session"], value["review_count"]),
                          ("implement", self.session, 0))
         self.assertIsNone(self.tool("Bash", command=self.command("status", OTHER_ID)))
-        self.assert_denied(self.tool("Bash", command=self.command("cancel --reason x", OTHER_ID, flow="implement")))
+        self.assertIsNone(self.tool("Bash", command=self.command("cancel --reason x", OTHER_ID, flow="implement")))
         code, output, _ = self.invoke("--session", self.session, "--run", identifier, "implement", "resume")
         self.assertEqual((code, json.loads(output)["error"]), (2, "UsageError"))
 
@@ -325,7 +333,7 @@ class PendingStartGuardTests(RuntimeFixture):
         super().setUp()
         self.prompt("/devflow:implement feature.md")
 
-    def test_only_diagnostics_read_only_work_and_the_exact_start_are_permitted(self):
+    def test_pending_implement_permits_everything(self):
         for name, data in (("Read", {"file_path": str(self.plan_file)}), ("Bash", {"command": "grep -rn 'a|b' ."}),
                            ("Bash", {"command": self.command("status")}), ("Bash", {"command": self.command("doctor")}),
                            ("Bash", {"command": self.command("start --help", flow="implement")}),
@@ -337,6 +345,7 @@ class PendingStartGuardTests(RuntimeFixture):
                 self.assertIsNone(self.tool(name, **data))
         other = self.project / "other.md"
         other.write_text("x\n", encoding="utf-8")
+        # Implement never denies before its start either (D1).
         for name, data in (("AskUserQuestion", {"questions": [{"question": "Q?"}]}),
                            ("Write", {"file_path": str(self.project / "source.py")}),
                            ("Bash", {"command": "rm -rf build"}),
@@ -344,7 +353,18 @@ class PendingStartGuardTests(RuntimeFixture):
                            ("Bash", {"command": self.command("checkpoint --summary-file x.md", flow="implement")}),
                            ("Skill", {"skill": "grilling"})):
             with self.subTest(name=name, data=data):
-                self.assert_denied(self.tool(name, **data))
+                self.assertIsNone(self.tool(name, **data))
+
+    def test_plan_crash_window_before_creation_keeps_its_guard(self):
+        # A Plan start that dies between the pending record and the run (here a
+        # SystemExit, which _start does not catch) leaves the pending record;
+        # Plan still restricts tools in that window.
+        with patch.object(runtime, "_create", side_effect=SystemExit(1)):
+            with self.assertRaises(SystemExit):
+                self.prompt("/devflow:plan REVIEW-10 の計画を作成して")
+        self.assertEqual(self.record()["pending_start"]["flow"], "plan")
+        self.assert_denied(self.tool("Write", file_path=str(self.project / "source.py")))
+        self.assertIsNone(self.tool("Read", file_path=str(self.plan_file)))
 
     def test_stop_and_answers_are_not_recorded_while_pending(self):
         self.assertIsNone(runtime.handle_hook(self.payload(event="Stop"), PLUGIN))
@@ -420,26 +440,50 @@ class RunFormatTests(RuntimeFixture):
             self.prompt("/devflow:resume " + identifier)
         self.plan_start()
         current = RunStore(self.project, WORKFLOWS["plan"]).inspect(self.record()["run"]["run_id"])
-        self.assertEqual(current.schema_version, 3)
+        self.assertEqual(current.schema_version, SCHEMA_VERSION)
 
-    def bind_to_old_run(self, session=None, pending=False, identifier="20261101T123456Z-123456abcdef"):
-        self.raw_run("implement", identifier, status="implementing", schema_version=2)
+    def bind_to_old_run(self, session=None, pending=False, identifier="20261101T123456Z-123456abcdef",
+                        flow="implement", version=2):
+        self.raw_run(flow, identifier, status="implementing" if flow == "implement" else "planning",
+                     schema_version=version)
         record = sessions.empty_record(session or self.session)
         if pending:
-            record = dict(record, pending_start={"flow": "implement", "run_id": identifier, "args": "x",
+            record = dict(record, pending_start={"flow": flow, "run_id": identifier, "args": "x",
                                                  "created_at": "t",
-                                                 "event": make_event({"prompt": "/devflow:implement x"}, "prompt")})
+                                                 "event": make_event({"prompt": f"/devflow:{flow} x"}, "prompt")})
         else:
-            record = dict(record, run={"flow": "implement", "run_id": identifier})
+            record = dict(record, run={"flow": flow, "run_id": identifier})
         sessions.write_record(self.project, record, WORKFLOWS)
         return identifier
 
-    def test_session_bound_to_a_0_2_run_stays_guarded_until_released(self):
-        identifier = self.bind_to_old_run()
-        # Before any prompt: still guarded, never unguarded.
+    def test_session_bound_to_an_old_plan_run_stays_guarded_until_released(self):
+        identifier = self.bind_to_old_run(flow="plan")
+        # Plan restricts tools: before any prompt the session is still guarded.
         self.assert_denied(self.tool("Write", file_path=str(self.project / "x.py")))
-        self.assert_denied(self.tool("Bash", command=self.command("cancel --reason x", flow="implement")))
+        self.assert_denied(self.tool("Bash", command=self.command("cancel --reason x", flow="plan")))
         self.assertIsNone(self.tool("Read", file_path=str(self.plan_file)))
+        self.assertIsNone(self.prompt("hello"))
+        self.assertIsNone(self.record())  # Released by the next prompt.
+        self.assertTrue(self.run_dir("plan", identifier).exists())
+
+    def test_session_bound_to_an_old_implement_run_is_never_denied_until_released(self):
+        for version, release in ((2, "0.2.x"), (3, "0.3.x")):
+            with self.subTest(version=version):
+                identifier = self.bind_to_old_run(identifier=f"20261101T12345{version}Z-123456abcdef", version=version)
+                self.assertIsNone(self.tool("Write", file_path=str(self.project / "x.py")))
+                self.assertIsNone(self.tool("Bash", command=self.command("cancel --reason x", flow="implement")))
+                value = runtime.status(self.project, self.session, None)
+                self.assertEqual((value["status"], value["owner_matches"]), ("unsupported", False))
+                self.assertIn(release, value["message"])
+                self.assertIsNone(self.prompt("hello"))
+                self.assertIsNone(self.record())
+                self.assertIsNone(self.tool("Write", file_path=str(self.project / "x.py")))
+                self.assertFalse(runtime.status(self.project, None, None)["sessions"]["pending_starts"])
+                # An old run never blocks a new start.
+                self.assertTrue(self.run_dir("implement", identifier).exists())
+
+    def test_session_bound_to_a_0_2_run_reports_unsupported_until_released(self):
+        identifier = self.bind_to_old_run()
         value = runtime.status(self.project, self.session, None)
         self.assertEqual((value["status"], value["owner_matches"]), ("unsupported", False))
         self.assertEqual(value["message"], f"Run {identifier} was started with DevFlow 0.2.x; "
@@ -465,7 +509,7 @@ class RunFormatTests(RuntimeFixture):
         self.assertTrue(self.run_dir("implement", identifier).exists())
 
     def test_damaged_runs_are_shown_individually_and_block_starts(self):
-        for index, (version, extra) in enumerate(((None, {}), (True, {}), ("2", {}), (0, {}), (4, {}),
+        for index, (version, extra) in enumerate(((None, {}), (True, {}), ("2", {}), (0, {}), (SCHEMA_VERSION + 1, {}),
                                                   (1, {"run_id": OTHER_ID}), (1, {"flow": "implement"}),
                                                   (1, {"flow": None}), (2, {"run_id": OTHER_ID}),
                                                   (2, {"project": "/elsewhere"}))):
@@ -495,7 +539,7 @@ class RunFormatTests(RuntimeFixture):
             state["last_error"] = {"message": "interrupted"}
             desired = dict(state, state_revision=state["state_revision"] + 1)
             atomic_json(self.run_dir("plan", identifier) / "transaction.json",
-                        {"schema_version": 3, "base_revision": state["state_revision"], "state": desired, "writes": {}})
+                        {"schema_version": SCHEMA_VERSION, "base_revision": state["state_revision"], "state": desired, "writes": {}})
         before = sorted(p.name for p in self.run_dir("plan", identifier).iterdir())
         overview = runtime.status(self.project, "other-session", None)
         self.assertTrue(overview["runs"][0]["recovery_required"])
@@ -514,13 +558,14 @@ class RunFormatTests(RuntimeFixture):
             state = store.load(identifier)
             desired = dict(state, state_revision=state["state_revision"] + 1, last_error={"message": "x"})
             atomic_json(self.run_dir("plan", identifier) / "transaction.json",
-                        {"schema_version": 3, "base_revision": state["state_revision"], "state": desired, "writes": {}})
+                        {"schema_version": SCHEMA_VERSION, "base_revision": state["state_revision"], "state": desired, "writes": {}})
         self.assertEqual(self.engine("plan").cancel(identifier)["status"], "cancelled")
         self.assertFalse((self.run_dir("plan", identifier) / "transaction.json").exists())
 
     def test_corrupt_journal_is_not_resumed(self):
         identifier = self.plan_start()
-        (self.run_dir("plan", identifier) / "transaction.json").write_text('{"schema_version": 3}', encoding="utf-8")
+        (self.run_dir("plan", identifier) / "transaction.json").write_text(
+            json.dumps({"schema_version": SCHEMA_VERSION}), encoding="utf-8")
         with self.assertRaisesRegex(DevFlowError, "pending transaction"):
             self.prompt("/devflow:resume " + identifier)
         self.assertTrue((self.run_dir("plan", identifier) / "transaction.json").exists())
@@ -634,7 +679,8 @@ class InterruptionTests(RuntimeFixture):
                 self.prompt("/devflow:resume " + identifier, session="new-session")
         self.assertEqual(self.record("new-session")["run"]["run_id"], identifier)
         self.assertEqual(self.engine("implement").status(identifier)["owner_session"], self.session)
-        self.assert_denied(self.tool(file_path=str(self.project / "x.py"), session="new-session"))
+        # Not the owner yet: implement never denies it, and nothing is recorded.
+        self.assertIsNone(self.tool(file_path=str(self.project / "x.py"), session="new-session"))
         context = self.prompt("continue", session="new-session")["hookSpecificOutput"]["additionalContext"]
         self.assertIn("/devflow:resume " + identifier, context)
         self.assertIsNone(self.tool("Read", file_path=str(self.plan_file)))  # The original owner keeps working.
@@ -733,11 +779,76 @@ class SessionRecordTests(RuntimeFixture):
         self.assertIsNone(self.tool("WebSearch", query="x"))
         self.assertIsNone(self.tool("Bash", command="grep -rn VALUE ."))
         self.assertIsNone(self.tool("Bash", command=self.command("status", identifier)))
-        self.assert_denied(self.tool("Write", file_path=str(self.project / "x.py")))
-        self.assert_denied(self.tool("AskUserQuestion", questions=[{"question": "q?"}]))
-        self.assert_denied(self.tool("Bash", command=self.command("cancel --reason x", flow="implement")))
+        # A stale implement session is never denied (D1) and never recorded.
+        self.assertIsNone(self.tool("Write", file_path=str(self.project / "x.py")))
+        self.assertIsNone(self.tool("AskUserQuestion", questions=[{"question": "q?"}]))
+        self.assertIsNone(self.tool("Bash", command=self.command("cancel --reason x", flow="implement")))
         self.assertIsNone(runtime.handle_hook(self.payload(event="Stop"), PLUGIN))
         self.assertEqual(len(read_json(self.run_dir("implement", identifier) / "state.json")["event_ids"]), events)
+
+
+class ProjectResolutionTests(RuntimeFixture):
+    """Hooks find the project from CLAUDE_PROJECT_DIR (the session's start directory)."""
+
+    def hook_from(self, cwd, environ, event="UserPromptSubmit", **fields):
+        payload = self.payload(event=event, **fields)
+        payload["cwd"] = str(cwd)
+        return runtime.handle_hook(payload, PLUGIN, environ)
+
+    def elsewhere(self):
+        other = self.base / "another repository"
+        (other / ".git").mkdir(parents=True, exist_ok=True)
+        return other
+
+    def recorded(self, identifier):
+        return len(read_json(self.run_dir("plan", identifier) / "state.json")["event_ids"])
+
+    def test_the_project_directory_wins_over_a_cwd_in_another_repository(self):
+        identifier = self.plan_start()
+        before = self.recorded(identifier)
+        context = self.hook_from(self.elsewhere(), {"CLAUDE_PROJECT_DIR": str(self.project)},
+                                 prompt="Continue planning")
+        self.assertIn("recorded_event_id", context["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(self.recorded(identifier), before + 1)
+        # The Plan guard still applies to the session, wherever its cwd went.
+        denied = self.hook_from(self.elsewhere(), {"CLAUDE_PROJECT_DIR": str(self.project)}, event="PreToolUse",
+                                tool_name="Write", tool_input={"file_path": str(self.project / "source.py")})
+        self.assert_denied(denied)
+        # Without the variable, the foreign cwd is a different (inert) project.
+        self.assertIsNone(self.hook_from(self.elsewhere(), {}, prompt="Continue planning"))
+
+    def test_unset_or_empty_falls_back_to_the_cwd(self):
+        identifier = self.plan_start()
+        for environ in ({}, {"CLAUDE_PROJECT_DIR": ""}):
+            with self.subTest(environ=environ):
+                before = self.recorded(identifier)
+                self.assertIsNotNone(self.hook_from(self.project, environ, prompt="More detail"))
+                self.assertEqual(self.recorded(identifier), before + 1)
+
+    def test_an_invalid_value_is_an_error(self):
+        afile = self.base / "a file"
+        afile.write_text("x", encoding="utf-8")
+        for value in ("relative/project", str(self.base / "missing"), str(afile)):
+            with self.subTest(value=value), self.assertRaisesRegex(DevFlowError, "CLAUDE_PROJECT_DIR"):
+                self.hook_from(self.project, {"CLAUDE_PROJECT_DIR": value}, prompt="hello")
+
+    def test_a_subdirectory_resolves_to_the_project_root(self):
+        identifier = self.plan_start()
+        sub = self.project / "src" / "deep"
+        sub.mkdir(parents=True)
+        before = self.recorded(identifier)
+        self.assertIsNotNone(self.hook_from(sub, {"CLAUDE_PROJECT_DIR": str(sub)}, prompt="Look here"))
+        self.assertEqual(self.recorded(identifier), before + 1)
+
+    def test_the_real_hook_entry_point_reads_the_environment(self):
+        identifier = self.plan_start()
+        payload = json.dumps(dict(self.payload(prompt="From a worktree"), cwd=str(self.elsewhere())))
+        env = dict(os.environ, CLAUDE_PROJECT_DIR=str(self.project))
+        result = subprocess.run([sys.executable, "-B", str(SCRIPT), "hook"], input=payload, capture_output=True,
+                                encoding="utf-8", timeout=30, shell=False, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("recorded_event_id", json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"])
+        self.assertTrue(self.recorded(identifier) >= 2)
 
 
 class UnifiedCliTests(RuntimeFixture):
@@ -806,7 +917,7 @@ class UnifiedCliTests(RuntimeFixture):
                                         "runtime_verified": False, "reason": "Fixture metadata permits invocation"}
         return (patch.object(cli, "preflight", return_value={"offline": True}),
                 patch("devflow_core.plan.interview.inspect_interview_skill", return_value=skill_report),
-                patch.object(cli, "claude_version", return_value={"supported": supported, "version": "2.1.295"}),
+                patch.object(cli, "claude_version", return_value={"supported": supported, "version": "2.1.316"}),
                 patch.object(cli.shutil, "which", side_effect=which or (lambda name: "/synthetic/available")))
 
     def test_doctor_is_offline_and_reports_minimum_supported_claude(self):
@@ -815,7 +926,7 @@ class UnifiedCliTests(RuntimeFixture):
             code, output, error = self.invoke("doctor")
         self.assertEqual((code, error), (0, ""))
         report = json.loads(output)
-        self.assertEqual(report["minimum_claude_code"], "2.1.295")
+        self.assertEqual(report["minimum_claude_code"], "2.1.316")
         self.assertTrue(report["ready"], report)
         self.assertEqual(report["workflows"]["plan"]["interview_skill"]["status"], "available")
         self.assertEqual(report["workflows"]["plan"]["configuration_source"], "project_settings")
@@ -854,7 +965,7 @@ class UnifiedCliTests(RuntimeFixture):
         self.assertIn("Pending implement start", " ".join(json.loads(output)["warnings"]))
 
     def test_claude_version_probe_never_authenticates_or_uses_shell(self):
-        result = subprocess.CompletedProcess(["claude", "--version"], 0, "2.1.295 (Claude Code)\n", "")
+        result = subprocess.CompletedProcess(["claude", "--version"], 0, "2.1.316 (Claude Code)\n", "")
         with patch.object(cli.shutil, "which", return_value="/safe/claude"), \
              patch.object(cli.subprocess, "run", return_value=result) as execute:
             report = cli.claude_version()

@@ -7,6 +7,7 @@ so the runner path the guard accepts is that plugin's ``scripts/devflow.py``.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shlex
 import tempfile
@@ -165,6 +166,18 @@ class GuardTests(PlanHookFixture):
         except (OSError, NotImplementedError):
             self.skipTest("This platform does not permit test symlinks.")
         self.assertDenied(self.check("Write", file_path=str(link)))
+
+    def test_hard_linked_draft_file_denied(self):
+        # Moved from the implement hook tests: implement no longer guards
+        # writes, so the shared safe_relative rule is covered through Plan.
+        original = self.project / "secret.txt"
+        original.write_text("secret", encoding="utf-8")
+        alias = self.draft / "alias.md"
+        try:
+            os.link(original, alias)
+        except OSError:
+            self.skipTest("Hard links unavailable on this platform")
+        self.assertDenied(self.check("Edit", file_path=str(alias)))
 
     def test_multiedit_cannot_smuggle_another_file(self):
         self.assertDenied(self.check(
@@ -489,6 +502,18 @@ class DispatchTests(PlanHookFixture):
         atomic_json(self.run / "state.json", state)
         with self.assertRaisesRegex(DevFlowError, "cannot be read"):
             self.hook(self.payload("PreToolUse", tool_name="Skill", tool_input={"skill": "grilling"}))
+
+    def test_a_damaged_plan_run_still_fails_closed(self):
+        # Plan restricts tools, so an unreadable run blocks its hooks (unlike implement).
+        self.start()
+        atomic_json(self.run / "state.json", {})
+        question = {"questions": [{"question": "Q?"}]}
+        for payload in (self.payload(prompt="Keep going"),
+                        self.payload("PreToolUse", tool_name="Read", tool_input={"file_path": "notes.md"}),
+                        self.payload("PostToolUse", tool_name="AskUserQuestion", tool_use_id="q-1",
+                                     tool_input=question, tool_response={"answers": {"Q?": "Yes"}})):
+            with self.subTest(event=payload["hook_event_name"]), self.assertRaisesRegex(DevFlowError, "cannot be read"):
+                self.hook(payload)
 
     def test_terminal_releases_only_after_next_human_prompt(self):
         for status in ("completed", "exhausted", "cancelled"):

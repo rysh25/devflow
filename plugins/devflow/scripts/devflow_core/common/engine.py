@@ -130,8 +130,15 @@ class RunEngine:
         result = {key: value for key, value in state.items() if key not in {"artifacts", "event_ids"}}
         run = self._run(run_id)
         result.update(run_dir=str(run), draft_dir=str(run / "draft"), **self.workflow.summary(state),
-                      bash_timeout_ms=self.workflow.bash_timeouts(state),
-                      human_events=approval_candidates(state, self._events(state)))
+                      bash_timeout_ms=self.workflow.bash_timeouts(state))
+        # Status is read-only display: unreadable event records are reported,
+        # not raised. Acting on an event (resolve) still reads them strictly.
+        try:
+            events = self._events(state)
+            result.update(human_events=approval_candidates(state, events),
+                          observations=sum(1 for event in events if event["kind"] == "observation"), events_error=None)
+        except (DevFlowError, OSError, ValueError) as exc:
+            result.update(human_events=[], observations=None, events_error=f"Human event records cannot be read: {exc}")
         self._status_details(state, result)
         return result
 

@@ -3,21 +3,14 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import subprocess
 
 from ..common.errors import DevFlowError, GuardError
-from ..common.guard import as_path, draft_path, name_key, safe_relative, same_path
 from ..common.environment import bash_timeout_ms
 from ..common.review import HARD_MAX_REVIEWS, check_review_config, review_budget
 from ..common.runs import TERMINAL
 from ..common.storage import digest, json_bytes, no_symlinks, now
-from ..common.workflow import Workflow
+from ..common.workflow import Option, Workflow
 from .commands import COMMANDS
-
-EDIT_STATUSES = frozenset({"implementing", "needs_revision"})
-PROTECTED_COMPONENTS = frozenset({".git", ".devflow", ".claude", ".codex", ".opencode", ".agents"})
-PROTECTED_NAMES = frozenset({"devflow.config.json", "claude.md", "agents.md", ".mcp.json",
-                             "opencode.json", "opencode.jsonc", ".gitignore", ".gitattributes"})
 
 
 def _checks_timeout_ms(config: dict) -> int:
@@ -49,10 +42,16 @@ class ImplementWorkflow(Workflow):
     state_fields = frozenset({"config", "plan_source", "source_digest", "attempts", "approvals", "revision",
                               "checkpoint_count", "check_attempts", "check_dispatch_count", "check_history",
                               "escalations", "resolutions", "reflections", "candidate", "validation",
-                              "binary_attestation", "last_error", "baseline_id", "report_path", "resume_status"})
+                              "binary_attestation", "last_error", "baseline_id", "report_path", "resume_status",
+                              "workspace"})
     start_option = "--plan"
-    guidance = ("Edit project source only while the run permits it and write runner inputs to the run's "
-                "draft directory; preserve pre-existing changes.")
+    extra_start_options = (Option("--workspace", "text", required=False),)
+    # DevFlow never denies a tool here: the session's own settings and permission
+    # mode decide. Runs record and verify instead (snapshots, hashes, events).
+    restricts_tools = False
+    guidance = ("DevFlow records and verifies this run but does not restrict tools. Write runner input files "
+                "to the run's draft directory, preserve pre-existing changes, and use the runner's checks "
+                "as the validation evidence.")
 
     def normalize_args(self, raw: str, project: Path | None = None) -> str:
         argument = plan_argument(raw)
@@ -63,17 +62,20 @@ class ImplementWorkflow(Workflow):
             path = Path(project) / path
         return os.path.normpath(str(path))
 
-    def build_start(self, project: Path, pending: dict) -> tuple[dict, dict[str, bytes]]:
+    def build_start(self, project: Path, pending: dict, options: dict) -> tuple[dict, dict[str, bytes]]:
         from . import snapshot
         from .config import load_config
         from .engine import _plan_bytes
+        from .workspace import resolve_workspace
         plan = Path(pending["args"])
         no_symlinks(plan)
         config = load_config(project, self)
         if plan.suffix.lower() not in {".md", ".markdown"}:
             raise DevFlowError("The input plan must be a UTF-8 Markdown file")
+        # The workspace is decided once, before anything is created, and frozen.
+        workspace = resolve_workspace(project, options.get("workspace"), config["snapshot"]["mode"])
         data = _plan_bytes(plan, config["max_plan_bytes"])
-        baseline = snapshot.capture(project, config)
+        baseline = snapshot.capture(Path(workspace["path"]), config)
         if _plan_bytes(plan, config["max_plan_bytes"]) != data:
             raise DevFlowError("Input plan changed during startup; no run was created. Confirm the plan and invoke implement again")
         fields = {
@@ -82,11 +84,12 @@ class ImplementWorkflow(Workflow):
             "check_attempts": 0, "check_dispatch_count": 0, "check_history": [], "escalations": [],
             "resolutions": [], "reflections": [], "candidate": None, "validation": None,
             "binary_attestation": None, "last_error": None, "baseline_id": baseline["snapshot_id"],
-            "report_path": None, "resume_status": None, "escalation": None,
+            "report_path": None, "resume_status": None, "escalation": None, "workspace": workspace,
         }
         artifacts = {
             "plan.md": data, "config.json": json_bytes(config), "baseline.json": json_bytes(baseline),
-            "request.json": json_bytes({"intent": {"action": "start", "args": pending["args"]},
+            "request.json": json_bytes({"intent": {"action": "start", "args": pending["args"],
+                                                   "workspace": options.get("workspace")},
                                         "event": pending["event"]}),
         }
         if baseline.get("git", {}) and baseline["git"].get("dirty") and not config["allow_dirty"]:
@@ -98,7 +101,9 @@ class ImplementWorkflow(Workflow):
         return fields, artifacts
 
     def check_state(self, state: dict) -> None:
+        from .workspace import check_frozen
         check_review_config(state["config"])
+        check_frozen(state["workspace"])
         if not isinstance(state["attempts"], list) or len(state["attempts"]) > HARD_MAX_REVIEWS:
             raise DevFlowError("Incompatible/corrupt run state; never reset the review count")
 
@@ -126,39 +131,23 @@ class ImplementWorkflow(Workflow):
         if state["status"] in {"completed", "exhausted", "cancelled"}:
             from .engine import terminal_report
             relative = f"reports/final-{state['state_revision'] + 1:06}.json"
-            store.stage(state, relative, json_bytes(terminal_report(store.project, state)))
+            # Ending a run must not depend on every event file being readable;
+            # a damaged one is reported instead of blocking cancel or recover.
+            try:
+                observed = [event["event_id"] for event in store.events(state) if event["kind"] == "observation"]
+                observed_error = None
+            except (DevFlowError, OSError, ValueError) as exc:
+                observed, observed_error = None, str(exc)
+            store.stage(state, relative, json_bytes(terminal_report(store.project, state, observed, observed_error)))
             state["report_path"] = relative
-
-    def check_write(self, state: dict, project: Path, path: str, cwd: Path, plugin_root: Path) -> None:
-        run_dir = project / ".devflow" / "runs" / self.name / state["run_id"]
-        if draft_path(path, cwd, run_dir):
-            return
-        if state["status"] not in EDIT_STATUSES:
-            raise GuardError("Source edits are permitted only during implementing or needs_revision.")
-        candidate, relative = safe_relative(path, cwd, project)
-        parts = [name_key(part) for part in Path(relative).parts]
-        if any(part in PROTECTED_COMPONENTS for part in parts) or parts[-1] in PROTECTED_NAMES:
-            raise GuardError("Workflow, Git, agent-instruction and permission configuration files are protected.")
-        if same_path(candidate, as_path(state["plan_source"], project)):
-            raise GuardError("The original plan is read-only.")
-        from .snapshot import path_in_scope
-        if not path_in_scope(relative, state["config"]):
-            raise GuardError("The target is outside the frozen snapshot include/exclude scope.")
-        if state["config"]["snapshot"]["mode"] == "git":
-            env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
-            result = subprocess.run(
-                ["git", "-c", "core.fsmonitor=false", "-C", str(project), "check-ignore", "-q", "--", relative],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                shell=False, timeout=10, check=False, env=env)
-            if result.returncode == 0:
-                raise GuardError("Git-ignored files are not in the reviewed source scope.")
-            if result.returncode != 1:
-                raise GuardError("Cannot establish whether this write is in the Git snapshot scope.")
 
     def context_fields(self, state: dict, run_dir: Path) -> dict:
         budget = self.summary(state)
+        workspace = state["workspace"]
         return {"review_count": budget["review_count"], "next_reviewer": budget["next_reviewer"],
-                "candidate_snapshot_id": (state.get("candidate") or {}).get("snapshot_id")}
+                "candidate_snapshot_id": (state.get("candidate") or {}).get("snapshot_id"),
+                "project": state["project"],
+                "workspace": {"path": workspace["path"], "identity_verified": workspace["identity"] is not None}}
 
     def summary(self, state: dict) -> dict:
         return review_budget(len(state["attempts"]), state["config"], state["status"])

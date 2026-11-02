@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 
-from .checks import bounded_run
+from ..common.git import run_git
 from ..common.errors import DevFlowError
 
 
@@ -132,19 +132,6 @@ def _safe_path(root: Path, relative: str) -> Path:
     return root.joinpath(*PurePosixPath(relative).parts)
 
 
-def _git(root: Path, *args: str, ok_codes: tuple[int, ...] = (0,)) -> bytes:
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"})
-    command = ["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-C", str(root), *args]
-    result = bounded_run(command, root, 30, max_output_bytes=8 * 1024 * 1024, env=env)
-    if result["error"]:
-        raise DevFlowError("Cannot inspect Git repository: " + result["error"])
-    if result["exit_code"] not in ok_codes:
-        message = result["stderr_bytes"].decode("utf-8", "replace").strip()[:1000]
-        raise DevFlowError(f"Git inspection failed ({result['exit_code']}): {message}")
-    return result["stdout_bytes"]
-
-
 def _scoped_status(raw: bytes, settings: dict) -> list[dict]:
     """Parse porcelain-v1 -z, including the extra source path for renames."""
     entries = raw.split(b"\0")
@@ -177,13 +164,13 @@ def _scoped_status(raw: bytes, settings: dict) -> list[dict]:
 
 def _git_inventory(root: Path, settings: dict) -> tuple[list[tuple[str, str | None]], dict]:
     try:
-        top = _git(root, "rev-parse", "--show-toplevel").decode("utf-8", "strict").strip()
+        top = run_git(root, "rev-parse", "--show-toplevel").decode("utf-8", "strict").strip()
         if Path(top).resolve() != root:
             raise DevFlowError("snapshot.mode=git requires the exact repository root; parent repositories are not selected implicitly.")
-        head_raw = _git(root, "rev-parse", "--verify", "HEAD", ok_codes=(0, 128))
+        head_raw = run_git(root, "rev-parse", "--verify", "HEAD", ok_codes=(0, 128))
         head = head_raw.decode("ascii", "strict").strip() or None
         candidates: dict[str, str | None] = {}
-        for entry in _git(root, "ls-files", "--stage", "-z").split(b"\0"):
+        for entry in run_git(root, "ls-files", "--stage", "-z").split(b"\0"):
             if not entry:
                 continue
             prefix, raw_path = entry.split(b"\t", 1)
@@ -191,10 +178,10 @@ def _git_inventory(root: Path, settings: dict) -> tuple[list[tuple[str, str | No
             if stage != "0":
                 raise DevFlowError("Unmerged Git index entries require human resolution before an implementation run starts.")
             candidates[raw_path.decode("utf-8", "strict")] = mode
-        for raw_path in _git(root, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0"):
+        for raw_path in run_git(root, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0"):
             if raw_path:
                 candidates[raw_path.decode("utf-8", "strict")] = None
-        status = _scoped_status(_git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all"), settings)
+        status = _scoped_status(run_git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all"), settings)
     except (UnicodeError, ValueError) as exc:
         raise DevFlowError("Git paths must have valid UTF-8 names and a readable index/status.") from exc
     return sorted(candidates.items()), {

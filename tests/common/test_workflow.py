@@ -1,6 +1,9 @@
 """The workflow contract: one command table from which the guard and the CLI derive."""
+import argparse
+import inspect
 import unittest
 
+from devflow_core import cli
 from devflow_core.common import guard
 from devflow_core.common.errors import GuardError
 from devflow_core.common.workflow import Command, Option
@@ -30,6 +33,30 @@ class CommandTableTests(unittest.TestCase):
                 self.assertNotIn("recover", workflow.actions)
                 recover = next(c for c in workflow.commands if c.name == "recover")
                 self.assertIn("confirm", [option.kind for option in recover.options])
+
+
+class StartContractTests(unittest.TestCase):
+    def test_every_workflow_builds_a_start_from_the_same_arguments(self):
+        for workflow in WORKFLOWS.values():
+            with self.subTest(workflow=workflow.name):
+                parameters = list(inspect.signature(workflow.build_start).parameters)
+                self.assertEqual(parameters, ["project", "pending", "options"])
+
+    def test_start_options_come_only_from_the_declared_extra_options(self):
+        parser = cli.parser()
+        implement = WORKFLOWS["implement"]
+        args = parser.parse_args(["implement", "start", "--plan", "plan.md", "--workspace", "../worktree"])
+        self.assertEqual(implement.start_options(args), {"workspace": "../worktree"})
+        args = parser.parse_args(["implement", "start", "--plan", "plan.md"])
+        self.assertEqual(implement.start_options(args), {"workspace": None})
+        # Plan declares no extra start option: nothing is read from args (not even workspace).
+        self.assertEqual(WORKFLOWS["plan"].start_options(argparse.Namespace()), {})
+        with self.assertRaises(cli.UsageError):
+            parser.parse_args(["implement", "start", "--plan", "plan.md", "--unknown", "x"])
+
+    def test_restricting_is_a_declared_property_not_a_name(self):
+        self.assertTrue(WORKFLOWS["plan"].restricts_tools)
+        self.assertFalse(WORKFLOWS["implement"].restricts_tools)
 
 
 if __name__ == "__main__":

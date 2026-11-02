@@ -48,7 +48,7 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual((run / "input.txt").read_bytes(), b"data\n")
         self.assertTrue((run / "draft").is_dir())
         self.assertEqual((self.project / ".devflow" / ".gitignore").read_text(), "# Private DevFlow records; never publish them.\n*\n")
-        self.assertEqual(self.state["schema_version"], 3)
+        self.assertEqual(self.state["schema_version"], runs.SCHEMA_VERSION)
         self.assertEqual(len(self.state["event_ids"]), 1)
 
     def test_failed_creation_leaves_no_run_directory(self):
@@ -80,7 +80,7 @@ class RunStoreTests(unittest.TestCase):
             state = self.store.load(self.run_id)
         desired = dict(state, note="journaled", state_revision=1)
         journal = self.store.run_dir(self.run_id) / "transaction.json"
-        atomic_json(journal, {"schema_version": 3, "base_revision": 0, "state": desired, "writes": {}})
+        atomic_json(journal, {"schema_version": runs.SCHEMA_VERSION, "base_revision": 0, "state": desired, "writes": {}})
         info = self.store.inspect(self.run_id)
         self.assertTrue(info.recovery_required)
         self.assertEqual(self.store.read(self.run_id)["note"], "n")
@@ -206,11 +206,19 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(runs.unsupported_message(previous, 2),
                          f"Run {previous} was started with DevFlow 0.2.x; this version cannot continue it")
         self.assertEqual(self.store.inspect(self.run_id).schema_version, runs.SCHEMA_VERSION)
+        # 0.3.x wrote format 3; it is now an older format that is never continued.
+        third = runs.new_run_id()
+        atomic_json(self.store.root / third / "state.json", {"schema_version": 3, "run_id": third, "flow": "toy",
+                                                              "project": str(self.project), "status": "x"})
+        info = self.store.inspect(third)
+        self.assertEqual((info.format, info.schema_version), ("unsupported", 3))
+        self.assertEqual(info.public()["message"], "Started with DevFlow 0.3.x; this version cannot continue it")
         bad = runs.new_run_id()
         (self.store.root / bad).mkdir()
         self.assertEqual((self.store.inspect(bad).format, self.store.inspect(bad).schema_version), ("invalid", None))
         listed, creating = self.store.scan()
-        self.assertEqual(sorted(info.format for info in listed), ["current", "invalid", "unsupported", "unsupported"])
+        self.assertEqual(sorted(info.format for info in listed),
+                         ["current", "invalid", "unsupported", "unsupported", "unsupported"])
         self.assertEqual(creating, [])
 
 

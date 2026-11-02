@@ -290,8 +290,10 @@ class HookCliEngineTests(FlowFixture):
         self.assertIsNone(report["workspace_capture_error"])
         self.assertEqual([call.args[0]["id"] for call in dispatch.call_args_list], ["codex", "opencode"])
         self.assertEqual(first["candidate"]["snapshot_id"], second["candidate"]["snapshot_id"])
-        blocked = hook(self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(self.source)}), PLUGIN)
-        self.assertEqual(blocked["hookSpecificOutput"]["permissionDecision"], "deny")
+        # Implement never denies (D1), even after completion; the report above
+        # records the exact snapshot that was reviewed.
+        self.assertIsNone(hook(self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(self.source)}),
+                               PLUGIN))
 
     def test_status_command_is_usable_in_its_documented_form(self):
         self.start()
@@ -392,14 +394,12 @@ class HookCliEngineTests(FlowFixture):
         resumed = self.invoke("status", session=new_session)
         self.assertEqual(resumed["review_count"], 1)
         self.assertEqual(resumed["next_reviewer"], "opencode")
-        # The previous session no longer owns the run: it keeps only non-writing
-        # work until it explicitly resumes again (or the run ends), never silently freed.
-        stale = hook(self.event("PreToolUse", tool_name="Bash", tool_input={"command": "normal user work"}), PLUGIN)
-        self.assertEqual(stale["hookSpecificOutput"]["permissionDecision"], "deny")
-        stale = hook(self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(self.source)}), PLUGIN)
-        self.assertEqual(stale["hookSpecificOutput"]["permissionDecision"], "deny")
-        self.assertIsNone(hook(self.event("PreToolUse", tool_name="Read", tool_input={"file_path": str(self.source)}),
-                               PLUGIN))
+        # The previous session no longer owns the run. Implement never denies it
+        # (D1); nothing it does is recorded, and its binding stays until it
+        # resumes again or the run ends.
+        for tool, data in (("Bash", {"command": "normal user work"}), ("Write", {"file_path": str(self.source)}),
+                           ("Read", {"file_path": str(self.source)})):
+            self.assertIsNone(hook(self.event("PreToolUse", tool_name=tool, tool_input=data), PLUGIN))
         before = len(read_json(Path(self.engine.status(self.run_id)["run_dir"]) / "state.json")["event_ids"])
         context = self.submit("Keep going here")["hookSpecificOutput"]["additionalContext"]
         self.assertIn("/devflow:resume " + self.run_id, context)
@@ -444,10 +444,10 @@ class HookCliEngineTests(FlowFixture):
         self.start()
         cancelled = self.invoke("cancel", "--reason", "No implementation requested")
         report_path = Path(cancelled["run_dir"]) / cancelled["report_path"]
+        # Implement never denies a write, even to its own records (D1). A
+        # recorded report must still fail its integrity check when read.
         decision = hook(self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(report_path)}), PLUGIN)
-        self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
-        # External tampering is not a simulated model tool operation. A recorded
-        # report must still fail its integrity check when read by the engine.
+        self.assertIsNone(decision)
         forged = dict(cancelled["report"], all_reviewers_approved=True)
         write_json(report_path, forged)
         message = self.invoke("status", expect=2)

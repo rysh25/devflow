@@ -23,7 +23,7 @@ from .common.settings import validate_document
 from .workflows import WORKFLOWS
 
 PLUGIN_ROOT = paths.PLUGIN_ROOT
-MINIMUM_CLAUDE_CODE = "2.1.295"
+MINIMUM_CLAUDE_CODE = "2.1.316"
 MAX_HOOK_BYTES = 16 * 1024 * 1024
 
 
@@ -145,7 +145,8 @@ def main(argv=None) -> int:
         elif args.action == "start":
             if args.run:
                 raise DevFlowError("A new start cannot target an existing run")
-            emit(router.runner_start(project, args.session, command, args.start_value))
+            options = WORKFLOWS[command].start_options(args)
+            emit(router.runner_start(project, args.session, command, args.start_value, options))
         else:
             run_id = router.selected_run(project, args.session, command, args.run)
             if run_id is None:

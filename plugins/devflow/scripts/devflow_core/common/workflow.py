@@ -54,6 +54,11 @@ class Command:
             raise ValueError(f"Action {self.name!r} available to Claude has an option the guard cannot check")
 
 
+def option_name(flag: str) -> str:
+    """The Python name of a runner flag: ``--workspace`` -> ``workspace``."""
+    return flag.lstrip("-").replace("-", "_")
+
+
 class Workflow:
     #: Public name: the slash command, runner selector and record directory.
     name: str = ""
@@ -69,6 +74,13 @@ class Workflow:
     #: Runner option of the ``start`` action that must match the pending
     #: request; ``None`` when the run is created inside the prompt hook.
     start_option: str | None = None
+    #: Further ``start`` options, chosen by Claude rather than the user's
+    #: command; never compared with the pending request.
+    extra_start_options: tuple[Option, ...] = ()
+    #: True: DevFlow's PreToolUse guard limits tools while a run is active.
+    #: False: DevFlow never denies a tool; Claude Code's own settings and
+    #: permission mode decide, and DevFlow only records and verifies.
+    restricts_tools: bool = True
     #: Workflow-specific guidance added to hook context.
     guidance: str = ""
 
@@ -96,9 +108,18 @@ class Workflow:
         """Canonical start argument; the guard and the engine compare these."""
         raise NotImplementedError
 
-    def build_start(self, project: Path, pending: dict) -> tuple[dict, dict[str, bytes]]:
-        """Return the workflow fields (including ``status``) and initial artifacts."""
+    def build_start(self, project: Path, pending: dict, options: dict) -> tuple[dict, dict[str, bytes]]:
+        """Return the workflow fields (including ``status``) and initial artifacts.
+
+        ``options`` holds the values of ``extra_start_options`` (by
+        ``option_name``); it is empty when the run starts inside the hook.
+        """
         raise NotImplementedError
+
+    def start_options(self, args: argparse.Namespace) -> dict:
+        """Values of ``extra_start_options`` from parsed runner arguments (absent ones are None)."""
+        return {option_name(option.flag): getattr(args, option_name(option.flag), None)
+                for option in self.extra_start_options}
 
     def can_transfer(self, state: dict, session: str) -> str | None:
         """Return a refusal reason, or ``None`` when ownership may move."""
@@ -178,6 +199,8 @@ class Workflow:
         if self.start_option:
             start = parsers.add_parser("start", help="Create the run requested by the user's pending command")
             start.add_argument(self.start_option, dest="start_value", required=True)
+            for option in self.extra_start_options:
+                start.add_argument(option.flag, dest=option_name(option.flag), required=option.required)
 
     def run_command(self, args: argparse.Namespace, project: Path, run_id: str | None, session: str | None) -> Any:
         command = next(item for item in self.commands if item.name == args.action)

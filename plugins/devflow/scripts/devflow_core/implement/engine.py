@@ -5,6 +5,7 @@ from pathlib import Path
 
 from . import checks, snapshot
 from .review import validate_review
+from .workspace import verify_workspace
 from ..common.errors import DevFlowError
 from ..common.review import all_approved, next_reviewer
 from ..common.reviewers import preflight, run_review
@@ -12,8 +13,6 @@ from ..common.engine import RunEngine
 from ..common.runs import RUNNER_WAIT, TERMINAL, open_escalation
 from ..common.sessions import approval_candidates
 from ..common.storage import checked_text, digest, json_bytes, no_symlinks, now, read_json, within
-
-EDIT_STATUSES = frozenset({"implementing", "needs_revision"})
 
 
 def _plan_bytes(path: Path, limit: int) -> bytes:
@@ -53,6 +52,10 @@ class Engine(RunEngine):
     def _owner(self, state, session_id):
         self._require_owner(state, session_id)
 
+    def _workspace(self, state) -> Path:
+        """The frozen workspace, re-verified (path, repository, directory identity)."""
+        return verify_workspace(self.project, state["workspace"], state["config"]["snapshot"]["mode"])
+
     def _draft(self, state, path):
         path = Path(path)
         if not path.is_absolute():
@@ -81,7 +84,7 @@ class Engine(RunEngine):
             self._require(state,{"implementing","ready_check","ready_review"})
             self._verify(state)
             summary = checked_text(self._draft(state, summary_file), 256*1024)
-            current = snapshot.capture(self.project,state["config"])
+            current = snapshot.capture(self._workspace(state),state["config"])
             delta = snapshot.compare(read_json(self._run(run_id)/"baseline.json"),current)
             number = state["checkpoint_count"] + 1
             base = f"snapshots/{number:03}"
@@ -104,7 +107,7 @@ class Engine(RunEngine):
         candidate = state.get("candidate")
         if not candidate:
             raise DevFlowError("Create a checkpoint first")
-        current = snapshot.capture(self.project,state["config"])
+        current = snapshot.capture(self._workspace(state),state["config"])
         if current["snapshot_id"] != candidate["snapshot_id"]:
             raise DevFlowError("Code changed since checkpoint; create a fresh checkpoint and rerun checks")
         return current
@@ -120,11 +123,14 @@ class Engine(RunEngine):
             state["check_attempts"] += 1
             state["check_dispatch_count"] += 1
             index = state["check_dispatch_count"]
-            # No lock is held while project code runs.
-            return index, state["candidate"]["snapshot_id"], None, {"index": index, "checks": state["config"]["checks"]}
+            # No lock is held while project code runs. Checks run in the
+            # workspace that _current has just verified.
+            return index, state["candidate"]["snapshot_id"], None, {
+                "index": index, "checks": state["config"]["checks"], "root": state["workspace"]["path"]}
 
         def execute(work):
-            return checks.run_checks(self.project, work["checks"], self._run(run_id) / "check-processes" / f"{work['index']:03}")
+            return checks.run_checks(Path(work["root"]), work["checks"],
+                                     self._run(run_id) / "check-processes" / f"{work['index']:03}")
 
         return self._dispatch(run_id, "checking", "check", prepare, execute, self._finish_check)
 
@@ -360,13 +366,15 @@ def verify_source(state):
         raise DevFlowError("Original plan changed/missing. Resolve requirements and start a new run; do not silently replace it")
 
 
-def terminal_report(project, state):
+def terminal_report(project, state, observed=(), observed_error=None):
     """Evidence at the moment a run ends; later edits are not covered."""
     candidate = state.get("candidate") or {}
     actual = None
     capture_error = None
     try:
-        actual = snapshot.capture(project,state["config"])["snapshot_id"]
+        # A removed or recreated workspace is reported, never captured.
+        root = verify_workspace(project, state["workspace"], state["config"]["snapshot"]["mode"])
+        actual = snapshot.capture(root,state["config"])["snapshot_id"]
     except (DevFlowError,OSError) as exc:
         # Cancellation must remain possible even if a new unsafe/oversized
         # file prevents capture. Unknown is never represented as a pass.
@@ -381,5 +389,8 @@ def terminal_report(project, state):
         "final_workspace_verified":bool(matches) and validation.get("snapshot_id") == actual and validation.get("status") in {"passed","human_attested"},
         "workspace_capture_error":capture_error,"final_snapshot_reviewed":reviewed,
         "unreviewed_final_changes":(actual != state["baseline_id"] and not reviewed) if actual else None,
+        "workspace":state["workspace"],
+        "prefilled_question_events":None if observed is None else list(observed),
+        "prefilled_question_events_error":observed_error,
         "reported_at":now(),"automatic_commit_push_deploy":False,
         "note":"This report describes its captured snapshot and time only. Later edits are not covered. Reviews/checks are not a correctness guarantee or permission to publish."}

@@ -48,7 +48,7 @@ COMMANDS = (
             (Option("--event-id", "event"), Option("--decision", "decision"), Option("--reason", "text"))),
     Command("cancel", "Keep all audit data and stop the run",
             lambda e, a, run, s: e.cancel(run, s, a.reason), (Option("--reason", "text"),)),
-    Command("recover", "HUMAN ONLY: first verify no associated process remains alive",
+    Command("recover", "For a human after confirming no associated process remains alive (not enforced by a guard)",
             lambda e, a, run, s: e.recover(run, a.confirm_process_stopped),
             (Option("--confirm-process-stopped", "confirm"),), claude=False),
 )

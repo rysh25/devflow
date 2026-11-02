@@ -22,7 +22,7 @@ import unittest
 from unittest.mock import patch
 
 from devflow_core import router
-from devflow_core.common import sessions
+from devflow_core.common import runs, sessions
 from devflow_core.common.errors import DevFlowError
 from devflow_core.common.paths import PLUGIN_ROOT
 from devflow_core.common.storage import atomic_write_json, digest, json_bytes, read_json
@@ -254,7 +254,7 @@ class EngineFlowTests(EngineFixture):
         self.preflight.assert_not_called()
         self.reviewer.assert_not_called()
         request = read_json(self.run / "request.json")
-        self.assertEqual(request["intent"], {"action": "start", "args": str(self.plan)})
+        self.assertEqual(request["intent"], {"action": "start", "args": str(self.plan), "workspace": None})
         self.assertIn(str(self.plan), request["event"]["payload"]["prompt"])
         self.assertEqual(request["event"]["event_id"], self.state()["event_ids"][0])
 
@@ -696,8 +696,13 @@ class HumanEvidenceTests(EngineFixture):
                          f"/devflow:resume {self.run_id}")
         with self.assertRaises(DevFlowError):
             self.engine.resolve(self.run_id, self.session, resume_event, "continue", "Resume is not an answer.")
-        with self.assertRaises(DevFlowError):
-            self.answer("A stale session cannot answer for the new owner.", session=old_session)
+        # A stale implement session is neither denied nor recorded: its answer
+        # never reaches the run (no event, no hook context).
+        events_before = read_json(self.run / "state.json")["event_ids"]
+        self.assertIsNone(self.hook("PostToolUse", old_session, tool_name="AskUserQuestion", tool_use_id="stale-1",
+                                    tool_input={"questions": [{"question": "Continue with this exact version?"}]},
+                                    tool_response={"answers": {"Continue with this exact version?": "Yes"}}))
+        self.assertEqual(read_json(self.run / "state.json")["event_ids"], events_before)
         event = self.answer("New owner confirms VALUE = 1 after seeing the question.")
         self.assertEqual([item["event_id"] for item in self.engine.status(self.run_id)["human_events"]], [event])
         result = self.engine.resolve(self.run_id, self.session, event, "continue", "New-session explicit answer.")
@@ -745,6 +750,24 @@ class HumanEvidenceTests(EngineFixture):
         self.assertIsNone(result["validation"])
         self.assertFalse(result["report"]["all_reviewers_approved"])
         self.assertFinalReportSaved(result)
+
+    def test_cancel_is_saved_even_if_an_event_file_is_damaged(self):
+        # Review finding: the final report lists prefilled questions; a damaged
+        # event file is reported there instead of blocking the cancellation.
+        self.start()
+        event_id = self.state()["event_ids"][0]
+        (self.run / "events" / f"{event_id}.json").write_text("{}", encoding="utf-8")
+        result = self.engine.cancel(self.run_id, self.session, "Stop here.")
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(self.state()["status"], "cancelled")
+        self.assertIsNone(result["report"]["prefilled_question_events"])
+        self.assertIn("Invalid human event record", result["report"]["prefilled_question_events_error"])
+        self.assertFinalReportSaved(result)
+        # Status is display only: it reports the unreadable events instead of failing.
+        self.assertEqual(result["human_events"], [])
+        self.assertIsNone(result["observations"])
+        self.assertIn("Invalid human event record", result["events_error"])
+        self.assertIsNone(self.engine.status(self.run_id)["observations"])
 
 
 class RecoveryAndIntegrityTests(EngineFixture):
@@ -908,7 +931,7 @@ class RecoveryAndIntegrityTests(EngineFixture):
         desired["state_revision"] += 1
         desired["last_error"] = "Recovered pending transaction fixture."
         desired["artifacts"][relative] = digest(payload)
-        journal = {"schema_version": 3, "base_revision": current["state_revision"], "state": desired,
+        journal = {"schema_version": runs.SCHEMA_VERSION, "base_revision": current["state_revision"], "state": desired,
                    "writes": {relative: base64.b64encode(payload).decode("ascii")}}
         atomic_write_json(self.run / "transaction.json", journal)
         return current, desired, relative, payload
@@ -986,31 +1009,32 @@ class RecoveryAndIntegrityTests(EngineFixture):
         self.assertTrue((self.run / "transaction.json").exists())
         self.assertTrue(lock.exists())
 
-    def test_source_edits_are_blocked_through_checks_reviews_and_final_turn(self):
+    def test_source_edits_are_never_denied_but_invalidate_stale_results(self):
+        # Decision D1: implement never denies a tool. Changed code is detected
+        # by the snapshot hash instead, before and after every check and review.
         self.start()
-        self.assertIsNone(self.tool(file_path=str(self.source)))
-        self.assertDenied(self.tool(file_path=str(self.plan)))
-        self.assertDenied(self.tool(file_path=str(self.run / "state.json")))
+        for path in (self.source, self.plan, self.run / "state.json", self.draft / "notes.md"):
+            self.assertIsNone(self.tool(file_path=str(path)))
+        self.source.write_text("VALUE = 1\n", encoding="utf-8")
         self.checkpoint()
-        self.assertDenied(self.tool(file_path=str(self.source)))
-        self.engine.check(self.run_id, self.session)
-        self.assertDenied(self.tool(file_path=str(self.source)))
+        self.assertIsNone(self.tool(file_path=str(self.source)))
+        self.source.write_text("VALUE = 1\n# edited after the checkpoint\n", encoding="utf-8")
+        with self.assertRaisesRegex(DevFlowError, "changed since checkpoint"):
+            self.engine.check(self.run_id, self.session)
+        self.source.write_text("VALUE = 1\n", encoding="utf-8")
+        self.assertEqual(self.engine.check(self.run_id, self.session)["status"], "ready_review")
 
-        def inspect(*args):
-            self.assertDenied(self.tool(file_path=str(self.source)))
-            self.assertIsNone(self.tool(file_path=str(self.draft / "notes.md")))
+        def edit_during_review(*args):
+            self.assertIsNone(self.tool(file_path=str(self.source)))
+            self.source.write_text("VALUE = 2\n", encoding="utf-8")
             return self.respond(*args)
 
-        self.reviewer.side_effect = inspect
-        self.review()
-        self.review()
-        self.assertDenied(self.tool(file_path=str(self.source)))
-        self.assertIsNone(self.prompt("Thanks. The bounded implementation task is finished."))
-        self.assertIsNone(self.tool(file_path=str(self.source)))
-
-
-class ExternalProcessTests(EngineFixture):
-    """Checks and reviews hold no lock while the external process runs."""
+        self.reviewer.side_effect = edit_during_review
+        result = self.review()
+        self.assertEqual(result["status"], "paused_error")
+        self.assertIn("changed since checkpoint", result["last_error"])
+        self.assertEqual(result["review_count"], 1)
+        self.assertEqual(result["attempts"][-1]["status"], "failed")
 
     def run_checks_with(self, during):
         original = checks_module.run_checks

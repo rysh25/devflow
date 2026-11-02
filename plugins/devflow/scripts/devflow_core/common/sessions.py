@@ -246,12 +246,20 @@ def approval_candidates(state: dict, events: list[dict]) -> list[dict]:
     escalation = state.get("escalation")
     if not escalation:
         return []
+    # A question whose answers the model filled in before the screen (recorded as
+    # an observation at PreToolUse) is never a human answer. Observations are
+    # collected from every event, including those before the boundary.
+    prefilled = {(event["payload"].get("session_id"), event["payload"].get("tool_use_id"))
+                 for event in events if event["kind"] == "observation"}
     result = []
     for event in events[escalation["boundary"]:]:
         payload = event["payload"]
         if (event["kind"] != "question" or payload.get("is_error")
                 or payload.get("session_id") != state["owner_session"]
-                or payload.get("hook_event_name") != "PostToolUse" or payload.get("tool_name") != "AskUserQuestion"):
+                or payload.get("hook_event_name") != "PostToolUse" or payload.get("tool_name") != "AskUserQuestion"
+                # Only answers in the main conversation count, not a subagent's.
+                or payload.get("agent_id")
+                or (payload.get("session_id"), payload.get("tool_use_id")) in prefilled):
             continue
         try:
             text = human_answer_text(payload.get("tool_response"))

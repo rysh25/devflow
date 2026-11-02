@@ -8,11 +8,12 @@ never grants tool permissions or dispatches a model itself.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import os
 from pathlib import Path
 
 from . import __version__
 from .common import guard, sessions
-from .common.paths import project_root
+from .common.paths import hook_project, project_root
 from .common.errors import DevFlowError
 from .common.runs import (HOOK_WAIT, RUNNER_WAIT, TERMINAL, RunStore, data_root, ensure_data_root,
                           event_bytes, make_event, new_run_id, unsupported_message, validate_run_id)
@@ -85,9 +86,10 @@ def assert_available(project: Path, session: str, all_stores: dict[str, RunStore
                                "finish it in that session, or have a human move the record away")
 
 
-def _create(project: Path, session: str, pending: dict, all_stores: dict[str, RunStore]) -> dict:
+def _create(project: Path, session: str, pending: dict, all_stores: dict[str, RunStore],
+            options: dict | None = None) -> dict:
     workflow = WORKFLOWS[pending["flow"]]
-    fields, artifacts = workflow.build_start(project, pending)
+    fields, artifacts = workflow.build_start(project, pending, dict(options or {}))
     return all_stores[pending["flow"]].create(fields, artifacts, run_id=pending["run_id"], owner=session,
                                               first_event=pending["event"])
 
@@ -119,11 +121,14 @@ def _context(event: str, flow: str, state: dict, store: RunStore, plugin_root: P
 
 
 def _inactive_reason(current: sessions.Binding) -> str:
+    restricted = WORKFLOWS[current.flow].restricts_tools
     if not current.supported:
         return (unsupported_message(current.run_id, current.schema_version)
-                + "; only non-writing work is available until your next prompt releases it.")
+                + ("; only non-writing work is available until your next prompt releases it." if restricted
+                   else "; your next prompt releases it."))
+    available = "Only non-writing work is available here; " if restricted else "DevFlow does not record this session; "
     return (f"This session no longer owns DevFlow run {current.run_id} (or its resume did not complete). "
-            f"Only non-writing work is available here; send /devflow:resume {current.run_id} to continue the run.")
+            f"{available}send /devflow:resume {current.run_id} to continue the run.")
 
 
 def _start(project: Path, session: str, flow: str, argument: str, payload: dict, record: dict,
@@ -140,13 +145,15 @@ def _start(project: Path, session: str, flow: str, argument: str, payload: dict,
     record = dict(record, run=None, pending_start=pending)
     sessions.write_record(project, record, WORKFLOWS)
     if workflow.start_option is not None:
+        extra = "".join(f" {option.flag} is optional." for option in workflow.extra_start_options)
+        limits = ("until it starts, only non-writing tools, the allowed Bash commands, diagnostics and this start "
+                  "are available. " if workflow.restricts_tools else "")
         return guard.context("UserPromptSubmit", (
             f"DevFlow {flow} start is pending. Run the {flow} start action with {workflow.start_option} naming "
-            f"exactly this input; until it starts, only non-writing tools, the allowed Bash commands, "
-            f"diagnostics and this start are available. "
+            f"exactly this input;{extra} {limits}"
             f"Runner: {guard.runner_path(plugin_root)}. Pending input: {args}"))
     try:
-        state = _create(project, session, pending, all_stores)
+        state = _create(project, session, pending, all_stores, {})
     except Exception:
         # No run exists after a failed creation; drop the pending start so it
         # cannot block other sessions. A killed process is settled next prompt.
@@ -180,7 +187,7 @@ def _resume(project: Path, session: str, argument: str, payload: dict, record: d
     return _context("UserPromptSubmit", flow, state, store, plugin_root, state["event_ids"][-1])
 
 
-def runner_start(project: Path, session: str | None, flow: str, raw: str) -> dict:
+def runner_start(project: Path, session: str | None, flow: str, raw: str, options: dict | None = None) -> dict:
     """``FLOW start`` from the runner: creates exactly the run the user asked for."""
     if not session:
         raise DevFlowError("start requires the actual current Claude session ID")
@@ -195,7 +202,7 @@ def runner_start(project: Path, session: str | None, flow: str, raw: str) -> dic
         if workflow.normalize_args(raw, project) != pending["args"]:
             raise DevFlowError(f"The {workflow.start_option} value does not match the user's explicit start command")
         assert_available(project, session, all_stores)
-        state = _create(project, session, pending, all_stores)
+        state = _create(project, session, pending, all_stores, options)
         sessions.write_record(project, _bound(record, flow, state["run_id"]), WORKFLOWS)
     result = workflow.engine(project).status(state["run_id"])
     warnings = workflow.timeout_warnings(workflow.frozen_config(state))
@@ -223,7 +230,7 @@ def selected_run(project: Path, session: str | None, flow: str, explicit: str | 
     return None
 
 
-def handle_hook(payload: dict, plugin_root: Path) -> dict | None:
+def handle_hook(payload: dict, plugin_root: Path, environ=None) -> dict | None:
     if not isinstance(payload, dict):
         raise DevFlowError("Hook input must be a JSON object")
     event = payload.get("hook_event_name")
@@ -232,7 +239,7 @@ def handle_hook(payload: dict, plugin_root: Path) -> dict | None:
     cwd, session = payload.get("cwd"), payload.get("session_id")
     if not isinstance(cwd, str) or not cwd or not isinstance(session, str) or not sessions.SESSION_ID.fullmatch(session):
         raise DevFlowError("Hook requires project cwd and a valid Claude session ID")
-    project = project_root(Path(cwd))
+    project = hook_project(Path(cwd), os.environ if environ is None else environ)
     all_stores = stores(project, HOOK_WAIT)
     record = sessions.read_record(project, session, WORKFLOWS)
     if event == "UserPromptSubmit":
@@ -248,44 +255,107 @@ def handle_hook(payload: dict, plugin_root: Path) -> dict | None:
         elif command in WORKFLOWS:
             WORKFLOWS[command].normalize_args(argument, project)
             event_bytes(make_event(payload, "prompt"))
-        with dispatch_lock(project, HOOK_WAIT):
-            original = sessions.read_record(project, session, WORKFLOWS) or sessions.empty_record(session)
-            record = _settle(project, original, all_stores)
-            if record != original:
-                # Kept even if the command below fails (e.g. resuming a 0.2.x run).
-                sessions.write_record(project, record, WORKFLOWS)
-            if command == RESUME:
-                return _resume(project, session, argument, payload, record, all_stores, plugin_root)
-            if command in WORKFLOWS:
-                return _start(project, session, command, argument, payload, record, all_stores, plugin_root)
-            sessions.write_record(project, record, WORKFLOWS)
-            current = sessions.binding(project, record, all_stores)
-            if current is None:
-                return None
-            if not current.owner:
-                # A prompt here is ordinary conversation, never a human event of the run.
-                return guard.context(event, _inactive_reason(current))
-            store = all_stores[current.flow]
-            event_id = store.append_event(current.run_id, payload, "prompt")
-            return _context(event, current.flow, store.read(current.run_id), store, plugin_root, event_id)
+        if command is None and _records_only(record):
+            # A flow that never restricts tools never blocks the human's prompt:
+            # if its run cannot be read or recorded, the prompt goes through
+            # with a warning (DevFlow commands above still fail visibly).
+            try:
+                return _submit(project, session, None, "", payload, all_stores, plugin_root)
+            except (DevFlowError, OSError, ValueError) as exc:
+                return guard.context(event, _unrecorded(record, exc, "this prompt was not recorded as a run event."))
+        return _submit(project, session, command, argument, payload, all_stores, plugin_root)
     if record is None:
         return None
     pending = record["pending_start"]
     if pending:
-        if event == "PreToolUse":
-            return guard.pending_decision(payload, project, plugin_root, pending, WORKFLOWS[pending["flow"]], WORKFLOWS)
+        workflow = WORKFLOWS[pending["flow"]]
+        if event == "PreToolUse" and workflow.restricts_tools:
+            return guard.pending_decision(payload, project, plugin_root, pending, workflow, WORKFLOWS)
         return None  # No run exists yet, so nothing is recorded as evidence.
+    if _records_only(record):
+        if event == "PreToolUse" and not (payload.get("tool_name") == "AskUserQuestion"
+                                          and guard.prefilled_question(payload.get("tool_input"))):
+            # An ordinary call in a flow that never denies: return before reading
+            # the run, so a damaged or unreadable run never blocks normal work.
+            # Only a prefilled question needs the run (its owner, its record).
+            return None
+        if event != "PreToolUse":
+            # Recording an answer or a stop never blocks in such a flow; an
+            # answer that was not recorded is said so, and cannot resolve anything.
+            try:
+                return _tool_event(project, event, payload, record, all_stores, plugin_root)
+            except (DevFlowError, OSError, ValueError) as exc:
+                if event == "Stop":
+                    return None
+                return guard.context(event, _unrecorded(
+                    record, exc, "this answer was not recorded and cannot resolve a DevFlow escalation."))
+    return _tool_event(project, event, payload, record, all_stores, plugin_root)
+
+
+def _records_only(record: dict | None) -> bool:
+    """The session's run (or pending start) belongs to a flow that never restricts tools."""
+    target = record and (record["run"] or record["pending_start"])
+    return bool(target) and not WORKFLOWS[target["flow"]].restricts_tools
+
+
+def _unrecorded(record: dict, exc: Exception, what: str) -> str:
+    target = record["run"] or record["pending_start"]
+    return (f"DevFlow could not read or record {target['flow']} run {target['run_id']} ({exc}); {what} "
+            f"DevFlow does not restrict tools in {target['flow']}. Check the run with the runner's status "
+            "command and tell the human; do not repair or replace run records.")
+
+
+def _submit(project: Path, session: str, command: str | None, argument: str, payload: dict,
+            all_stores: dict[str, RunStore], plugin_root: Path) -> dict | None:
+    """UserPromptSubmit for a session with a record or a DevFlow command."""
+    event = "UserPromptSubmit"
+    with dispatch_lock(project, HOOK_WAIT):
+        original = sessions.read_record(project, session, WORKFLOWS) or sessions.empty_record(session)
+        record = _settle(project, original, all_stores)
+        if record != original:
+            # Kept even if the command below fails (e.g. resuming a 0.2.x run).
+            sessions.write_record(project, record, WORKFLOWS)
+        if command == RESUME:
+            return _resume(project, session, argument, payload, record, all_stores, plugin_root)
+        if command in WORKFLOWS:
+            return _start(project, session, command, argument, payload, record, all_stores, plugin_root)
+        sessions.write_record(project, record, WORKFLOWS)
+        current = sessions.binding(project, record, all_stores)
+        if current is None:
+            return None
+        if not current.owner:
+            # A prompt here is ordinary conversation, never a human event of the run.
+            return guard.context(event, _inactive_reason(current))
+        store = all_stores[current.flow]
+        event_id = store.append_event(current.run_id, payload, "prompt")
+        return _context(event, current.flow, store.read(current.run_id), store, plugin_root, event_id)
+
+
+def _tool_event(project: Path, event: str, payload: dict, record: dict, all_stores: dict[str, RunStore],
+                plugin_root: Path) -> dict | None:
+    """PreToolUse, PostToolUse and Stop for a session bound to a run."""
     current = sessions.binding(project, record, all_stores)
     if current is None:
         return None
+    workflow = WORKFLOWS[current.flow]
     if not current.owner:
+        if not workflow.restricts_tools:
+            return None  # Never denied, never recorded: this session does not own the run.
         if event == "PreToolUse":
             return guard.inactive_decision(payload, project, plugin_root, WORKFLOWS, _inactive_reason(current))
         if event == "Stop":
             return None  # Nothing is recorded for a run this session does not own.
         raise DevFlowError("A stale session cannot contribute human events to a transferred run")
-    workflow, store = WORKFLOWS[current.flow], all_stores[current.flow]
+    store = all_stores[current.flow]
     if event == "PreToolUse":
+        if not workflow.restricts_tools:
+            # Only a prefilled AskUserQuestion reaches this point (see handle_hook).
+            # Record, never deny: the answers are visible only here, because
+            # the question screen adds the human's answers before PostToolUse.
+            # A failure to record blocks this one call (onFailure: block), so an
+            # unrecorded prefill can never later count as a human answer.
+            store.append_event(current.run_id, payload, "observation")
+            return None
         return guard.bound_decision(payload, project, plugin_root, current.state,
                                     store.run_dir(current.run_id), workflow, WORKFLOWS)
     if event == "PostToolUse":

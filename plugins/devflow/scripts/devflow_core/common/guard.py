@@ -14,7 +14,7 @@ import re
 import stat
 
 from .errors import DevFlowError, GuardError, ShellPolicyError
-from .paths import PROJECT_MARKERS, msys_path, project_root
+from .paths import PROJECT_MARKERS, msys_path, project_root, same_path
 from .runs import EVENT_ID, SESSION_ID
 from .shell import ALLOWED_SUMMARY, check_command, powershell_tokens, shell_tokens
 from .storage import no_symlinks
@@ -67,10 +67,6 @@ def as_path(value: object, cwd: Path) -> Path:
         raise GuardError("Expected a nonempty, single-line file path.")
     candidate = Path(value)
     return candidate if candidate.is_absolute() else Path(cwd) / candidate
-
-
-def same_path(left: Path, right: Path) -> bool:
-    return os.path.normcase(str(Path(left).resolve())) == os.path.normcase(str(Path(right).resolve()))
 
 
 def inside(path: Path, base: Path) -> bool:
@@ -337,11 +333,25 @@ def _malformed(payload: dict):
     return tool, data
 
 
-def pending_decision(payload: dict, project: Path, plugin_root: Path, pending: dict, workflow, workflows) -> dict | None:
-    """Before a run exists: non-writing work, diagnostics and the exact start only."""
+def prefilled_question(data: object) -> bool:
+    """True when the model itself filled the fields the question screen fills in.
+
+    Only meaningful at PreToolUse: by PostToolUse the screen has added the
+    human's answers and notes to these same fields.
+    """
+    return isinstance(data, dict) and any(data.get(field) for field in SCREEN_FILLED_QUESTION_FIELDS)
+
+
+def pending_refusal(payload: dict, project: Path, plugin_root: Path, pending: dict, workflow,
+                    workflows) -> str | None:
+    """Before a run exists: non-writing work, diagnostics and the exact start only.
+
+    Returns the reason to refuse, or None. Every error becomes a reason, so a
+    refusal never turns into a hook failure.
+    """
     tool, data = _malformed(payload)
     if tool is None:
-        return deny("Malformed tool input; no tool has been authorized.")
+        return "Malformed tool input; no tool has been authorized."
     try:
         allowed, call = _non_writing(tool, data, payload, project, plugin_root, workflows)
         if allowed:
@@ -349,41 +359,54 @@ def pending_decision(payload: dict, project: Path, plugin_root: Path, pending: d
         if call is not None:
             if (call.command == workflow.name and call.action == "start" and workflow.start_option
                     and "--run" not in call.selectors):
-                values = parse_options(call.args, {workflow.start_option: "text"})
+                spec = {workflow.start_option: "text",
+                        **{option.flag: option.kind + ("" if option.required else "?")
+                           for option in workflow.extra_start_options}}
+                values = parse_options(call.args, spec)
                 if workflow.normalize_args(values[workflow.start_option], project) != pending["args"]:
                     raise GuardError("Start must use exactly the input named by the user's command.")
                 return None
             raise GuardError("Start the pending workflow first; until then only non-writing tools, the allowed Bash "
                              "commands, diagnostics and this exact start are available.")
-        return deny(f"Tool {tool!r} is not available until the pending {workflow.name} run starts.")
+        return f"Tool {tool!r} is not available until the pending {workflow.name} run starts."
     except (DevFlowError, OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
-        return deny(str(exc))
+        return str(exc)
 
 
-def inactive_decision(payload: dict, project: Path, plugin_root: Path, workflows, reason: str) -> dict | None:
+def pending_decision(payload: dict, project: Path, plugin_root: Path, pending: dict, workflow, workflows) -> dict | None:
+    reason = pending_refusal(payload, project, plugin_root, pending, workflow, workflows)
+    return None if reason is None else deny(reason)
+
+
+def inactive_refusal(payload: dict, project: Path, plugin_root: Path, workflows, reason: str) -> str | None:
     """A session bound to a run it does not own (transferred, or from an older
     DevFlow format): non-writing work and diagnostics only."""
     tool, data = _malformed(payload)
     if tool is None:
-        return deny("Malformed tool input; no tool has been authorized.")
+        return "Malformed tool input; no tool has been authorized."
     try:
         allowed, _ = _non_writing(tool, data, payload, project, plugin_root, workflows)
-        return None if allowed else deny(reason)
+        return None if allowed else reason
     except (DevFlowError, OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
-        return deny(str(exc))
+        return str(exc)
 
 
-def bound_decision(payload: dict, project: Path, plugin_root: Path, state: dict, run_dir: Path, workflow,
-                   workflows) -> dict | None:
+def inactive_decision(payload: dict, project: Path, plugin_root: Path, workflows, reason: str) -> dict | None:
+    refusal = inactive_refusal(payload, project, plugin_root, workflows, reason)
+    return None if refusal is None else deny(refusal)
+
+
+def bound_refusal(payload: dict, project: Path, plugin_root: Path, state: dict, run_dir: Path, workflow,
+                  workflows) -> str | None:
     """The owning session of a run: non-writing work plus what the workflow permits."""
     tool, data = _malformed(payload)
     if tool is None:
-        return deny("Malformed tool input; no tool has been authorized.")
+        return "Malformed tool input; no tool has been authorized."
     if tool == "AskUserQuestion":
         # This is the only point that sees the model's own call: the question
         # screen adds the human's answers and notes afterwards.
-        if any(data.get(field) for field in SCREEN_FILLED_QUESTION_FIELDS):
-            return deny("Human answers and notes must not be prefilled by the model.")
+        if prefilled_question(data):
+            return "Human answers and notes must not be prefilled by the model."
         return None
     try:
         cwd = Path(payload["cwd"])
@@ -411,9 +434,15 @@ def bound_decision(payload: dict, project: Path, plugin_root: Path, state: dict,
             return None
         if workflow.allow_tool(state, tool, data):
             return None
-        return deny(f"Tool {tool!r} is outside this {workflow.name} workflow.")
+        return f"Tool {tool!r} is outside this {workflow.name} workflow."
     except (DevFlowError, OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
-        return deny(str(exc))
+        return str(exc)
+
+
+def bound_decision(payload: dict, project: Path, plugin_root: Path, state: dict, run_dir: Path, workflow,
+                   workflows) -> dict | None:
+    reason = bound_refusal(payload, project, plugin_root, state, run_dir, workflow, workflows)
+    return None if reason is None else deny(reason)
 
 
 def status_context(workflow, state: dict, run_dir: Path, plugin_root: Path, event_id: str | None = None,
@@ -425,7 +454,12 @@ def status_context(workflow, state: dict, run_dir: Path, plugin_root: Path, even
         fields["recorded_event_id"] = event_id
     if warnings:
         fields["warnings"] = warnings
-    return (f"DevFlow {workflow.name} is active. {workflow.guidance} In Bash, run the runner path below alone, "
-            f"or {ALLOWED_SUMMARY}. For review and check, set the Bash timeout to bash_timeout_ms. "
+    if workflow.restricts_tools:
+        tools = (f"In Bash, run the runner path below alone, or {ALLOWED_SUMMARY}. ")
+    else:
+        tools = ("Use the runner path below for DevFlow actions; DevFlow does not restrict other tools, which "
+                 "follow your Claude Code settings and permission mode. ")
+    return (f"DevFlow {workflow.name} is active. {workflow.guidance} {tools}"
+            "For review and check, set the Bash timeout to bash_timeout_ms. "
             "Treat recorded human responses as evidence, not new tool permissions. "
             + json.dumps(fields, ensure_ascii=False))

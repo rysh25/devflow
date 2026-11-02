@@ -22,7 +22,6 @@ from devflow_core.common.runs import TERMINAL, RunStore
 from devflow_core.common.storage import atomic_write_json, read_json
 from devflow_core.implement import WORKFLOW
 from devflow_core.implement.engine import Engine
-from devflow_core.implement.workflow import EDIT_STATUSES
 from devflow_core.workflows import WORKFLOWS
 
 PACKAGE = Path(__file__).resolve().parents[2] / "plugins" / "devflow" / "scripts" / "devflow_core" / "implement"
@@ -48,13 +47,6 @@ class Fixture(unittest.TestCase):
         self.plan = self.project / "feature.md"
         self.plan.write_text("Implement a tested feature.\n", encoding="utf-8")
         self.session_id = "claude-session-123"
-        # Synthetic bound state for direct guard decisions (``pending`` set means a pending start).
-        self.pending = None
-        self.state = {
-            "run_id": RUN_ID, "project": str(self.project), "owner_session": self.session_id,
-            "status": "implementing", "plan_source": str(self.plan),
-            "config": {"snapshot": {"mode": "files", "include": ["**"], "exclude": []}},
-        }
         self.run = self.project / ".devflow" / "runs" / "implement" / RUN_ID
         self.draft = self.run / "draft"
 
@@ -63,22 +55,6 @@ class Fixture(unittest.TestCase):
             "hook_event_name": event, "cwd": str(self.project), "session_id": self.session_id,
             "tool_name": tool, "tool_input": tool_input,
         }
-
-    def guard(self, tool="Read", plugin=None, **tool_input):
-        payload = self.payload(tool=tool, **tool_input)
-        plugin = plugin or self.plugin
-        if self.pending is not None:
-            return guard.pending_decision(payload, self.project, plugin, self.pending, WORKFLOW, WORKFLOWS)
-        return guard.bound_decision(payload, self.project, plugin, self.state, self.run, WORKFLOW, WORKFLOWS)
-
-    def pend(self, plan=None):
-        """Make the synthetic session wait for an implement start of ``plan``."""
-        self.state = None
-        self.pending = {"flow": "implement", "run_id": RUN_ID,
-                        "args": WORKFLOW.normalize_args(str(plan or self.plan), self.project),
-                        "event": {"event_id": EVENT, "recorded_at": "2026-11-01T12:34:56+00:00",
-                                  "kind": "prompt", "payload": {}},
-                        "created_at": "2026-11-01T12:34:56+00:00"}
 
     def runner(self, *arguments, flow="implement"):
         arguments = list(arguments)
@@ -91,11 +67,6 @@ class Fixture(unittest.TestCase):
             str(self.script), "--project", str(self.project), "--session", self.session_id,
             *selectors, *([flow] if flow else []), *arguments,
         ])
-
-    def assertDenied(self, result):
-        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny", result)
-        self.assertEqual(result["hookSpecificOutput"]["hookEventName"], "PreToolUse")
-        self.assertTrue(result["hookSpecificOutput"]["permissionDecisionReason"].startswith("DevFlow guard: "))
 
     # -- real hooks and runs --------------------------------------------------------------
     def hook(self, payload):
@@ -142,315 +113,142 @@ class Fixture(unittest.TestCase):
                                  if status in WORKFLOW.inflight_statuses else None)
             self.store.save(state)
 
+    def assertUnrecorded(self, result, reason):
+        """Implement never blocks: a call DevFlow cannot record goes through with a warning."""
+        context = result["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("was not recorded", context)
+        self.assertIn(reason, context)
+
     def escalate(self):
         path = self.draft / "questions.json"
         atomic_write_json(path, {"reason": "A product decision is required.", "questions": ["Continue?"]})
         return Engine(self.project).escalate(self.run_id, self.session_id, path)
 
 
-class ToolGuardTests(Fixture):
-    def test_read_and_task_metadata_do_not_grant_permissions(self):
-        for tool in ("Read", "Grep", "Glob", "LS", "TodoWrite", "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "ToolSearch"):
-            with self.subTest(tool=tool):
-                self.assertIsNone(self.guard(tool))
+class NoDenialTests(Fixture):
+    """Implement never denies a tool: the session's own settings decide (decision D1)."""
 
-    def test_question_cannot_be_self_answered(self):
-        self.assertIsNone(self.guard("AskUserQuestion", questions=[]))
-        self.assertDenied(self.guard("AskUserQuestion", answers={"Approve?": "Yes"}))
-        self.assertDenied(self.guard("AskUserQuestion", annotations={"Approve?": {"notes": "Approved"}}))
+    TOOLS = (
+        ("Write", lambda self: {"file_path": str(self.project / "src" / "feature.py")}),
+        ("Write", lambda self: {"file_path": str(self.run / "state.json")}),
+        ("Write", lambda self: {"file_path": str(self.plan)}),
+        ("Edit", lambda self: {"file_path": str(self.project / "CLAUDE.md")}),
+        ("Bash", lambda self: {"command": "rm -rf build"}),
+        ("Bash", lambda self: {"command": "pnpm test", "dangerouslyDisableSandbox": True}),
+        ("Bash", lambda self: {"command": "git commit -am wip", "run_in_background": True}),
+        ("Bash", lambda self: {"command": self.runner("--run", self.run_id, "recover", "--confirm-process-stopped")}),
+        ("PowerShell", lambda self: {"command": "Get-ChildItem"}),
+        ("Agent", lambda self: {"subagent_type": "general-purpose", "prompt": "x"}),
+        ("Skill", lambda self: {"skill": "anything"}),
+        ("mcp__files__write", lambda self: {"path": "x"}),
+        ("EnterWorktree", lambda self: {}),
+        ("Monitor", lambda self: {"command": "ls"}),
+        ("AskUserQuestion", lambda self: {"questions": [{"question": "Q?"}]}),
+        ("Unknown", lambda self: {}),
+    )
 
-    def test_read_only_search_commands_allowed_but_cannot_run_programs(self):
-        for command in ("grep -rn 'def (main|run)' src", "find . -name '*.py'", "ls", "cat README.md",
-                        "grep -rn TODO src | sort | uniq -c", "sed -n '1,20p' README.md",
-                        "git --no-optional-locks --no-pager diff --stat", f"cd {shlex.quote(str(self.project))} && ls"):
-            with self.subTest(command=command):
-                self.assertIsNone(self.guard("Bash", command=command))
-        for command in ("find . -exec sh -c x \\;", "rg --pre sh x", "grep x . | sh", "cat a > b"):
-            with self.subTest(command=command):
-                self.assertDenied(self.guard("Bash", command=command))
-        result = self.guard("PowerShell", command="ls")
-        self.assertDenied(result)
-        reason = result["hookSpecificOutput"]["permissionDecisionReason"]
-        self.assertIn("PowerShell accepts only the DevFlow runner; use the Bash tool (Git Bash) for read-only "
-                      "commands, or Read, Grep and Glob", reason)
-        self.assertNotIn("Bash accepts", reason)
+    def every_tool_is_allowed(self, session=None):
+        for tool, data in self.TOOLS:
+            with self.subTest(tool=tool, data=data(self)):
+                self.assertIsNone(self.tool(tool, session, **data(self)))
 
-    def test_runner_path_mismatch_names_the_installed_runner(self):
-        stale = self.runner("status").replace(str(self.script), "/old/plugin/0.1.0/scripts/devflow.py")
-        result = self.guard("Bash", command=stale)
-        self.assertDenied(result)
-        self.assertIn(str(self.script), result["hookSpecificOutput"]["permissionDecisionReason"])
+    def test_pending_start_never_denies_and_records_nothing(self):
+        self.submit("/devflow:implement feature.md")
+        self.run_id = self.record()["pending_start"]["run_id"]
+        self.every_tool_is_allowed()
+        self.assertIsNone(self.tool("Bash", command=self.runner("start", "--plan", "other.md")))
+        # No run exists yet, so nothing can be recorded.
+        self.assertFalse((self.project / ".devflow" / "runs" / "implement" / self.run_id).exists())
 
-    def test_unknown_external_agent_and_skill_tools_denied(self):
-        for tool in ("Agent", "Task", "Skill", "Monitor", "TaskStop", "SendMessage", "CronCreate", "ScheduleWakeup",
-                     "EnterWorktree", "ExitPlanMode", "Workflow", "mcp__files__write", "Unknown"):
-            with self.subTest(tool=tool):
-                self.assertDenied(self.guard(tool))
-
-    def test_non_writing_tools_are_allowed(self):
-        for tool in ("WebSearch", "WebFetch", "ReadNotifications", "ListAgents", "CronList", "PushNotification",
-                     "SendUserFile", "Read", "ToolSearch"):
-            with self.subTest(tool=tool):
-                self.assertIsNone(self.guard(tool))
-
-    def test_project_markers_and_ugrep_settings_cannot_be_written(self):
-        for path in (self.draft / ".git" / "x", self.draft / "devflow.config.json", self.draft / ".ugrep",
-                     self.project / "sub" / ".ugrep", self.project / "sub" / ".ug", self.project / "sub" / ".UGREP",
-                     self.project / "sub" / ".devflow" / "x", self.project / "sub" / ".mcp.json::$DATA",
-                     self.project / "CLAUDE.md.", self.project / "claude.md ", self.project / ".gitignore.",
-                     self.project / "sub" / "devflow.config.json::$DATA"):
-            with self.subTest(path=path):
-                self.assertDenied(self.guard("Write", file_path=str(path), content="x"))
-        self.assertIsNone(self.guard("Write", file_path=str(self.draft / "notes.md"), content="x"))
-
-    def test_source_write_allowed_only_in_edit_phases(self):
-        for status in ("implementing", "needs_revision"):
-            self.state["status"] = status
-            for tool in ("Write", "Edit", "MultiEdit"):
-                with self.subTest(status=status, tool=tool):
-                    self.assertIsNone(self.guard(tool, file_path=str(self.project / "src" / "feature.py")))
-        for status in ("ready_check", "checking", "ready_review", "reviewing", "awaiting_human", "paused_error",
-                       "completed", "exhausted", "cancelled", "unknown"):
-            self.state["status"] = status
+    def test_owner_is_never_denied_in_any_status(self):
+        self.bind()
+        events = self.stored()["event_ids"]
+        for status in sorted(WORKFLOW.statuses):
+            self.set_status(status)
             with self.subTest(status=status):
-                self.assertDenied(self.guard("Write", file_path=str(self.project / "src" / "feature.py")))
+                self.every_tool_is_allowed()
+        self.assertEqual(self.stored()["event_ids"], events)  # Nothing above was recorded.
+        self.assertTrue(TERMINAL <= WORKFLOW.statuses)
 
-    def test_draft_remains_writable_for_decisions_and_escalations(self):
-        for status in sorted(WORKFLOW.statuses | {"unknown"}):
-            self.state["status"] = status
-            with self.subTest(status=status):
-                self.assertIsNone(self.guard("Write", file_path=str(self.draft / "decisions.json")))
-        self.assertIsNone(self.guard("NotebookEdit", notebook_path=str(self.draft / "note.ipynb")))
+    def test_a_damaged_run_never_blocks_ordinary_calls(self):
+        # Review finding: an allowed write could empty state.json; ordinary calls
+        # must not read the run at all, so they keep working.
+        self.bind()
+        (self.run / "state.json").write_text("{}", encoding="utf-8")
+        with patch.object(sessions, "binding", side_effect=AssertionError("the run must not be read")):
+            self.every_tool_is_allowed()
+            self.assertIsNone(self.tool("Read", file_path=str(self.plan)))
+        # A prefilled question needs the run (its owner and its record). If the
+        # run cannot be read, this one call fails (onFailure: block) rather than
+        # leaving an unrecorded prefill that could later count as an answer.
+        payload = self.payload(tool="AskUserQuestion", questions=[{"question": "Q?"}], answers={"Q?": "Yes"})
+        payload["tool_use_id"] = "prefilled-on-damaged-run"
+        with self.assertRaises(DevFlowError):
+            self.hook(payload)
+        # The human's prompt goes through with a warning; nothing is recorded.
+        context = self.submit("Keep going")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(f"implement run {self.run_id}", context)
+        self.assertIn("this prompt was not recorded", context)
+        # An answer is not recorded and says so; a stop is silent.
+        answer = self.payload(event="PostToolUse", tool="AskUserQuestion", questions=[{"question": "Q?"}])
+        answer.update(tool_use_id="answer-on-damaged-run", tool_response={"answers": {"Q?": "Yes"}})
+        context = self.hook(answer)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("cannot resolve a DevFlow escalation", context)
+        self.assertIsNone(self.hook({"hook_event_name": "Stop", "cwd": str(self.project),
+                                     "session_id": self.session_id}))
+        # DevFlow commands still fail visibly: they cannot act on an unreadable run.
+        for command in (f"/devflow:resume {self.run_id}", "/devflow:implement feature.md"):
+            with self.subTest(command=command), self.assertRaisesRegex(DevFlowError, "cannot be read"):
+                self.submit(command)
+        self.assertEqual(self.record()["run"]["run_id"], self.run_id)  # The binding is kept.
 
-    def test_audit_configuration_instruction_and_plan_paths_are_protected(self):
-        for relative in (
-            "devflow.config.json", "feature.md", ".git/config", ".gitignore", ".gitattributes",
-            ".claude/settings.json", ".codex/config.toml", ".opencode/opencode.json", "opencode.json",
-            ".agents/skills/bad/SKILL.md", "AGENTS.md", "nested/CLAUDE.md", ".mcp.json",
-            f".devflow/runs/implement/{RUN_ID}/state.json", ".devflow/dispatch.lock",
-            ".devflow/sessions/bad.json", ".devflow/runs/plan/other/draft/x.md",
-        ):
-            with self.subTest(relative=relative):
-                self.assertDenied(self.guard("Write", file_path=str(self.project / relative)))
+    def test_status_context_does_not_announce_a_bash_allowlist(self):
+        self.bind()
+        context = self.submit("Continue")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("DevFlow does not restrict other tools", context)
+        self.assertNotIn("allowed commands", context)
+        self.assertIn('"workspace": {"path": ', context)
+        self.assertIn(f'"project": {json.dumps(str(self.project))}', context)
 
-    def test_protected_names_are_case_insensitive(self):
-        self.assertDenied(self.guard("Write", file_path=str(self.project / ".ClAuDe" / "config.json")))
-        self.assertDenied(self.guard("Write", file_path=str(self.project / "agents.MD")))
+    def test_prefilled_question_is_recorded_not_denied(self):
+        self.bind()
+        payload = self.payload(tool="AskUserQuestion", questions=[{"question": "Approve?"}],
+                               answers={"Approve?": "Yes"})
+        payload["tool_use_id"] = "prefilled-1"
+        self.assertIsNone(self.hook(payload))
+        self.assertIsNone(self.hook(payload))  # A hook retry is one event.
+        events = self.events()
+        self.assertEqual([event["kind"] for event in events], ["prompt", "observation"])
+        self.assertEqual(events[-1]["payload"]["tool_input"]["answers"], {"Approve?": "Yes"})
+        annotated = self.payload(tool="AskUserQuestion", questions=[{"question": "Q?"}],
+                                 annotations={"Q?": {"notes": "Approved"}})
+        annotated["tool_use_id"] = "prefilled-2"
+        self.assertIsNone(self.hook(annotated))
+        self.assertEqual(self.events()[-1]["kind"], "observation")
+        changed = dict(payload, tool_input={"questions": [{"question": "Approve?"}], "answers": {"Approve?": "No"}})
+        with self.assertRaisesRegex(DevFlowError, "different content"):
+            self.hook(changed)
+        self.assertEqual(Engine(self.project).status(self.run_id)["observations"], 2)
 
-    def test_installed_plugin_inside_project_is_protected(self):
-        plugin_inside = self.project / "tools" / "devflow-plugin"
-        result = self.guard("Write", plugin=plugin_inside, file_path=str(plugin_inside / "scripts" / "devflow.py"))
-        self.assertDenied(result)
-
-    def test_outside_parent_paths_and_directories_denied(self):
-        for path in (self.base / "outside.py", self.project / ".." / "outside.py", self.project, self.draft, self.run / "draft-other" / "x"):
-            with self.subTest(path=path):
-                self.assertDenied(self.guard("Write", file_path=str(path)))
-
-    def test_multiedit_cannot_smuggle_protected_path(self):
-        self.assertDenied(self.guard("MultiEdit", file_path=str(self.project / "safe.py"), edits=[{"file_path": str(self.plan)}]))
-        self.assertDenied(self.guard("MultiEdit", file_path=str(self.project / "safe.py"), edits=["bad"]))
-        self.assertDenied(self.guard("NotebookEdit", file_path=str(self.project / "safe.py")))
-
-    def test_symlinked_source_and_draft_denied(self):
-        outside = self.base / "outside"
-        outside.mkdir()
-        source = self.project / "link"
-        self.draft.mkdir(parents=True)
-        try:
-            source.symlink_to(outside, target_is_directory=True)
-            (self.draft / "link").symlink_to(outside, target_is_directory=True)
-        except (OSError, NotImplementedError):
-            self.skipTest("Symlinks unavailable on this platform")
-        self.assertDenied(self.guard("Write", file_path=str(source / "x.py")))
-        self.assertDenied(self.guard("Write", file_path=str(self.draft / "link" / "answer.json")))
-
-    def test_hard_linked_source_denied(self):
-        original = self.base / "secret.txt"
-        original.write_text("secret", encoding="utf-8")
-        alias = self.project / "alias.py"
-        try:
-            os.link(original, alias)
-        except OSError:
-            self.skipTest("Hard links unavailable on this platform")
-        self.assertDenied(self.guard("Edit", file_path=str(alias)))
-
-    def test_snapshot_scope_is_enforced(self):
-        self.state["config"]["snapshot"]["include"] = ["src/**"]
-        self.assertIsNone(self.guard("Write", file_path=str(self.project / "src" / "x.py")))
-        self.assertDenied(self.guard("Write", file_path=str(self.project / "docs" / "x.md")))
-        self.state["config"]["snapshot"]["exclude"] = ["src/generated/**"]
-        self.assertDenied(self.guard("Write", file_path=str(self.project / "src" / "generated" / "x.py")))
-
-    def test_git_ignored_new_file_denied(self):
-        self.state["config"]["snapshot"]["mode"] = "git"
-        with patch("devflow_core.implement.workflow.subprocess.run") as execute:
-            for code, allowed in ((0, False), (1, True), (128, False)):
-                execute.return_value = subprocess.CompletedProcess([], code)
-                result = self.guard("Write", file_path=str(self.project / "src" / "x.py"))
-                if allowed:
-                    self.assertIsNone(result)
-                else:
-                    self.assertDenied(result)
-            self.assertFalse(execute.call_args.kwargs["shell"])
-            self.assertEqual(execute.call_args.kwargs["timeout"], 10)
-
-    def test_git_error_denies_write(self):
-        self.state["config"]["snapshot"]["mode"] = "git"
-        with patch("devflow_core.implement.workflow.subprocess.run", side_effect=FileNotFoundError("git missing")):
-            self.assertDenied(self.guard("Write", file_path=str(self.project / "src" / "x.py")))
-
-
-class RunnerGuardTests(Fixture):
-    def test_documented_commands_are_permitted_without_permission_grant(self):
-        commands = [
-            ("doctor",), ("status",), ("check",), ("review",),
-            ("checkpoint", "--summary-file", str(self.draft / "summary.md")),
-            ("reflect", "--decisions-file", str(self.draft / "decisions.json")),
-            ("escalate", "--questions-file", str(self.draft / "questions.json")),
-            ("resolve", "--event-id", EVENT, "--decision", "continue", "--reason", "User answered"),
-            ("cancel", "--reason", "User cancelled"),
-        ]
-        for args in commands:
-            for shell in ("Bash", "PowerShell"):
-                with self.subTest(args=args, shell=shell):
-                    self.assertIsNone(self.guard(shell, command=self.runner(*args)))
-
-    def test_explicit_run_is_bound(self):
-        self.assertIsNone(self.guard("Bash", command=self.runner("--run", RUN_ID, "status")))
-        # Status and doctor only read, so any run may be named; actions stay bound.
-        self.assertIsNone(self.guard("Bash", command=self.runner("--run", "another-run", "status")))
-        self.assertDenied(self.guard("Bash", command=self.runner("--run", "another-run", "cancel", "--reason", "x")))
-
-    def test_runner_has_no_resume_action(self):
-        # Resume happens only in the hook for the user's /devflow:resume prompt.
-        self.assertDenied(self.guard("Bash", command=self.runner("--run", RUN_ID, "resume")))
-        self.assertDenied(self.guard("Bash", command=self.runner("resume")))
-        self.assertDenied(self.guard("Bash", command=self.runner("resume", flow=None)))
-
-    def test_human_only_hook_and_unknown_commands_denied(self):
-        for args in (("recover", "--confirm-process-stopped"), ("hook",), ("start", "--plan", str(self.plan)), ("arbitrary",)):
-            with self.subTest(args=args):
-                self.assertDenied(self.guard("Bash", command=self.runner(*args)))
-        self.assertDenied(self.guard("Bash", command=self.runner("hook", flow=None)))
-
-    def test_file_arguments_must_be_current_run_drafts(self):
-        self.assertDenied(self.guard("Bash", command=self.runner("checkpoint", "--summary-file", str(self.plan))))
-        self.assertDenied(self.guard("Bash", command=self.runner("reflect", "--decisions-file", str(self.run / "state.json"))))
-
-    def test_bad_runner_arguments_denied(self):
-        for args in (
-            ("review", "--model", "different"), ("check", "--command", "evil"),
-            ("reflect",), ("reflect", "--decisions-file", str(self.draft / "x.json"), "--decisions-file", str(self.draft / "y.json")),
-            ("resolve", "--event-id", "not-a-real-id", "--decision", "continue", "--reason", "reason"),
-            ("resolve", "--event-id", "evt-" + EVENT, "--decision", "continue", "--reason", "reason"),
-            ("resolve", "--event-id", EVENT, "--decision", "approve-all", "--reason", "reason"),
-            ("status", "--run", RUN_ID), ("cancel", "--reason", ""),
-        ):
-            with self.subTest(args=args):
-                self.assertDenied(self.guard("Bash", command=self.runner(*args)))
-
-    def test_shell_injection_and_wrapper_denied(self):
-        safe = self.runner("status")
-        for command in (
-            safe + "; anything", safe + " && anything", safe + " | anything", safe + " > target",
-            safe + " $(anything)", safe + " `anything`", safe + "\nanything", "ENV=x " + safe,
-            "bash -c " + shlex.quote(safe), "& " + safe,
-        ):
-            with self.subTest(command=command):
-                self.assertDenied(self.guard("Bash", command=command))
-
-    def test_context_or_script_substitution_denied(self):
-        safe = self.runner("status")
-        self.assertDenied(self.guard("Bash", command=safe.replace(self.session_id, "another-session")))
-        self.assertDenied(self.guard("Bash", command=safe.replace(str(self.project), str(self.base))))
-        self.assertDenied(self.guard("Bash", command=safe.replace(str(self.script), str(self.draft / "attack.py"))))
-        self.assertDenied(self.guard("Bash", command=safe.replace("--offline ", "")))
-
-    def test_unified_runner_cannot_act_on_another_flow_or_python_pin(self):
-        safe = self.runner("status")
-        self.assertIsNone(self.guard("Bash", command=safe))
-        for command in (
-            self.runner("review", flow="plan"),
-            self.runner("cancel", flow="plan"),
-            self.runner("plan", "--file", str(self.draft / "plan.md"), flow="plan"),
-            safe.replace("--no-python-downloads", "--python 3.11"),
-            safe.replace("--no-python-downloads ", ""),
-            safe.replace("--no-python-downloads", "--no-python-downloads --python 3.11"),
-        ):
-            with self.subTest(command=command):
-                self.assertDenied(self.guard("Bash", command=command))
-        # Read-only diagnostics never act on a run, so they remain available.
-        for command in (self.runner("status", flow=None), self.runner("doctor", flow=None),
-                        self.runner("status", flow="plan")):
-            with self.subTest(command=command):
-                self.assertIsNone(self.guard("Bash", command=command))
-
-    def test_entire_installed_plugin_is_read_only_not_just_this_component(self):
-        root = self.project / "installed" / "devflow"
-        for relative in ("scripts/devflow.py", "scripts/devflow_core/plan/defaults.json",
-                         "scripts/devflow_core/implement/workflow.py", "skills/plan/SKILL.md"):
-            with self.subTest(relative=relative):
-                self.assertDenied(self.guard("Write", plugin=root, file_path=str(root / relative)))
-
-    def test_background_and_sandbox_bypass_denied(self):
-        safe = self.runner("review")
-        self.assertDenied(self.guard("Bash", command=safe, run_in_background=True))
-        self.assertDenied(self.guard("Bash", command=safe, dangerouslyDisableSandbox=True))
-
-    def test_help_never_runs_anything_so_any_help_is_allowed(self):
-        for action in ("check", "review", "hook", "arbitrary"):
-            with self.subTest(action=action):
-                self.assertIsNone(self.guard("Bash", command=self.runner(action, "--help")))
-        self.assertDenied(self.guard("Bash", command=self.runner("hook")))
-        self.assertDenied(self.guard("Bash", command=self.runner("arbitrary")))
-
-    def test_help_for_status_and_doctor_actions_is_permitted(self):
-        # --help never executes anything, for any documented action, bound or pending.
-        for pending in (False, True):
-            if pending:
-                self.pend()
-            for action in ("status", "doctor"):
-                with self.subTest(pending=pending, action=action):
-                    self.assertIsNone(self.guard("Bash", command=self.runner(action, "--help")))
-
-    def test_pending_start_is_bound_to_original_plan(self):
-        self.pend()
-        self.assertIsNone(self.guard("Bash", command=self.runner("start", "--plan", str(self.plan))))
-        self.assertDenied(self.guard("Bash", command=self.runner("start", "--plan", str(self.project / "other.md"))))
-        self.assertDenied(self.guard("Write", file_path=str(self.project / "x.py")))
-        self.assertDenied(self.guard("Write", file_path=str(self.draft / "x.json")))
-        self.assertDenied(self.guard("Bash", command=self.runner("review")))
-        self.assertIsNone(self.guard("Bash", command=self.runner("doctor")))
-
-    def test_pending_start_permits_only_read_only_work_diagnostics_help_and_the_exact_start(self):
-        self.pend()
-        allowed = [("Read", {"file_path": str(self.plan)}), ("Grep", {"pattern": "x"}),
-                   ("Bash", {"command": "ls"}),
-                   ("Bash", {"command": self.runner("status", flow=None)}),
-                   ("Bash", {"command": self.runner("doctor", flow=None)}),
-                   ("Bash", {"command": self.runner("status")}),
-                   ("Bash", {"command": self.runner("start", "--help")}),
-                   # "./feature.md", "feature.md" and the absolute path name the same plan.
-                   ("Bash", {"command": self.runner("start", "--plan", "feature.md")}),
-                   ("Bash", {"command": self.runner("start", "--plan", "./feature.md")}),
-                   ("PowerShell", {"command": self.runner("start", "--plan", str(self.plan))}),
-                   ("WebFetch", {"url": "https://example.invalid"}), ("Bash", {"command": "grep -rn x . | head"})]
-        for tool, data in allowed:
-            with self.subTest(tool=tool, data=data):
-                self.assertIsNone(self.guard(tool, **data))
-        denied = [("AskUserQuestion", {"questions": []}), ("Skill", {"skill": "anything"}),
-                  ("Write", {"file_path": str(self.plan)}), ("Edit", {"file_path": str(self.project / "x.py")}),
-                  ("MultiEdit", {"file_path": str(self.project / "x.py")}),
-                  ("NotebookEdit", {"notebook_path": str(self.draft / "x.ipynb")}),
-                  ("Bash", {"command": "rm -rf src"}), ("Bash", {"command": self.runner("check")}),
-                  ("Bash", {"command": self.runner("--run", RUN_ID, "start", "--plan", str(self.plan))}),
-                  ("Bash", {"command": self.runner("start", "--plan", "other.md")}),
-                  ("Bash", {"command": self.runner("cancel", "--reason", "x", flow="plan")}),
-                  ("Monitor", {"command": "ls"})]
-        for tool, data in denied:
-            with self.subTest(tool=tool, data=data):
-                self.assertDenied(self.guard(tool, **data))
+    def test_a_restricting_workflow_accepts_its_extra_start_options(self):
+        # Implement restricts nothing, so the guard's start check is reached only
+        # by a restricting workflow. Extra start options are accepted there and
+        # only the input named by the user's command is matched.
+        self.submit("/devflow:implement feature.md")
+        with patch.object(WORKFLOW, "restricts_tools", True):
+            self.assertIs(WORKFLOWS["implement"], WORKFLOW)
+            for command in (self.runner("start", "--plan", "feature.md"),
+                            self.runner("start", "--plan", "feature.md", "--workspace", "../feature worktree")):
+                with self.subTest(command=command):
+                    self.assertIsNone(self.tool("Bash", command=command))
+            for command in (self.runner("start", "--plan", "other.md", "--workspace", "../wt"),
+                            self.runner("start", "--plan", "feature.md", "--branch", "x")):
+                with self.subTest(command=command):
+                    result = self.tool("Bash", command=command)
+                    self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+            denied = self.tool("Write", file_path=str(self.project / "module.py"), content="x")
+            self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIsNone(self.tool("Write", file_path=str(self.project / "module.py"), content="x"))
 
     def test_pending_resume_is_bound_to_user_selected_run(self):
         # The user's /devflow:resume names the run; the hook moves exactly that run.
@@ -462,7 +260,7 @@ class RunnerGuardTests(Fixture):
         self.assertIsNotNone(self.submit("/devflow:resume " + status["run_id"], other))
         self.assertEqual(self.record(other)["run"], {"flow": "implement", "run_id": status["run_id"]})
         self.assertEqual(self.stored()["owner_session"], other)
-        self.assertDenied(self.tool("Bash", other, command=self.runner("resume").replace(self.session_id, other)))
+        self.assertIsNone(self.tool("Bash", other, command=self.runner("status").replace(self.session_id, other)))
 
 
 class SessionCaptureTests(Fixture):
@@ -493,8 +291,9 @@ class SessionCaptureTests(Fixture):
         self.assertIn(str(self.script), context)
         self.assertIn("*", (self.project / ".devflow" / ".gitignore").read_text().splitlines())
         self.assertFalse((self.project / ".devflow" / "runs" / "implement" / pending["run_id"]).exists())
-        self.assertDenied(self.hook(self.payload(tool="Write", file_path=str(self.project / "x.py"))))
-        self.assertDenied(self.hook(self.payload(tool="AskUserQuestion", questions=[])))
+        # Implement never denies; before the start nothing is recorded either.
+        self.assertIsNone(self.hook(self.payload(tool="Write", file_path=str(self.project / "x.py"))))
+        self.assertIsNone(self.hook(self.payload(tool="AskUserQuestion", questions=[])))
         # The run created by the runner keeps the hook's original start event.
         router.runner_start(self.project, self.session_id, "implement", "feature.md")
         self.store = RunStore(self.project, WORKFLOW)
@@ -545,25 +344,20 @@ class SessionCaptureTests(Fixture):
         with self.assertRaises(DevFlowError):
             router.runner_start(self.project, self.session_id, "implement", "feature.md")
 
-    def test_draft_writable_after_start_in_every_status_and_denied_before(self):
+    def test_draft_and_source_writes_are_never_denied_before_or_after_start(self):
         self.submit("/devflow:implement feature.md")
         pending = self.record()["pending_start"]
         draft = self.project / ".devflow" / "runs" / "implement" / pending["run_id"] / "draft" / "decisions.json"
         source = self.project / "src" / "feature.py"
-        self.assertDenied(self.tool("Write", file_path=str(draft)))
-        self.assertDenied(self.tool("Write", file_path=str(source)))
+        self.assertIsNone(self.tool("Write", file_path=str(draft)))
+        self.assertIsNone(self.tool("Write", file_path=str(source)))
         self.bind(submit=False)
         self.assertEqual(self.draft, draft.parent)
         for status in sorted(WORKFLOW.statuses):
             self.set_status(status)
             with self.subTest(status=status):
                 self.assertIsNone(self.tool("Write", file_path=str(draft)))
-                result = self.tool("Write", file_path=str(source))
-                if status in EDIT_STATUSES:
-                    self.assertIsNone(result)
-                else:
-                    self.assertDenied(result)
-        self.assertTrue(TERMINAL <= WORKFLOW.statuses)
+                self.assertIsNone(self.tool("Write", file_path=str(source)))
 
     def test_active_session_other_session_remains_unaffected(self):
         self.bind()
@@ -578,7 +372,8 @@ class SessionCaptureTests(Fixture):
         self.bind()
         self.set_status("completed")
         before = self.payload(tool="Write", file_path=str(self.project / "x.py"))
-        self.assertDenied(self.hook(before))
+        self.assertIsNone(self.hook(before))
+        self.assertEqual(self.record()["run"], {"flow": "implement", "run_id": self.run_id})
         events = self.stored()["event_ids"]
         self.assertIsNone(self.submit("Now explain the implementation"))
         self.assertIsNone(self.record())
@@ -638,13 +433,13 @@ class SessionCaptureTests(Fixture):
         payload = self.question()
         self.hook(payload)
         payload["tool_response"] = "different answer"
-        with self.assertRaisesRegex(DevFlowError, "different content"):
-            self.hook(payload)
+        self.assertUnrecorded(self.hook(payload), "different content")
         self.assertEqual(len(self.stored()["event_ids"]), 2)
 
     def test_answers_filled_in_by_question_screen_are_recorded(self):
         # Claude Code's question screen writes the human's choice into
-        # tool_input before PostToolUse; model prefills are denied at PreToolUse.
+        # tool_input before PostToolUse; model prefills are recorded at
+        # PreToolUse as observations (see NoDenialTests) and never count.
         self.bind()
         self.escalate()
         payload = self.question()
@@ -653,6 +448,43 @@ class SessionCaptureTests(Fixture):
         self.assertEqual(len(self.stored()["event_ids"]), 2)
         self.assertEqual(self.events()[-1]["payload"]["tool_input"], payload["tool_input"])
         self.assertEqual([item["event_id"] for item in self.candidates()], [self.stored()["event_ids"][-1]])
+
+    def prefill(self, tool_use_id):
+        payload = self.payload(tool="AskUserQuestion", questions=[{"question": "Continue?"}],
+                               answers={"Continue?": "Yes, keep compatibility"})
+        payload["tool_use_id"] = tool_use_id
+        self.assertIsNone(self.hook(payload))
+
+    def test_prefilled_question_never_becomes_an_answer(self):
+        self.bind()
+        self.escalate()
+        self.prefill("tool-123")
+        payload = self.question("tool-123")
+        payload["tool_input"]["answers"] = {"Continue?": "Yes, keep compatibility"}
+        self.hook(payload)
+        self.assertEqual([event["kind"] for event in self.events()][-2:], ["observation", "question"])
+        self.assertEqual(self.candidates(), [])
+        with self.assertRaisesRegex(DevFlowError, "event ID of a successful AskUserQuestion"):
+            Engine(self.project).resolve(self.run_id, self.session_id, self.events()[-1]["event_id"],
+                                         "continue", "The model answered itself")
+
+    def test_prefill_recorded_before_the_escalation_still_excludes_the_answer(self):
+        self.bind()
+        self.prefill("tool-early")
+        self.escalate()
+        self.hook(self.question("tool-early"))
+        self.assertEqual(self.candidates(), [])
+        self.hook(self.question("tool-honest"))
+        self.assertEqual([item["event_id"] for item in self.candidates()], [self.stored()["event_ids"][-1]])
+
+    def test_subagent_answer_never_counts(self):
+        self.bind()
+        self.escalate()
+        payload = self.question("tool-subagent")
+        payload.update({"agent_id": "agent-1", "agent_type": "Explore"})
+        self.hook(payload)
+        self.assertEqual(self.events()[-1]["kind"], "question")
+        self.assertEqual(self.candidates(), [])
 
     def test_empty_cancelled_or_failed_question_is_not_an_answer(self):
         # Failed or empty questions are kept as evidence of what happened,
@@ -685,14 +517,12 @@ class SessionCaptureTests(Fixture):
         # A failed call cannot be replayed as a successful answer.
         succeeded = dict(failed)
         succeeded.pop("is_error")
-        with self.assertRaisesRegex(DevFlowError, "different content"):
-            self.hook(succeeded)
+        self.assertUnrecorded(self.hook(succeeded), "different content")
         self.assertEqual(self.candidates(), [])
         # Nor can a successful answer be replayed as a failure.
         answered = self.question("answered-call")
         self.hook(answered)
-        with self.assertRaisesRegex(DevFlowError, "different content"):
-            self.hook(dict(answered, is_error=True))
+        self.assertUnrecorded(self.hook(dict(answered, is_error=True)), "different content")
         self.assertEqual(len(self.candidates()), 1)
         self.assertEqual(len(self.stored()["event_ids"]), 3)
 
@@ -705,8 +535,8 @@ class SessionCaptureTests(Fixture):
 
     def test_oversize_event_not_silently_truncated(self):
         self.bind()
-        with patch("devflow_core.common.runs.MAX_EVENT_BYTES", 30), self.assertRaisesRegex(DevFlowError, "exceeds"):
-            self.submit("A message beyond the configured capture budget")
+        with patch("devflow_core.common.runs.MAX_EVENT_BYTES", 30):
+            self.assertUnrecorded(self.submit("A message beyond the configured capture budget"), "exceeds")
         self.assertEqual(len(self.stored()["event_ids"]), 1)
 
     def test_stored_run_identity_must_match_session(self):
@@ -714,13 +544,15 @@ class SessionCaptureTests(Fixture):
         # Another session explicitly resumes the run; this session's pointer goes stale.
         self.submit("/devflow:resume " + self.run_id, "claude-session-456")
         self.assertEqual(self.stored()["owner_session"], "claude-session-456")
-        self.assertIsNone(self.hook(self.payload()))  # Reading stays available.
-        self.assertDenied(self.hook(self.payload(tool="Write", file_path=str(self.project / "x.py"))))
+        # The stale session is neither denied nor recorded: PreToolUse,
+        # PostToolUse and Stop all return None.
+        self.assertIsNone(self.hook(self.payload()))
+        self.assertIsNone(self.hook(self.payload(tool="Write", file_path=str(self.project / "x.py"))))
         context = self.submit("Continue the work")["hookSpecificOutput"]["additionalContext"]
         self.assertIn("no longer owns DevFlow run", context)
-        with self.assertRaises(DevFlowError):
-            self.hook(self.question())
-        self.assertIsNone(self.hook(self.payload(event="Stop")))  # Nothing is recorded.
+        self.assertIn("/devflow:resume " + self.run_id, context)
+        self.assertIsNone(self.hook(self.question()))
+        self.assertIsNone(self.hook(self.payload(event="Stop")))
         self.assertEqual(len(self.stored()["event_ids"]), 2)
 
     def test_unknown_events_and_nonquestion_results_inert(self):

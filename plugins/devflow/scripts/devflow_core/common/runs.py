@@ -8,6 +8,7 @@ for display never change a file.
 from __future__ import annotations
 
 import base64
+import json
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -21,10 +22,10 @@ from .errors import DevFlowError
 from .storage import (atomic_json, digest, file_lock, json_bytes, no_symlinks, now,
                       read_json, within, write_new)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 # Older run formats (every version below SCHEMA_VERSION) and the releases that wrote
 # them; they are never continued. A test keeps this table complete.
-RELEASES = {1: "0.1.x", 2: "0.2.x"}
+RELEASES = {1: "0.1.x", 2: "0.2.x", 3: "0.3.x"}
 
 
 def release_name(version: int) -> str:
@@ -33,7 +34,9 @@ TERMINAL = frozenset({"completed", "exhausted", "cancelled"})
 RUN_ID = re.compile(r"[0-9]{8}T[0-9]{6}Z-[a-f0-9]{12}\Z")
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}\Z")
 EVENT_ID = re.compile(r"[a-f0-9]{32}\Z")
-EVENT_KINDS = frozenset({"prompt", "question", "stop"})
+#: ``observation``: a PreToolUse call the run records instead of denying
+#: (an AskUserQuestion whose answers the model prefilled); never an answer.
+EVENT_KINDS = frozenset({"prompt", "question", "observation", "stop"})
 MAX_EVENT_BYTES = 4 * 1024 * 1024
 MAX_EVENTS = 5000
 CREATING = ".creating-"
@@ -442,10 +445,16 @@ class RunStore:
 
     # -- human events -----------------------------------------------------------------------
     def events(self, state: dict) -> list[dict]:
+        """Every event of the run, including ones staged in the current transaction."""
         run = self.run_dir(state["run_id"])
+        pending = state.get("_pending_writes", {})
         result = []
         for identifier in state["event_ids"]:
-            value = validate_event(read_json(run / "events" / (identifier + ".json"), limit=MAX_EVENT_BYTES + 4096))
+            relative = f"events/{identifier}.json"
+            if relative in pending:
+                value = validate_event(json.loads(base64.b64decode(pending[relative])))
+            else:
+                value = validate_event(read_json(run / relative, limit=MAX_EVENT_BYTES + 4096))
             if value["event_id"] != identifier:
                 raise DevFlowError("Human event record does not match its ID")
             result.append(value)
@@ -459,20 +468,23 @@ class RunStore:
                 return None
             if payload.get("session_id") != state["owner_session"]:
                 raise DevFlowError("This run is owned by another session; stale-session events cannot become human evidence")
-            if kind == "question":
+            if kind in ("question", "observation"):
                 use_id = payload.get("tool_use_id")
                 if (not isinstance(use_id, str) or not use_id.strip() or len(use_id) > 512
-                        or not isinstance(payload.get("tool_input"), dict) or "tool_response" not in payload):
-                    raise DevFlowError("Question capture requires its actual tool identity, input and result")
+                        or not isinstance(payload.get("tool_input"), dict)
+                        or (kind == "question" and "tool_response" not in payload)):
+                    raise DevFlowError("Question capture requires its actual tool identity, input and result"
+                                       if kind == "question" else
+                                       "Observation capture requires its actual tool identity and input")
                 for old in self.events(state):
                     earlier = old["payload"]
-                    if (old["kind"] == "question" and earlier.get("session_id") == payload["session_id"]
+                    if (old["kind"] == kind and earlier.get("session_id") == payload["session_id"]
                             and earlier.get("tool_use_id") == use_id):
                         if (earlier.get("tool_input") != payload["tool_input"]
-                                or earlier.get("tool_response") != payload["tool_response"]
+                                or earlier.get("tool_response") != payload.get("tool_response")
                                 or bool(earlier.get("is_error")) != bool(payload.get("is_error"))):
-                            raise DevFlowError("A captured question ID was replayed with different content")
-                        return old["event_id"]  # A hook retry, not a new answer.
+                            raise DevFlowError(f"A captured {kind} ID was replayed with different content")
+                        return old["event_id"]  # A hook retry, not a new event.
             if len(state["event_ids"]) >= MAX_EVENTS:
                 raise DevFlowError("This run reached its human event limit; start a new run")
             event = make_event(payload, kind)

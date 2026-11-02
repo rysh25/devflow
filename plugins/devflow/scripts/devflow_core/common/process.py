@@ -29,8 +29,14 @@ class Completed:
     duration_seconds: float
 
 
-def stop_tree(process: subprocess.Popen) -> None:
-    """Best-effort termination of the child's process group; not an OS security boundary."""
+def stop_tree(process: subprocess.Popen, kill_group: bool = True) -> None:
+    """Best-effort termination of the child and its descendants; not an OS security boundary.
+
+    ``kill_group`` is false for a child started in the caller's own process
+    group (``run_bounded(new_session=False)``): that child is not a group
+    leader, so ``killpg(child.pid)`` could reach an unrelated group. Only the
+    child itself is killed then.
+    """
     if os.name == "nt":
         # A separate process group alone does not terminate descendants on Windows.
         taskkill = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "taskkill.exe")
@@ -39,7 +45,7 @@ def stop_tree(process: subprocess.Popen) -> None:
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, shell=False)
         except (OSError, subprocess.TimeoutExpired):
             pass
-    else:
+    elif kill_group:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
@@ -52,7 +58,8 @@ def stop_tree(process: subprocess.Popen) -> None:
 
 
 def run_bounded(argv: list[str], *, cwd: Path | None, timeout: float, limit: int,
-                env: dict | None = None, data: bytes | None = None, per_stream: bool = False) -> Completed:
+                env: dict | None = None, data: bytes | None = None, per_stream: bool = False,
+                new_session: bool = True) -> Completed:
     """Run argv (never a shell), capping output at ``limit`` bytes.
 
     The limit covers stdout and stderr together, or each stream separately
@@ -60,9 +67,18 @@ def run_bounded(argv: list[str], *, cwd: Path | None, timeout: float, limit: int
 
     The process tree is stopped on timeout, on overflow, or when a descendant
     keeps the output pipes open after the command exits.
+
+    ``new_session`` (the default) starts the child in its own process group so
+    the whole group can be stopped. A helper that runs inside another bounded
+    process (the reviewer read server's git) passes ``False``: the child then
+    stays in the caller's group, so stopping the caller's group stops it too,
+    and only the child itself is killed here.
     """
     started = time.monotonic()
-    options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
+    if os.name == "nt":
+        options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if new_session else {}
+    else:
+        options = {"start_new_session": True} if new_session else {}
     try:
         process = subprocess.Popen(argv, cwd=cwd, env=env, shell=False,
                                    stdin=subprocess.DEVNULL if data is None else subprocess.PIPE,
@@ -107,20 +123,20 @@ def run_bounded(argv: list[str], *, cwd: Path | None, timeout: float, limit: int
     try:
         while process.poll() is None:
             if overflow.is_set():
-                stop_tree(process)
+                stop_tree(process, new_session)
                 break
             if time.monotonic() - started >= timeout:
                 timed_out = True
-                stop_tree(process)
+                stop_tree(process, new_session)
                 break
             time.sleep(0.01)
     except BaseException:
-        stop_tree(process)
+        stop_tree(process, new_session)
         raise
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        stop_tree(process)
+        stop_tree(process, new_session)
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired as exc:
@@ -129,7 +145,7 @@ def run_bounded(argv: list[str], *, cwd: Path | None, timeout: float, limit: int
         thread.join(timeout=0.3)
     retained = any(thread.is_alive() for thread in threads)
     if retained:
-        stop_tree(process)
+        stop_tree(process, new_session)
         for thread in threads:
             thread.join(timeout=1)
     with lock:
