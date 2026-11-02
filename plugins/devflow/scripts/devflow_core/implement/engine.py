@@ -228,7 +228,9 @@ class Engine(RunEngine):
                 error = exc
         if error is not None:
             state["attempts"][-1].update(status="failed",error=str(error),finished_at=now())
-            state.update(status="paused_error" if number < state["config"]["max_reviews"] else "exhausted",resume_status="ready_review",last_error=str(error),approvals={})
+            # A reviewer failure says nothing about the code: approvals for this
+            # snapshot stay (as in plan); this attempt never adds one.
+            state.update(status="paused_error" if number < state["config"]["max_reviews"] else "exhausted",resume_status="ready_review",last_error=str(error))
             return
         review_path = f"reviews/{number:02}/review.json"
         self._artifact(state,review_path,json_bytes(review))

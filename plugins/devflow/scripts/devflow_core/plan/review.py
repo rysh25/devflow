@@ -5,7 +5,7 @@ from typing import Any
 
 from ..common.errors import ReviewerError
 from ..common.reviewers import text
-from ..common.review import check_verdict
+from ..common.review import check_fields, check_verdict
 
 REVIEW_KEYS = {"schema_version", "verdict", "summary", "findings", "questions"}
 FINDING_KEYS = {"id", "severity", "category", "location", "evidence", "recommendation", "requires_human"}
@@ -14,8 +14,7 @@ QUESTION_KEYS = {"id", "question", "why_human", "options"}
 
 def validate_review(value: Any) -> dict:
     """Validate the exact semantic contract, including cross-field invariants."""
-    if not isinstance(value, dict) or set(value) != REVIEW_KEYS:
-        raise ReviewerError("Review must contain exactly schema_version, verdict, summary, findings, questions")
+    check_fields(value, REVIEW_KEYS, "Review")
     if type(value["schema_version"]) is not int or value["schema_version"] != 1:
         raise ReviewerError("Unsupported review schema_version")
     text(value["summary"], "summary", 32768)
@@ -25,9 +24,8 @@ def validate_review(value: Any) -> dict:
     if not isinstance(questions, list) or len(questions) > 64:
         raise ReviewerError("questions must be an array of at most 64 items")
     seen: set[str] = set()
-    for item in findings:
-        if not isinstance(item, dict) or set(item) != FINDING_KEYS:
-            raise ReviewerError("Finding has missing or unknown fields")
+    for index, item in enumerate(findings):
+        check_fields(item, FINDING_KEYS, f"findings[{index}]")
         for key in FINDING_KEYS - {"requires_human"}:
             text(item[key], f"finding.{key}", 32768 if key != "id" else 128)
         if item["id"] in seen:
@@ -37,9 +35,8 @@ def validate_review(value: Any) -> dict:
             raise ReviewerError("Unsupported finding severity")
         if type(item["requires_human"]) is not bool:
             raise ReviewerError("requires_human must be a boolean")
-    for item in questions:
-        if not isinstance(item, dict) or set(item) != QUESTION_KEYS:
-            raise ReviewerError("Question has missing or unknown fields")
+    for index, item in enumerate(questions):
+        check_fields(item, QUESTION_KEYS, f"questions[{index}]")
         for key in ("id", "question", "why_human"):
             text(item[key], f"question.{key}", 32768 if key != "id" else 128)
         if item["id"] in seen:

@@ -96,14 +96,16 @@ class ImplementWorkflow(Workflow):
 
     def on_recover(self, store, state: dict) -> None:
         if state["status"] == "checking":
-            # A check never consumes a review, so it always returns to implementing.
-            state.update(status="paused_error", resume_status="implementing")
+            # A check never consumes a review, so it always returns to implementing,
+            # which (as everywhere) clears approvals.
+            state.update(status="paused_error", resume_status="implementing", approvals={})
         else:
+            # An interrupted review is a reviewer failure: other approvals stay.
             state["attempts"][-1].update(status="failed", error="Human-confirmed interrupted dispatch; outcome unknown",
                                          finished_at=now())
             state.update(status="paused_error" if len(state["attempts"]) < state["config"]["max_reviews"] else "exhausted",
                          resume_status="ready_review")
-        state.update(approvals={}, last_error="Recovered interrupted operation after human process confirmation")
+        state.update(last_error="Recovered interrupted operation after human process confirmation")
 
     def on_transfer(self, state: dict) -> None:
         if state["status"] == "paused_error":

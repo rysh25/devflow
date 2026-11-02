@@ -25,6 +25,14 @@ class RecoverTests(unittest.TestCase):
         WORKFLOW.on_recover(None, state)
         self.assertEqual((state["status"], state["resume_status"]), ("paused_error", "ready_review"))
 
+    def test_interrupted_review_keeps_other_approvals(self):
+        # Like any reviewer failure; an interrupted check still clears them (above).
+        for attempts in (3, 6):
+            with self.subTest(attempts=attempts):
+                state = self.state("reviewing", attempts)
+                WORKFLOW.on_recover(None, state)
+                self.assertEqual(state["approvals"], {"codex": "x"})
+
 
 if __name__ == "__main__":
     unittest.main()

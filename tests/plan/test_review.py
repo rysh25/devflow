@@ -10,6 +10,7 @@ import unittest
 
 from devflow_core.common.errors import DevFlowError, ReviewerError
 from devflow_core.plan.review import validate_review
+from tests.common.test_common import FIELD_ERROR
 
 
 PASS = {"schema_version": 1, "verdict": "pass", "summary": "問題なし", "findings": [], "questions": []}
@@ -21,6 +22,18 @@ QUESTION = {"id": "Q1", "question": "Which scope?", "why_human": "Scope is undec
 
 
 class ValidationTests(unittest.TestCase):
+    def test_extra_finding_field_is_named(self):
+        # The shape of a real OpenCode reply: a finding with an added field.
+        value = {**PASS, "verdict": "changes_required", "findings": [{**FINDING, "consequence": "Breaks X"}]}
+        with self.assertRaises(ReviewerError) as caught:
+            validate_review(value)
+        self.assertEqual(str(caught.exception), FIELD_ERROR)
+
+    def test_missing_review_field_is_named(self):
+        value = {key: item for key, item in PASS.items() if key != "questions"}
+        with self.assertRaisesRegex(ReviewerError, r'^Review has missing or unknown fields \(missing: "questions"; unknown: none\)$'):
+            validate_review(value)
+
     def test_pass(self):
         self.assertEqual(validate_review(PASS), PASS)
 

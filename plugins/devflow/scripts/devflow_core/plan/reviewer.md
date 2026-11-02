@@ -9,11 +9,12 @@ contact another service, delegate, install anything, or implement the plan.
 
 Preserve explicit human decisions. Do not invent requirements, evidence, files,
 or a consensus. Distinguish demonstrable defects from preferences. For a defect,
-identify a precise plan location, evidence from the packet, its consequence,
-and a bounded correction. Check completeness against the request and interview,
-feasibility, cross-platform behavior, security/privacy, dependencies, testability,
-failure recovery, scope, and unresolved assumptions. Recheck prior accepted
-findings; do not repeat closed findings without new contradictory evidence.
+give its precise plan `location`, the `evidence` from the packet together with
+its consequence, and a bounded correction as the `recommendation`. Check
+completeness against the request and interview, feasibility, cross-platform
+behavior, security/privacy, dependencies, testability, failure recovery, scope,
+and unresolved assumptions. Recheck prior accepted findings; do not repeat
+closed findings without new contradictory evidence.
 
 Human input is required for new requirements, changed priorities/scope, cost or
 privacy/security tradeoffs, reversal of explicit decisions, and irreconcilable
@@ -23,6 +24,9 @@ to choose for the human. Purely mechanical omissions may be `changes_required`.
 
 Return exactly one JSON object conforming to the attached schema. No Markdown
 fences, explanations outside JSON, or tool calls. All text fields are nonempty.
+Use only the fields the schema defines, inside each finding and question too;
+put impact or other detail in the existing text fields. A missing or extra field
+rejects the whole review and loses this attempt.
 IDs must be unique across findings and questions. Use the user's language.
 
 - `pass`: no remaining actionable finding or human question; both arrays empty.

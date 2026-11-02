@@ -1,2 +1,2 @@
 """DevFlow: planning and implementation workflows with bounded independent reviews."""
-__version__ = "0.2.0"
+__version__ = "0.2.1"

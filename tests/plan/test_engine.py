@@ -284,6 +284,24 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(next_state["review_count"], 2)
         self.assertEqual(next_state["status"], "ready")
 
+    def test_reviewer_failure_keeps_other_passes_for_the_same_plan(self):
+        initial = self.ready()
+        outcomes = [review_value(), ReviewerError("malformed opencode reply"),
+                    ReviewerError("malformed codex reply"), review_value()]
+        with patch(RUN_REVIEW, side_effect=outcomes) as call:
+            self.assertEqual(self.engine.review(self.run_id)["status"], "ready")
+            self.assertEqual(self.engine.review(self.run_id)["status"], "paused_error")
+            self.resume(self.session)
+            self.assertEqual(self.engine.review(self.run_id)["status"], "paused_error")
+            self.resume(self.session)
+            final = self.engine.review(self.run_id)
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(final["review_count"], 4)
+        self.assertEqual(final["plan_hash"], initial["plan_hash"])
+        self.assertEqual([c.args[0]["id"] for c in call.call_args_list], ["codex", "opencode", "codex", "opencode"])
+        for number in ("02", "03"):
+            self.assertTrue((self.run / "reviews" / number / "error.json").is_file(), number)
+
     def test_ownership_moving_during_preflight_stops_the_old_owner_from_reviewing(self):
         self.ready()
         caller = Engine(self.project, session=self.session)

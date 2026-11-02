@@ -1,4 +1,4 @@
-# DevFlow 0.2.0 — Claude Code Plugin
+# DevFlow 0.2.1 — Claude Code Plugin
 
 人間との要件整理から計画作成、実装、独立レビューまでを支援する **単一の Claude Code Plugin** です。インストールするプラグインは `devflow` だけです。
 
@@ -187,6 +187,11 @@ run-id は一回の作業を識別する自動生成 ID です。レビューご
 - `recovery_required` の run は、`/devflow:resume RUN_ID` か cancel で書き込みを完了できます。
 - 外部処理（チェック・レビュー）の中断は、関係するプロセスが止まったことを確認してから、人間が自分の端末で `recover` を実行します。
 - `.devflow/runs/<flow>/.creating-*` や、失ったセッションの開始待ち・壊れたセッション記録（`.devflow/sessions/<ハッシュ>.json`）が新しい開始を止める場合は、`status` と `doctor` が示すファイルを、人間が `.devflow` の外へ移してください。run の記録そのものは消さないでください。
+
+## 0.2.1 の変更
+
+- Implement でも、レビュアーの失敗（不正な応答、タイムアウト、中断からの `recover` など）は、同じスナップショットに対する他のレビュアーの承認を取り消しません。Plan と同じ扱いです。
+- レビューの応答の項目に過不足があるときのエラーが、足りない項目と余分な項目の名前を示すようになりました（例: `findings[0] has missing or unknown fields (missing: none; unknown: "consequence")`）。レビュアーへの指示文でも、スキーマに無い項目を足さないよう明記しました。
 
 ## 開発・配布
 

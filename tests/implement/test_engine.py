@@ -505,6 +505,28 @@ class EngineFlowTests(EngineFixture):
         self.assertEqual(result["review_count"], 2)
         self.assertEqual(result["approvals"], {})
 
+    def test_reviewer_failure_keeps_other_approvals_for_the_same_snapshot(self):
+        self.start()
+        self.ready()
+        self.assertEqual(self.review()["status"], "ready_review")  # codex passes
+        snapshot = self.state()["candidate"]["snapshot_id"]
+        self.alter = lambda review: review.update(unexpected="not allowed")
+        failed = self.review()  # opencode: a reply with an extra field
+        self.assertEqual(failed["status"], "paused_error")
+        self.assertEqual(failed["approvals"], {"codex": snapshot})
+        self.resume()
+        failed = self.review()  # codex fails too; its earlier pass still counts
+        self.assertEqual(failed["status"], "paused_error")
+        self.assertEqual(failed["approvals"], {"codex": snapshot})
+        self.resume()
+        self.alter = None
+        final = self.review()  # opencode passes
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(final["review_count"], 4)
+        self.assertEqual([r["id"] for r in self.reviewers], ["codex", "opencode", "codex", "opencode"])
+        self.assertEqual([a["status"] for a in final["attempts"]], ["succeeded", "failed", "failed", "succeeded"])
+        self.assertEqual(final["approvals"], {"codex": snapshot, "opencode": snapshot})
+
     def test_sixth_correction_is_checked_but_marked_unreviewed_and_exhausted(self):
         self.start()
         self.ready()

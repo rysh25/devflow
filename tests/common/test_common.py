@@ -8,9 +8,13 @@ ROOT = Path(__file__).resolve().parents[2]
 
 from devflow_core.common.storage import (DevFlowError, atomic_json, checked_text, digest,
     file_lock, json_bytes, no_symlinks, read_json, within, write_new)
-from devflow_core.common.review import all_approved, next_reviewer, review_budget, validate_limit
+from devflow_core.common.errors import ReviewerError
+from devflow_core.common.review import all_approved, check_fields, next_reviewer, review_budget, validate_limit
 from devflow_core.common.settings import validate_document, workflow_overlay
 from devflow_core.common.shell import READ_ONLY_COMMANDS, ShellPolicyError, read_only_tokens, shell_tokens
+
+# The one canonical field error; the plan and implement validator tests share it.
+FIELD_ERROR = 'findings[0] has missing or unknown fields (missing: none; unknown: "consequence")'
 
 
 class SharedStorageTests(unittest.TestCase):
@@ -102,6 +106,53 @@ class SharedStorageTests(unittest.TestCase):
             with file_lock(path):
                 self.fail("Existing lock unexpectedly removed")
         self.assertEqual(read_json(path), stale)
+
+
+class FieldCheckTests(unittest.TestCase):
+    EXPECTED = {"id", "evidence"}
+
+    def message(self, value, label="findings[0]"):
+        with self.assertRaises(ReviewerError) as caught:
+            check_fields(value, self.EXPECTED, label)
+        return str(caught.exception)
+
+    def test_exact_fields_pass(self):
+        self.assertIsNone(check_fields({"evidence": "e", "id": "F1"}, self.EXPECTED, "findings[0]"))
+
+    def test_canonical_message(self):
+        self.assertEqual(self.message({"id": "F1", "evidence": "e", "consequence": "c"}), FIELD_ERROR)
+
+    def test_missing_only(self):
+        self.assertEqual(self.message({}, "Review"),
+                         'Review has missing or unknown fields (missing: "evidence", "id"; unknown: none)')
+
+    def test_names_are_sorted_whatever_the_input_order(self):
+        for order in (("b", "a", "c"), ("c", "b", "a")):
+            with self.subTest(order=order):
+                value = {"id": "F1", "evidence": "e", **{name: 1 for name in order}}
+                self.assertTrue(self.message(value).endswith('(missing: none; unknown: "a", "b", "c")'))
+
+    def test_at_most_eight_names_per_category(self):
+        value = {f"x{index:02d}": 1 for index in range(10)}
+        shown = ", ".join(f'"x{index:02d}"' for index in range(8))
+        self.assertEqual(self.message(value),
+                         'findings[0] has missing or unknown fields '
+                         f'(missing: "evidence", "id"; unknown: {shown}, and 2 more)')
+
+    def test_long_names_are_cut_before_escaping(self):
+        name = "n" * 100
+        self.assertIn(f'unknown: "{"n" * 64}")', self.message({"id": "F1", "evidence": "e", name: 1}))
+
+    def test_control_and_bidirectional_characters_are_escaped(self):
+        message = self.message({"id": "F1", "evidence": "e", "a\n\u202eb": 1})
+        self.assertIn('unknown: "a\\n\\u202eb")', message)
+        self.assertNotIn("\n", message)
+        self.assertNotIn("\u202e", message)
+
+    def test_non_objects_are_rejected(self):
+        for value in (None, [], "id", 1):
+            with self.subTest(value=value):
+                self.assertEqual(self.message(value), "findings[0] must be a JSON object")
 
 
 class SharedReviewTests(unittest.TestCase):

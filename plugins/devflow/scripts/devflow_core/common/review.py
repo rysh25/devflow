@@ -1,8 +1,14 @@
 """Shared budget, approval and verdict mechanics; domain policy remains in each flow."""
+import json
+
 from .errors import DevFlowError, ReviewerError
 from .runs import TERMINAL
 
 HARD_MAX_REVIEWS = 6
+# Field names in a rejected response come from the model: show a bounded,
+# escaped, deterministic selection.
+SHOWN_FIELD_NAMES = 8
+FIELD_NAME_CHARS = 64
 
 
 def validate_limit(value: int) -> int:
@@ -25,6 +31,28 @@ def all_approved(reviewers: list, approvals: dict, artifact_digest: str) -> bool
 
 
 VERDICTS = ("pass", "changes_required", "human_required")
+
+
+def _field_names(names: list[str]) -> str:
+    if not names:
+        return "none"
+    # ensure_ascii escapes control and bidirectional characters, so a name
+    # cannot disguise the message; the cut applies before escaping.
+    shown = [json.dumps(name[:FIELD_NAME_CHARS]) for name in names[:SHOWN_FIELD_NAMES]]
+    if len(names) > SHOWN_FIELD_NAMES:
+        shown.append(f"and {len(names) - SHOWN_FIELD_NAMES} more")
+    return ", ".join(shown)
+
+
+def check_fields(value: object, expected: set[str] | frozenset[str], label: str) -> None:
+    """Require exactly the expected keys, naming the missing and unknown ones."""
+    if not isinstance(value, dict):
+        raise ReviewerError(f"{label} must be a JSON object")
+    actual = set(value)
+    missing, unknown = sorted(expected - actual), sorted(actual - expected)
+    if missing or unknown:
+        raise ReviewerError(f"{label} has missing or unknown fields "
+                            f"(missing: {_field_names(missing)}; unknown: {_field_names(unknown)})")
 
 
 def check_verdict(verdict: str, findings: list, questions: list) -> None:

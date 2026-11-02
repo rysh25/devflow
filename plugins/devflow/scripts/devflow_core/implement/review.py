@@ -7,7 +7,7 @@ from typing import Any
 
 from ..common.errors import ReviewerError
 from ..common.reviewers import text
-from ..common.review import check_verdict
+from ..common.review import check_fields, check_verdict
 
 REVIEW_KEYS = {"schema_version", "snapshot_id", "verdict", "summary", "findings", "questions"}
 FINDING_KEYS = {"id", "severity", "category", "file", "line_start", "line_end",
@@ -16,8 +16,7 @@ FINDING_KEYS = {"id", "severity", "category", "file", "line_start", "line_end",
 
 def validate_review(value: Any) -> dict:
     """Validate exact fields and invariants. Never repair or salvage model JSON."""
-    if not isinstance(value, dict) or set(value) != REVIEW_KEYS:
-        raise ReviewerError("Review has missing or unknown fields")
+    check_fields(value, REVIEW_KEYS, "Review")
     if type(value["schema_version"]) is not int or value["schema_version"] != 1:
         raise ReviewerError("Unsupported review schema_version")
     text(value["snapshot_id"], "snapshot_id", 128)
@@ -30,9 +29,8 @@ def validate_review(value: Any) -> dict:
     if not isinstance(questions, list) or len(questions) > 64:
         raise ReviewerError("questions must be an array of at most 64 strings")
     seen = set()
-    for finding in findings:
-        if not isinstance(finding, dict) or set(finding) != FINDING_KEYS:
-            raise ReviewerError("Finding has missing or unknown fields")
+    for index, finding in enumerate(findings):
+        check_fields(finding, FINDING_KEYS, f"findings[{index}]")
         for field in ("id", "severity", "category", "file", "evidence", "recommendation"):
             text(finding[field], f"finding.{field}", 128 if field == "id" else 32768)
         if finding["id"] in seen:
