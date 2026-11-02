@@ -130,6 +130,7 @@ class RunEngine:
         result = {key: value for key, value in state.items() if key not in {"artifacts", "event_ids"}}
         run = self._run(run_id)
         result.update(run_dir=str(run), draft_dir=str(run / "draft"), **self.workflow.summary(state),
+                      bash_timeout_ms=self.workflow.bash_timeouts(state),
                       human_events=approval_candidates(state, self._events(state)))
         self._status_details(state, result)
         return result

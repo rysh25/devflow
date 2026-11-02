@@ -1,16 +1,18 @@
 """The plan workflow's runner actions: one table for the guard, the parser and dispatch."""
 from __future__ import annotations
 
+from ..common.environment import python_errors
 from ..common.workflow import Command, Option
 from .config import diagnose
 
 
 def doctor(engine, args, run_id, session) -> dict:
     """Offline checks of the frozen (selected) or project configuration; repairs nothing."""
-    if not run_id:
-        return {**diagnose(engine.project, engine.workflow), "run_id": None}
-    frozen = engine.read_frozen_config(run_id)
-    return {**diagnose(engine.project, engine.workflow, effective_config=frozen), "run_id": run_id}
+    frozen = engine.read_frozen_config(run_id) if run_id else None
+    report = diagnose(engine.project, engine.workflow, effective_config=frozen)
+    errors = python_errors()
+    return {**report, "run_id": run_id or None, "warnings": engine.workflow.timeout_warnings(report["config"]),
+            "errors": errors, "ready": report["ready"] and not errors}
 
 
 COMMANDS = (

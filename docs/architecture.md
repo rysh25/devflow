@@ -2,7 +2,7 @@
 
 ## 一つの配布と独立したワークフロー
 
-DevFlow 0.2.1 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
+DevFlow 0.3.0 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
 
 ```mermaid
 flowchart TD
@@ -36,11 +36,13 @@ Python コードは `plugins/devflow/scripts/devflow_core/` の1つのパッケ�
 | `engine.py` | 各フローのエンジンの基底クラス（RunEngine）：RunStore の利用と所有者の確認、外部処理のライフサイクル（`_dispatch`：ロック内で予約 → ロック外で実行 → 予約が有効なら確定、古い結果は `late/`）、`recover`（人間の確認が必須）、共通の `status`（各フローの `summary` を含む）、凍結した設定の照合（`Workflow.frozen_config` を通す） |
 | `process.py` | チェックとレビュアー CLI で共通の、出力上限・時間切れ・プロセスツリー停止付きの子プロセス実行 |
 | `sessions.py` | セッション記録、承認に使える回答の規則、回答文の取り出し |
-| `guard.py` | PreToolUse の判定の骨組み：読み取り専用ツール、Bash の検査、ランナー呼び出しの解析、パス検査、プラグイン保護 |
+| `guard.py` | PreToolUse の判定の骨組み：書き込まないツール、Bash の検査、ランナー呼び出しの解析（Bash と PowerShell）、パス検査、プラグインとプロジェクトの目印の保護、`cd` の行き先の判定。開始前・持ち主・持ち主でない会話（引き継がれた元の会話と、0.2.x の run に紐づいた会話）の3つの判定は、書き込まない作業という同じ土台を共有する |
 | `reviewers.py` | Codex / OpenCode の事前確認・起動・分離・出力検査 |
 | `settings.py` | `devflow.config.json` の重ね合わせと、レビュアー設定の共通規則 |
 | `workflow.py` | 各フローが実装する契約（`Workflow` クラス）と、動作の表（`Command` / `Option`）。ガードの許可、CLI の登録、振り分けはこの表から導く。共通層はフロー固有の state の項目を直接読まず、`summary` や `frozen_config` などの契約を通す |
-| `errors.py`、`storage.py`、`shell.py`、`review.py`、`paths.py` | エラーの系統、原子的な保存とロック、シェルの方針、回数と承認の判定、インストール先 |
+| `shell.py` | Bash を bash と同じ規則で語と区切りに分け（`split_words`）、許可するコマンドの表（`COMMANDS`）で各部分を検査する。PowerShell はランナーだけのトークン化 |
+| `environment.py` | Claude Code の Bash の上限（`BASH_MAX_TIMEOUT_MS` と `BASH_DEFAULT_TIMEOUT_MS` の大きい方）と、長い処理に要る時間（`bash_timeout_ms`）。MSYS2・Cygwin の Python の検出 |
+| `errors.py`、`storage.py`、`review.py`、`paths.py` | エラーの系統、原子的な保存とロック、回数と承認の判定、インストール先とプロジェクトの根（`project_root`） |
 
 import の向きは一方向です。`common` はフローや router を import せず、フロー同士も互いを import しません。フローを import するのは登録表だけです。`tools/package.py` がこの向きと、各フローのリソースが揃っていることと、登録表がフローのパッケージと一致することを静的に検査します。ワークフロー名の正本は登録表だけで、設定ファイルの最上位のキーも、登録表を持つ CLI と router が検査します。
 
@@ -108,14 +110,16 @@ Gitモードでは、対象範囲内の追跡済みファイルとGitに無視�
 
 エンジンは共通のレビューJSONを扱い、CLI固有のオプションやイベント形式はアダプターで吸収します。設定だけで未実装のツールを任意に実行するのではなく、新しいツールを追加する際は専用アダプターとテストを実装します。
 
-モデル名・推論設定は設定として保持し、実行開始後は固定します。OpenCodeのv1/v2は明示的に区別します。CLIの未知の出力・途中終了・禁止ツール呼び出しを、都合よく読み替えて合格にはしません。
+モデル名・推論設定は設定として保持し、実行開始後は固定します。OpenCode は 2.x（プロトコル 2）だけに対応します。レビュアーが使えるツールは、`web` が真（既定）のときの Web 検索と Web の取得だけです。CLIの未知の出力・途中終了・禁止ツール呼び出しを、都合よく読み替えて合格にはしません。
+
+レビューとチェックは、1 回のランナーの呼び出しの中で外部の処理を待ちます。Claude Code の Bash がその前に打ち切ると、run は処理中のまま残ります。このため、ランナーの結果と状態の通知は、次の `review` と `check` に要る Bash の時間（`bash_timeout_ms`）をその時点の状態から返し、Claude Code の上限が足りない設定では doctor と開始時に警告します。
 
 ## 状態保存と復旧
 
 対象プロジェクトの `.devflow/runs/plan/RUN_ID/` と `.devflow/runs/implement/RUN_ID/` に、計画、設定、ベースライン、スナップショット、チェック、レビュー、採否、人間の発言を保存します。確定記録は上書きしません。
 
-- **run の state**（`schema_version` 2）は、全フロー共通の枠（`owner_session`、`event_ids`、`inflight`、`escalation` など）と、各フローが宣言した項目だけを持ちます。処理中の状態（チェック中・レビュー中）と `inflight` は必ず一致します。0.1.x の run は `unsupported`、読めない run は `invalid` として扱い、`unsupported` だけは新しい開始を止めません。
-- **所有者**は run の `owner_session` だけで決まります。セッション記録（`.devflow/sessions/<ハッシュ>.json`）は、そのセッションが見ている run か、開始待ちのどちらか一方だけを持ちます。紐付けが所有者と一致しなければ「所有者でない」として扱い、ワークフローの道具を拒みます。
+- **run の state**（`schema_version` 3）は、全フロー共通の枠（`owner_session`、`event_ids`、`inflight`、`escalation` など）と、各フローが宣言した項目だけを持ちます。処理中の状態（チェック中・レビュー中）と `inflight` は必ず一致します。それより古い形式（0.1.x の 1、0.2.x の 2）の run は `unsupported`、読めない run は `invalid` として扱い、`unsupported` だけは新しい開始を止めません。
+- **所有者**は run の `owner_session` だけで決まります。セッション記録（`.devflow/sessions/<ハッシュ>.json`、形式 2 のまま）は、そのセッションが見ている run か、開始待ちのどちらか一方だけを持ちます。紐付けが所有者と一致しなければ「所有者でない」として扱い、書き込まない作業だけを許します。`unsupported` の run への紐付けも同じ扱いで、次の有効な入力で外します（紐付けが無いことと区別し、ガードを外しません）。
 - **開始**は「開始待ちの記録 → run の作成 → 紐付け」の3段階です。run は一時ディレクトリに全部作ってから rename で置くので、途中の状態の run は現れません。途中で止まった場合、次の入力で、作成済みなら紐付けを完了し、未作成なら開始待ちを取り消します。
 - **resume** はフックの中で行います。紐付けを先に書き、その後で所有者の変更・resume の依頼の記録・回答の境界の更新を1回で確定します。途中で止まった場合は「所有者でない」状態になり、`/devflow:resume` の再送で完了します。
 - **人間の発言**（`events/<ID>.json`）はフックの入力そのものを保存します。承認に使えるのは、保留中の質問の後に、所有するセッションで記録された AskUserQuestion の成功した回答だけです。

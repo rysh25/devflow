@@ -1240,8 +1240,9 @@ class EngineTests(unittest.TestCase):
         old_payload = self.event(prompt="Obsolete session says yes.")
         self.resume("new-owner-session")
         before = read_json(self.run / "state.json")
-        with self.assertRaisesRegex(DevFlowError, "owned by another session"):
-            self.hook(old_payload)
+        # The old session may keep talking, but its prompt is never recorded as evidence.
+        context = self.hook(old_payload)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("no longer owns DevFlow run", context)
         with self.assertRaisesRegex(DevFlowError, "stale-session"):
             self.engine.store.append_event(self.run_id, old_payload, "prompt")
         self.assertEqual(read_json(self.run / "state.json"), before)

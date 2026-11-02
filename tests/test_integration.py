@@ -52,6 +52,15 @@ def review_pass(provider, packet_path, *_):
             "summary": "Synthetic review: no unresolved findings.", "findings": [], "questions": []}
 
 
+def review_changes(provider, packet_path, *_):
+    packet = json.loads(Path(packet_path).read_text(encoding="utf-8"))
+    return {"schema_version": 1, "snapshot_id": packet["snapshot_id"], "verdict": "changes_required",
+            "summary": "Synthetic review: one fix needed.", "questions": [],
+            "findings": [{"id": "F1", "severity": "medium", "category": "correctness", "file": "feature.py",
+                          "line_start": 1, "line_end": 1, "evidence": "VALUE is wrong.",
+                          "recommendation": "Fix VALUE.", "requires_human": False}]}
+
+
 class BundleContractTests(unittest.TestCase):
     def test_marketplace_and_plugin_names_match_exact_sources(self):
         marketplace = read_json(ROOT / ".claude-plugin" / "marketplace.json")
@@ -383,12 +392,19 @@ class HookCliEngineTests(FlowFixture):
         resumed = self.invoke("status", session=new_session)
         self.assertEqual(resumed["review_count"], 1)
         self.assertEqual(resumed["next_reviewer"], "opencode")
-        # The previous session no longer owns the run: it is stopped until it
-        # explicitly resumes again (or the run ends), never silently freed.
+        # The previous session no longer owns the run: it keeps only non-writing
+        # work until it explicitly resumes again (or the run ends), never silently freed.
         stale = hook(self.event("PreToolUse", tool_name="Bash", tool_input={"command": "normal user work"}), PLUGIN)
         self.assertEqual(stale["hookSpecificOutput"]["permissionDecision"], "deny")
-        with self.assertRaisesRegex(DevFlowError, "/devflow:resume"):
-            self.submit("Keep going here")
+        stale = hook(self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(self.source)}), PLUGIN)
+        self.assertEqual(stale["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIsNone(hook(self.event("PreToolUse", tool_name="Read", tool_input={"file_path": str(self.source)}),
+                               PLUGIN))
+        before = len(read_json(Path(self.engine.status(self.run_id)["run_dir"]) / "state.json")["event_ids"])
+        context = self.submit("Keep going here")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("/devflow:resume " + self.run_id, context)
+        self.assertEqual(len(read_json(Path(self.engine.status(self.run_id)["run_dir"]) / "state.json")["event_ids"]),
+                         before)
         with patch("devflow_core.implement.engine.run_review", side_effect=review_pass):
             result = self.invoke("review", session=new_session)
         self.assertEqual(result["status"], "completed")
@@ -471,6 +487,103 @@ class WorkflowIndependenceTests(FlowFixture):
         self.assertEqual(self.plan_engine.status(plan_run)["status"], "completed")
         payload = self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(self.source)})
         self.assertIsNone(hook(payload, PLUGIN))
+
+
+
+def without_bash_settings(**values):
+    """os.environ without Claude Code's Bash settings, plus ``values``."""
+    env = {key: value for key, value in os.environ.items() if not key.startswith("BASH_")}
+    env.update(values)
+    return patch.dict(os.environ, env, clear=True)
+
+
+class BashTimeoutTests(FlowFixture):
+    """Every runner result and the status context carry the Bash timeout the
+    next long actions need; DevFlow warns when Claude Code's limit is shorter."""
+
+    def setUp(self):
+        super().setUp()
+        self.config["reviewers"] = [
+            {"id": "codex", "kind": "codex", "command": ["codex"], "model": "gpt-6.1-sol", "effort": "xhigh",
+             "timeout_seconds": 300},
+            {"id": "opencode", "kind": "opencode", "command": ["opencode"], "model": "opencode-go/deepseek-v4.1-flash",
+             "effort": "high", "timeout_seconds": 900}]
+        write_json(self.project / "devflow.config.json", {"schema_version": 1, "implement": self.config})
+
+    def test_results_follow_the_next_reviewer_and_drop_finished_actions(self):
+        with without_bash_settings(BASH_MAX_TIMEOUT_MS="2000000"):
+            started = self.start()
+        self.assertEqual(started["bash_timeout_ms"], {"review": 360000, "check": 70000})
+        self.assertNotIn("warnings", started)
+        self.assertIs(read_json(Path(started["run_dir"]) / "config.json")["reviewers"][0]["web"], True)
+        self.edit(self.source, "VALUE = 2\n")
+        self.checkpoint()
+        self.assertEqual(self.invoke("check")["bash_timeout_ms"]["review"], 360000)
+        with patch("devflow_core.implement.engine.run_review", side_effect=review_pass):
+            first = self.invoke("review")
+        # Same turn, next reviewer: the value changes with it.
+        self.assertEqual(first["bash_timeout_ms"], {"review": 960000, "check": 70000})
+        self.assertEqual(self.invoke("status")["bash_timeout_ms"], first["bash_timeout_ms"])
+        context = self.submit("continue")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn('"bash_timeout_ms": {"review": 960000, "check": 70000}', context)
+        with patch("devflow_core.implement.engine.run_review", side_effect=review_changes):
+            second = self.invoke("review")
+        self.assertEqual(second["status"], "needs_revision")
+        self.assertEqual(second["bash_timeout_ms"], {"review": 360000, "check": 70000})  # codex is next again
+
+    def test_a_finished_run_has_no_review_or_check_timeout(self):
+        with without_bash_settings(BASH_MAX_TIMEOUT_MS="2000000"):
+            self.start()
+        self.edit(self.source, "VALUE = 2\n")
+        self.checkpoint()
+        self.invoke("check")
+        with patch("devflow_core.implement.engine.run_review", side_effect=review_pass):
+            self.invoke("review")
+            second = self.invoke("review")
+        self.assertEqual(second["status"], "completed")
+        self.assertEqual(second["bash_timeout_ms"], {})  # Nothing is left to time.
+
+    def test_no_check_timeout_without_checks_and_nothing_once_finished(self):
+        self.config["checks"] = []
+        write_json(self.project / "devflow.config.json", {"schema_version": 1, "implement": self.config})
+        with without_bash_settings(BASH_MAX_TIMEOUT_MS="2000000"):
+            started = self.start()
+        self.assertEqual(started["bash_timeout_ms"], {"review": 360000})
+        state = read_json(Path(started["run_dir"]) / "state.json")
+        for status in ("completed", "exhausted", "cancelled"):
+            with self.subTest(status=status):
+                self.assertEqual(WORKFLOWS["implement"].bash_timeouts(dict(state, status=status)), {})
+
+    def test_limit_warnings_in_doctor_and_start(self):
+        warning = "is shorter than DevFlow needs for review (960000 ms)"
+        for env, warned in (({}, True), ({"BASH_MAX_TIMEOUT_MS": "960000"}, False),
+                            ({"BASH_DEFAULT_TIMEOUT_MS": "1800000"}, False),
+                            ({"BASH_MAX_TIMEOUT_MS": "700000", "BASH_DEFAULT_TIMEOUT_MS": "650000"}, True)):
+            with self.subTest(env=env), without_bash_settings(**env):
+                doctor = self.invoke("doctor", run=False)
+                self.assertEqual(any(warning in item for item in doctor["warnings"]), warned, doctor["warnings"])
+                overall = cli.doctor(self.project)
+                self.assertEqual(any(warning in item for item in overall["warnings"]), warned)
+                if env.get("BASH_DEFAULT_TIMEOUT_MS") == "650000":
+                    self.assertTrue(any("BASH_MAX_TIMEOUT_MS=700000 and BASH_DEFAULT_TIMEOUT_MS=650000" in item
+                                        for item in doctor["warnings"]))
+        with without_bash_settings():
+            started = self.start()
+        self.assertTrue(any(warning in item for item in started["warnings"]))
+
+    def test_plan_start_context_warns_and_finished_plan_has_no_review_timeout(self):
+        with without_bash_settings():
+            context = hook(self.event(prompt="/devflow:plan Make a tested pure function."), PLUGIN)
+        text = context["hookSpecificOutput"]["additionalContext"]
+        self.assertIn('"bash_timeout_ms": {"review": 960000}', text)
+        self.assertIn("is shorter than DevFlow needs for review (960000 ms)", text)
+        run_id = self.record()["run"]["run_id"]
+        state = read_json(self.plan_engine.store.run_dir(run_id) / "state.json")
+        for status, count in (("completed", 2), ("exhausted", 6), ("ready", 6)):
+            with self.subTest(status=status, review_count=count):
+                self.assertEqual(WORKFLOWS["plan"].bash_timeouts(dict(state, status=status, review_count=count)), {})
+        self.plan_engine.cancel(run_id)
+        self.assertEqual(self.plan_engine.status(run_id)["bash_timeout_ms"], {})
 
 
 if __name__ == "__main__":

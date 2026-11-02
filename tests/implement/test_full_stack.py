@@ -171,7 +171,10 @@ class FullStackTests(unittest.TestCase):
         self.assertEqual(codex["previous_review_count"], 0)
         self.assertEqual(opencode["previous_review_count"], 1)
         runtime = read_json(open_dir / "workspace" / "opencode.json")
-        self.assertEqual(runtime["permissions"], [{"action": "*", "resource": "*", "effect": "deny"}])
+        # Everything is denied except, by default, the web tools (allowed last).
+        self.assertEqual(runtime["permissions"], [{"action": "*", "resource": "*", "effect": "deny"},
+                                                  {"action": "webfetch", "resource": "*", "effect": "allow"},
+                                                  {"action": "websearch", "resource": "*", "effect": "allow"}])
         agent = opencode["args"][opencode["args"].index("--agent") + 1]
         self.assertIn(agent, runtime["agents"])
 

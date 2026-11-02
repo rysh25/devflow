@@ -908,7 +908,7 @@ class RecoveryAndIntegrityTests(EngineFixture):
         desired["state_revision"] += 1
         desired["last_error"] = "Recovered pending transaction fixture."
         desired["artifacts"][relative] = digest(payload)
-        journal = {"schema_version": 2, "base_revision": current["state_revision"], "state": desired,
+        journal = {"schema_version": 3, "base_revision": current["state_revision"], "state": desired,
                    "writes": {relative: base64.b64encode(payload).decode("ascii")}}
         atomic_write_json(self.run / "transaction.json", journal)
         return current, desired, relative, payload

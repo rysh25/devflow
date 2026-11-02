@@ -160,13 +160,20 @@ class ToolGuardTests(Fixture):
         self.assertDenied(self.guard("AskUserQuestion", annotations={"Approve?": {"notes": "Approved"}}))
 
     def test_read_only_search_commands_allowed_but_cannot_run_programs(self):
-        for command in ("grep -rn 'def (main|run)' src", "find . -name '*.py'", "ls", "cat README.md"):
+        for command in ("grep -rn 'def (main|run)' src", "find . -name '*.py'", "ls", "cat README.md",
+                        "grep -rn TODO src | sort | uniq -c", "sed -n '1,20p' README.md",
+                        "git --no-optional-locks --no-pager diff --stat", f"cd {shlex.quote(str(self.project))} && ls"):
             with self.subTest(command=command):
                 self.assertIsNone(self.guard("Bash", command=command))
         for command in ("find . -exec sh -c x \\;", "rg --pre sh x", "grep x . | sh", "cat a > b"):
             with self.subTest(command=command):
                 self.assertDenied(self.guard("Bash", command=command))
-        self.assertDenied(self.guard("PowerShell", command="ls"))
+        result = self.guard("PowerShell", command="ls")
+        self.assertDenied(result)
+        reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("PowerShell accepts only the DevFlow runner; use the Bash tool (Git Bash) for read-only "
+                      "commands, or Read, Grep and Glob", reason)
+        self.assertNotIn("Bash accepts", reason)
 
     def test_runner_path_mismatch_names_the_installed_runner(self):
         stale = self.runner("status").replace(str(self.script), "/old/plugin/0.1.0/scripts/devflow.py")
@@ -175,9 +182,26 @@ class ToolGuardTests(Fixture):
         self.assertIn(str(self.script), result["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_unknown_external_agent_and_skill_tools_denied(self):
-        for tool in ("Agent", "Task", "Skill", "WebSearch", "WebFetch", "mcp__files__write", "Unknown"):
+        for tool in ("Agent", "Task", "Skill", "Monitor", "TaskStop", "SendMessage", "CronCreate", "ScheduleWakeup",
+                     "EnterWorktree", "ExitPlanMode", "Workflow", "mcp__files__write", "Unknown"):
             with self.subTest(tool=tool):
                 self.assertDenied(self.guard(tool))
+
+    def test_non_writing_tools_are_allowed(self):
+        for tool in ("WebSearch", "WebFetch", "ReadNotifications", "ListAgents", "CronList", "PushNotification",
+                     "SendUserFile", "Read", "ToolSearch"):
+            with self.subTest(tool=tool):
+                self.assertIsNone(self.guard(tool))
+
+    def test_project_markers_and_ugrep_settings_cannot_be_written(self):
+        for path in (self.draft / ".git" / "x", self.draft / "devflow.config.json", self.draft / ".ugrep",
+                     self.project / "sub" / ".ugrep", self.project / "sub" / ".ug", self.project / "sub" / ".UGREP",
+                     self.project / "sub" / ".devflow" / "x", self.project / "sub" / ".mcp.json::$DATA",
+                     self.project / "CLAUDE.md.", self.project / "claude.md ", self.project / ".gitignore.",
+                     self.project / "sub" / "devflow.config.json::$DATA"):
+            with self.subTest(path=path):
+                self.assertDenied(self.guard("Write", file_path=str(path), content="x"))
+        self.assertIsNone(self.guard("Write", file_path=str(self.draft / "notes.md"), content="x"))
 
     def test_source_write_allowed_only_in_edit_phases(self):
         for status in ("implementing", "needs_revision"):
@@ -294,7 +318,9 @@ class RunnerGuardTests(Fixture):
 
     def test_explicit_run_is_bound(self):
         self.assertIsNone(self.guard("Bash", command=self.runner("--run", RUN_ID, "status")))
-        self.assertDenied(self.guard("Bash", command=self.runner("--run", "another-run", "status")))
+        # Status and doctor only read, so any run may be named; actions stay bound.
+        self.assertIsNone(self.guard("Bash", command=self.runner("--run", "another-run", "status")))
+        self.assertDenied(self.guard("Bash", command=self.runner("--run", "another-run", "cancel", "--reason", "x")))
 
     def test_runner_has_no_resume_action(self):
         # Resume happens only in the hook for the user's /devflow:resume prompt.
@@ -408,7 +434,8 @@ class RunnerGuardTests(Fixture):
                    # "./feature.md", "feature.md" and the absolute path name the same plan.
                    ("Bash", {"command": self.runner("start", "--plan", "feature.md")}),
                    ("Bash", {"command": self.runner("start", "--plan", "./feature.md")}),
-                   ("PowerShell", {"command": self.runner("start", "--plan", str(self.plan))})]
+                   ("PowerShell", {"command": self.runner("start", "--plan", str(self.plan))}),
+                   ("WebFetch", {"url": "https://example.invalid"}), ("Bash", {"command": "grep -rn x . | head"})]
         for tool, data in allowed:
             with self.subTest(tool=tool, data=data):
                 self.assertIsNone(self.guard(tool, **data))
@@ -420,7 +447,7 @@ class RunnerGuardTests(Fixture):
                   ("Bash", {"command": self.runner("--run", RUN_ID, "start", "--plan", str(self.plan))}),
                   ("Bash", {"command": self.runner("start", "--plan", "other.md")}),
                   ("Bash", {"command": self.runner("cancel", "--reason", "x", flow="plan")}),
-                  ("WebFetch", {"url": "https://example.invalid"})]
+                  ("Monitor", {"command": "ls"})]
         for tool, data in denied:
             with self.subTest(tool=tool, data=data):
                 self.assertDenied(self.guard(tool, **data))
@@ -687,13 +714,13 @@ class SessionCaptureTests(Fixture):
         # Another session explicitly resumes the run; this session's pointer goes stale.
         self.submit("/devflow:resume " + self.run_id, "claude-session-456")
         self.assertEqual(self.stored()["owner_session"], "claude-session-456")
-        self.assertDenied(self.hook(self.payload()))
-        with self.assertRaisesRegex(DevFlowError, "another session"):
-            self.submit("Continue the work")
+        self.assertIsNone(self.hook(self.payload()))  # Reading stays available.
+        self.assertDenied(self.hook(self.payload(tool="Write", file_path=str(self.project / "x.py"))))
+        context = self.submit("Continue the work")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("no longer owns DevFlow run", context)
         with self.assertRaises(DevFlowError):
             self.hook(self.question())
-        with self.assertRaises(DevFlowError):
-            self.hook(self.payload(event="Stop"))
+        self.assertIsNone(self.hook(self.payload(event="Stop")))  # Nothing is recorded.
         self.assertEqual(len(self.stored()["event_ids"]), 2)
 
     def test_unknown_events_and_nonquestion_results_inert(self):

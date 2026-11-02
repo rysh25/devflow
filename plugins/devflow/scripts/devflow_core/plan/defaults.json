@@ -11,7 +11,8 @@
       "command": ["codex"],
       "model": "gpt-6.1-sol",
       "effort": "xhigh",
-      "timeout_seconds": 600
+      "timeout_seconds": 900,
+      "web": true
     },
     {
       "id": "opencode",
@@ -20,7 +21,8 @@
       "model": "opencode-go/deepseek-v4.1-flash",
       "effort": "high",
       "protocol_version": 2,
-      "timeout_seconds": 600
+      "timeout_seconds": 900,
+      "web": true
     }
   ]
 }

@@ -4,6 +4,7 @@ from __future__ import annotations
 import shutil
 
 from .. import __version__
+from ..common.environment import python_errors
 from ..common.errors import DevFlowError
 from ..common.reviewers import preflight
 from ..common.workflow import Command, Option
@@ -19,10 +20,11 @@ def doctor(engine, args, run_id, session) -> dict:
             results.append({"id": provider["id"], "ready": True, "details": preflight(provider)})
         except DevFlowError as exc:
             results.append({"id": provider["id"], "ready": False, "error": str(exc)})
+    errors = python_errors()
     return {"schema_version": 1, "plugin": "devflow", "workflow": workflow.name, "version": __version__,
             "project": str(engine.project), "run_id": run_id, "config": config, "reviewers": results,
             "executables": {name: shutil.which(name) for name in ("uv", "claude", "git")},
-            "ready": all(item["ready"] for item in results),
+            "ready": all(item["ready"] for item in results) and not errors, "errors": errors,
             "warnings": workflow.doctor(engine.project, config).get("warnings", []),
             "not_verified": ["CLI authentication and model access", "Actual model used by provider",
                              "Real Claude Code hook execution", "Native Windows/macOS behavior"],

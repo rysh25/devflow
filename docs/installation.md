@@ -25,13 +25,29 @@ Claude Code のセッション内からは、実際の解凍先パスを使い�
 
 パスは例です。実在するパスへ置き換えてください。画面でスコープと導入内容を確認し、反映時期は install summary に従ってください。必要なら `/reload-plugins` または新しいセッションを使用します。
 
-対象プロジェクトで `/devflow:doctor` を実行します。doctor は環境診断であり、アカウントで指定モデルが使えることまで保証するものではありません。
+対象プロジェクトで `/devflow:doctor` を実行します。doctor は環境診断であり、アカウントで指定モデルが使えることまで保証するものではありません。doctor はプロジェクトのファイルを書きませんが、設定したレビュアー CLI の `--version` と `--help` を実行します。
+
+### Claude Code の Bash の上限を上げる
+
+レビュアーの既定の制限時間は 900 秒です。Claude Code の Bash は、既定では 1 回 10 分で打ち切ります。打ち切られると、run は処理中のまま残り、人が `recover` する必要があり、その回は使用済みになります。Bash の実際の上限は `BASH_MAX_TIMEOUT_MS` と `BASH_DEFAULT_TIMEOUT_MS` の大きい方です。通常は `BASH_MAX_TIMEOUT_MS` を、必要な値（レビュアーの `timeout_seconds` に 60 秒を足したミリ秒。既定では 960000）以上にします。`BASH_DEFAULT_TIMEOUT_MS` を上げると、すべての Bash の既定の待ち時間も長くなります。
+
+```json
+{"env": {"BASH_MAX_TIMEOUT_MS": "960000"}}
+```
+
+これを `~/.claude/settings.json`（またはプロジェクトの `.claude/settings.json`）に書き、Claude Code を起動し直します。Implement のチェックは 1 回の `check` で全チェックを順に実行するので、各チェックの `timeout_seconds` の合計に 60 秒を足した時間が必要です。足りない場合、`doctor` と run の開始時に警告します。run の中では、ランナーの結果と状態の通知の `bash_timeout_ms` に、次の `review` と `check` に要る値が出ます。
+
+### Windows
+
+Windows では Git for Windows（Git Bash）を入れてください。Claude Code は Git Bash があれば Bash ツールにそれを使い、`grep` と `find` も Linux・macOS と同じものになります。PowerShell では、DevFlow はランナーだけを通します。Git Bash が無い場合も、ランナー・`Read`・`Grep`・`Glob`・Web は使えますが、Bash のコマンドは使えません。
+
+claude.ai や Console のアカウントでは、Git Bash があっても PowerShell ツールが既定で有効で、Claude はそれを主に使います。拒否されると Bash に切り替えますが、`CLAUDE_CODE_USE_POWERSHELL_TOOL=0` を設定すると、最初から Bash を主にできます。uv が MSYS2 や Cygwin の Python を選ぶと、パスの扱いが変わるため doctor がエラーにします。Windows 版の Python を使ってください。
 
 面接スキルの診断も静的確認です。`static_ready` や `model_invocable` が真でも、Claude Code での実際の呼び出し確認を意味しません。`runtime_verified` は偽であることを区別してください。診断の探索範囲外なら `unverified`、探索できる場所で見つからない場合は `missing` として扱い、`reason` と `checked_locations` を確認します。
 
 `/devflow:doctor` は現在のプロジェクト設定を診断します。Plan 実行中にランナーから呼ぶ `plan doctor` は、対象の session / run がある場合、その実行に保存された固定設定を診断します。結果の `configuration_source` と `run_id` で対象を確認できます。新しい設定が進行中の実行に適用済みだとは解釈しないでください。
 
-スキル本文が要求するすべてのツールとの互換性までは診断しません。DevFlow は呼び出し時に Plan の制限を伝え、`grilling` 内の調査も同じ会話の読み取りツールへ限定します。サブエージェントや任意の Bash を許可するためにガードを緩めず、必要な情報をその範囲で取得できない場合は人間にエスカレーションします。
+スキル本文が要求するすべてのツールとの互換性までは診断しません。DevFlow は呼び出し時に Plan の制限を伝え、`grilling` 内の調査も同じ会話の、書き込まないツール・Web・許可された Bash のコマンドへ限定します。サブエージェントや任意の Bash を許可するためにガードを緩めず、必要な情報をその範囲で取得できない場合は人間にエスカレーションします。
 
 ## GitHub から導入する
 
@@ -90,11 +106,35 @@ plugin は offline で動き自動ダウンロードしません。人間が Pyt
 
 設定は run 開始時に固定されます。進行中 run の設定ファイルを直接編集して呼び出し先を差し替えないでください。
 
-### Plan の Bash コマンドがガードに拒否される
+### ガードに拒否される Bash コマンド
 
-Plan・Implement 実行中の Bash は、スキルに記載された `uv` ランナーの単独呼び出しと、読み取り専用の検索コマンド（`grep`、`rg`、`find`、`ls`、`cat`、`head`、`tail`、`wc`）の単独呼び出しだけを許可します。`pwd`、`cd`、`which`、`env`、`uv --version` などの補助コマンド、`&&` や `|` での連結、リダイレクト、`find -exec` や `rg --pre` のように別のプログラムを動かすオプションは許可しません。シェルの記号は単一引用符の中でだけ文字として使えます（例：`grep -rn 'foo|bar' docs`）。プロジェクトの調査には `Read`（環境にあれば `Grep` / `Glob`）か、これらの検索コマンド、依存の確認には `/devflow:doctor` を使います。プラグインを更新した後にランナーの場所が拒否された場合は、DevFlow の状態の通知にある `runner` の場所を使います。
+Plan・Implement の実行中、Bash で使えるのは次の2つです。
 
-拒否された場合は実際のコマンドとスキルの起動書式を照合し、正規の呼び出しであるか確認します。エラー表示だけから特定の原因を断定したり、ガードの削除・権限の拡大で継続したりしないでください。
+- スキルに記載された `uv` ランナー。単独で呼びます。ほかのコマンドとつなげません。
+- ファイルに書かず、ほかのプログラムを動かさないコマンド。`|`、`&&`、`||`、`;`、改行でつなげ、`< ファイル` で読み、出力は `/dev/null` へだけ捨てられます（`2>/dev/null`、`2>&1` など）。
+
+使えるコマンドは次のとおりです（状態の通知にも一覧が出ます）。
+
+| コマンド | 使える形 |
+| --- | --- |
+| `basename`、`cat`、`cmp`、`comm`、`cut`、`df`、`dirname`、`du`、`echo`、`head`、`ls`、`md5sum`、`nl`、`od`、`pwd`、`readlink`、`realpath`、`sha256sum`、`shasum`、`stat`、`tail`、`tr`、`type`、`uname`、`wc`、`which` | そのまま |
+| `grep`、`rg`、`find`、`diff`、`sort`、`file` | プログラムを動かす・ファイルに書くオプションは不可（`grep --filter`、`rg --pre`・`-z`、`find -exec`・`-delete`・`-rm`、`diff -l`、`sort -o`・`-T`、`file -C`・`-z`・`-p` など。略記も不可） |
+| `sed` | `-n`・`-E`・`-r` と、`10,40p` や `/正規表現/,/正規表現/p` のような `p` の命令だけ |
+| `git` | `git --no-optional-locks --no-pager` に続けて `status`・`log`・`diff`・`grep`・`show`・`rev-parse`・`ls-files`・`blame`・`merge-base`。`-C パス` はこのプロジェクトの中だけ。`--output`・`--ext-diff`・`--show-signature`・書式の `%G…`・`--help`（マニュアルを開くため）、`git grep` の `-O`（一致したファイルをページャーで開くため）と `--ext-grep`（外部の grep を呼べるため）は不可 |
+| `uniq` | オプションだけ（ファイルは指定できません） |
+| `date` | `+書式` と表示用のオプション（`-u`、`-R`、`-I`、`-r`、`-v`）だけ |
+| `cd` | このプロジェクトの中の、`..` を含まない絶対パスへだけ |
+| `command`、`uv` | `command -v 名前`、`uv --version` だけ |
+
+拒否されるもの：
+
+- `$` による展開とコマンド置換、`` ` ``、`( )`、`{ }`、コメント（`#`）、背後実行（`&`）、行の継続（`\` と改行）。
+- 上の表に無いコマンド（`env`、`printenv`、`printf`、`awk`、`xargs`、`python` など）。
+- ファイルへのリダイレクト。
+
+シェルの記号は、引用符の中なら文字として使えます。ただし二重引用符の中の `$` と `` ` `` は不可です（例：`grep -rn 'foo|bar' docs`、`grep -E "a|b" .`）。`grep`・`rg`・`find`・`git` などオプションに制限のあるコマンドでは、`*` などのグロブや非 ASCII の文字は引用符で囲みます。シェルがファイル名に展開した結果が、オプションとして働くのを防ぐためです（例：`grep -rn --include='*.py' foo .`、`find . -name '*.md'`）。プロジェクトの調査には `Read`（環境にあれば `Grep` / `Glob`）、Web、これらのコマンドを使います。依存の確認には、Claude はランナーの `doctor` を、人は `/devflow:doctor` を使います。PowerShell ではランナーだけを通します。プラグインを更新した後にランナーの場所が拒否された場合は、DevFlow の状態の通知にある `runner` の場所を使います。
+
+拒否された場合は、拒否の理由と実際のコマンドを照合します。エラー表示だけから特定の原因を断定したり、ガードの削除・権限の拡大で継続したりしないでください。
 
 ### テストが自動実行されない
 

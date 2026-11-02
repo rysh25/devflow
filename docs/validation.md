@@ -1,4 +1,4 @@
-# DevFlow 0.2.1 の検証範囲
+# DevFlow 0.3.0 の検証範囲
 
 ## 再実行方法
 
@@ -20,7 +20,12 @@ python tools/package.py --validate-only
 - 人間の質問・回答の記録と、要約・決定事項を原文と分けて扱うこと。
 - Plan と Implement の独立性、明示した Markdown のみを入力にすること。
 - `.devflow/runs/{plan,implement}/` と、1セッション1ファイルのセッション記録、統合設定。
-- 保存形式の版（`schema_version` 2）と、0.1.x の run・破損した run・復旧待ちの run の区別。
+- 保存形式の版（`schema_version` 3）と、0.1.x・0.2.x の run・破損した run・復旧待ちの run の区別。0.2.x の run に紐づいた会話が、外れるまでガードされ、次の有効な入力で外れること。
+- Bash のガード：許可するコマンドと、拒否するオプション（略記・まとめ書き・引用符と `\` を外した後の語を含む）、`sed`・`git`・`date`・`uniq`・`cd` の許す形、リダイレクト、グロブ、`find -rm`。ガードの語と区切り（`|`、`&&`、`||`、改行を含む）の分け方が bash と一致すること（無作為に作った約2,000件の文字列を、PATH を絞った bash で照合。`&&` と `||` の短絡も含めて比べる。zsh があれば zsh でも）。
+- 許可した `git --no-optional-locks --no-pager status` が `.git/index` を書き換えないこと（実際の git で確認）、`sort` の一時ファイルが `TMPDIR` にだけ作られ消えること。
+- 書き込まないツール（Web を含む）の許可、プロジェクトの目印と `.ugrep` を作らせないこと、引き継がれた元の会話で書き込まない作業ができること、`status` と `doctor` の `--run`、PowerShell のランナーだけの解析。
+- レビュアーの Web：Codex と OpenCode の設定の書き分け、Web の出来事（Codex の `id` の重複、複数の答えの文、OpenCode の途中の段階）の受け入れと、Web を切ったときと Web 以外のツールの拒否。
+- `bash_timeout_ms` がランナーの結果と状態の通知で次のレビュアーに合わせて変わること、Bash の上限の警告。
 - 開始・resume の途中で止まった場合の完了と取り消し、外部処理中の発言の記録。
 - `/devflow:*` コマンド、Python の厳密な版固定を含まない runner/guard 契約。
 - 設定された面接スキルの限定的なローカル診断、モデル呼び出し禁止・不足・曖昧さ・未検証の区別、Implement からの独立性。
@@ -36,13 +41,23 @@ python tools/package.py --validate-only
 - ZIP を展開し、プラグインだけを別の場所へ置いてもエントリーポイントを起動できること。
 - Python 3.11 構文としての静的解析、ZIP 再現性、全ファイル SHA-256、実行履歴・秘密ファイルの除外。
 
+## 実際のレビュアーで一度だけ確かめたこと
+
+0.3.0 の作成時に、Linux で codex-cli 0.166.0 と OpenCode 2.2.5 を使い、模擬の小さな計画を1回ずつレビューさせました（作業用の一時ディレクトリで実施）。
+
+- Codex（Web あり）：Web 検索の項目に `id` が2回書かれること、答えの文が前置きと本体の2つになることを確かめ、新しい解析が受け入れました。
+- OpenCode（Web あり）：`webfetch` と `websearch` の `tool_use`、`tool-calls` で終わる段階と別の `messageID` の最後の段階を確かめ、新しい解析が受け入れました。指摘の根拠に URL が書かれていました。
+- OpenCode（Web なし）：全拒否の設定（`websearch` の項目なし）で、ツールの出来事が無く、受け入れました。
+
+一度の確認であり、各サービスやモデルの今後の出力の形を保証するものではありません。
+
 ## この作成環境では確認しないもの
 
 - Claude Code 本体での plugin インストール、外部 `grilling` を含む実際の skill 展開、hooks の実行。
 - 認証済み Codex / OpenCode と実サービスの接続、課金・レート制限、モデルの利用権限。
 - `gpt-6.1-sol`、`opencode-go/deepseek-v4.1-flash` および effort 設定のアカウントごとの提供状況。
 - サービス内部で実際に選択されたバックエンドモデルの独立した証明。
-- Windows ネイティブ / macOS / WSL、ネットワークドライブや exFAT でのライブ動作。
+- Windows ネイティブ / macOS / WSL、ネットワークドライブや exFAT でのライブ動作。zsh との照合（この環境に zsh はありません）。
 - 同梱の Python / Next.js / Unity 設定例を利用者の実プロジェクトで実行した結果。
 
 コードとテストは OS 依存を抑えていますが、「クロスプラットフォームを意図した設計」と「すべての OS で実動作確認済み」は異なります。GitHub Actions には Linux / macOS / Windows × Python 3.11 / 3.12 / 3.13 の設定を同梱します。実行成功は各リポジトリの Actions で別途確認してください。

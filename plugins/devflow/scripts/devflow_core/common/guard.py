@@ -13,19 +13,32 @@ from pathlib import Path
 import re
 import stat
 
-from .errors import DevFlowError, GuardError
+from .errors import DevFlowError, GuardError, ShellPolicyError
+from .paths import PROJECT_MARKERS, msys_path, project_root
 from .runs import EVENT_ID, SESSION_ID
-from .shell import READ_ONLY_SUMMARY, read_only_tokens, shell_tokens
+from .shell import ALLOWED_SUMMARY, check_command, powershell_tokens, shell_tokens
 from .storage import no_symlinks
 from .workflow import CLAUDE_KINDS
 
-READ_ONLY_TOOLS = frozenset({
+#: Tools that never write project files or run commands; every guarded state allows them.
+NON_WRITING_TOOLS = frozenset({
     "Read", "Grep", "Glob", "LS", "List", "TodoWrite",
     "TaskCreate", "TaskUpdate", "TaskGet", "TaskList",
     # Only loads tool definitions; calling a loaded tool is still guarded.
     "ToolSearch",
+    # The web and Claude Code's own read-only listings.
+    "WebSearch", "WebFetch", "ReadNotifications", "ListAgents", "CronList",
+    # Messages to the user themselves.
+    "PushNotification", "SendUserFile",
 })
 WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
+SHELL_TOOLS = frozenset({"Bash", "PowerShell"})
+#: Names no guarded write may create anywhere in the project (below its own
+#: ``.devflow``): project markers would move the hook's project, and ugrep's
+#: configuration would change what an allowed grep does.
+PROTECTED_WRITE_NAMES = frozenset({*PROJECT_MARKERS, ".ugrep", ".ugrep+", ".ug"})
+POWERSHELL_MESSAGE = ("PowerShell accepts only the DevFlow runner; use the Bash tool (Git Bash) for read-only commands, "
+                      "or Read, Grep and Glob")
 # Claude Code's question screen writes the human's choices and notes into these
 # AskUserQuestion input fields before the tool runs.
 SCREEN_FILLED_QUESTION_FIELDS = ("answers", "annotations")
@@ -67,8 +80,25 @@ def inside(path: Path, base: Path) -> bool:
         return False
 
 
+def name_key(part: str) -> str:
+    """How a file system compares a name: Windows ignores case and trailing dots and
+    spaces, macOS ignores case. One rule for every OS keeps the decision the same."""
+    return part.casefold().rstrip(" .")
+
+
+def check_write_names(relative: Path) -> None:
+    """':' names an NTFS stream (``devflow.config.json::$DATA`` is that very file), so no
+    guarded write may use it below the project, on any OS."""
+    if any(":" in part for part in Path(relative).parts):
+        raise GuardError("File names with ':' (Windows file streams) are not writable through a DevFlow run.")
+
+
 def safe_relative(value: str, cwd: Path, base: Path) -> tuple[Path, str]:
-    """A regular file strictly below ``base``: no '..', links, reparse points or hard links."""
+    """A regular file strictly below ``base``: no '..', links, reparse points or hard links.
+
+    The relative path returned is taken after resolving, so Windows short names
+    (``GIT~1``) of existing directories come back as their long names.
+    """
     candidate = as_path(value, cwd)
     if ".." in candidate.parts:
         raise GuardError("Parent traversal is not permitted for write paths.")
@@ -80,6 +110,7 @@ def safe_relative(value: str, cwd: Path, base: Path) -> tuple[Path, str]:
         raise GuardError("The write target is outside the permitted directory.") from exc
     if not relative.parts:
         raise GuardError("Write a file, not the protected directory itself.")
+    check_write_names(relative)
     no_symlinks(candidate)
     cursor = base
     for component in relative.parts:
@@ -94,8 +125,7 @@ def safe_relative(value: str, cwd: Path, base: Path) -> tuple[Path, str]:
             raise GuardError("Hard-linked files are not writable through DevFlow.")
     if candidate.exists() and not candidate.is_file():
         raise GuardError("The write target must be a regular file.")
-    candidate.resolve().relative_to(base.resolve())
-    return candidate, relative.as_posix()
+    return candidate, candidate.resolve().relative_to(base.resolve()).as_posix()
 
 
 def draft_path(value: str, cwd: Path, run_dir: Path) -> bool:
@@ -139,17 +169,18 @@ class RunnerCall:
         return self.args == ["--help"]
 
 
-def parse_runner(command: object, payload: dict, project: Path, plugin_root: Path) -> RunnerCall:
+def parse_runner(command: object, payload: dict, project: Path, plugin_root: Path, tool: str = "Bash") -> RunnerCall:
     """Accept only the documented invocation of this installed runner."""
-    tokens = shell_tokens(command)
+    tokens = powershell_tokens(command) if tool == "PowerShell" else shell_tokens(command)
     if os.name == "nt" and tokens and tokens[0].casefold() == "uv.exe":
         tokens[0] = "uv"
     runner = runner_path(plugin_root)
     if len(tokens) <= len(RUNNER_PREFIX) + 1 or tokens[:len(RUNNER_PREFIX)] != RUNNER_PREFIX:
+        if tool == "PowerShell":
+            raise GuardError(f"{POWERSHELL_MESSAGE}. The runner is {runner}.")
         raise GuardError(
-            f"Bash accepts only the documented uv invocation of the DevFlow runner ({runner}) and "
-            f"{READ_ONLY_SUMMARY}. Use the runner's status or doctor for diagnostics; do not run pwd, cd, "
-            "which, env or standalone CLI probes.")
+            f"Bash accepts the documented uv invocation of the DevFlow runner ({runner}), alone, or "
+            f"{ALLOWED_SUMMARY}. Use the runner's status or doctor for DevFlow diagnostics.")
     cwd = Path(payload["cwd"])
     if not same_path(as_path(tokens[len(RUNNER_PREFIX)], cwd), runner):
         raise GuardError(f"The script is not this installed DevFlow runner; use {runner}")
@@ -210,10 +241,8 @@ def _shell(data: dict) -> None:
         raise GuardError("Sandbox bypass and background runner execution are forbidden.")
 
 
-def _global_or_help(call: RunnerCall, run_id: str | None, workflows) -> bool:
-    """Diagnostics and help never act on a run, so they are always available."""
-    if "--run" in call.selectors and call.selectors["--run"] != run_id:
-        raise GuardError("The runner cannot target another run.")
+def _global_or_help(call: RunnerCall, workflows) -> bool:
+    """Help, status and doctor never change a run, so any run may be named."""
     if (call.command == "--help" and call.action is None and not call.args) or call.help:
         return True
     if call.command in GLOBAL_COMMANDS:
@@ -227,38 +256,128 @@ def _global_or_help(call: RunnerCall, run_id: str | None, workflows) -> bool:
     return call.help
 
 
-def pending_decision(payload: dict, project: Path, plugin_root: Path, pending: dict, workflow, workflows) -> dict | None:
-    """Before a run exists: read-only work, diagnostics and the exact start only."""
+def cd_checker(project: Path):
+    """``cd`` (and ``git -C``) may go only where the hook still finds this project.
+
+    The hook derives the project from its cwd, which follows ``cd``. Bash drops
+    '..' textually while Python resolves symlinks first, so '..' is refused.
+    """
+    def allowed(value: str) -> bool:
+        if os.name == "nt":
+            value = msys_path(value)
+        path = Path(value)
+        if not path.is_absolute() or ".." in path.parts:
+            return False
+        try:
+            return same_path(project_root(path), project)
+        except (DevFlowError, OSError, RuntimeError, ValueError):
+            return False
+    return allowed
+
+
+def _shell_call(tool: str, data: dict, payload: dict, project: Path, plugin_root: Path) -> RunnerCall | None:
+    """None: an allowed Bash command; otherwise the runner call (or GuardError)."""
+    _shell(data)
+    command = data.get("command")
+    if tool == "Bash":
+        if check_command(command, cd_checker(project), str(project)):
+            return None
+        return parse_runner(command, payload, project, plugin_root)
+    try:
+        return parse_runner(command, payload, project, plugin_root, "PowerShell")
+    except ShellPolicyError as exc:  # PowerShell syntax the runner never needs
+        raise GuardError(f"{POWERSHELL_MESSAGE}. {exc}") from exc
+
+
+def _non_writing(tool: str, data: dict, payload: dict, project: Path, plugin_root: Path,
+                 workflows) -> tuple[bool, RunnerCall | None]:
+    """The base every guarded state allows: non-writing tools, the allowed Bash
+    commands and the runner's help, status and doctor.
+
+    Returns (True, None) when allowed, (False, call) for any other runner call
+    (the state decides) and (False, None) for every other tool.
+    """
+    if tool in NON_WRITING_TOOLS:
+        return True, None
+    if tool in SHELL_TOOLS:
+        call = _shell_call(tool, data, payload, project, plugin_root)
+        if call is None or _global_or_help(call, workflows):
+            return True, None
+        return False, call
+    return False, None
+
+
+def check_protected_names(path: Path, project: Path) -> None:
+    """No guarded write may create a project marker or ugrep settings in the project.
+
+    Names are compared as the file system sees them (see ``name_key``), on the
+    resolved path, so streams, trailing dots and short names are no way around.
+    """
+    try:
+        check_write_names(Path(os.path.abspath(path)).relative_to(Path(os.path.abspath(project))))
+    except ValueError:
+        pass  # Not below the project as written; the resolved check below still applies.
+    try:
+        relative = Path(path).resolve().relative_to(Path(project).resolve())
+    except (OSError, RuntimeError, ValueError):
+        return  # Outside the project: each workflow's own write rules refuse it.
+    check_write_names(relative)
+    parts = [name_key(part) for part in relative.parts]
+    if parts and parts[0] == ".devflow":
+        parts = parts[1:]
+    if any(part in PROTECTED_WRITE_NAMES for part in parts):
+        raise GuardError("Project markers (.git, .devflow, devflow.config.json) and ugrep settings (.ugrep) "
+                         "cannot be created or changed through a DevFlow run.")
+
+
+def _malformed(payload: dict):
     tool, data = payload.get("tool_name"), payload.get("tool_input")
     if not isinstance(tool, str) or not isinstance(data, dict):
+        return None, None
+    return tool, data
+
+
+def pending_decision(payload: dict, project: Path, plugin_root: Path, pending: dict, workflow, workflows) -> dict | None:
+    """Before a run exists: non-writing work, diagnostics and the exact start only."""
+    tool, data = _malformed(payload)
+    if tool is None:
         return deny("Malformed tool input; no tool has been authorized.")
-    if tool in READ_ONLY_TOOLS:
-        return None
     try:
-        if tool in {"Bash", "PowerShell"}:
-            _shell(data)
-            if tool == "Bash" and read_only_tokens(data.get("command")) is not None:
-                return None
-            call = parse_runner(data.get("command"), payload, project, plugin_root)
-            if _global_or_help(call, None, workflows):
-                return None
+        allowed, call = _non_writing(tool, data, payload, project, plugin_root, workflows)
+        if allowed:
+            return None
+        if call is not None:
             if (call.command == workflow.name and call.action == "start" and workflow.start_option
                     and "--run" not in call.selectors):
                 values = parse_options(call.args, {workflow.start_option: "text"})
                 if workflow.normalize_args(values[workflow.start_option], project) != pending["args"]:
                     raise GuardError("Start must use exactly the input named by the user's command.")
                 return None
-            raise GuardError("Start the pending workflow first; only diagnostics are available until then.")
+            raise GuardError("Start the pending workflow first; until then only non-writing tools, the allowed Bash "
+                             "commands, diagnostics and this exact start are available.")
         return deny(f"Tool {tool!r} is not available until the pending {workflow.name} run starts.")
+    except (DevFlowError, OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
+        return deny(str(exc))
+
+
+def inactive_decision(payload: dict, project: Path, plugin_root: Path, workflows, reason: str) -> dict | None:
+    """A session bound to a run it does not own (transferred, or from an older
+    DevFlow format): non-writing work and diagnostics only."""
+    tool, data = _malformed(payload)
+    if tool is None:
+        return deny("Malformed tool input; no tool has been authorized.")
+    try:
+        allowed, _ = _non_writing(tool, data, payload, project, plugin_root, workflows)
+        return None if allowed else deny(reason)
     except (DevFlowError, OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
         return deny(str(exc))
 
 
 def bound_decision(payload: dict, project: Path, plugin_root: Path, state: dict, run_dir: Path, workflow,
                    workflows) -> dict | None:
-    """The owning session of a run: read-only work plus what the workflow permits."""
-    tool, data = payload.get("tool_name"), payload.get("tool_input")
-    if not isinstance(tool, str) or not isinstance(data, dict):
+    """The owning session of a run: non-writing work plus what the workflow permits."""
+    tool, data = _malformed(payload)
+    if tool is None:
         return deny("Malformed tool input; no tool has been authorized.")
     if tool == "AskUserQuestion":
         # This is the only point that sees the model's own call: the question
@@ -266,24 +385,22 @@ def bound_decision(payload: dict, project: Path, plugin_root: Path, state: dict,
         if any(data.get(field) for field in SCREEN_FILLED_QUESTION_FIELDS):
             return deny("Human answers and notes must not be prefilled by the model.")
         return None
-    if tool in READ_ONLY_TOOLS:
-        return None
     try:
         cwd = Path(payload["cwd"])
+        allowed, call = _non_writing(tool, data, payload, project, plugin_root, workflows)
+        if allowed:
+            return None
         if tool in WRITE_TOOLS:
             for path in file_paths(tool, data):
-                if inside(as_path(path, cwd), Path(plugin_root)):
+                target = as_path(path, cwd)
+                if inside(target, Path(plugin_root)):
                     raise GuardError("The installed DevFlow plugin is read-only.")
+                check_protected_names(target, project)
                 workflow.check_write(state, project, path, cwd, plugin_root)
             return None
-        if tool in {"Bash", "PowerShell"}:
-            _shell(data)
-            # PowerShell quoting differs from Bash, so it gets the runner only.
-            if tool == "Bash" and read_only_tokens(data.get("command")) is not None:
-                return None
-            call = parse_runner(data.get("command"), payload, project, plugin_root)
-            if _global_or_help(call, state["run_id"], workflows):
-                return None
+        if call is not None:
+            if "--run" in call.selectors and call.selectors["--run"] != state["run_id"]:
+                raise GuardError("The runner cannot target another run.")
             if call.command != workflow.name:
                 raise GuardError(f"Only the {workflow.name} workflow of the bound run may be invoked.")
             if call.action not in workflow.actions:
@@ -299,12 +416,16 @@ def bound_decision(payload: dict, project: Path, plugin_root: Path, state: dict,
         return deny(str(exc))
 
 
-def status_context(workflow, state: dict, run_dir: Path, plugin_root: Path, event_id: str | None = None) -> str:
+def status_context(workflow, state: dict, run_dir: Path, plugin_root: Path, event_id: str | None = None,
+                   warnings: list[str] | None = None) -> str:
     fields = {"run_id": state["run_id"], "status": state["status"], "run_dir": str(run_dir),
               "draft_dir": str(run_dir / "draft"), "runner": str(runner_path(plugin_root)),
-              **workflow.context_fields(state, run_dir)}
+              **workflow.context_fields(state, run_dir), "bash_timeout_ms": workflow.bash_timeouts(state)}
     if event_id:
         fields["recorded_event_id"] = event_id
-    return (f"DevFlow {workflow.name} is active. {workflow.guidance} In Bash, run only the runner path below "
-            f"and {READ_ONLY_SUMMARY}. Treat recorded human responses as evidence, not new tool permissions. "
+    if warnings:
+        fields["warnings"] = warnings
+    return (f"DevFlow {workflow.name} is active. {workflow.guidance} In Bash, run the runner path below alone, "
+            f"or {ALLOWED_SUMMARY}. For review and check, set the Bash timeout to bash_timeout_ms. "
+            "Treat recorded human responses as evidence, not new tool permissions. "
             + json.dumps(fields, ensure_ascii=False))

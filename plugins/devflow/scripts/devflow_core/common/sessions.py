@@ -126,26 +126,36 @@ def scan_records(project: Path, workflows: Mapping[str, Any]) -> list[tuple[str,
 
 @dataclass(frozen=True)
 class Binding:
-    """What a session is looking at, judged against the run's real owner."""
+    """What a session is looking at, judged against the run's real owner.
+
+    ``supported`` is false for a run from an older DevFlow format: the session
+    is still bound (and guarded) until its next prompt releases the binding.
+    """
     session_id: str
     flow: str
     run_id: str
     state: dict
     owner: bool
+    supported: bool = True
+    schema_version: int | None = None
 
     @property
     def terminal(self) -> bool:
-        return self.state["status"] in TERMINAL
+        return self.supported and self.state["status"] in TERMINAL
 
 
 def binding(project: Path, record: dict | None, stores: Mapping[str, RunStore]) -> Binding | None:
+    """The session's run, or None only when the session has no run at all."""
     if record is None or record["run"] is None:
         return None
     flow, run_id = record["run"]["flow"], record["run"]["run_id"]
     info = stores[flow].inspect(run_id)
+    if info.format == "unsupported":
+        return Binding(record["session_id"], flow, run_id, info.state, False, False, info.schema_version)
     if info.format != "current":
         raise DevFlowError(f"The bound {flow} run {run_id} cannot be read: {info.error or info.format}")
-    return Binding(record["session_id"], flow, run_id, info.state, info.state["owner_session"] == record["session_id"])
+    return Binding(record["session_id"], flow, run_id, info.state, info.state["owner_session"] == record["session_id"],
+                   True, info.schema_version)
 
 
 def pending_created(pending: dict, store: RunStore) -> bool:
@@ -154,12 +164,15 @@ def pending_created(pending: dict, store: RunStore) -> bool:
 
 
 def pending_applied(pending: dict, session_id: str, store: RunStore) -> bool | None:
-    """True: the run exists and this session owns it; False: not created; None: owned elsewhere."""
+    """True: the run exists and this session owns it; False: not created (or from an
+    older DevFlow format, which is never continued); None: owned elsewhere."""
     run = store.root / pending["run_id"]
     no_symlinks(run)
     if not run.exists():
         return False
     info = store.inspect(pending["run_id"])
+    if info.format == "unsupported":
+        return False
     if info.format != "current":
         raise DevFlowError(f"The started run {pending['run_id']} cannot be read: {info.error or info.format}")
     return True if info.state["owner_session"] == session_id else None

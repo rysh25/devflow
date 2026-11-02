@@ -111,7 +111,7 @@ class UnifiedDispatchTests(RuntimeFixture):
         self.assertEqual(request["request"], "REVIEW-10 の計画を作成して")
         self.assertFalse((self.project / ".devflow" / "runs" / "implement").exists())
         state = read_json(self.run_dir("plan", identifier) / "state.json")
-        self.assertEqual((state["schema_version"], state["owner_session"]), (2, self.session))
+        self.assertEqual((state["schema_version"], state["owner_session"]), (3, self.session))
         self.assertEqual(len(state["event_ids"]), 1)  # The start prompt itself.
 
     def test_implementation_start_only_captures_pending_start_until_cli_start(self):
@@ -255,18 +255,22 @@ class UnifiedDispatchTests(RuntimeFixture):
                             safe.replace("--offline ", ""), safe.replace(self.session, "someone-else"),
                             safe.replace(shlex.quote(str(SCRIPT)), shlex.quote(str(self.project / "evil.py"))),
                             safe.replace(shlex.quote(str(self.project)), shlex.quote(str(self.base))),
-                            safe.replace(identifier, OTHER_ID),
                             safe + " --extra", safe.replace("--no-python-downloads", "--python 3.11")):
                 with self.subTest(command=command):
                     self.assert_denied(self.tool("Bash", command=command))
             self.assert_denied(self.tool("Bash", command=safe, run_in_background=True))
             self.assert_denied(self.tool("Bash", command=safe, dangerouslyDisableSandbox=True))
+            # Diagnostics only read, so they may name any run (README: from any session).
+            self.assertIsNone(self.tool("Bash", command=safe.replace(identifier, OTHER_ID)))
+        self.assert_denied(self.tool("Bash", command=self.command("cancel", OTHER_ID, flow="plan")))
 
     def test_global_runner_exemption_does_not_grant_permissions_for_pending_implement(self):
         self.prompt("/devflow:implement feature.md")
         self.assertIsNone(self.tool("PowerShell", command=self.command("status")))
         self.assert_denied(self.tool("Bash", command=self.command("status") + " && other"))
-        self.assert_denied(self.tool("Bash", command=self.command("status", OTHER_ID)))
+        self.assertIsNone(self.tool("Bash", command=self.command("status", OTHER_ID)))
+        self.assert_denied(self.tool("Bash", command=self.command("start --plan feature.md", OTHER_ID,
+                                                                  flow="implement")))
 
     def test_unsealed_interview_cannot_move_even_after_a_pause(self):
         identifier = self.plan_start()
@@ -296,7 +300,8 @@ class UnifiedDispatchTests(RuntimeFixture):
         value = json.loads(output)
         self.assertEqual((value["flow"], value["owner_session"], value["review_count"]),
                          ("implement", self.session, 0))
-        self.assert_denied(self.tool("Bash", command=self.command("status", OTHER_ID)))
+        self.assertIsNone(self.tool("Bash", command=self.command("status", OTHER_ID)))
+        self.assert_denied(self.tool("Bash", command=self.command("cancel --reason x", OTHER_ID, flow="implement")))
         code, output, _ = self.invoke("--session", self.session, "--run", identifier, "implement", "resume")
         self.assertEqual((code, json.loads(output)["error"]), (2, "UsageError"))
 
@@ -404,10 +409,66 @@ class RunFormatTests(RuntimeFixture):
         self.plan_start()
         self.assertTrue((self.run_dir("plan", identifier) / "transaction.json").exists())  # Never touched.
 
+    def test_runs_from_0_2_are_unsupported_and_never_block(self):
+        identifier = self.raw_run("plan", status="reviewing", schema_version=2)
+        info = RunStore(self.project, WORKFLOWS["plan"]).inspect(identifier)
+        self.assertEqual((info.format, info.schema_version), ("unsupported", 2))
+        selected = runtime.status(self.project, None, identifier)
+        self.assertEqual(selected["message"], "Started with DevFlow 0.2.x; this version cannot continue it")
+        with self.assertRaisesRegex(DevFlowError, f"Run {identifier} was started with DevFlow 0.2.x; "
+                                                  "this version cannot continue it"):
+            self.prompt("/devflow:resume " + identifier)
+        self.plan_start()
+        current = RunStore(self.project, WORKFLOWS["plan"]).inspect(self.record()["run"]["run_id"])
+        self.assertEqual(current.schema_version, 3)
+
+    def bind_to_old_run(self, session=None, pending=False, identifier="20261101T123456Z-123456abcdef"):
+        self.raw_run("implement", identifier, status="implementing", schema_version=2)
+        record = sessions.empty_record(session or self.session)
+        if pending:
+            record = dict(record, pending_start={"flow": "implement", "run_id": identifier, "args": "x",
+                                                 "created_at": "t",
+                                                 "event": make_event({"prompt": "/devflow:implement x"}, "prompt")})
+        else:
+            record = dict(record, run={"flow": "implement", "run_id": identifier})
+        sessions.write_record(self.project, record, WORKFLOWS)
+        return identifier
+
+    def test_session_bound_to_a_0_2_run_stays_guarded_until_released(self):
+        identifier = self.bind_to_old_run()
+        # Before any prompt: still guarded, never unguarded.
+        self.assert_denied(self.tool("Write", file_path=str(self.project / "x.py")))
+        self.assert_denied(self.tool("Bash", command=self.command("cancel --reason x", flow="implement")))
+        self.assertIsNone(self.tool("Read", file_path=str(self.plan_file)))
+        value = runtime.status(self.project, self.session, None)
+        self.assertEqual((value["status"], value["owner_matches"]), ("unsupported", False))
+        self.assertEqual(value["message"], f"Run {identifier} was started with DevFlow 0.2.x; "
+                                           "this version cannot continue it")
+        code, output, _ = self.invoke("--session", self.session, "implement", "status")
+        self.assertEqual(code, 2)
+        self.assertIn("0.2.x", json.loads(output)["message"])
+        self.assertIsNone(self.prompt("hello"))
+        self.assertIsNone(self.record())  # Released by the next prompt.
+
+    def test_resuming_a_0_2_run_is_refused_but_releases_the_binding(self):
+        identifier = self.bind_to_old_run()
+        with self.assertRaisesRegex(DevFlowError, "0.2.x"):
+            self.prompt("/devflow:resume " + identifier)
+        self.assertIsNone(self.record())
+
+    def test_pending_starts_of_0_2_runs(self):
+        self.bind_to_old_run(session="someone-else", pending=True)
+        self.plan_start()  # Another session's created 0.2.x start never blocks.
+        identifier = self.bind_to_old_run(session="third-session", pending=True, identifier=OTHER_ID)
+        self.assertIsNone(self.prompt("hi", session="third-session"))
+        self.assertIsNone(self.record("third-session"))  # Its own unapplied start is dropped.
+        self.assertTrue(self.run_dir("implement", identifier).exists())
+
     def test_damaged_runs_are_shown_individually_and_block_starts(self):
-        for index, (version, extra) in enumerate(((None, {}), (True, {}), ("2", {}), (0, {}), (3, {}),
+        for index, (version, extra) in enumerate(((None, {}), (True, {}), ("2", {}), (0, {}), (4, {}),
                                                   (1, {"run_id": OTHER_ID}), (1, {"flow": "implement"}),
-                                                  (1, {"flow": None}))):
+                                                  (1, {"flow": None}), (2, {"run_id": OTHER_ID}),
+                                                  (2, {"project": "/elsewhere"}))):
             with self.subTest(version=version, extra=extra):
                 identifier = f"20261101T12345{index}Z-123456abcdef"
                 path = self.run_dir("plan", identifier) / "state.json"
@@ -434,7 +495,7 @@ class RunFormatTests(RuntimeFixture):
             state["last_error"] = {"message": "interrupted"}
             desired = dict(state, state_revision=state["state_revision"] + 1)
             atomic_json(self.run_dir("plan", identifier) / "transaction.json",
-                        {"schema_version": 2, "base_revision": state["state_revision"], "state": desired, "writes": {}})
+                        {"schema_version": 3, "base_revision": state["state_revision"], "state": desired, "writes": {}})
         before = sorted(p.name for p in self.run_dir("plan", identifier).iterdir())
         overview = runtime.status(self.project, "other-session", None)
         self.assertTrue(overview["runs"][0]["recovery_required"])
@@ -453,13 +514,13 @@ class RunFormatTests(RuntimeFixture):
             state = store.load(identifier)
             desired = dict(state, state_revision=state["state_revision"] + 1, last_error={"message": "x"})
             atomic_json(self.run_dir("plan", identifier) / "transaction.json",
-                        {"schema_version": 2, "base_revision": state["state_revision"], "state": desired, "writes": {}})
+                        {"schema_version": 3, "base_revision": state["state_revision"], "state": desired, "writes": {}})
         self.assertEqual(self.engine("plan").cancel(identifier)["status"], "cancelled")
         self.assertFalse((self.run_dir("plan", identifier) / "transaction.json").exists())
 
     def test_corrupt_journal_is_not_resumed(self):
         identifier = self.plan_start()
-        (self.run_dir("plan", identifier) / "transaction.json").write_text('{"schema_version": 2}', encoding="utf-8")
+        (self.run_dir("plan", identifier) / "transaction.json").write_text('{"schema_version": 3}', encoding="utf-8")
         with self.assertRaisesRegex(DevFlowError, "pending transaction"):
             self.prompt("/devflow:resume " + identifier)
         self.assertTrue((self.run_dir("plan", identifier) / "transaction.json").exists())
@@ -484,7 +545,7 @@ class RunFormatTests(RuntimeFixture):
         with patch.object(sessions, "write_record", side_effect=fail_on_binding), self.assertRaises(OSError):
             self.prompt("/devflow:plan Interrupted request")
         identifier = self.record()["pending_start"]["run_id"]
-        atomic_json(self.run_dir("plan", identifier) / "state.json", {"schema_version": 2, "status": []})
+        atomic_json(self.run_dir("plan", identifier) / "state.json", {"schema_version": 4, "status": []})
         overview = runtime.status(self.project, "other-session", None)
         self.assertEqual(overview["runs"][0]["format"], "invalid")
         self.assertEqual(overview["sessions"]["pending_starts"], [])
@@ -574,8 +635,8 @@ class InterruptionTests(RuntimeFixture):
         self.assertEqual(self.record("new-session")["run"]["run_id"], identifier)
         self.assertEqual(self.engine("implement").status(identifier)["owner_session"], self.session)
         self.assert_denied(self.tool(file_path=str(self.project / "x.py"), session="new-session"))
-        with self.assertRaisesRegex(DevFlowError, "/devflow:resume"):
-            self.prompt("continue", session="new-session")
+        context = self.prompt("continue", session="new-session")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("/devflow:resume " + identifier, context)
         self.assertIsNone(self.tool("Read", file_path=str(self.plan_file)))  # The original owner keeps working.
         self.prompt("/devflow:resume " + identifier, session="new-session")
         self.assertEqual(self.engine("implement").status(identifier)["owner_session"], "new-session")
@@ -664,7 +725,19 @@ class SessionRecordTests(RuntimeFixture):
         self.prompt("/devflow:resume " + identifier, session="other-session")
         value = runtime.status(self.project, self.session, None)
         self.assertEqual((value["status"], value["owner_matches"]), ("stale", False))
-        self.assert_denied(self.tool("Read", file_path=str(self.plan_file)))
+        events = len(read_json(self.run_dir("implement", identifier) / "state.json")["event_ids"])
+        context = self.prompt("What does the plan say?")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("no longer owns DevFlow run " + identifier, context)
+        self.assertEqual(len(read_json(self.run_dir("implement", identifier) / "state.json")["event_ids"]), events)
+        self.assertIsNone(self.tool("Read", file_path=str(self.plan_file)))
+        self.assertIsNone(self.tool("WebSearch", query="x"))
+        self.assertIsNone(self.tool("Bash", command="grep -rn VALUE ."))
+        self.assertIsNone(self.tool("Bash", command=self.command("status", identifier)))
+        self.assert_denied(self.tool("Write", file_path=str(self.project / "x.py")))
+        self.assert_denied(self.tool("AskUserQuestion", questions=[{"question": "q?"}]))
+        self.assert_denied(self.tool("Bash", command=self.command("cancel --reason x", flow="implement")))
+        self.assertIsNone(runtime.handle_hook(self.payload(event="Stop"), PLUGIN))
+        self.assertEqual(len(read_json(self.run_dir("implement", identifier) / "state.json")["event_ids"]), events)
 
 
 class UnifiedCliTests(RuntimeFixture):

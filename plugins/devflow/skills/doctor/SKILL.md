@@ -2,7 +2,7 @@
 name: doctor
 description: Check DevFlow prerequisites and project settings offline without invoking a model, installing tools, or changing the project.
 disable-model-invocation: true
-allowed-tools: Bash(uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *)
+allowed-tools: Bash(uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *) PowerShell(uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *)
 ---
 
 # DevFlow diagnostics

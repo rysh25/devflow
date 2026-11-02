@@ -123,7 +123,8 @@ class PlanWorkflow(Workflow):
                 "warnings": ([] if inspection["static_ready"] else
                              ["Planning interview skill " + inspection["configured_name"] + ": " + inspection["reason"]])
                             + ["Interview skill callability is not runtime-verified; static metadata cannot "
-                               "establish effective permissions or skillOverrides"]}
+                               "establish effective permissions or skillOverrides"]
+                            + self.timeout_warnings(config)}
 
     def engine(self, project: Path, session: str | None = None):
         from .engine import Engine

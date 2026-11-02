@@ -109,6 +109,13 @@ if "--output-last-message" in args:
     print(json.dumps({"type": "turn.started"}))
     if mode == "tool":
         print(json.dumps({"type": "item.completed", "item": {"type": "command_execution", "command": "echo unsafe"}}))
+    if mode == "web":
+        # Codex writes the item's id and the search call's id under the same key.
+        print('{"type":"item.started","item":{"id":"item_0","type":"web_search","id":"ws_1","query":"",'
+              '"action":{"type":"other"}}}')
+        print('{"type":"item.completed","item":{"id":"item_0","type":"web_search","id":"ws_1","query":"q",'
+              '"action":{"type":"search","query":"q"}}}')
+        print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "Checking."}}))
     print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": text}}))
     print(json.dumps({"type": "turn.completed", "usage": {}}))
 else:
@@ -125,8 +132,16 @@ else:
     print(json.dumps({"type": "step_start", "sessionID": "s1", "part": {"messageID": "m1"}}))
     if mode == "tool":
         print(json.dumps({"type": "tool_use", "sessionID": "s1", "part": {"messageID": "m1"}}))
-    print(json.dumps({"type": "text", "sessionID": "s1", "part": {"messageID": "m1", "id": "p1", "text": text}}))
-    print(json.dumps({"type": "step_finish", "sessionID": "s1", "part": {"messageID": "m1", "reason": "stop"}}))
+    message = "m1"
+    if mode == "web":
+        print(json.dumps({"type": "text", "sessionID": "s1", "part": {"messageID": "m1", "id": "p0", "text": "Checking."}}))
+        print(json.dumps({"type": "tool_use", "sessionID": "s1", "part": {
+            "messageID": "m1", "type": "tool", "tool": "websearch", "state": {"status": "completed"}}}))
+        print(json.dumps({"type": "step_finish", "sessionID": "s1", "part": {"messageID": "m1", "reason": "tool-calls"}}))
+        print(json.dumps({"type": "step_start", "sessionID": "s1", "part": {"messageID": "m2"}}))
+        message = "m2"
+    print(json.dumps({"type": "text", "sessionID": "s1", "part": {"messageID": message, "id": "p1", "text": text}}))
+    print(json.dumps({"type": "step_finish", "sessionID": "s1", "part": {"messageID": message, "reason": "stop"}}))
 '''
 
 
@@ -210,6 +225,48 @@ class JsonAndEventTests(unittest.TestCase):
             with self.subTest(new=new), self.assertRaises(ReviewerError):
                 reviewers.parse_opencode_events("\n".join(lines))
 
+    def test_codex_web_search_items_only_with_web(self):
+        lines = codex_events().splitlines()
+        search = ('{"type":"item.completed","item":{"id":"item_0","type":"web_search","id":"ws_1","query":"q",'
+                  '"action":{"type":"search","query":"q"}}}')
+        preamble = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "Checking."}})
+        stream = "\n".join(lines[:2] + [search, preamble] + lines[2:])
+        self.assertEqual(reviewers.parse_codex_events(stream, web=True), REVIEW)
+        with self.assertRaises(ReviewerError):
+            reviewers.parse_codex_events(stream)
+        # Only the id key, and only in a web_search item, may repeat.
+        for bad in (search.replace('"query":"q",', '"query":"q","query":"r",'),
+                    json.dumps({"type": "item.completed", "item": {"type": "agent_message"}})
+                    .replace('"type": "agent_message"', '"id": "a", "type": "agent_message", "id": "b", "text": "x"'),
+                    search.replace("web_search", "command_execution")):
+            with self.subTest(bad=bad), self.assertRaises(ReviewerError):
+                reviewers.parse_codex_events("\n".join(lines[:2] + [bad] + lines[2:]), web=True)
+
+    def test_codex_web_takes_the_last_answer(self):
+        lines = codex_events().splitlines()
+        first = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "{\"draft\": 1}"}})
+        self.assertEqual(reviewers.parse_codex_events("\n".join(lines[:2] + [first] + lines[2:]), web=True), REVIEW)
+
+    def test_opencode_web_tools_and_steps_only_with_web(self):
+        def stream(tool="websearch", status="completed"):
+            return "\n".join(json.dumps(item) for item in [
+                {"type": "step_start", "sessionID": "s", "part": {"messageID": "m1"}},
+                {"type": "text", "sessionID": "s", "part": {"messageID": "m1", "id": "p0", "text": "Checking."}},
+                {"type": "tool_use", "sessionID": "s", "part": {"messageID": "m1", "type": "tool", "tool": tool,
+                                                                "state": {"status": status}}},
+                {"type": "step_finish", "sessionID": "s", "part": {"messageID": "m1", "reason": "tool-calls"}},
+                {"type": "step_start", "sessionID": "s", "part": {"messageID": "m2"}},
+                {"type": "text", "sessionID": "s", "part": {"messageID": "m2", "id": "p1", "text": json.dumps(REVIEW)}},
+                {"type": "step_finish", "sessionID": "s", "part": {"messageID": "m2", "reason": "stop"}}])
+        for tool in ("websearch", "webfetch"):
+            for status in ("completed", "error"):
+                with self.subTest(tool=tool, status=status):
+                    self.assertEqual(reviewers.parse_opencode_events(stream(tool, status), web=True), REVIEW)
+        for label, value, web in (("without web", stream(), False), ("other tool", stream("bash"), True),
+                                  ("no final status", stream(status="running"), True)):
+            with self.subTest(label), self.assertRaises(ReviewerError):
+                reviewers.parse_opencode_events(value, web=web)
+
     def test_opencode_duplicate_event_keys_rejected(self):
         with self.assertRaises(ReviewerError):
             reviewers.parse_opencode_events('{"type":"text","type":"step_start","part":{}}')
@@ -228,7 +285,7 @@ class CommandTests(unittest.TestCase):
                                     "--ignore-rules", "--model", "gpt-6.1-sol"])
         for flag in ("--ephemeral", "--json", "--skip-git-repo-check"):
             self.assertIn(flag, argv)
-        for setting in ('model_reasoning_effort="xhigh"', 'approval_policy="never"', 'web_search="disabled"',
+        for setting in ('model_reasoning_effort="xhigh"', 'approval_policy="never"', 'web_search="live"',
                         "project_doc_max_bytes=0", "mcp_servers={}", "features.code_mode.enabled=false",
                         "features.shell_tool=false", "features.apps=false", "features.hooks=false",
                         "features.plugins=false"):
@@ -241,6 +298,10 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(env, {})
         for absent in ("--resume", "--ask-for-approval", "--yolo"):
             self.assertNotIn(absent, argv)
+        without_web, _ = reviewers.build_command(reviewer(web=False), Path("round 1"), Path("schema.json"))
+        self.assertIn('web_search="disabled"', without_web)
+        self.assertNotIn('web_search="live"', without_web)
+        self.assertIn('web_search="live"', reviewers.build_command(reviewer(web=True), Path("r"), Path("s"))[0])
 
     def test_opencode_v2_is_default_and_uses_variant_selector(self):
         work = Path("round 1")
@@ -260,66 +321,57 @@ class CommandTests(unittest.TestCase):
                                "OPENCODE_DISABLE_PROJECT_CONFIG": "1", "OPENCODE_CONFIG_PROJECT_DISABLE": "1",
                                "OPENCODE_DISABLE_CLAUDE_CODE": "1"})
 
-    def test_opencode_v1_must_be_explicit_and_denies_all(self):
-        work = Path("round 1")
-        argv, env = reviewers.build_command(reviewer("opencode", protocol_version=1), work, Path("schema.json"))
-        self.assertEqual(argv[:3], ["opencode", "--pure", "run"])
-        self.assertEqual(argv[argv.index("--model") + 1], "opencode-go/deepseek-v4.1-flash")
-        self.assertEqual(argv[argv.index("--variant") + 1], "high")
-        self.assertIn("DevFlow", argv[argv.index("--title") + 1])
-        # v1 treats --file as a greedy array; the attachment must come last.
-        self.assertEqual(argv[-2], "--file")
-        self.assertEqual(Path(argv[-1]), work.resolve() / "workspace" / "review-input.md")
-        for absent in ("--standalone", "--auto", "--continue"):
-            self.assertNotIn(absent, argv)
-        agent = argv[argv.index("--agent") + 1]
-        self.assertRegex(agent, AGENT_ID)
-        runtime = json.loads(env["OPENCODE_CONFIG_CONTENT"])
-        self.assertEqual(runtime, reviewers.runtime_config("opencode-go/deepseek-v4.1-flash", 1, agent))
-        self.assertEqual(runtime["permission"], "deny")
-        self.assertEqual(runtime["agent"][agent]["permission"], "deny")
-        self.assertEqual(runtime["agent"][agent]["mode"], "primary")
-        self.assertEqual(env["OPENCODE_CONFIG_DIR"], str(work.resolve() / "workspace"))
-        self.assertEqual(json.loads(env["OPENCODE_PERMISSION"]), "deny")
-        for key in ("OPENCODE_DISABLE_PROJECT_CONFIG", "OPENCODE_DISABLE_CLAUDE_CODE", "OPENCODE_PURE",
-                    "OPENCODE_DISABLE_EXTERNAL_SKILLS", "OPENCODE_DISABLE_AUTOUPDATE"):
-            self.assertEqual(env[key], "true")
+    def test_opencode_prompt_names_the_web_only_when_allowed(self):
+        with_web, _ = reviewers.build_command(reviewer("opencode"), Path("r"), Path("s"))
+        without_web, _ = reviewers.build_command(reviewer("opencode", web=False), Path("r"), Path("s"))
+        self.assertIn("web search or web fetch", with_web[-1])
+        self.assertIn("without tools", without_web[-1])
 
-    def test_agent_id_is_per_round_for_both_protocols(self):
-        for protocol in (1, 2):
-            config = reviewer("opencode", protocol_version=protocol)
+    def test_opencode_protocol_one_is_rejected_with_migration_steps(self):
+        with self.assertRaisesRegex(ReviewerError, "no longer supported. Upgrade OpenCode to 2.x"):
+            reviewers.build_command(reviewer("opencode", protocol_version=1), Path("r"), Path("s"))
 
-            def agent(work):
-                argv, _ = reviewers.build_command(config, work, Path("schema.json"))
-                return argv[argv.index("--agent") + 1]
-            with self.subTest(protocol=protocol):
-                self.assertRegex(agent(Path("round1")), AGENT_ID)
-                self.assertEqual(agent(Path("round1")), agent(Path("round1").resolve()))
-                self.assertNotEqual(agent(Path("round1")), agent(Path("round2")))
+    def test_agent_id_is_per_round(self):
+        config = reviewer("opencode")
 
-    def test_v2_runtime_denies_tools_mcp_skills_and_plugins(self):
-        config = reviewers.runtime_config("opencode-go/deepseek-v4.1-flash", 2, "my-reviewer")
+        def agent(work):
+            argv, _ = reviewers.build_command(config, work, Path("schema.json"))
+            return argv[argv.index("--agent") + 1]
+        self.assertRegex(agent(Path("round1")), AGENT_ID)
+        self.assertEqual(agent(Path("round1")), agent(Path("round1").resolve()))
+        self.assertNotEqual(agent(Path("round1")), agent(Path("round2")))
+
+    def test_runtime_without_web_denies_tools_mcp_skills_and_plugins(self):
+        config = reviewers.runtime_config("opencode-go/deepseek-v4.1-flash", "my-reviewer", web=False)
         self.assertEqual(config["permissions"], [{"action": "*", "resource": "*", "effect": "deny"}])
         self.assertEqual(config["agents"]["my-reviewer"]["permissions"], config["permissions"])
         self.assertEqual(config["agents"]["my-reviewer"]["mode"], "primary")
         self.assertIn("DevFlow", config["agents"]["my-reviewer"]["system"])
+        self.assertIn("Never use tools", config["agents"]["my-reviewer"]["system"])
         self.assertEqual({p["action"] for p in config["policies"]}, {"tool.use", "mcp.use", "skill.use", "plugin.use"})
         self.assertEqual({p["effect"] for p in config["policies"]}, {"deny"})
+        self.assertNotIn("websearch", config)
         self.assertTrue(config["agents"]["title"]["disabled"])
         self.assertEqual(config["update"], "disable")
         self.assertFalse(config["snapshots"])
         self.assertFalse(config["compaction"]["auto"])
         self.assertFalse(config["warming"])
 
-    def test_v1_runtime_denies_everything(self):
-        config = reviewers.runtime_config("opencode-go/deepseek-v4.1-flash", 1, "my-reviewer")
-        self.assertEqual(config["permission"], "deny")
-        self.assertEqual(config["agent"]["my-reviewer"]["permission"], "deny")
-        self.assertEqual(config["agent"]["my-reviewer"]["model"], "opencode-go/deepseek-v4.1-flash")
-        self.assertIn("DevFlow", config["agent"]["my-reviewer"]["prompt"])
-        self.assertEqual((config["plugin"], config["mcp"]), ([], {}))
-        self.assertFalse(config["autoupdate"])
-        self.assertEqual(config["share"], "disabled")
+    def test_runtime_with_web_allows_only_web_tools_last(self):
+        config = reviewers.runtime_config("opencode-go/deepseek-v4.1-flash", "my-reviewer")
+        allows = [{"action": "webfetch", "resource": "*", "effect": "allow"},
+                  {"action": "websearch", "resource": "*", "effect": "allow"}]
+        self.assertEqual(config["permissions"], [{"action": "*", "resource": "*", "effect": "deny"}] + allows)
+        self.assertEqual(config["agents"]["my-reviewer"]["permissions"], config["permissions"])
+        self.assertEqual(config["policies"][:4], [{"action": a, "resource": "*", "effect": "deny"}
+                                                  for a in ("tool.use", "mcp.use", "skill.use", "plugin.use")])
+        self.assertEqual(config["policies"][4:], [{"action": "tool.use", "resource": "webfetch:*", "effect": "allow"},
+                                                  {"action": "tool.use", "resource": "websearch:*", "effect": "allow"}])
+        self.assertNotIn("integration.use", {p["action"] for p in config["policies"]})
+        self.assertEqual(config["websearch"], {"provider": "exa"})
+        system = config["agents"]["my-reviewer"]["system"]
+        for phrase in ("untrusted", "web search and web fetch", "evidence", "Never put secrets"):
+            self.assertIn(phrase, system)
 
     def test_invalid_entries_rejected_as_reviewer_errors(self):
         for change in ({"command": "codex; touch BAD"}, {"command": ["env", "bash", "-c", "codex"]},
@@ -401,18 +453,33 @@ class ReviewerSettingsTests(unittest.TestCase):
             with self.subTest(timeout=timeout):
                 self.assertRejected(reviewer(timeout_seconds=timeout), "timeout_seconds")
 
-    def test_protocol_version_one_two_or_omitted(self):
-        for changes in ({"protocol_version": 1}, {"protocol_version": 2}, {}):
+    def test_protocol_version_two_or_omitted(self):
+        for changes in ({"protocol_version": 2}, {}):
             with self.subTest(changes=changes):
                 settings.validate_reviewer(reviewer("opencode", **changes))
+        with self.assertRaises(DevFlowError) as raised:
+            settings.validate_reviewer(reviewer("opencode", protocol_version=1))
+        self.assertEqual(str(raised.exception), settings.PROTOCOL_ONE_MESSAGE)
+        self.assertIn('remove "protocol_version" or set it to 2', settings.PROTOCOL_ONE_MESSAGE)
         for protocol in (0, 3, 99, True, 2.0, "2", None):
             with self.subTest(protocol=protocol):
                 self.assertRejected(reviewer("opencode", protocol_version=protocol), "protocol_version")
         self.assertRejected(reviewer(protocol_version=2), "OpenCode setting")
 
+    def test_web_is_a_boolean_and_recorded_as_true_by_default(self):
+        for value in (True, False):
+            with self.subTest(value=value):
+                settings.validate_reviewer(reviewer(web=value))
+        for value in ("yes", 1, None, "false"):
+            with self.subTest(value=value):
+                self.assertRejected(reviewer(web=value), "web")
+        entries = [reviewer(), reviewer("opencode", web=False)]
+        settings.with_web_default(entries)
+        self.assertEqual([entry["web"] for entry in entries], [True, False])
+
     def test_max_output_bytes_boundaries(self):
-        self.assertEqual(settings.DEFAULT_OUTPUT_BYTES, 4 * MIB)
-        self.assertEqual(reviewers.MAX_OUTPUT_BYTES, 4 * MIB)
+        self.assertEqual(settings.DEFAULT_OUTPUT_BYTES, 16 * MIB)
+        self.assertEqual(reviewers.MAX_OUTPUT_BYTES, 16 * MIB)
         self.assertEqual(settings.MAX_OUTPUT_BYTES, 16 * MIB)
         for limit in (1024, 16 * MIB):
             with self.subTest(limit=limit):
@@ -517,13 +584,12 @@ class ProcessTests(unittest.TestCase):
         self.assertFalse((self.base / "attempts.txt").exists())
         self.assertFalse((Path.cwd() / "attempts.txt").exists())
 
-    def test_preflight_reports_protocol_one_two_or_omitted(self):
-        for changes, mode, expected in (({"protocol_version": 1}, "v1", 1),
-                                        ({"protocol_version": 2}, "pass", 2), ({}, "pass", 2)):
+    def test_preflight_reports_protocol_two(self):
+        for changes in ({"protocol_version": 2}, {}):
             with self.subTest(changes=changes):
-                result = reviewers.preflight(self.config("opencode", mode, **changes))
-                self.assertEqual(result["protocol_version"], expected)
-                self.assertEqual(result["cli_version"], "1.20.0" if expected == 1 else "2.2.3")
+                result = reviewers.preflight(self.config("opencode", "pass", **changes))
+                self.assertEqual(result["protocol_version"], 2)
+                self.assertEqual(result["cli_version"], "2.2.3")
 
     def test_missing_executable_and_cmd_shims_rejected(self):
         with self.assertRaisesRegex(ReviewerError, "not found"):
@@ -556,7 +622,9 @@ class ProcessTests(unittest.TestCase):
         self.assertFalse(meta["shell"])
         self.assertEqual(meta["prefix_arg_count"], 2)
         self.assertEqual(meta["timeout_seconds"], 10)
-        self.assertEqual(meta["max_output_bytes"], 4 * MIB)
+        self.assertEqual(meta["max_output_bytes"], 16 * MIB)
+        self.assertIs(meta["web"], True)
+        self.assertEqual(meta["access_policy"], "packet plus web search/fetch; trusted CLI and managed configuration required")
         self.assertEqual(meta["packet_sha256"], hashlib.sha256(self.packet.read_bytes()).hexdigest())
         prompt = (self.workspace / "stdin.txt").read_text(encoding="utf-8")
         self.assertEqual(prompt, (self.workspace / "review-input.md").read_text(encoding="utf-8"))
@@ -568,9 +636,9 @@ class ProcessTests(unittest.TestCase):
         packet = self.packet.read_text(encoding="utf-8")
         schema = self.schema.read_text(encoding="utf-8")
         for kind, mode, changes in (("codex", "pass", {}), ("opencode", "pass", {}),
-                                    ("opencode", "v1", {"protocol_version": 1})):
-            self.output = self.base / f"{kind} {mode}"
-            with self.subTest(kind=kind, mode=mode):
+                                    ("opencode", "pass", {"web": False})):
+            self.output = self.base / f"{kind} {mode} {changes}"
+            with self.subTest(kind=kind, mode=mode, changes=changes):
                 self.run_fixture(kind, mode, **changes)
                 prompt = (self.workspace / "review-input.md").read_text(encoding="utf-8")
                 self.assertEqual(prompt.count(SENTINEL), 1)
@@ -603,8 +671,9 @@ class ProcessTests(unittest.TestCase):
         config_file = self.workspace / "opencode.json"
         self.assertEqual(Path(env["OPENCODE_CONFIG_DIR"]), config_file.parent.resolve())
         runtime = json.loads(config_file.read_text(encoding="utf-8"))
-        self.assertEqual(runtime["permissions"], [{"action": "*", "resource": "*", "effect": "deny"}])
         agent = seen["args"][seen["args"].index("--agent") + 1]
+        self.assertEqual(runtime, reviewers.runtime_config("opencode-go/deepseek-v4.1-flash", agent))
+        self.assertEqual(runtime["permissions"][0], {"action": "*", "resource": "*", "effect": "deny"})
         self.assertRegex(agent, AGENT_ID)
         self.assertEqual(runtime["agents"][agent]["permissions"], runtime["permissions"])
         self.assertTrue(any(p["action"] == "mcp.use" and p["effect"] == "deny" for p in runtime["policies"]))
@@ -615,28 +684,25 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(self.meta()["protocol_version"], 2)
         self.assertNotIn("credential-sentinel", (self.output / "invocation.json").read_text(encoding="utf-8"))
 
-    def test_opencode_v1_process_and_isolation(self):
-        with patch.dict(os.environ, HOSTILE_ENV):
-            result = self.run_fixture("opencode", "v1", protocol_version=1)
+    def test_opencode_without_web_writes_a_deny_all_runtime(self):
+        result = self.run_fixture("opencode", web=False)
         self.assertEqual(result, FIXTURE_REVIEW)
-        seen = self.seen()
-        self.assertIn("--pure", seen["args"])
-        env = seen["env"]
-        self.assertIsNone(env["OPENCODE_CONFIG"])
-        self.assertIsNone(env["OPENCODE_SERVER"])
-        self.assertEqual(json.loads(env["OPENCODE_PERMISSION"]), "deny")
-        self.assertEqual(env["DEVFLOW_TEST_CREDENTIAL"], "credential-sentinel")
-        self.assertEqual(Path(env["OPENCODE_CONFIG_DIR"]), self.workspace.resolve())
-        agent = seen["args"][seen["args"].index("--agent") + 1]
-        self.assertRegex(agent, AGENT_ID)
-        runtime = json.loads(env["OPENCODE_CONFIG_CONTENT"])
-        self.assertEqual(runtime["permission"], "deny")
-        self.assertEqual(runtime["agent"][agent]["permission"], "deny")
-        self.assertEqual(json.loads((self.workspace / "opencode.json").read_text(encoding="utf-8")), runtime)
-        self.assertEqual(self.meta()["protocol_version"], 1)
+        runtime = json.loads((self.workspace / "opencode.json").read_text(encoding="utf-8"))
+        self.assertEqual(runtime["permissions"], [{"action": "*", "resource": "*", "effect": "deny"}])
+        self.assertNotIn("websearch", runtime)
+        self.assertEqual(self.meta()["access_policy"], "packet-only; trusted CLI and managed configuration required")
+
+    def test_web_use_is_accepted_only_for_reviewers_with_web(self):
+        for kind in ("codex", "opencode"):
+            self.output = self.base / f"web {kind}"
+            with self.subTest(kind=kind):
+                self.assertEqual(self.run_fixture(kind, "web"), FIXTURE_REVIEW)
+            self.output = self.base / f"no web {kind}"
+            with self.subTest(kind=kind, web=False), self.assertRaises(ReviewerError):
+                self.run_fixture(kind, "web", web=False)
 
     def test_wrong_protocol_or_old_cli_refuses_dispatch(self):
-        for changes, mode, message in (({"protocol_version": 1}, "pass", "configured v1"),
+        for changes, mode, message in (({"protocol_version": 1}, "pass", "no longer supported"),
                                        ({}, "v1", "configured v2"),
                                        ({"protocol_version": 2}, "v1", "configured v2"),
                                        ({}, "v2-old", r"at least 2\.2\.3")):
@@ -700,6 +766,7 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(self.attempts(), ["timeout"])
 
     def test_output_size_is_bounded_by_default_limit(self):
+        # The default is the 16 MiB ceiling; patch it down to exercise the bound.
         with patch.object(reviewers, "MAX_OUTPUT_BYTES", 1024):
             with self.assertRaisesRegex(ReviewerError, "size limit"):
                 self.run_fixture("codex", "too-large")

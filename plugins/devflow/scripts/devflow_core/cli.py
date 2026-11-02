@@ -16,6 +16,7 @@ import sys
 
 from . import __version__, router
 from .common import paths
+from .common.environment import python_errors
 from .common.errors import DevFlowError, UsageError
 from .common.reviewers import preflight
 from .common.settings import validate_document
@@ -101,11 +102,14 @@ def doctor(project: Path) -> dict:
     warnings.extend(router.blocking_warnings(project))
     version = claude_version()
     executables = {name: shutil.which(name) for name in ("uv", "claude", "git")}
+    errors = python_errors()
     return {"plugin": "devflow", "version": __version__, "project": str(project),
             "minimum_claude_code": MINIMUM_CLAUDE_CODE, "claude_code": version,
-            "python": {"version": sys.version.split()[0], "requires": ">=3.11", "fixed_minor": False},
-            "executables": executables, "workflows": reports, "warnings": warnings,
-            "ready": bool(executables["uv"]) and version["supported"] and all(item["ready"] for item in reports.values()),
+            "python": {"version": sys.version.split()[0], "requires": ">=3.11", "fixed_minor": False,
+                       "platform": sys.platform},
+            "executables": executables, "workflows": reports, "warnings": warnings, "errors": errors,
+            "ready": (bool(executables["uv"]) and version["supported"] and not errors
+                      and all(item["ready"] for item in reports.values())),
             "readiness_scope": "Offline project-settings prerequisites only; use a workflow's doctor with the active session/run to inspect frozen run configuration.",
             "not_verified": ["CLI authentication and model access", "Effective model and reasoning settings",
                              "Real Claude Code hook and interview skill execution", "Native Windows/macOS execution"],

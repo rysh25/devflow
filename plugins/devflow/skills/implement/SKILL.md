@@ -3,7 +3,7 @@ name: implement
 description: Implement an explicitly selected Markdown plan, run approved project checks, and alternate independent Codex and OpenCode reviews with a hard limit of six review attempts. Use only when the user invokes /devflow:implement with a plan file.
 argument-hint: "<plan-file>"
 disable-model-invocation: true
-allowed-tools: Bash(uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *)
+allowed-tools: Bash(uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *) PowerShell(uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *)
 ---
 
 # DevFlow implementation
@@ -12,19 +12,19 @@ Implement the file specified by `$ARGUMENTS` in the current main Claude Code ses
 
 ## Start
 
-1. Resolve the exact project directory and single Markdown file path in the user's arguments. Do not substitute another plan or discover a plan automatically. Quotes around a path with spaces are supported. Inspect the plan and applicable repository instructions with read-only tools. If a requirement is ambiguous, retain it for escalation after the run starts.
+1. Resolve the exact project directory and single Markdown file path in the user's arguments. Do not substitute another plan or discover a plan automatically. Quotes around a path with spaces are supported. Inspect the plan and applicable repository instructions with tools that do not write. If a requirement is ambiguous, retain it for escalation after the run starts.
 2. Run `doctor` using the exact runner below. Stop on missing/unsupported CLI capability. Do not install tools, authenticate, change models/effort, or weaken controls automatically.
-3. Run `start --plan "ABSOLUTE_PLAN_PATH"`. A real `UserPromptSubmit` hook capture must authorize this exact path (relative and absolute spellings of the same file are equivalent). Until the run starts, only read-only tools, `doctor`, `status` and this exact `start` are available; AskUserQuestion is unavailable because there is no run to record the answer in. Never invoke the `hook` action yourself or fabricate session/event data. Save the returned run ID and draft directory.
+3. Run `start --plan "ABSOLUTE_PLAN_PATH"`. A real `UserPromptSubmit` hook capture must authorize this exact path (relative and absolute spellings of the same file are equivalent). Until the run starts, only tools that do not write, the allowed Bash commands, `doctor`, `status` and this exact `start` are available; AskUserQuestion is unavailable because there is no run to record the answer in. Never invoke the `hook` action yourself or fabricate session/event data. Save the returned run ID and draft directory.
 4. Read `${CLAUDE_PLUGIN_ROOT}/references/implement-workflow.md` in full. Follow its state-driven loop until a terminal result or a genuine human/permission blocker. Do not stop merely because one review finished.
 
-Runner template; replace placeholders with actual paths/IDs, keep global options before the `implement` selector, and do not join commands with shell operators:
+Runner template; replace placeholders with actual paths/IDs, keep global options before the `implement` selector, and run it alone (never joined with other commands):
 
 ```text
 uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" --project "ABSOLUTE_PROJECT_PATH" --session "${CLAUDE_SESSION_ID}" implement doctor
 uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" --project "ABSOLUTE_PROJECT_PATH" --session "${CLAUDE_SESSION_ID}" implement start --plan "ABSOLUTE_PLAN_PATH"
 ```
 
-For later actions, insert `--run RUN_ID` before the `implement` selector. Use the path expanded from this plugin, not a repository script with the same name. Do not use `cd`, environment assignments, shell redirection, pipes, command substitutions, or Python snippets in the runner invocation. Only this runner is pre-approved; ordinary Claude Code and organization permissions remain in force.
+For later actions, insert `--run RUN_ID` before the `implement` selector. Use the path expanded from this plugin, not a repository script with the same name. Do not add `cd`, environment assignments, shell redirection, pipes, command substitutions, or Python snippets to the runner invocation. For `review` and `check`, set the Bash tool's timeout to the `bash_timeout_ms` value of the last runner result. Only this runner is pre-approved; ordinary Claude Code and organization permissions remain in force. For other work, Bash accepts the commands listed in the DevFlow status context (none writes files or starts other programs); tests run only through the runner's checks.
 
 ## Boundaries
 

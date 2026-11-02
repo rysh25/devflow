@@ -3,14 +3,14 @@ name: resume
 description: Resume one explicitly selected DevFlow run without resetting its review budget or changing its frozen inputs and settings.
 argument-hint: "<run-id>"
 disable-model-invocation: true
-allowed-tools: Bash(uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *)
+allowed-tools: Bash(uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *) PowerShell(uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *)
 ---
 
 # Resume DevFlow
 
 Selected run ID: $ARGUMENTS
 
-The user must provide exactly one existing ID. The prompt hook has already handled `/devflow:resume RUN_ID`: it selected the workflow from the stored run, made this session the run's owner, and recorded the request (which is never an answer to a pending question). If the hook refused (for example a run started with DevFlow 0.1.x, a damaged or ambiguous run, another unfinished run, a process that may still be running, or an unsealed plan interview from another conversation), report that message and stop. Never create a replacement run to obtain more review attempts. Do not manually edit session records, counters, locks, or audit records.
+The user must provide exactly one existing ID. The prompt hook has already handled `/devflow:resume RUN_ID`: it selected the workflow from the stored run, made this session the run's owner, and recorded the request (which is never an answer to a pending question). If the hook refused (for example a run started with an older DevFlow such as 0.1.x or 0.2.x, a damaged or ambiguous run, another unfinished run, a process that may still be running, or an unsealed plan interview from another conversation), report that message and stop. Never create a replacement run to obtain more review attempts. Do not manually edit session records, counters, locks, or audit records.
 
 1. Run the following status command with the exact ID. Read the returned `flow` field; do not guess from filenames.
 

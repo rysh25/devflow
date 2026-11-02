@@ -11,10 +11,16 @@ from .storage import no_symlinks, read_json
 
 SHELLS = frozenset({"sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "cmd", "powershell", "pwsh"})
 REVIEWER_KINDS = frozenset({"codex", "opencode"})
-REVIEWER_FIELDS = frozenset({"id", "kind", "command", "model", "effort", "timeout_seconds", "protocol_version", "max_output_bytes"})
+REVIEWER_FIELDS = frozenset({"id", "kind", "command", "model", "effort", "timeout_seconds", "protocol_version",
+                             "max_output_bytes", "web"})
 REVIEWER_REQUIRED = frozenset({"id", "kind", "command", "model", "effort", "timeout_seconds"})
-DEFAULT_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+# Web results and fetched pages enlarge reviewer output; the default is the ceiling.
+DEFAULT_OUTPUT_BYTES = MAX_OUTPUT_BYTES
+#: The only supported OpenCode protocol (OpenCode 2.x).
+OPENCODE_PROTOCOL = 2
+PROTOCOL_ONE_MESSAGE = ("OpenCode protocol 1 (OpenCode 1.x) is no longer supported. Upgrade OpenCode to 2.x, then "
+                        'remove "protocol_version" or set it to 2 in devflow.config.json.')
 
 
 def _document(project: Path) -> dict:
@@ -52,6 +58,15 @@ def _program(value: str) -> str:
     for suffix in (".exe", ".cmd", ".bat", ".ps1"):
         name = name.removesuffix(suffix)
     return name
+
+
+def with_web_default(reviewers: object) -> object:
+    """Record ``web`` explicitly (default true) so a run's frozen settings show it."""
+    if isinstance(reviewers, list):
+        for reviewer in reviewers:
+            if isinstance(reviewer, dict):
+                reviewer.setdefault("web", True)
+    return reviewers
 
 
 def validate_reviewers(reviewers: object, max_reviews: int) -> list:
@@ -97,8 +112,14 @@ def validate_reviewer(reviewer: object) -> dict:
     if type(timeout) is not int or not 5 <= timeout <= 3600:
         raise DevFlowError("timeout_seconds must be an integer between 5 and 3600")
     if "protocol_version" in reviewer:
-        if reviewer["kind"] != "opencode" or type(reviewer["protocol_version"]) is not int or reviewer["protocol_version"] not in (1, 2):
-            raise DevFlowError("protocol_version is an OpenCode setting and must be 1 or 2")
+        if reviewer["kind"] != "opencode" or type(reviewer["protocol_version"]) is not int:
+            raise DevFlowError("protocol_version is an OpenCode setting and must be 2")
+        if reviewer["protocol_version"] == 1:
+            raise DevFlowError(PROTOCOL_ONE_MESSAGE)
+        if reviewer["protocol_version"] != OPENCODE_PROTOCOL:
+            raise DevFlowError("protocol_version is an OpenCode setting and must be 2")
+    if "web" in reviewer and type(reviewer["web"]) is not bool:
+        raise DevFlowError("web must be true or false")
     if "max_output_bytes" in reviewer:
         limit = reviewer["max_output_bytes"]
         if type(limit) is not int or not 1024 <= limit <= MAX_OUTPUT_BYTES:

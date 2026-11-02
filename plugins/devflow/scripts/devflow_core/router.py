@@ -12,24 +12,15 @@ from pathlib import Path
 
 from . import __version__
 from .common import guard, sessions
+from .common.paths import project_root
 from .common.errors import DevFlowError
 from .common.runs import (HOOK_WAIT, RUNNER_WAIT, TERMINAL, RunStore, data_root, ensure_data_root,
-                          event_bytes, make_event, new_run_id, validate_run_id)
+                          event_bytes, make_event, new_run_id, unsupported_message, validate_run_id)
 from .common.settings import validate_document
 from .common.storage import file_lock, now
 from .workflows import WORKFLOWS
 
 RESUME = "resume"
-
-
-def project_root(start: Path) -> Path:
-    current = Path(start).resolve()
-    if not current.is_dir():
-        raise DevFlowError("Project directory does not exist")
-    for directory in (current, *current.parents):
-        if any((directory / marker).exists() for marker in (".devflow", "devflow.config.json", ".git")):
-            return directory
-    return current
 
 
 def stores(project: Path, wait: float = RUNNER_WAIT) -> dict[str, RunStore]:
@@ -73,7 +64,7 @@ def assert_available(project: Path, session: str, all_stores: dict[str, RunStore
         runs, _ = store.scan()
         for info in runs:
             if selected == (flow, info.run_id) or info.format == "unsupported":
-                continue  # A 0.1.x run is never continued, so it never blocks (even mid-transaction).
+                continue  # A run from an older format is never continued, so it never blocks (even mid-transaction).
             if info.format == "invalid":
                 raise DevFlowError(f"Run {flow}/{info.run_id} cannot be read ({info.error}); "
                                    "preserve it for human recovery before starting another")
@@ -106,7 +97,8 @@ def _bound(record: dict, flow: str, run_id: str) -> dict:
 
 
 def _settle(project: Path, record: dict, all_stores: dict[str, RunStore]) -> dict:
-    """Finish an applied start, drop an unapplied one, and release a finished run.
+    """Finish an applied start, drop an unapplied one, and release a finished run
+    or a run from an older DevFlow format (never continued).
 
     Only an actual next prompt reaches this point, so a finished run stays
     guarded for the rest of the turn that finished it.
@@ -114,14 +106,24 @@ def _settle(project: Path, record: dict, all_stores: dict[str, RunStore]) -> dic
     record = sessions.settle_pending_start(record, all_stores)
     if record["run"]:
         info = all_stores[record["run"]["flow"]].inspect(record["run"]["run_id"])
-        if info.format == "current" and info.state["status"] in TERMINAL:
+        if info.format == "unsupported" or (info.format == "current" and info.state["status"] in TERMINAL):
             record = dict(record, run=None)
     return record
 
 
-def _context(event: str, flow: str, state: dict, store: RunStore, plugin_root: Path, event_id: str | None) -> dict:
+def _context(event: str, flow: str, state: dict, store: RunStore, plugin_root: Path, event_id: str | None,
+             warnings: list[str] | None = None) -> dict:
     run_dir = store.run_dir(state["run_id"])
-    return guard.context(event, guard.status_context(WORKFLOWS[flow], state, run_dir, plugin_root, event_id))
+    return guard.context(event, guard.status_context(WORKFLOWS[flow], state, run_dir, plugin_root, event_id,
+                                                     warnings))
+
+
+def _inactive_reason(current: sessions.Binding) -> str:
+    if not current.supported:
+        return (unsupported_message(current.run_id, current.schema_version)
+                + "; only non-writing work is available until your next prompt releases it.")
+    return (f"This session no longer owns DevFlow run {current.run_id} (or its resume did not complete). "
+            f"Only non-writing work is available here; send /devflow:resume {current.run_id} to continue the run.")
 
 
 def _start(project: Path, session: str, flow: str, argument: str, payload: dict, record: dict,
@@ -140,7 +142,8 @@ def _start(project: Path, session: str, flow: str, argument: str, payload: dict,
     if workflow.start_option is not None:
         return guard.context("UserPromptSubmit", (
             f"DevFlow {flow} start is pending. Run the {flow} start action with {workflow.start_option} naming "
-            f"exactly this input; until it starts, only diagnostics and read-only tools are available. "
+            f"exactly this input; until it starts, only non-writing tools, the allowed Bash commands, "
+            f"diagnostics and this start are available. "
             f"Runner: {guard.runner_path(plugin_root)}. Pending input: {args}"))
     try:
         state = _create(project, session, pending, all_stores)
@@ -150,7 +153,8 @@ def _start(project: Path, session: str, flow: str, argument: str, payload: dict,
         sessions.write_record(project, dict(record, pending_start=None), WORKFLOWS)
         raise
     sessions.write_record(project, _bound(record, flow, state["run_id"]), WORKFLOWS)
-    return _context("UserPromptSubmit", flow, state, all_stores[flow], plugin_root, pending["event"]["event_id"])
+    return _context("UserPromptSubmit", flow, state, all_stores[flow], plugin_root, pending["event"]["event_id"],
+                    workflow.timeout_warnings(workflow.frozen_config(state)))
 
 
 def _resume(project: Path, session: str, argument: str, payload: dict, record: dict,
@@ -158,7 +162,7 @@ def _resume(project: Path, session: str, argument: str, payload: dict, record: d
     run_id = validate_run_id(argument)
     flow, info = resolve_run(project, run_id, all_stores)
     if info.format == "unsupported":
-        raise DevFlowError(f"Run {run_id} was started with DevFlow 0.1.x; this version cannot continue it")
+        raise DevFlowError(unsupported_message(run_id, info.schema_version))
     current = sessions.binding(project, record, all_stores)
     if current is not None and (current.flow, current.run_id) != (flow, run_id) and not current.terminal:
         raise DevFlowError("Finish or cancel this session's active workflow before resuming another")
@@ -193,7 +197,9 @@ def runner_start(project: Path, session: str | None, flow: str, raw: str) -> dic
         assert_available(project, session, all_stores)
         state = _create(project, session, pending, all_stores)
         sessions.write_record(project, _bound(record, flow, state["run_id"]), WORKFLOWS)
-    return workflow.engine(project).status(state["run_id"])
+    result = workflow.engine(project).status(state["run_id"])
+    warnings = workflow.timeout_warnings(workflow.frozen_config(state))
+    return {**result, "warnings": warnings} if warnings else result
 
 
 def selected_run(project: Path, session: str | None, flow: str, explicit: str | None) -> str | None:
@@ -203,13 +209,17 @@ def selected_run(project: Path, session: str | None, flow: str, explicit: str | 
         if selected_flow != flow:
             raise DevFlowError("The selected run belongs to another workflow")
         if info.format == "unsupported":
-            raise DevFlowError(f"Run {explicit} was started with DevFlow 0.1.x; this version cannot continue it")
+            raise DevFlowError(unsupported_message(explicit, info.schema_version))
         return explicit
     if not session:
         return None
     record = sessions.read_record(project, session, WORKFLOWS)
     if record and record["run"] and record["run"]["flow"] == flow:
-        return record["run"]["run_id"]
+        run_id = record["run"]["run_id"]
+        info = RunStore(project, WORKFLOWS[flow]).inspect(run_id)
+        if info.format == "unsupported":
+            raise DevFlowError(unsupported_message(run_id, info.schema_version))
+        return run_id
     return None
 
 
@@ -239,8 +249,11 @@ def handle_hook(payload: dict, plugin_root: Path) -> dict | None:
             WORKFLOWS[command].normalize_args(argument, project)
             event_bytes(make_event(payload, "prompt"))
         with dispatch_lock(project, HOOK_WAIT):
-            record = sessions.read_record(project, session, WORKFLOWS) or sessions.empty_record(session)
-            record = _settle(project, record, all_stores)
+            original = sessions.read_record(project, session, WORKFLOWS) or sessions.empty_record(session)
+            record = _settle(project, original, all_stores)
+            if record != original:
+                # Kept even if the command below fails (e.g. resuming a 0.2.x run).
+                sessions.write_record(project, record, WORKFLOWS)
             if command == RESUME:
                 return _resume(project, session, argument, payload, record, all_stores, plugin_root)
             if command in WORKFLOWS:
@@ -250,8 +263,8 @@ def handle_hook(payload: dict, plugin_root: Path) -> dict | None:
             if current is None:
                 return None
             if not current.owner:
-                raise DevFlowError("This run is owned by another session, or its resume did not complete; "
-                                   f"send /devflow:resume {current.run_id}")
+                # A prompt here is ordinary conversation, never a human event of the run.
+                return guard.context(event, _inactive_reason(current))
             store = all_stores[current.flow]
             event_id = store.append_event(current.run_id, payload, "prompt")
             return _context(event, current.flow, store.read(current.run_id), store, plugin_root, event_id)
@@ -267,7 +280,9 @@ def handle_hook(payload: dict, plugin_root: Path) -> dict | None:
         return None
     if not current.owner:
         if event == "PreToolUse":
-            return guard.deny("This session no longer owns its run; explicitly resume before using workflow tools")
+            return guard.inactive_decision(payload, project, plugin_root, WORKFLOWS, _inactive_reason(current))
+        if event == "Stop":
+            return None  # Nothing is recorded for a run this session does not own.
         raise DevFlowError("A stale session cannot contribute human events to a transferred run")
     workflow, store = WORKFLOWS[current.flow], all_stores[current.flow]
     if event == "PreToolUse":
@@ -341,8 +356,10 @@ def status(project: Path, session: str | None, run_id: str | None) -> dict:
         except DevFlowError as exc:
             record_error = str(exc)
     pending = record["pending_start"] if record else None
-    caller = ("bound" if current.owner else "stale") if current else "pending_start" if pending else "idle"
-    return {"plugin": "devflow", "version": __version__, "project": str(project), "status": caller,
+    caller = (("unsupported" if not current.supported else "bound" if current.owner else "stale") if current
+              else "pending_start" if pending else "idle")
+    extra = {"message": unsupported_message(current.run_id, current.schema_version)} if caller == "unsupported" else {}
+    return {"plugin": "devflow", "version": __version__, "project": str(project), "status": caller, **extra,
             "run": record["run"] if current else None, "owner_matches": current.owner if current else None,
             "pending_start": pending and {key: pending[key] for key in ("flow", "run_id", "args", "created_at")},
             "session_record_error": record_error,

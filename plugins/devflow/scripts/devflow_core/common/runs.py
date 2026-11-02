@@ -21,7 +21,14 @@ from .errors import DevFlowError
 from .storage import (atomic_json, digest, file_lock, json_bytes, no_symlinks, now,
                       read_json, within, write_new)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+# Older run formats (every version below SCHEMA_VERSION) and the releases that wrote
+# them; they are never continued. A test keeps this table complete.
+RELEASES = {1: "0.1.x", 2: "0.2.x"}
+
+
+def release_name(version: int) -> str:
+    return RELEASES.get(version, f"an older version (run format {version})")
 TERMINAL = frozenset({"completed", "exhausted", "cancelled"})
 RUN_ID = re.compile(r"[0-9]{8}T[0-9]{6}Z-[a-f0-9]{12}\Z")
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}\Z")
@@ -89,6 +96,11 @@ def validate_event(value: object) -> dict:
     return value
 
 
+def unsupported_message(run_id: str, version: int) -> str:
+    """Why a run from an older format cannot continue (one wording everywhere)."""
+    return f"Run {run_id} was started with DevFlow {release_name(version)}; this version cannot continue it"
+
+
 def open_escalation(state: dict, identifier: str, reason: str, questions: list, return_status: str,
                     detail: dict | None = None) -> dict:
     """Pause for a human; only answers recorded after this point may resolve it."""
@@ -106,6 +118,7 @@ class RunInfo:
     state: dict | None
     error: str | None
     recovery_required: bool
+    schema_version: int | None = None
 
     def public(self) -> dict:
         value = {"flow": self.flow, "run_id": self.run_id, "format": self.format,
@@ -115,7 +128,8 @@ class RunInfo:
         if self.format == "unsupported":
             value["status"] = self.state.get("status")
             value["project"] = self.state.get("project")
-            value["message"] = "Started with DevFlow 0.1.x; this version cannot continue it"
+            value["message"] = (f"Started with DevFlow {release_name(self.schema_version)}; "
+                                "this version cannot continue it")
         return value
 
 
@@ -274,13 +288,13 @@ class RunStore:
             if not isinstance(raw, dict):
                 raise DevFlowError("Run state must be an object")
             version = raw.get("schema_version")
-            if type(version) is int and version == 1:
+            if type(version) is int and 1 <= version < SCHEMA_VERSION:
                 if (raw.get("run_id") == run_id and raw.get("flow") == self.flow
                         and raw.get("project") == str(self.project) and isinstance(raw.get("status"), str)):
-                    return RunInfo(self.flow, run_id, "unsupported", raw, None, recovery)
-                raise DevFlowError("Run state from DevFlow 0.1.x has mismatched basic information")
+                    return RunInfo(self.flow, run_id, "unsupported", raw, None, recovery, version)
+                raise DevFlowError("Run state from an older DevFlow format has mismatched basic information")
             state = self.read(run_id)
-            return RunInfo(self.flow, run_id, "current", state, None, recovery)
+            return RunInfo(self.flow, run_id, "current", state, None, recovery, SCHEMA_VERSION)
         except (DevFlowError, OSError, TypeError, KeyError, ValueError, AttributeError) as exc:
             return RunInfo(self.flow, run_id, "invalid", None, str(exc), recovery)
 

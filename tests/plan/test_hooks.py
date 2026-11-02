@@ -173,9 +173,24 @@ class GuardTests(PlanHookFixture):
         ))
 
     def test_subagent_external_and_unknown_tools_denied(self):
-        for tool in ("Agent", "Task", "mcp__files__write", "WebFetch", "Unknown"):
+        for tool in ("Agent", "Task", "mcp__files__write", "Monitor", "TaskStop", "Unknown"):
             with self.subTest(tool=tool):
                 self.assertDenied(self.check(tool))
+
+    def test_web_and_other_non_writing_tools_are_allowed(self):
+        for tool in ("WebSearch", "WebFetch", "ReadNotifications", "ListAgents", "CronList", "PushNotification",
+                     "SendUserFile"):
+            with self.subTest(tool=tool):
+                self.assertIsNone(self.check(tool))
+
+    def test_draft_cannot_hold_project_markers_or_ugrep_settings(self):
+        for name in (".git", "devflow.config.json", ".ugrep", ".devflow", ".UG",
+                     # NTFS streams, trailing dots and spaces name the same file on Windows.
+                     "devflow.config.json::$DATA", "devflow.config.json.", "devflow.config.json ",
+                     ".git::$INDEX_ALLOCATION", "notes:x.md"):
+            with self.subTest(name=name):
+                self.assertDenied(self.check("Write", file_path=str(self.draft / name), content="x"))
+        self.assertDenied(self.check("Write", file_path=str(self.draft / "a" / ".git" / "config"), content="x"))
 
     def test_valid_runner_commands_allow_no_permission_bypass(self):
         commands = [
@@ -210,15 +225,18 @@ class GuardTests(PlanHookFixture):
         self.assertDenied(self.check("Bash", command=command, run_in_background=True))
         self.assertIsNone(self.check("Bash", command=command, run_in_background=False))
 
-    def test_shell_discovery_rejected_with_supported_alternatives(self):
-        reasons = {}
-        for command in ("pwd", "cd /tmp", "which uv", "env", "uv --version", "claude --version"):
+    def test_shell_discovery_is_allowed_but_not_secrets_or_other_programs(self):
+        for command in ("pwd", "which uv", "uv --version", "command -v codex", f"cd {shlex.quote(str(self.project))}"):
             with self.subTest(command=command):
-                reason = reasons[command] = self.assertDenied(self.check("Bash", command=command))
-                self.assertIn("read-only search commands (grep, rg, find, ls, cat, head, tail, wc)", reason)
-                self.assertIn(str(self.script), reason)
-        # The supported alternative to probing the environment is the runner's doctor.
-        self.assertIn("doctor", reasons["which uv"], "the denial no longer points to the runner's doctor")
+                self.assertIsNone(self.check("Bash", command=command))
+        reasons = {}
+        for command in ("cd /tmp", "env", "printenv", "claude --version", "printf x"):
+            with self.subTest(command=command):
+                reasons[command] = self.assertDenied(self.check("Bash", command=command))
+        # Commands outside the table get the runner's message: the allowed list and the doctor.
+        self.assertIn("allowed commands (basename, cat, cd, cmp", reasons["env"])
+        self.assertIn(str(self.script), reasons["env"])
+        self.assertIn("doctor", reasons["env"], "the denial no longer points to the runner's doctor")
 
     def test_read_only_search_commands_keep_normal_permissions(self):
         for command in (
@@ -231,12 +249,15 @@ class GuardTests(PlanHookFixture):
 
     def test_read_only_commands_cannot_run_programs_write_or_chain(self):
         for command in (
-            "find . -exec rm {} +", "find . -delete", "find . -fprint out.txt", "rg --pre=sh x .", "rg --pre sh x .",
-            "grep -rn x . | head", "grep x . > out.txt", "cat a; rm b", "grep \"$HOME\" .", "cat $(echo a)",
-            "grep x . && rm y", "grep \"a|b\" .", "cat a\nrm b",
+            "find . -exec rm {} +", "find . -delete", "find . -rm", "find . -fprint out.txt", "rg --pre=sh x .",
+            "rg --pre sh x .", "grep -rn x . | sh", "grep x . > out.txt", "cat a; rm b", "grep \"$HOME\" .",
+            "cat $(echo a)", "grep x . && rm y", "cat a\nrm b", "find * -name x",
         ):
             with self.subTest(command=command):
                 self.assertDenied(self.check("Bash", command=command))
+        for command in ("grep -rn x . | head", 'grep "a|b" .', "cat a\nls b", "ls 2>/dev/null"):
+            with self.subTest(command=command):
+                self.assertIsNone(self.check("Bash", command=command))
         # PowerShell quotes differently, so it gets the runner only.
         self.assertDenied(self.check("PowerShell", command="ls"))
         self.assertDenied(self.check("Bash", command="grep -rn x .", run_in_background=True))
@@ -249,7 +270,7 @@ class GuardTests(PlanHookFixture):
         good = self.runner("status")
         for command in (
             good.replace(self.session, "another-session"),
-            self.runner("--run", "another-run", "status"),
+            self.runner("--run", "another-run", "cancel"),
             good.replace(str(self.project), str(self.project.parent)),
         ):
             with self.subTest(command=command):

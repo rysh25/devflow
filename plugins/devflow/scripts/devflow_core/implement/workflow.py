@@ -6,8 +6,10 @@ from pathlib import Path
 import subprocess
 
 from ..common.errors import DevFlowError, GuardError
-from ..common.guard import as_path, draft_path, safe_relative, same_path
+from ..common.guard import as_path, draft_path, name_key, safe_relative, same_path
+from ..common.environment import bash_timeout_ms
 from ..common.review import HARD_MAX_REVIEWS, check_review_config, review_budget
+from ..common.runs import TERMINAL
 from ..common.storage import digest, json_bytes, no_symlinks, now
 from ..common.workflow import Workflow
 from .commands import COMMANDS
@@ -16,6 +18,12 @@ EDIT_STATUSES = frozenset({"implementing", "needs_revision"})
 PROTECTED_COMPONENTS = frozenset({".git", ".devflow", ".claude", ".codex", ".opencode", ".agents"})
 PROTECTED_NAMES = frozenset({"devflow.config.json", "claude.md", "agents.md", ".mcp.json",
                              "opencode.json", "opencode.jsonc", ".gitignore", ".gitattributes"})
+
+
+def _checks_timeout_ms(config: dict) -> int:
+    """All checks run in one runner call, one after another."""
+    from .checks import validate_checks
+    return bash_timeout_ms(sum(check["timeout_seconds"] for check in validate_checks(config["checks"])))
 
 
 def plan_argument(argument: str) -> str:
@@ -128,7 +136,7 @@ class ImplementWorkflow(Workflow):
         if state["status"] not in EDIT_STATUSES:
             raise GuardError("Source edits are permitted only during implementing or needs_revision.")
         candidate, relative = safe_relative(path, cwd, project)
-        parts = [part.casefold() for part in Path(relative).parts]
+        parts = [name_key(part) for part in Path(relative).parts]
         if any(part in PROTECTED_COMPONENTS for part in parts) or parts[-1] in PROTECTED_NAMES:
             raise GuardError("Workflow, Git, agent-instruction and permission configuration files are protected.")
         if same_path(candidate, as_path(state["plan_source"], project)):
@@ -163,8 +171,21 @@ class ImplementWorkflow(Workflow):
         return load_config(project, self)
 
     def doctor(self, project: Path, config: dict) -> dict:
-        return {"warnings": [] if config["checks"] else
-                ["No implementation checks configured; every revised snapshot requires actual human validation"]}
+        return {"warnings": ([] if config["checks"] else
+                             ["No implementation checks configured; every revised snapshot requires actual human validation"])
+                + self.timeout_warnings(config)}
+
+    def bash_needs(self, config: dict) -> dict[str, int]:
+        value = super().bash_needs(config)
+        if config["checks"]:
+            value["check"] = _checks_timeout_ms(config)
+        return value
+
+    def bash_timeouts(self, state: dict) -> dict[str, int]:
+        value = super().bash_timeouts(state)
+        if state["config"]["checks"] and state["status"] not in TERMINAL:
+            value["check"] = _checks_timeout_ms(state["config"])
+        return value
 
     def engine(self, project: Path, session: str | None = None):
         from .engine import Engine
