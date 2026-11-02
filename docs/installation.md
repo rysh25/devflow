@@ -46,6 +46,32 @@ claude plugin install devflow@devflow-marketplace --scope user
 
 public は必須ではありません。private も、実行環境の通常の GitHub/Git 認証で読み取れる場合に利用できます。認証情報を plugin、設定、ZIP に埋め込まないでください。組織の marketplace 許可ポリシーも適用されます。
 
+## 更新する
+
+更新の前に、README の「0.2.0 への更新」などの節で、その版の注意点を確認してください。版によっては、それまでの run を続けられないことがあります（例：0.1.x で始めた run は 0.2.0 以降では続けられません）。
+
+### GitHub から導入した場合
+
+```text
+claude plugin marketplace update devflow-marketplace
+claude plugin update devflow@devflow-marketplace
+```
+
+- 1つ目で、登録したリポジトリから最新の内容を読み込みます。2つ目で、プラグインを新しい版に入れ替えます。`claude plugin update` にはプラグインの名前 `devflow@devflow-marketplace` が必要です。
+- `user` 以外のスコープに入れた場合は、`--scope project` のようにスコープを付けます。
+- 入れ替えた版は、Claude Code を起動し直すか、セッション内で `/reload-plugins` を実行すると使われます。それまでは、起動中のセッションは前の版のまま動きます。
+- `already at the latest version` と表示された場合は、版が変わっていません。DevFlow は `plugin.json` に版を書いているので、版が上がるまで新しい内容は入りません。
+
+### ZIP から導入した場合
+
+`claude plugin marketplace add .` で登録したディレクトリの中身を、新しい配布物の中身に置き換えます。このプラグインはそのディレクトリから直接読み込まれるので、`claude plugin update` は不要です。Claude Code を起動し直すか、`/reload-plugins` を実行すると反映されます。
+
+### 更新の後
+
+- 対象プロジェクトで `/devflow:doctor` を実行し、`version` が新しい版になっていることを確認します。
+- 実行中の run がある場合は、レビューやチェックの外部処理が終わってから更新してください。新しい会話で続けるときは `/devflow:resume RUN_ID` を使います。面接の途中の Plan は元の会話でしか続けられないので、面接を終えてから更新してください。
+- プラグインを更新した後にランナーの場所が拒否された場合は、DevFlow の状態の通知にある `runner` の場所を使います。
+
 ## よくある問題
 
 ### Plugin が marketplace にない
@@ -86,4 +112,5 @@ Git モードでは、新規作成された正式プランや設定ファイル�
 
 - [Claude Code plugin 導入・スコープ・private marketplace](https://code.claude.com/docs/en/discover-plugins)
 - [Claude Code plugin manifest](https://code.claude.com/docs/en/plugins-reference)
+- [Claude Code plugin の読み込み・版・更新](https://code.claude.com/docs/en/plugins/loading)
 - [uv script metadata](https://docs.astral.sh/uv/guides/scripts/)

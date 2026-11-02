@@ -25,6 +25,13 @@ claude plugin install devflow@devflow-marketplace --scope user
 
 GitHub に置く場合も公開リポジトリは必須ではありません。認証済みの private リポジトリを marketplace として登録できます。詳細は [インストールと環境設定](docs/installation.md) を参照してください。
 
+更新は、GitHub から導入した場合は次の2つを実行し、Claude Code を起動し直します。ZIP から導入した場合と、更新の前後の注意は [更新する](docs/installation.md#更新する) を参照してください。
+
+```text
+claude plugin marketplace update devflow-marketplace
+claude plugin update devflow@devflow-marketplace
+```
+
 ## 必要なもの
 
 | 依存 | 用途・注意点 |
@@ -204,6 +211,8 @@ python tools/package.py
 ```
 
 `python` は環境に応じて `python3` などに読み替えてください。ZIP は既存の同名ファイルを上書きせず、固定された順序・タイムスタンプと `SHA256SUMS` を含みます。
+
+変更を配るときは、版を上げます。Claude Code は版が同じだと、GitHub から導入した利用者のプラグインを更新しません。版は `plugins/devflow/.claude-plugin/plugin.json` と `plugins/devflow/scripts/devflow_core/__init__.py` の2か所に書き、版を固定しているテスト（`tests/test_distribution.py`、`tests/router/test_entrypoint.py`）の期待値も合わせて直します。
 
 `tools/package.py` は静的検証です。Claude Code 本体によるプラグイン検証・hooks 実行・認証済みモデル呼び出しとは異なります。GitHub Actions には Linux / macOS / Windows の試験設定を同梱しますが、設定があること自体は各 OS の成功実績ではありません。
 
