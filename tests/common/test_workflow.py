@@ -1,38 +1,51 @@
-"""The workflow contract: one command table from which the guard and the CLI derive."""
+"""The workflow contract: one command table from which the CLI parser and dispatch derive."""
 import argparse
 import inspect
 import unittest
 
 from devflow_core import cli
-from devflow_core.common import guard
-from devflow_core.common.errors import GuardError
-from devflow_core.common.workflow import Command, Option
+from devflow_core.common.errors import DevFlowError
+from devflow_core.common.workflow import OPTION_KINDS, Option
 from devflow_core.workflows import WORKFLOWS
+
+
+def subcommands(parser: argparse.ArgumentParser) -> dict:
+    action = next(item for item in parser._actions if isinstance(item, argparse._SubParsersAction))
+    return action.choices
 
 
 class CommandTableTests(unittest.TestCase):
     def test_an_unknown_option_kind_fails_when_the_table_is_defined(self):
         with self.assertRaisesRegex(ValueError, "Unknown option kind"):
             Option("--file", "drafft")
+        for kind in OPTION_KINDS:
+            with self.subTest(kind=kind):
+                Option("--x", kind)
 
-    def test_a_claude_action_cannot_take_an_option_the_guard_cannot_check(self):
-        with self.assertRaisesRegex(ValueError, "cannot check"):
-            Command("count", "x", lambda *_: None, (Option("--n", "int"),))
-        Command("count", "x", lambda *_: None, (Option("--n", "int"),), claude=False)
-
-    def test_the_guard_refuses_an_unknown_kind(self):
-        with self.assertRaisesRegex(GuardError, "cannot be checked"):
-            guard.check_option("drafft", "x", None, None)
-
-    def test_guard_actions_and_human_actions_come_from_the_table(self):
+    def test_the_cli_offers_exactly_the_actions_of_the_table(self):
+        workflows = subcommands(cli.parser())
         for workflow in WORKFLOWS.values():
             with self.subTest(workflow=workflow.name):
                 names = {command.name for command in workflow.commands}
-                self.assertEqual(set(workflow.actions) | set(workflow.human_actions), names)
-                self.assertIn("recover", workflow.human_actions)
-                self.assertNotIn("recover", workflow.actions)
+                if workflow.start_option:
+                    names.add("start")
+                self.assertEqual(set(subcommands(workflows[workflow.name])), names)
                 recover = next(c for c in workflow.commands if c.name == "recover")
                 self.assertIn("confirm", [option.kind for option in recover.options])
+
+
+class OwnerTests(unittest.TestCase):
+    def test_every_change_to_a_run_needs_the_owning_session_except_a_humans_recover(self):
+        for name, workflow in WORKFLOWS.items():
+            for command in workflow.commands:
+                with self.subTest(flow=name, action=command.name):
+                    self.assertEqual(command.needs_owner, command.name not in ("status", "doctor", "recover"))
+                    if command.name in ("status", "doctor", "recover"):
+                        continue
+                    # Without --session, a change never runs (the owner is checked before the action).
+                    args = argparse.Namespace(action=command.name)
+                    with self.assertRaisesRegex(DevFlowError, "pass --session"):
+                        workflow.run_command(args, None, "20260101T000000Z-000000000000", None)
 
 
 class StartContractTests(unittest.TestCase):
@@ -53,10 +66,6 @@ class StartContractTests(unittest.TestCase):
         self.assertEqual(WORKFLOWS["plan"].start_options(argparse.Namespace()), {})
         with self.assertRaises(cli.UsageError):
             parser.parse_args(["implement", "start", "--plan", "plan.md", "--unknown", "x"])
-
-    def test_restricting_is_a_declared_property_not_a_name(self):
-        self.assertTrue(WORKFLOWS["plan"].restricts_tools)
-        self.assertFalse(WORKFLOWS["implement"].restricts_tools)
 
 
 if __name__ == "__main__":

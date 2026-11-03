@@ -81,25 +81,39 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(out["messages"][0]["content"], "/devflow:plan add X")
         self.assertNotIn("SECRET SKILL INSTRUCTION", json.dumps(out))
 
-    def test_original_prompt_may_be_absent_but_followups_must_match(self):
+    def test_original_prompt_may_be_absent_and_unplaced_prompts_use_the_hook_records(self):
         marker = transcript_marker(str(self.path))
         self.write(entry("assistant", "Question"), entry("user", "answer"))
         out = capture_interview(marker, [self.prompt("/devflow:plan request"), self.prompt("answer")])
         self.assertEqual(out["messages"][0]["content"], "/devflow:plan request")
-        with self.assertRaises(CaptureError):
-            capture_interview(marker, [self.prompt("req"), self.prompt("missing answer")])
+        self.assertEqual(out["coverage"]["mode"], "bounded-transcript-with-hook-provenance")
+        # A follow-up the transcript does not show: the hook records alone, in order.
+        out = capture_interview(marker, [self.prompt("req"), self.prompt("missing answer")])
+        self.assertEqual(out["coverage"]["mode"], "hook-records-only")
+        # The transcript's own human text (no hook record) is kept at the end, marked.
+        self.assertEqual([m["content"] for m in out["messages"]], ["req", "missing answer", "answer"])
+        self.assertIs(out["messages"][-1]["source"]["hook_record"], False)
+        self.assertEqual(out["coverage"]["human_response_count"], 1)
 
-    def test_unknown_visible_block_fails(self):
+    def test_unknown_visible_block_is_skipped_and_counted(self):
         marker = transcript_marker(str(self.path))
-        self.write(entry("assistant", [{"type": "future-visible-block", "text": "not safely understood"}]))
-        with self.assertRaises(CaptureError):
-            capture_interview(marker, [self.prompt("req")])
+        self.write(entry("user", "req"),
+                   entry("assistant", [{"type": "future-visible-block", "text": "FUTURE-BLOCK"},
+                                       {"type": "text", "text": "Q?"}]),
+                   entry("user", "A"))
+        out = capture_interview(marker, [self.prompt("req"), self.prompt("A")])
+        self.assertEqual([m["content"] for m in out["messages"]], ["req", "Q?", "A"])
+        self.assertEqual(out["coverage"]["unknown_types"]["blocks"], {"future-visible-block": 1})
+        self.assertNotIn("FUTURE-BLOCK", json.dumps(out))
 
-    def test_unrecognized_injected_user_text_is_not_exported(self):
+    def test_user_text_without_a_hook_record_is_kept_and_marked(self):
         marker = transcript_marker(str(self.path))
-        self.write(entry("user", "req"), entry("user", "unrecognized injected instructions"), entry("assistant", "Q?"))
-        with self.assertRaises(CaptureError):
-            capture_interview(marker, [self.prompt("req")])
+        self.write(entry("user", "req"), entry("user", "text without a hook record"), entry("assistant", "Q?"))
+        out = capture_interview(marker, [self.prompt("req")])
+        kept = [m for m in out["messages"] if m["content"] == "text without a hook record"]
+        self.assertEqual(len(kept), 1)
+        self.assertIs(kept[0]["source"]["hook_record"], False)
+        self.assertEqual(out["coverage"]["user_texts_without_hook_record"], 1)
 
     def test_empty_answer_never_counts_as_human_participation(self):
         marker = transcript_marker(str(self.path))
@@ -110,15 +124,19 @@ class TranscriptTests(unittest.TestCase):
                 "hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_input": q, "tool_response": {"answers": {}},
             }])
 
-    def test_prefilled_question_never_counts_as_human_participation(self):
+    def test_prefilled_question_is_kept_but_never_counts_as_human_participation(self):
         marker = transcript_marker(str(self.path))
         question = {"questions": [{"question": "Q?"}], "answers": {"Q?": "Prefilled by model"}}
         self.write(entry("user", "req"), entry("assistant", [{"type": "tool_use", "id": "q", "name": "AskUserQuestion", "input": question}]))
-        with self.assertRaisesRegex(CaptureError, "prefilled"):
-            capture_interview(marker, [self.prompt("req"), {
-                "hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_input": question,
-                "tool_response": {"answers": {"Q?": "Prefilled by model"}},
-            }])
+        out = capture_interview(marker, [self.prompt("req"), {
+            "hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_input": question,
+            "tool_response": {"answers": {"Q?": "Prefilled by model"}},
+        }])
+        kinds = [m["source"].get("kind") for m in out["messages"]]
+        self.assertEqual(kinds, ["prompt", "questionnaire_prefilled", "questionnaire_prefilled_answer"])
+        self.assertEqual(out["coverage"]["prefilled_questions"], 1)
+        self.assertEqual(out["coverage"]["answered_questions"], 0)
+        self.assertEqual(out["coverage"]["human_response_count"], 0)
 
     def test_hook_input_filled_in_by_question_screen_matches_transcript_question(self):
         # The transcript keeps the model's call; the hook sees the same input
@@ -143,32 +161,39 @@ class TranscriptTests(unittest.TestCase):
         marker = transcript_marker(str(self.path))
         question = {"questions": [{"question": "Q?"}], "annotations": {"Q?": {"notes": "Prefilled by model"}}}
         self.write(entry("user", "req"), entry("assistant", [{"type": "tool_use", "id": "q", "name": "AskUserQuestion", "input": question}]))
-        with self.assertRaisesRegex(CaptureError, "prefilled"):
-            capture_interview(marker, [self.prompt("req"), {
-                "hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_use_id": "q",
-                "tool_input": {**question, "answers": {"Q?": "Yes"}}, "tool_response": {"answers": {"Q?": "Yes"}},
-            }])
+        out = capture_interview(marker, [self.prompt("req"), {
+            "hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_use_id": "q",
+            "tool_input": {**question, "answers": {"Q?": "Yes"}}, "tool_response": {"answers": {"Q?": "Yes"}},
+        }])
+        self.assertEqual(out["coverage"]["prefilled_questions"], 1)
+        self.assertEqual(out["coverage"]["human_response_count"], 0)
 
     def test_unsuccessful_question_hook_never_replaces_valid_answer(self):
         marker = transcript_marker(str(self.path))
         question = {"questions": [{"question": "Q?"}]}
         self.write(entry("user", "req"), entry("assistant", [{"type": "tool_use", "id": "q", "name": "AskUserQuestion", "input": question}]),
                    entry("user", [{"type": "tool_result", "tool_use_id": "q", "content": "Transcript answer"}]))
-        with self.assertRaisesRegex(CaptureError, "unsuccessful"):
-            capture_interview(marker, [self.prompt("req"), {
-                "hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_input": question,
-                "tool_response": {"answers": {"Q?": "Changed answer"}}, "is_error": True,
-            }])
+        out = capture_interview(marker, [self.prompt("req"), {
+            "hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_input": question,
+            "tool_response": {"answers": {"Q?": "Changed answer"}}, "is_error": True,
+        }])
+        self.assertIn("Transcript answer", [m["content"] for m in out["messages"]])
+        self.assertNotIn("Changed answer", json.dumps(out))
 
-    def test_unanswered_or_empty_question_fails(self):
-        for questions, message in (([{"question": "Q?"}], "unanswered"), ([], "no supported nonempty questions")):
-            with self.subTest(questions=questions):
-                self.path.unlink(missing_ok=True)
-                marker = transcript_marker(str(self.path))
-                self.write(entry("user", "request"),
-                           entry("assistant", [{"type": "tool_use", "id": "q", "name": "AskUserQuestion", "input": {"questions": questions}}]))
-                with self.assertRaisesRegex(CaptureError, message):
-                    capture_interview(marker, [self.prompt("request")])
+    def test_unanswered_question_is_kept_and_empty_question_fails(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"),
+                   entry("assistant", [{"type": "tool_use", "id": "q", "name": "AskUserQuestion",
+                                        "input": {"questions": [{"question": "Q?"}]}}]))
+        out = capture_interview(marker, [self.prompt("request")])
+        self.assertEqual(out["coverage"]["unanswered_questions"], 1)
+        self.assertEqual(out["coverage"]["answered_questions"], 0)
+        self.path.unlink()
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"),
+                   entry("assistant", [{"type": "tool_use", "id": "q", "name": "AskUserQuestion", "input": {"questions": []}}]))
+        with self.assertRaisesRegex(CaptureError, "no supported nonempty questions"):
+            capture_interview(marker, [self.prompt("request")])
 
     def cancelled_question(self, **record_extra):
         question = {"questions": [{"question": "Q?"}]}
@@ -219,21 +244,265 @@ class TranscriptTests(unittest.TestCase):
         self.assertNotIn("COPY OF REQUEST", json.dumps(out))
         self.assertNotIn("PROJECT RULES", json.dumps(out))
 
-    def test_automated_messages_and_unknown_records_fail_closed(self):
-        for extra, message in (
+    def test_automated_messages_and_unknown_records_are_skipped_and_counted(self):
+        for extra, group, name in (
+            # Queued messages that are not the human's: another session, a scheduler.
             ({"type": "attachment", "attachment": {"type": "queued_command", "commandMode": "prompt", "isMeta": True,
-                                                   "origin": {"kind": "peer"}, "prompt": "<agent-message>"}}, "queued_command"),
-            ({"type": "attachment", "attachment": {"type": "queued_command", "commandMode": "task-notification",
-                                                   "origin": {"kind": "task-notification"}, "prompt": "done"}}, "queued_command"),
-            ({"type": "attachment", "attachment": "malformed"}, "None"),
-            ({"type": "brand-new-record", "text": "?"}, "brand-new-record"),
+                                                   "origin": {"kind": "peer", "from": "elsewhere"},
+                                                   "prompt": "<agent-message>OTHER-SECRET"}}, None, None),
+            ({"type": "attachment", "attachment": {"type": "queued_command", "commandMode": "prompt",
+                                                   "origin": {"kind": "scheduler"}, "prompt": "OTHER-SECRET"}}, None, None),
+            ({"type": "attachment", "attachment": "OTHER-SECRET"}, "attachments", "(untyped)"),
+            ({"type": "attachment", "attachment": {"type": "brand-new-attachment", "text": "OTHER-SECRET"}},
+             "attachments", "brand-new-attachment"),
+            ({"type": "brand-new-record", "message": {"role": "user", "content": "OTHER-SECRET"}},
+             "records", "brand-new-record"),
+            ({"type": "Odd Type!", "text": "OTHER-SECRET"}, "records", "Odd Type!"),
+            ({"text": "OTHER-SECRET"}, "records", "(untyped)"),
         ):
             with self.subTest(extra=extra):
                 self.path.unlink(missing_ok=True)
                 marker = transcript_marker(str(self.path))
                 self.write(entry("user", "request"), extra, entry("assistant", "Question?"))
-                with self.assertRaisesRegex(CaptureError, message):
-                    capture_interview(marker, [self.prompt("request")])
+                out = capture_interview(marker, [self.prompt("request")])
+                self.assertEqual([m["content"] for m in out["messages"]], ["request", "Question?"])
+                self.assertNotIn("OTHER-SECRET", json.dumps(out))
+                if group:
+                    self.assertEqual(out["coverage"]["unknown_types"][group], {name: 1})
+
+    def test_unknown_types_are_counted_with_a_bound(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), *({"type": f"future-{index}"} for index in range(40)),
+                   entry("assistant", "Question?"))
+        counts = capture_interview(marker, [self.prompt("request")])["coverage"]["unknown_types"]["records"]
+        self.assertEqual(len(counts), 33)
+        self.assertEqual(counts["(other)"], 8)
+
+    def test_unknown_bookkeeping_records_are_skipped_and_counted(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"),
+                   {"type": "session-owner", "accountUuid": "a", "organizationUuid": "o", "sessionId": "s"},
+                   {"type": "future-setting", "value": "BOOKKEEPING-COPY"},
+                   {"type": "future-setting", "value": "again"},
+                   entry("assistant", "Question?"), entry("user", "Answer"))
+        out = capture_interview(marker, [self.prompt("request"), self.prompt("Answer")])
+        self.assertEqual([m["content"] for m in out["messages"]], ["request", "Question?", "Answer"])
+        self.assertEqual(out["coverage"]["unknown_types"]["records"], {"future-setting": 2})
+        self.assertNotIn("BOOKKEEPING-COPY", json.dumps(out))
+        # Human words cannot vanish into an unknown record: the hook records are used instead.
+        self.path.unlink()
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), entry("assistant", "Question?"),
+                   {"type": "future-prompt", "text": "Answer"})
+        out = capture_interview(marker, [self.prompt("request"), self.prompt("Answer")])
+        self.assertEqual(out["coverage"]["mode"], "hook-records-only")
+        self.assertEqual([m["content"] for m in out["messages"]], ["request", "Answer"])
+
+    def test_queued_reports_of_subagents_and_tasks_are_tool_output(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"),
+                   entry("assistant", [{"type": "tool_use", "id": "a1", "name": "Agent",
+                                        "input": {"subagent_type": "Explore", "prompt": "survey"}}]),
+                   entry("user", [{"type": "tool_result", "tool_use_id": "a1", "content": "Async agent launched"}],
+                         toolUseResult={"isAsync": True, "status": "async_launched", "agentId": "agent-7"}),
+                   {"type": "attachment", "attachment": {
+                       "type": "queued_command", "commandMode": "prompt", "isMeta": True,
+                       "origin": {"kind": "peer", "from": "agent-7", "senderTaskId": "agent-7", "name": "Explore"},
+                       "prompt": "<agent-message>SUBAGENT-REPORT-SECRET</agent-message>"}},
+                   {"type": "attachment", "attachment": {
+                       "type": "queued_command", "commandMode": "task-notification",
+                       "origin": {"kind": "task-notification", "producer": "session-task"},
+                       "prompt": "<task-notification>TASK-NOTICE-SECRET</task-notification>"}},
+                   entry("assistant", "Which scope?"), entry("user", "Only the API."))
+        out = capture_interview(marker, [self.prompt("request"), self.prompt("Only the API.")])
+        self.assertEqual([m["content"] for m in out["messages"] if m["role"] == "user"], ["request", "Only the API."])
+        text = json.dumps(out)
+        for secret in ("SUBAGENT-REPORT-SECRET", "TASK-NOTICE-SECRET", "survey"):
+            self.assertNotIn(secret, text)
+
+    def test_messages_claude_code_sends_as_prompts_are_not_human_words(self):
+        # Task notifications and subagent reports also reach UserPromptSubmit; the
+        # transcript marks their origin, so their hook prompts are consumed.
+        marker = transcript_marker(str(self.path))
+        notice = "<task-notification>\n<task-id>a1</task-id>\n</task-notification>"
+        report = '<agent-message from="a1">\n[Subagent hand-back] REPORT</agent-message>'
+        self.write(entry("user", "request"), entry("assistant", "Question?"),
+                   entry("user", notice, origin={"kind": "task-notification", "producer": "session-task"}),
+                   {"type": "attachment", "attachment": {"type": "queued_command", "commandMode": "prompt",
+                                                         "origin": {"kind": "peer", "from": "a1"}, "prompt": report}},
+                   entry("user", "Answer", origin={"kind": "human"}))
+        out = capture_interview(marker, [self.prompt("request"), self.prompt(notice), self.prompt(report),
+                                         self.prompt("Answer")])
+        self.assertEqual(out["coverage"]["mode"], "bounded-transcript-with-hook-provenance")
+        self.assertEqual([m["content"] for m in out["messages"]], ["request", "Question?", "Answer"])
+        self.assertEqual(out["coverage"]["human_response_count"], 1)
+
+    def test_question_disagreement_stops_even_when_prompts_cannot_be_placed(self):
+        marker = transcript_marker(str(self.path))
+        asked = {"questions": [{"question": "Q1?"}]}
+        self.write(entry("user", "request"),
+                   entry("assistant", [{"type": "tool_use", "id": "q", "name": "AskUserQuestion", "input": asked}]))
+        hook = {"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_use_id": "q",
+                "tool_input": {"questions": [{"question": "Q2?"}]}, "tool_response": {"answers": {"Q2?": "Yes"}}}
+        with self.assertRaisesRegex(CaptureError, "disagree"):
+            capture_interview(marker, [self.prompt("request"), self.prompt("a prompt the transcript lacks"), hook])
+
+    def test_unknown_block_in_a_queued_human_message_is_skipped_and_counted(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), entry("assistant", "Question?"),
+                   {"type": "attachment", "attachment": {
+                       "type": "queued_command", "commandMode": "prompt", "origin": {"kind": "human"},
+                       "prompt": [{"type": "text", "text": "Typed while working"},
+                                  {"type": "future-block", "data": "FUTURE-SECRET"}]}})
+        out = capture_interview(marker, [self.prompt("request"), self.prompt("Typed while working")])
+        self.assertIn("Typed while working", [m["content"] for m in out["messages"]])
+        self.assertEqual(out["coverage"]["unknown_types"]["blocks"], {"future-block": 1})
+        self.assertNotIn("FUTURE-SECRET", json.dumps(out))
+
+    def test_question_hooks_from_a_subagent_are_not_part_of_the_interview(self):
+        question = {"questions": [{"question": "Sub?"}]}
+        subagent = [{"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "tool_use_id": "s",
+                     "agent_id": "a1", "tool_input": question},
+                    {"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_use_id": "s",
+                     "agent_id": "a1", "tool_input": question, "tool_response": {"answers": {"Sub?": "SUB-ANSWER"}}}]
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), entry("assistant", "Question?"), entry("user", "Answer"))
+        out = capture_interview(marker, [self.prompt("request"), *subagent, self.prompt("Answer")])
+        self.assertEqual(out["coverage"]["mode"], "bounded-transcript-with-hook-provenance")
+        self.assertNotIn("SUB-ANSWER", json.dumps(out))
+        # The hook records alone (a prompt the transcript lacks) do not count it either.
+        out = capture_interview(marker, [self.prompt("request"), *subagent, self.prompt("missing")])
+        self.assertEqual(out["coverage"]["mode"], "hook-records-only")
+        self.assertNotIn("SUB-ANSWER", json.dumps(out))
+        self.assertEqual(out["coverage"]["answered_questions"], 0)
+
+    def test_a_prefilled_question_has_the_same_kind_in_the_hook_records_only_path(self):
+        marker = transcript_marker(str(self.path))
+        question = {"questions": [{"question": "Q?"}], "answers": {"Q?": "Model"}}
+        self.write(entry("user", "request"), entry("assistant", "Question?"))
+        events = [self.prompt("request"),
+                  {"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "tool_use_id": "q", "tool_input": question},
+                  {"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_use_id": "q",
+                   "tool_input": question, "tool_response": {"answers": {"Q?": "Model"}}},
+                  self.prompt("a prompt the transcript lacks")]
+        out = capture_interview(marker, events)
+        self.assertEqual(out["coverage"]["mode"], "hook-records-only")
+        kinds = [m["source"]["kind"] for m in out["messages"]]
+        self.assertEqual(kinds, ["prompt", "questionnaire_prefilled", "questionnaire_prefilled_answer", "prompt"])
+
+    def test_a_queued_message_from_claude_code_in_block_form_is_not_human_words(self):
+        marker = transcript_marker(str(self.path))
+        report = "[Subagent hand-back] REPORT"
+        self.write(entry("user", "request"), entry("assistant", "Question?"),
+                   {"type": "attachment", "attachment": {"type": "queued_command", "commandMode": "prompt",
+                                                         "origin": {"kind": "peer", "from": "a1"},
+                                                         "prompt": [{"type": "text", "text": report}]}},
+                   entry("user", "Answer"))
+        out = capture_interview(marker, [self.prompt("request"), self.prompt(report), self.prompt("Answer")])
+        self.assertEqual(out["coverage"]["mode"], "bounded-transcript-with-hook-provenance")
+        self.assertEqual([m["content"] for m in out["messages"]], ["request", "Question?", "Answer"])
+
+    def test_a_human_reply_with_the_same_text_as_a_notice_is_kept_when_using_the_hook_records(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), entry("assistant", "Question?"),
+                   entry("user", "Done", origin={"kind": "task-notification"}, promptId="p-notice"))
+        prompts = [self.prompt("request"), dict(self.prompt("Done"), prompt_id="p-notice"),
+                   dict(self.prompt("Done"), prompt_id="p-human"), self.prompt("a prompt the transcript lacks")]
+        out = capture_interview(marker, prompts)
+        self.assertEqual(out["coverage"]["mode"], "hook-records-only")
+        self.assertEqual([m["content"] for m in out["messages"]], ["request", "Done", "a prompt the transcript lacks"])
+        self.assertEqual(out["messages"][1]["source"]["hook_event_index"], 2)
+
+    def test_an_exchange_whose_questions_are_only_in_unknown_blocks_keeps_the_human_words(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), entry("assistant", [{"type": "future-block", "text": "Question?"}]),
+                   entry("user", "Answer"), entry("user", "Visible text without a hook record"))
+        out = capture_interview(marker, [self.prompt("request"), self.prompt("Answer")])
+        self.assertEqual(out["coverage"]["mode"], "bounded-transcript-with-hook-provenance")
+        self.assertEqual([m["content"] for m in out["messages"]],
+                         ["request", "Answer", "Visible text without a hook record"])
+        self.assertEqual(out["coverage"]["assistant_messages"], 0)
+        self.assertIn("No message of Claude's", out["coverage"]["reason"])
+        self.assertEqual(out["coverage"]["unknown_types"]["blocks"], {"future-block": 1})
+        self.assertEqual(out["coverage"]["user_texts_without_hook_record"], 1)
+
+    def test_a_notice_with_a_prompt_id_consumes_only_that_hook_prompt(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), entry("assistant", "Question?"),
+                   entry("user", "Done", origin={"kind": "task-notification"}, promptId="p-notice"),
+                   entry("user", "Done", origin={"kind": "human"}))
+        # The notice's own hook prompt is missing; the human's "Done" must not be taken for it.
+        out = capture_interview(marker, [self.prompt("request"), dict(self.prompt("Done"), prompt_id="p-human")])
+        self.assertEqual([m["content"] for m in out["messages"]], ["request", "Question?", "Done"])
+        self.assertEqual(out["messages"][-1]["source"]["origin"], "UserPromptSubmit")
+
+    def test_the_hook_records_path_keeps_visible_human_texts_without_a_hook_record(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), entry("assistant", "Question?"), entry("user", "Seen but not hooked"))
+        out = capture_interview(marker, [self.prompt("request"), self.prompt("a prompt the transcript lacks")])
+        self.assertEqual(out["coverage"]["mode"], "hook-records-only")
+        self.assertEqual([m["content"] for m in out["messages"]],
+                         ["request", "a prompt the transcript lacks", "Seen but not hooked"])
+        self.assertIs(out["messages"][-1]["source"]["hook_record"], False)
+        self.assertEqual(out["coverage"]["user_texts_without_hook_record"], 1)
+        # Both paths report the same coverage fields.
+        main = capture_interview(marker, [self.prompt("request")])["coverage"]
+        self.assertEqual(set(out["coverage"]) - {"reason"}, set(main))
+
+    def test_a_message_typed_while_claude_works_without_a_hook_record_is_kept_on_every_path(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), entry("assistant", "Question?"), self.queued("Keep the existing DB"))
+        out = capture_interview(marker, [self.prompt("request")])
+        kept = [m for m in out["messages"] if m["content"] == "Keep the existing DB"]
+        self.assertIs(kept[0]["source"]["hook_record"], False)
+        self.assertEqual(out["coverage"]["user_texts_without_hook_record"], 1)
+        # Claude Code marked it human, so it is a response on both paths.
+        self.assertEqual(out["coverage"]["human_response_count"], 1)
+        # Another prompt the transcript cannot place: the hook records path keeps it too.
+        out = capture_interview(marker, [self.prompt("request"), self.prompt("a prompt the transcript lacks")])
+        self.assertEqual(out["coverage"]["mode"], "hook-records-only")
+        self.assertEqual(out["messages"][-1]["content"], "Keep the existing DB")
+        self.assertIs(out["messages"][-1]["source"]["hook_record"], False)
+        self.assertEqual(out["coverage"]["user_texts_without_hook_record"], 1)
+        self.assertEqual(out["coverage"]["human_response_count"], 2)  # The extra hooked prompt, and this one.
+
+    def test_a_notice_whose_hook_prompt_has_no_or_another_prompt_id_is_still_not_human(self):
+        for hook_id in (None, "p-other"):
+            with self.subTest(hook_prompt_id=hook_id):
+                self.path.unlink(missing_ok=True)
+                marker = transcript_marker(str(self.path))
+                self.write(entry("user", "request"), entry("assistant", "Question?"),
+                           entry("user", "Done", origin={"kind": "task-notification"}, promptId="p-notice"))
+                notice = dict(self.prompt("Done"), **({"prompt_id": hook_id} if hook_id else {}))
+                out = capture_interview(marker, [self.prompt("request"), notice])
+                self.assertEqual([m["content"] for m in out["messages"]], ["request", "Question?"])
+                self.assertEqual(out["coverage"]["human_response_count"], 0)
+
+    def test_a_notice_and_a_human_with_the_same_text_and_both_hooks(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), entry("assistant", "Question?"),
+                   entry("user", "Done", origin={"kind": "task-notification"}, promptId="p-notice"),
+                   entry("user", "Done", origin={"kind": "human"}, promptId="p-human"))
+        out = capture_interview(marker, [self.prompt("request"), dict(self.prompt("Done"), prompt_id="p-notice"),
+                                         dict(self.prompt("Done"), prompt_id="p-human")])
+        self.assertEqual(out["coverage"]["mode"], "bounded-transcript-with-hook-provenance")
+        self.assertEqual([m["content"] for m in out["messages"]], ["request", "Question?", "Done"])
+        self.assertEqual(out["messages"][-1]["source"]["hook_event_index"], 2)
+        self.assertEqual(out["coverage"]["human_response_count"], 1)
+
+    def test_texts_without_a_hook_record_are_not_responses_on_either_path(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), entry("assistant", "Question?"), entry("user", "Answer"),
+                   entry("user", "Seen but not hooked"))
+        main = capture_interview(marker, [self.prompt("request"), self.prompt("Answer")])
+        fallback = capture_interview(marker, [self.prompt("request"), self.prompt("Answer"),
+                                              self.prompt("a prompt the transcript lacks")])
+        self.assertEqual(main["coverage"]["mode"], "bounded-transcript-with-hook-provenance")
+        self.assertEqual(fallback["coverage"]["mode"], "hook-records-only")
+        self.assertEqual(main["coverage"]["user_texts_without_hook_record"], 1)
+        self.assertEqual(fallback["coverage"]["user_texts_without_hook_record"], 1)
+        self.assertEqual(main["coverage"]["human_response_count"], 1)
+        self.assertEqual(fallback["coverage"]["human_response_count"], 2)  # Its extra hooked prompt counts.
 
     def queued(self, prompt):
         return {"type": "attachment", "uuid": "queued-1", "attachment": {
@@ -288,11 +557,17 @@ class TranscriptTests(unittest.TestCase):
         self.assertNotIn("SECRETPIXELS", json.dumps(out))
         self.assertNotIn("FILE BODY", json.dumps(out))
 
-    def test_compaction_fails(self):
+    def test_compaction_boundary_and_summary_are_skipped(self):
         marker = transcript_marker(str(self.path))
-        self.write({"type": "system", "subtype": "compact_boundary"})
-        with self.assertRaises(CaptureError):
-            capture_interview(marker, [self.prompt("request")])
+        self.write(entry("user", "request"), entry("assistant", "Question?"), entry("user", "Answer"),
+                   {"type": "system", "subtype": "compact_boundary", "content": "Conversation compacted"},
+                   entry("user", "This session is being continued... COMPACT-SUMMARY", isCompactSummary=True,
+                         isVisibleInTranscriptOnly=True),
+                   entry("assistant", "Next question?"), entry("user", "Next answer"))
+        out = capture_interview(marker, [self.prompt("request"), self.prompt("Answer"), self.prompt("Next answer")])
+        self.assertEqual([m["content"] for m in out["messages"]],
+                         ["request", "Question?", "Answer", "Next question?", "Next answer"])
+        self.assertNotIn("COMPACT-SUMMARY", json.dumps(out))
 
     def test_truncation_and_prefix_rewrite_fail(self):
         self.write(entry("user", "old"))

@@ -1,4 +1,4 @@
-"""The implement workflow's runner actions: one table for the guard, the parser and dispatch."""
+"""The implement workflow's runner actions: one table for the parser and dispatch."""
 from __future__ import annotations
 
 import shutil
@@ -32,8 +32,8 @@ def doctor(engine, args, run_id, session) -> dict:
 
 
 COMMANDS = (
-    Command("status", "Inspect the bound or named implementation run", lambda e, a, run, s: e.status(run)),
-    Command("doctor", "Offline executable/capability diagnostics; never calls a model", doctor, needs_run=False),
+    Command("status", "Inspect the bound or named implementation run", lambda e, a, run, s: e.status(run), needs_owner=False),
+    Command("doctor", "Offline executable/capability diagnostics; never calls a model", doctor, needs_run=False, needs_owner=False),
     Command("checkpoint", "Freeze the current code and an implementation summary",
             lambda e, a, run, s: e.checkpoint(run, s, a.summary_file), (Option("--summary-file", "draft"),)),
     Command("check", "Run the frozen, pre-approved project checks once", lambda e, a, run, s: e.check(run, s)),
@@ -48,7 +48,7 @@ COMMANDS = (
             (Option("--event-id", "event"), Option("--decision", "decision"), Option("--reason", "text"))),
     Command("cancel", "Keep all audit data and stop the run",
             lambda e, a, run, s: e.cancel(run, s, a.reason), (Option("--reason", "text"),)),
-    Command("recover", "For a human after confirming no associated process remains alive (not enforced by a guard)",
+    Command("recover", "HUMAN ONLY: after confirming no associated process remains alive, mark it stopped",
             lambda e, a, run, s: e.recover(run, a.confirm_process_stopped),
-            (Option("--confirm-process-stopped", "confirm"),), claude=False),
+            (Option("--confirm-process-stopped", "confirm"),), needs_owner=False),
 )

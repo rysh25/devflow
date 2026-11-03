@@ -203,8 +203,9 @@ class FlowFixture(unittest.TestCase):
             "uv", "run", "--offline", "--no-project", "--no-config", "--no-python-downloads",
             str(PLUGIN / "scripts" / "devflow.py"), *arguments,
         ])
-        decision = hook(self.event("PreToolUse", session=session, tool_name="Bash", tool_input={"command": command}), PLUGIN)
-        self.assertFalse(((decision or {}).get("hookSpecificOutput") or {}).get("permissionDecision") == "deny", decision)
+        # The hooks never stop the runner call (or any other tool).
+        self.assertIsNone(hook(self.event("PreToolUse", session=session, tool_name="Bash",
+                                          tool_input={"command": command}), PLUGIN))
         stdout, stderr = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             result = cli.main(arguments)
@@ -290,8 +291,8 @@ class HookCliEngineTests(FlowFixture):
         self.assertIsNone(report["workspace_capture_error"])
         self.assertEqual([call.args[0]["id"] for call in dispatch.call_args_list], ["codex", "opencode"])
         self.assertEqual(first["candidate"]["snapshot_id"], second["candidate"]["snapshot_id"])
-        # Implement never denies (D1), even after completion; the report above
-        # records the exact snapshot that was reviewed.
+        # DevFlow does not stop tools (D1), even after completion; the report
+        # above records the exact snapshot that was reviewed.
         self.assertIsNone(hook(self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(self.source)}),
                                PLUGIN))
 
@@ -365,9 +366,12 @@ class HookCliEngineTests(FlowFixture):
         self.assertEqual(waiting["status"], "awaiting_human")
         self.invoke("resolve", "--event-id", "b" * 32, "--decision", "continue", "--reason", "Claimed approval", expect=2)
         actual = "Keep the existing API and continue with a compatible implementation."
+        question = {"questions": [{"question": "Keep compatibility?"}]}
+        # The question as Claude sent it (PreToolUse), then the human's answer (PostToolUse).
+        hook(self.event("PreToolUse", tool_name="AskUserQuestion", tool_use_id="human-resolution-1",
+                        tool_input=question), PLUGIN)
         hook(self.event("PostToolUse", tool_name="AskUserQuestion", tool_use_id="human-resolution-1",
-                             tool_input={"questions": [{"question": "Keep compatibility?"}]},
-                             tool_response={"answers": {"Keep compatibility?": actual}}), PLUGIN)
+                        tool_input=question, tool_response={"answers": {"Keep compatibility?": actual}}), PLUGIN)
         after_answer = self.invoke("status")
         event = after_answer["human_events"][-1]
         resolved = self.invoke("resolve", "--event-id", event["event_id"], "--decision", "continue", "--reason", "Preserve the existing API")
@@ -385,7 +389,7 @@ class HookCliEngineTests(FlowFixture):
         self.invoke("resolve", "--event-id", event_id, "--decision", "continue", "--reason", "Resume is not an approval", expect=2)
         self.assertEqual(self.engine.status(self.run_id)["status"], "awaiting_human")
 
-    def test_new_session_resume_clears_old_guard_without_resetting_count(self):
+    def test_new_session_resume_moves_ownership_without_resetting_count(self):
         self.ready_review()
         with patch("devflow_core.implement.engine.run_review", side_effect=review_pass):
             self.invoke("review")
@@ -394,8 +398,8 @@ class HookCliEngineTests(FlowFixture):
         resumed = self.invoke("status", session=new_session)
         self.assertEqual(resumed["review_count"], 1)
         self.assertEqual(resumed["next_reviewer"], "opencode")
-        # The previous session no longer owns the run. Implement never denies it
-        # (D1); nothing it does is recorded, and its binding stays until it
+        # The previous session no longer owns the run. DevFlow does not stop its
+        # tools (D1); nothing it does is recorded, and its binding stays until it
         # resumes again or the run ends.
         for tool, data in (("Bash", {"command": "normal user work"}), ("Write", {"file_path": str(self.source)}),
                            ("Read", {"file_path": str(self.source)})):
@@ -427,7 +431,7 @@ class HookCliEngineTests(FlowFixture):
         self.assertTrue(report["unreviewed_final_changes"])
         self.assertEqual(self.source.read_text(encoding="utf-8"), "VALUE = 12\n")
 
-    def test_terminal_report_is_frozen_when_next_real_prompt_releases_guard(self):
+    def test_terminal_report_is_frozen_when_next_real_prompt_releases_the_binding(self):
         self.ready_review()
         with patch("devflow_core.implement.engine.run_review", side_effect=review_pass):
             self.invoke("review")
@@ -444,7 +448,7 @@ class HookCliEngineTests(FlowFixture):
         self.start()
         cancelled = self.invoke("cancel", "--reason", "No implementation requested")
         report_path = Path(cancelled["run_dir"]) / cancelled["report_path"]
-        # Implement never denies a write, even to its own records (D1). A
+        # DevFlow does not stop a write, even to its own records (D1). A
         # recorded report must still fail its integrity check when read.
         decision = hook(self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(report_path)}), PLUGIN)
         self.assertIsNone(decision)
@@ -463,8 +467,9 @@ class WorkflowIndependenceTests(FlowFixture):
     def test_plan_start_does_not_create_an_implementation_run(self):
         self.plan_start()
         self.assertFalse((self.project / ".devflow" / "runs" / "implement").exists())
+        # A Plan run does not stop tools either; the hook only adds context to prompts.
         payload = self.event("PreToolUse", tool_name="Bash", tool_input={"command": "rm -rf build"})
-        self.assertEqual(hook(payload, PLUGIN)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIsNone(hook(payload, PLUGIN))
 
     def test_implementation_start_does_not_create_a_plan_run(self):
         self.start()
@@ -474,7 +479,7 @@ class WorkflowIndependenceTests(FlowFixture):
 
     def test_completed_plan_next_prompt_starts_independent_implementation(self):
         plan_run, plan_file = self.plan_complete()
-        # The finished plan stays guarded until the next real prompt, which
+        # The finished plan stays bound until the next real prompt, which
         # releases it and then starts the explicitly requested implementation.
         self.submit("/devflow:implement " + str(plan_file))
         self.assertEqual(self.record()["pending_start"]["flow"], "implement")

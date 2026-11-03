@@ -6,15 +6,7 @@ class DevFlowError(Exception):
 
 
 class UsageError(DevFlowError):
-    """A malformed runner invocation."""
-
-
-class GuardError(DevFlowError):
-    """A tool call the active workflow does not permit."""
-
-
-class ShellPolicyError(DevFlowError):
-    """A shell command outside the strict runner or read-only policy."""
+    """A malformed runner invocation or start command."""
 
 
 class ReviewerError(DevFlowError):

@@ -1,8 +1,8 @@
-"""Offline, cross-platform tests of the implement workflow's session-scoped tool boundary.
+"""Offline, cross-platform tests of the implement workflow's session-scoped hooks.
 
-Guard rules are exercised directly through the shared guard with a synthetic
-run state; session capture runs real hooks through the router against real
-runs started the documented way (prompt hook, then the runner's start).
+DevFlow never stops a tool call; the hooks record human events and add
+context. Every test runs real hooks through the router against real runs
+started the documented way (prompt hook, then the runner's start).
 """
 from __future__ import annotations
 
@@ -10,14 +10,13 @@ import json
 import os
 from pathlib import Path
 import shlex
-import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from devflow_core import router
-from devflow_core.common import guard, sessions
-from devflow_core.common.errors import DevFlowError, GuardError
+from devflow_core.common import sessions
+from devflow_core.common.errors import DevFlowError
 from devflow_core.common.runs import TERMINAL, RunStore
 from devflow_core.common.storage import atomic_write_json, read_json
 from devflow_core.implement import WORKFLOW
@@ -39,7 +38,7 @@ class Fixture(unittest.TestCase):
         (self.project / "devflow.config.json").write_text(
             '{"schema_version":1,"implement":{"snapshot":{"mode":"files"}}}\n', encoding="utf-8",
         )
-        # A fake installed plugin: the guard only needs its runner path.
+        # A fake installed plugin: the hook context names its runner path.
         self.plugin = self.base / "plugin with spaces"
         self.script = self.plugin / "scripts" / "devflow.py"
         self.script.parent.mkdir(parents=True)
@@ -114,10 +113,16 @@ class Fixture(unittest.TestCase):
             self.store.save(state)
 
     def assertUnrecorded(self, result, reason):
-        """Implement never blocks: a call DevFlow cannot record goes through with a warning."""
+        """DevFlow never blocks: a call it cannot record goes through with a warning."""
         context = result["hookSpecificOutput"]["additionalContext"]
         self.assertIn("was not recorded", context)
         self.assertIn(reason, context)
+
+    def assertNotAccepted(self, result, reason=""):
+        context = result["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("did not accept", context)
+        self.assertIn(reason, context)
+        return context
 
     def escalate(self):
         path = self.draft / "questions.json"
@@ -125,8 +130,8 @@ class Fixture(unittest.TestCase):
         return Engine(self.project).escalate(self.run_id, self.session_id, path)
 
 
-class NoDenialTests(Fixture):
-    """Implement never denies a tool: the session's own settings decide (decision D1)."""
+class ToolCallTests(Fixture):
+    """DevFlow never stops a tool call: the session's own settings decide (decision D1)."""
 
     TOOLS = (
         ("Write", lambda self: {"file_path": str(self.project / "src" / "feature.py")}),
@@ -143,30 +148,30 @@ class NoDenialTests(Fixture):
         ("mcp__files__write", lambda self: {"path": "x"}),
         ("EnterWorktree", lambda self: {}),
         ("Monitor", lambda self: {"command": "ls"}),
-        ("AskUserQuestion", lambda self: {"questions": [{"question": "Q?"}]}),
         ("Unknown", lambda self: {}),
     )
 
-    def every_tool_is_allowed(self, session=None):
+    def every_tool_goes_through(self, session=None):
         for tool, data in self.TOOLS:
             with self.subTest(tool=tool, data=data(self)):
                 self.assertIsNone(self.tool(tool, session, **data(self)))
 
-    def test_pending_start_never_denies_and_records_nothing(self):
+    def test_pending_start_stops_nothing_and_records_nothing(self):
         self.submit("/devflow:implement feature.md")
         self.run_id = self.record()["pending_start"]["run_id"]
-        self.every_tool_is_allowed()
+        self.every_tool_goes_through()
+        self.assertIsNone(self.tool("AskUserQuestion", questions=[{"question": "Q?"}]))
         self.assertIsNone(self.tool("Bash", command=self.runner("start", "--plan", "other.md")))
         # No run exists yet, so nothing can be recorded.
         self.assertFalse((self.project / ".devflow" / "runs" / "implement" / self.run_id).exists())
 
-    def test_owner_is_never_denied_in_any_status(self):
+    def test_owner_is_never_stopped_in_any_status(self):
         self.bind()
         events = self.stored()["event_ids"]
         for status in sorted(WORKFLOW.statuses):
             self.set_status(status)
             with self.subTest(status=status):
-                self.every_tool_is_allowed()
+                self.every_tool_goes_through()
         self.assertEqual(self.stored()["event_ids"], events)  # Nothing above was recorded.
         self.assertTrue(TERMINAL <= WORKFLOW.statuses)
 
@@ -176,15 +181,16 @@ class NoDenialTests(Fixture):
         self.bind()
         (self.run / "state.json").write_text("{}", encoding="utf-8")
         with patch.object(sessions, "binding", side_effect=AssertionError("the run must not be read")):
-            self.every_tool_is_allowed()
+            self.every_tool_goes_through()
             self.assertIsNone(self.tool("Read", file_path=str(self.plan)))
-        # A prefilled question needs the run (its owner and its record). If the
-        # run cannot be read, this one call fails (onFailure: block) rather than
-        # leaving an unrecorded prefill that could later count as an answer.
-        payload = self.payload(tool="AskUserQuestion", questions=[{"question": "Q?"}], answers={"Q?": "Yes"})
-        payload["tool_use_id"] = "prefilled-on-damaged-run"
-        with self.assertRaises(DevFlowError):
-            self.hook(payload)
+        # A question needs the run (its owner and its record). If the run cannot
+        # be read, the hook reports it (the CLI exits 1, which does not stop the
+        # tool); without that record its answer can never count.
+        for extra in ({}, {"answers": {"Q?": "Yes"}}):
+            payload = self.payload(tool="AskUserQuestion", questions=[{"question": "Q?"}], **extra)
+            payload["tool_use_id"] = "question-on-damaged-run"
+            with self.subTest(extra=extra), self.assertRaisesRegex(DevFlowError, "cannot be read"):
+                self.hook(payload)
         # The human's prompt goes through with a warning; nothing is recorded.
         context = self.submit("Keep going")["hookSpecificOutput"]["additionalContext"]
         self.assertIn(f"implement run {self.run_id}", context)
@@ -196,21 +202,21 @@ class NoDenialTests(Fixture):
         self.assertIn("cannot resolve a DevFlow escalation", context)
         self.assertIsNone(self.hook({"hook_event_name": "Stop", "cwd": str(self.project),
                                      "session_id": self.session_id}))
-        # DevFlow commands still fail visibly: they cannot act on an unreadable run.
+        # DevFlow commands still say why they cannot act on an unreadable run.
         for command in (f"/devflow:resume {self.run_id}", "/devflow:implement feature.md"):
-            with self.subTest(command=command), self.assertRaisesRegex(DevFlowError, "cannot be read"):
-                self.submit(command)
+            with self.subTest(command=command):
+                self.assertNotAccepted(self.submit(command), "cannot be read")
         self.assertEqual(self.record()["run"]["run_id"], self.run_id)  # The binding is kept.
 
     def test_status_context_does_not_announce_a_bash_allowlist(self):
         self.bind()
         context = self.submit("Continue")["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("DevFlow does not restrict other tools", context)
+        self.assertIn("DevFlow does not limit any other tool", context)
         self.assertNotIn("allowed commands", context)
         self.assertIn('"workspace": {"path": ', context)
         self.assertIn(f'"project": {json.dumps(str(self.project))}', context)
 
-    def test_prefilled_question_is_recorded_not_denied(self):
+    def test_prefilled_question_is_recorded_as_an_observation(self):
         self.bind()
         payload = self.payload(tool="AskUserQuestion", questions=[{"question": "Approve?"}],
                                answers={"Approve?": "Yes"})
@@ -228,34 +234,14 @@ class NoDenialTests(Fixture):
         changed = dict(payload, tool_input={"questions": [{"question": "Approve?"}], "answers": {"Approve?": "No"}})
         with self.assertRaisesRegex(DevFlowError, "different content"):
             self.hook(changed)
-        self.assertEqual(Engine(self.project).status(self.run_id)["observations"], 2)
-
-    def test_a_restricting_workflow_accepts_its_extra_start_options(self):
-        # Implement restricts nothing, so the guard's start check is reached only
-        # by a restricting workflow. Extra start options are accepted there and
-        # only the input named by the user's command is matched.
-        self.submit("/devflow:implement feature.md")
-        with patch.object(WORKFLOW, "restricts_tools", True):
-            self.assertIs(WORKFLOWS["implement"], WORKFLOW)
-            for command in (self.runner("start", "--plan", "feature.md"),
-                            self.runner("start", "--plan", "feature.md", "--workspace", "../feature worktree")):
-                with self.subTest(command=command):
-                    self.assertIsNone(self.tool("Bash", command=command))
-            for command in (self.runner("start", "--plan", "other.md", "--workspace", "../wt"),
-                            self.runner("start", "--plan", "feature.md", "--branch", "x")):
-                with self.subTest(command=command):
-                    result = self.tool("Bash", command=command)
-                    self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
-            denied = self.tool("Write", file_path=str(self.project / "module.py"), content="x")
-            self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
-        self.assertIsNone(self.tool("Write", file_path=str(self.project / "module.py"), content="x"))
+        # Both were prefilled by the model; status counts only those.
+        self.assertEqual(Engine(self.project).status(self.run_id)["prefilled_questions"], 2)
 
     def test_pending_resume_is_bound_to_user_selected_run(self):
         # The user's /devflow:resume names the run; the hook moves exactly that run.
         status = self.bind()
         other = "claude-session-456"
-        with self.assertRaises(DevFlowError):
-            self.submit("/devflow:resume " + RUN_ID, other)
+        self.assertNotAccepted(self.submit("/devflow:resume " + RUN_ID, other), "missing or ambiguous")
         self.assertIsNone(self.record(other))
         self.assertIsNotNone(self.submit("/devflow:resume " + status["run_id"], other))
         self.assertEqual(self.record(other)["run"], {"flow": "implement", "run_id": status["run_id"]})
@@ -291,7 +277,7 @@ class SessionCaptureTests(Fixture):
         self.assertIn(str(self.script), context)
         self.assertIn("*", (self.project / ".devflow" / ".gitignore").read_text().splitlines())
         self.assertFalse((self.project / ".devflow" / "runs" / "implement" / pending["run_id"]).exists())
-        # Implement never denies; before the start nothing is recorded either.
+        # No tool is stopped; before the start nothing is recorded either.
         self.assertIsNone(self.hook(self.payload(tool="Write", file_path=str(self.project / "x.py"))))
         self.assertIsNone(self.hook(self.payload(tool="AskUserQuestion", questions=[])))
         # The run created by the runner keeps the hook's original start event.
@@ -314,10 +300,13 @@ class SessionCaptureTests(Fixture):
         self.submit("/devflow:implement ./feature.md")
         self.assertEqual(self.record()["pending_start"]["args"], str(self.plan))
 
-    def test_missing_or_malformed_start_rejected(self):
-        for prompt in ("/devflow:implement", "/devflow:implement --plan other", '/devflow:implement "unterminated', "/devflow:implement foo\n/other:skill"):
-            with self.subTest(prompt=prompt), self.assertRaises(GuardError):
-                self.submit(prompt)
+    def test_missing_or_malformed_start_is_not_accepted(self):
+        for prompt, reason in (("/devflow:implement", "one plan-file path"),
+                               ("/devflow:implement --plan other", "not runner options"),
+                               ('/devflow:implement "unterminated', "unmatched quotes"),
+                               ("/devflow:implement foo\n/other:skill", "one plan-file path")):
+            with self.subTest(prompt=prompt):
+                self.assertNotAccepted(self.submit(prompt), reason)
         self.assertFalse((self.project / ".devflow").exists())
 
     def test_resume_records_safe_run_id(self):
@@ -330,8 +319,8 @@ class SessionCaptureTests(Fixture):
         self.assertEqual(self.events()[-1]["payload"]["prompt"], "/devflow:resume " + status["run_id"])
         before = self.stored()
         for argument in ("../other", RUN_ID + "/..", ""):
-            with self.subTest(argument=argument), self.assertRaises(DevFlowError):
-                self.submit("/devflow:resume " + argument, "claude-session-789")
+            with self.subTest(argument=argument):
+                self.assertNotAccepted(self.submit("/devflow:resume " + argument, "claude-session-789"))
         self.assertIsNone(self.record("claude-session-789"))
         self.assertEqual(self.stored(), before)
 
@@ -344,7 +333,7 @@ class SessionCaptureTests(Fixture):
         with self.assertRaises(DevFlowError):
             router.runner_start(self.project, self.session_id, "implement", "feature.md")
 
-    def test_draft_and_source_writes_are_never_denied_before_or_after_start(self):
+    def test_draft_and_source_writes_are_never_stopped_before_or_after_start(self):
         self.submit("/devflow:implement feature.md")
         pending = self.record()["pending_start"]
         draft = self.project / ".devflow" / "runs" / "implement" / pending["run_id"] / "draft" / "decisions.json"
@@ -384,8 +373,7 @@ class SessionCaptureTests(Fixture):
     def test_running_flow_cannot_be_replaced_by_new_start(self):
         self.bind()
         (self.project / "other.md").write_text("Other plan.\n", encoding="utf-8")
-        with self.assertRaisesRegex(DevFlowError, "Finish or cancel"):
-            self.submit("/devflow:implement other.md")
+        self.assertNotAccepted(self.submit("/devflow:implement other.md"), "Finish or cancel")
         self.assertEqual(self.record()["run"], {"flow": "implement", "run_id": self.run_id})
         self.assertIsNone(self.record()["pending_start"])
 
@@ -411,6 +399,17 @@ class SessionCaptureTests(Fixture):
         payload = self.payload(event="PostToolUse", tool="AskUserQuestion", questions=[{"question": "Continue?"}])
         payload.update({"tool_use_id": tool_use_id, "tool_response": {"answers": {"Continue?": "Yes, keep compatibility"}}})
         return payload
+
+    def answer(self, payload):
+        """The human's answer as Claude Code delivers it: PreToolUse (the question as
+        Claude sent it, without the screen's fields), then PostToolUse."""
+        asked = {key: value for key, value in payload["tool_input"].items()
+                 if key not in sessions.SCREEN_FILLED_QUESTION_FIELDS}
+        before = dict(payload, hook_event_name="PreToolUse", tool_input=asked)
+        for key in ("tool_response", "is_error"):
+            before.pop(key, None)
+        self.assertIsNone(self.hook(before))
+        return self.hook(payload)
 
     def candidates(self):
         return Engine(self.project).status(self.run_id)["human_events"]
@@ -439,13 +438,13 @@ class SessionCaptureTests(Fixture):
     def test_answers_filled_in_by_question_screen_are_recorded(self):
         # Claude Code's question screen writes the human's choice into
         # tool_input before PostToolUse; model prefills are recorded at
-        # PreToolUse as observations (see NoDenialTests) and never count.
+        # PreToolUse as observations (see ToolCallTests) and never count.
         self.bind()
         self.escalate()
         payload = self.question()
         payload["tool_input"].update({"answers": {"Continue?": "Yes, keep compatibility"}, "annotations": {}})
-        self.hook(payload)
-        self.assertEqual(len(self.stored()["event_ids"]), 2)
+        self.answer(payload)
+        self.assertEqual([event["kind"] for event in self.events()], ["prompt", "observation", "question"])
         self.assertEqual(self.events()[-1]["payload"]["tool_input"], payload["tool_input"])
         self.assertEqual([item["event_id"] for item in self.candidates()], [self.stored()["event_ids"][-1]])
 
@@ -474,7 +473,7 @@ class SessionCaptureTests(Fixture):
         self.escalate()
         self.hook(self.question("tool-early"))
         self.assertEqual(self.candidates(), [])
-        self.hook(self.question("tool-honest"))
+        self.answer(self.question("tool-honest"))
         self.assertEqual([item["event_id"] for item in self.candidates()], [self.stored()["event_ids"][-1]])
 
     def test_subagent_answer_never_counts(self):
@@ -482,7 +481,7 @@ class SessionCaptureTests(Fixture):
         self.escalate()
         payload = self.question("tool-subagent")
         payload.update({"agent_id": "agent-1", "agent_type": "Explore"})
-        self.hook(payload)
+        self.answer(payload)
         self.assertEqual(self.events()[-1]["kind"], "question")
         self.assertEqual(self.candidates(), [])
 
@@ -498,21 +497,21 @@ class SessionCaptureTests(Fixture):
             payload = self.question(f"tool-{index}")
             payload["tool_response"] = response
             with self.subTest(response=response):
-                self.hook(payload)
+                self.answer(payload)
                 self.assertEqual(self.events()[-1]["payload"]["tool_response"], response)
                 self.assertEqual(self.candidates(), [])
-        self.assertEqual(len(self.stored()["event_ids"]), 1 + len(responses))
+        self.assertEqual(len(self.stored()["event_ids"]), 1 + 2 * len(responses))  # Observation and answer.
         for event_id in self.stored()["event_ids"][1:]:
             with self.assertRaises(DevFlowError):
                 Engine(self.project).resolve(self.run_id, self.session_id, event_id, "continue", "Not an answer.")
-        self.hook(dict(self.question("tool-text"), tool_response="Yes, keep compatibility"))
+        self.answer(dict(self.question("tool-text"), tool_response="Yes, keep compatibility"))
         self.assertEqual([item["answer_text"] for item in self.candidates()], ["Yes, keep compatibility"])
 
     def test_top_level_question_error_cannot_capture_or_replay_an_answer(self):
         self.bind()
         self.escalate()
         failed = dict(self.question("failed-call"), is_error=True)
-        self.hook(failed)
+        self.answer(failed)
         self.assertEqual(self.candidates(), [])
         # A failed call cannot be replayed as a successful answer.
         succeeded = dict(failed)
@@ -521,10 +520,10 @@ class SessionCaptureTests(Fixture):
         self.assertEqual(self.candidates(), [])
         # Nor can a successful answer be replayed as a failure.
         answered = self.question("answered-call")
-        self.hook(answered)
+        self.answer(answered)
         self.assertUnrecorded(self.hook(dict(answered, is_error=True)), "different content")
         self.assertEqual(len(self.candidates()), 1)
-        self.assertEqual(len(self.stored()["event_ids"]), 3)
+        self.assertEqual(len(self.stored()["event_ids"]), 5)  # The prompt, then an observation and answer each.
 
     def test_nonempty_question_text_blocks_preserved(self):
         self.bind()
@@ -544,7 +543,7 @@ class SessionCaptureTests(Fixture):
         # Another session explicitly resumes the run; this session's pointer goes stale.
         self.submit("/devflow:resume " + self.run_id, "claude-session-456")
         self.assertEqual(self.stored()["owner_session"], "claude-session-456")
-        # The stale session is neither denied nor recorded: PreToolUse,
+        # The stale session is neither stopped nor recorded: PreToolUse,
         # PostToolUse and Stop all return None.
         self.assertIsNone(self.hook(self.payload()))
         self.assertIsNone(self.hook(self.payload(tool="Write", file_path=str(self.project / "x.py"))))
@@ -565,24 +564,96 @@ class SessionCaptureTests(Fixture):
         self.assertIsNone(self.hook(self.payload(event="Stop")))
         self.assertEqual(self.events()[-1]["kind"], "stop")
 
-    def test_hook_configuration_uses_exec_form_and_no_stop_loop(self):
+    def test_hook_configuration_uses_exec_form_and_never_blocks(self):
         config = json.loads((PACKAGE.parents[2] / "hooks" / "hooks.json").read_text(encoding="utf-8"))
         self.assertEqual(set(config["hooks"]), {"UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"})
         for event, matchers in config["hooks"].items():
             for matcher in matchers:
+                # Tool hooks run only for AskUserQuestion; other tool calls start no process.
+                if event in {"PreToolUse", "PostToolUse"}:
+                    self.assertEqual(matcher["matcher"], "AskUserQuestion")
+                else:
+                    self.assertNotIn("matcher", matcher)
                 for hook in matcher["hooks"]:
                     self.assertEqual(hook["command"], "uv")
                     self.assertIsInstance(hook["args"], list)
-                    if event == "Stop":
-                        self.assertNotEqual(hook.get("onFailure"), "block")
-                        self.assertEqual(hook["timeout"], 15)
-                    else:
-                        self.assertEqual(hook["onFailure"], "block")
-                        self.assertEqual(hook["timeout"], 30)
+                    self.assertNotIn("onFailure", hook)
+                    self.assertEqual(hook["timeout"], 15 if event == "Stop" else 30)
                     self.assertEqual(hook["args"][-1], "hook")
                     self.assertIn("${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py", hook["args"])
                     self.assertIn("--no-python-downloads", hook["args"])
                     self.assertNotIn("--python", hook["args"])
+
+
+class ApprovalTests(Fixture):
+    """Which AskUserQuestion answers can resolve an escalation (sessions.approval_candidates).
+
+    An answer counts only when PreToolUse recorded the question (an observation
+    with the same session and tool_use_id) and Claude did not fill in the
+    screen's fields itself.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.bind()
+        self.escalate()
+
+    def ask(self, tool_use_id, **fields):
+        payload = self.payload(tool="AskUserQuestion", questions=[{"question": "Continue?"}], **fields)
+        payload["tool_use_id"] = tool_use_id
+        self.assertIsNone(self.hook(payload))
+
+    def reply(self, tool_use_id, **extra):
+        payload = self.payload(event="PostToolUse", tool="AskUserQuestion", questions=[{"question": "Continue?"}],
+                               answers={"Continue?": "Yes"})
+        payload.update(tool_use_id=tool_use_id, tool_response={"answers": {"Continue?": "Yes"}}, **extra)
+        context = self.hook(payload)["hookSpecificOutput"]["additionalContext"]
+        event_id = self.events()[-1]["event_id"]
+        self.assertIn(event_id, context)
+        return event_id
+
+    def candidates(self):
+        return [item["event_id"] for item in Engine(self.project).status(self.run_id)["human_events"]]
+
+    def assert_cannot_resolve(self, event_id):
+        with self.assertRaisesRegex(DevFlowError, "event ID of a successful AskUserQuestion"):
+            Engine(self.project).resolve(self.run_id, self.session_id, event_id, "continue", "The human agreed.")
+        self.assertEqual(self.stored()["status"], "awaiting_human")
+
+    def test_an_answer_without_a_recorded_question_is_not_a_candidate(self):
+        event_id = self.reply("unobserved")
+        self.assertEqual(self.events()[-1]["kind"], "question")
+        self.assertEqual(self.candidates(), [])
+        self.assert_cannot_resolve(event_id)
+
+    def test_an_answer_to_a_prefilled_question_is_not_a_candidate(self):
+        for use_id, fields in (("prefilled-answers", {"answers": {"Continue?": "Yes"}}),
+                               ("prefilled-notes", {"annotations": {"Continue?": {"notes": "Approved"}}})):
+            with self.subTest(fields=fields):
+                self.ask(use_id, **fields)
+                event_id = self.reply(use_id)
+                self.assertEqual(self.candidates(), [])
+                self.assert_cannot_resolve(event_id)
+
+    def test_an_observation_of_another_question_does_not_count(self):
+        self.ask("asked")
+        self.assertEqual(self.candidates(), [])
+        self.reply("not-asked")
+        self.assertEqual(self.candidates(), [])
+
+    def test_an_answer_to_a_recorded_question_is_a_candidate_and_resolves(self):
+        self.ask("asked", answers={}, annotations={})  # Empty screen fields are not a prefill.
+        event_id = self.reply("asked")
+        self.assertEqual([event["kind"] for event in self.events()[-2:]], ["observation", "question"])
+        self.assertEqual(self.candidates(), [event_id])
+        result = Engine(self.project).resolve(self.run_id, self.session_id, event_id, "continue", "The human agreed.")
+        self.assertNotEqual(result["status"], "awaiting_human")
+
+    def test_a_subagent_answer_is_not_a_candidate(self):
+        self.ask("subagent-question")
+        event_id = self.reply("subagent-question", agent_id="agent-1", agent_type="Explore")
+        self.assertEqual(self.candidates(), [])
+        self.assert_cannot_resolve(event_id)
 
 
 if __name__ == "__main__":

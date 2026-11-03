@@ -22,9 +22,9 @@ from .errors import DevFlowError
 from .storage import (atomic_json, digest, file_lock, json_bytes, no_symlinks, now,
                       read_json, within, write_new)
 
-SCHEMA_VERSION = 4
-# Older run formats (every version below SCHEMA_VERSION) and the releases that wrote
-# them; they are never continued. A test keeps this table complete.
+SCHEMA_VERSION = 5
+# Older run formats and the releases that wrote them; they are never continued.
+# A format that was never released has no name and is shown generically.
 RELEASES = {1: "0.1.x", 2: "0.2.x", 3: "0.3.x"}
 
 
@@ -34,8 +34,8 @@ TERMINAL = frozenset({"completed", "exhausted", "cancelled"})
 RUN_ID = re.compile(r"[0-9]{8}T[0-9]{6}Z-[a-f0-9]{12}\Z")
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}\Z")
 EVENT_ID = re.compile(r"[a-f0-9]{32}\Z")
-#: ``observation``: a PreToolUse call the run records instead of denying
-#: (an AskUserQuestion whose answers the model prefilled); never an answer.
+#: ``observation``: the AskUserQuestion input as Claude sent it, recorded at
+#: PreToolUse (before the question screen adds answers); never an answer itself.
 EVENT_KINDS = frozenset({"prompt", "question", "observation", "stop"})
 MAX_EVENT_BYTES = 4 * 1024 * 1024
 MAX_EVENTS = 5000
@@ -461,7 +461,12 @@ class RunStore:
         return result
 
     def append_event(self, run_id: str, payload: dict, kind: str) -> str | None:
-        """Record one hook payload from the owning session; terminal runs are frozen."""
+        """Record one hook payload from the owning session; terminal runs are frozen.
+
+        ``observation`` is every AskUserQuestion as Claude sent it at PreToolUse
+        (whether or not the model filled in the answers); ``question`` is its
+        PostToolUse result with the human's answers.
+        """
         with self.lock(run_id):
             state = self.load(run_id)
             if state["status"] in TERMINAL:

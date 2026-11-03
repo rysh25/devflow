@@ -1,4 +1,4 @@
-"""The plan workflow's runner actions: one table for the guard, the parser and dispatch."""
+"""The plan workflow's runner actions: one table for the parser and dispatch."""
 from __future__ import annotations
 
 from ..common.environment import python_errors
@@ -16,8 +16,8 @@ def doctor(engine, args, run_id, session) -> dict:
 
 
 COMMANDS = (
-    Command("status", "Inspect the bound or named plan run", lambda e, a, run, s: e.status(run)),
-    Command("doctor", "Offline config/PATH checks only; no model calls", doctor, needs_run=False),
+    Command("status", "Inspect the bound or named plan run", lambda e, a, run, s: e.status(run), needs_owner=False),
+    Command("doctor", "Offline config/PATH checks only; no model calls", doctor, needs_run=False, needs_owner=False),
     Command("seal", "Freeze the verbatim interview and human decisions",
             lambda e, a, run, s: e.seal(run, a.decisions_file, a.context_file),
             (Option("--decisions-file", "draft"), Option("--context-file", "draft", required=False))),
@@ -38,5 +38,5 @@ COMMANDS = (
             lambda e, a, run, s: e.publish(run)),
     Command("recover", "HUMAN ONLY: mark a stopped interrupted review as failed; consumes its attempt",
             lambda e, a, run, s: e.recover(run, a.confirm_process_stopped, expected_review=a.expected_review),
-            (Option("--expected-review", "int"), Option("--confirm-process-stopped", "confirm")), claude=False),
+            (Option("--expected-review", "int"), Option("--confirm-process-stopped", "confirm")), needs_owner=False),
 )

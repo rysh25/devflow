@@ -1,4 +1,4 @@
-"""One bounded way to run read-only git commands, shared by every caller.
+"""One bounded way to run DevFlow's own git commands, shared by every caller.
 
 The environment drops every ``GIT_*`` variable and ignores the system and
 global configuration, so the user's environment cannot redirect the

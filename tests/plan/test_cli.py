@@ -105,9 +105,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual((code, out, err), (0, "", ""))
         self.assertFalse((self.project / ".devflow").exists())
 
-    def test_malformed_hook_fails_closed(self):
+    def test_malformed_hook_exits_1_without_stdout(self):
+        # Exit status 2 would make Claude Code block the prompt or tool; 1 only reports.
         code, out, err = self.cli("hook", stdin="not valid JSON")
-        self.assertEqual(code, 2)
+        self.assertEqual(code, 1)
         self.assertEqual(out, "")
         self.assertIn("DevFlow hook failed", err)
 
@@ -132,13 +133,18 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("does not own", self.assertJsonError(out))
 
-    def test_explicit_cross_session_resume_refuses_unsealed_interview(self):
+    def assertNotAccepted(self, out, command, reason):
+        context = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(f"DevFlow did not accept /devflow:{command}", context)
+        self.assertIn(reason, context)
+
+    def test_explicit_cross_session_resume_of_unsealed_interview_is_not_accepted(self):
         state = self.start()
         prompt = "/devflow:resume " + state["run_id"]
         code, out, err = self.cli("hook", stdin=json.dumps(self.payload(session="new-session", prompt=prompt)))
-        self.assertEqual(code, 2)
-        self.assertEqual(out, "")
-        self.assertIn("original Claude session", err)
+        # The prompt goes through with a context message; it is never blocked.
+        self.assertEqual((code, err), (0, ""))
+        self.assertNotAccepted(out, "resume", "original Claude session")
         self.assertIsNone(sessions.read_record(self.project, "new-session", WORKFLOWS))
         code, out, err = self.cli("--session", "cli-session", "plan", "status")
         self.assertEqual(json.loads(out)["owner_session"], "cli-session")
@@ -169,8 +175,8 @@ class CliTests(unittest.TestCase):
         for prompt in ("/devflow:resume", "/devflow:resume ../" + state["run_id"]):
             with self.subTest(prompt=prompt):
                 code, out, err = self.cli("hook", stdin=json.dumps(self.payload(prompt=prompt)))
-                self.assertEqual((code, out), (2, ""))
-                self.assertIn("run ID", err)
+                self.assertEqual((code, err), (0, ""))
+                self.assertNotAccepted(out, "resume", "run ID")
         code, out, err = self.cli("--session", "cli-session", "plan", "status")
         value = json.loads(out)
         self.assertEqual(value["owner_session"], "cli-session")

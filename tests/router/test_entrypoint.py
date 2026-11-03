@@ -52,15 +52,18 @@ class UvEntrypointTests(unittest.TestCase):
         self.assertEqual(before, sorted(str(path.relative_to(self.project)) for path in self.project.rglob("*")))
         self.assertIn(result.stdout.strip(), ("", "{}"))
 
-    def test_malformed_hook_fails_closed_without_stdout(self):
-        result = subprocess.run(
-            [UV, "run", "--offline", "--no-project", "--no-config", "--no-python-downloads",
-             str(PLUGIN / "scripts" / "devflow.py"), "hook"],
-            cwd=self.project, env=self.environment, input="not json",
-            capture_output=True, text=True, encoding="utf-8", timeout=45, shell=False)
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(result.stdout, "")
-        self.assertIn("DevFlow hook failed", result.stderr)
+    def test_malformed_hook_exits_1_without_stdout_and_a_failed_stop_exits_0(self):
+        # Exit status 2 would make Claude Code block the tool or the prompt.
+        for raw, expected in (("not json", 1), (json.dumps({"hook_event_name": "Stop"}), 0)):
+            with self.subTest(raw=raw):
+                result = subprocess.run(
+                    [UV, "run", "--offline", "--no-project", "--no-config", "--no-python-downloads",
+                     str(PLUGIN / "scripts" / "devflow.py"), "hook"],
+                    cwd=self.project, env=self.environment, input=raw,
+                    capture_output=True, text=True, encoding="utf-8", timeout=45, shell=False)
+                self.assertEqual(result.returncode, expected)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("DevFlow hook failed", result.stderr)
         self.assertFalse((self.project / ".devflow").exists())
 
     def test_project_python_pin_does_not_override_plugin_requirement(self):

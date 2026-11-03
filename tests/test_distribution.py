@@ -3,6 +3,7 @@ import ast
 import hashlib
 import importlib.util
 import json
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -150,6 +151,49 @@ class DistributionTests(unittest.TestCase):
         (cloned / "plugins" / "devflow" / "scripts" / "devflow_core" / "implement" / "reviewer.md").unlink()
         with self.assertRaisesRegex(package.PackagingError, "Missing implement/reviewer.md"):
             package.validate(cloned)
+
+    def test_removed_mechanisms_leave_no_names_in_the_plugin_code(self):
+        # The tool limits and their helpers were removed in 0.4.0; none of their
+        # names may remain in the plugin's code, skills or references. Code
+        # names are matched as whole words; ``deny(`` and ``onFailure`` literally.
+        words = ("guard", "allowlist", "ShellPolicy", "ShellPolicyError", "shell_tokens", "split_words",
+                 "powershell_tokens", "check_command", "restricts_tools", "allow_tool", "check_write",
+                 "NON_WRITING_TOOLS", "PROTECTED_WRITE_NAMES", "GuardError", "permissionDecision", "SubagentHandback",
+                 "SKILL_NAME", "name_key", "CLAUDE_KINDS", "HUMAN_KINDS", "READ_ONLY_COMMANDS", "human_actions")
+        pattern = re.compile(r"\b(?:" + "|".join(map(re.escape, words)) + r")\b|deny\(|onFailure")
+        plugin = ROOT / "plugins" / "devflow"
+        self.assertFalse((plugin / "scripts" / "devflow_core" / "common" / "guard.py").exists())
+        self.assertFalse((plugin / "scripts" / "devflow_core" / "common" / "shell.py").exists())
+        for path in sorted(plugin.rglob("*")):
+            if path.is_file() and path.suffix in {".py", ".md", ".json"} and "__pycache__" not in path.parts:
+                with self.subTest(path=str(path.relative_to(ROOT))):
+                    self.assertEqual(pattern.findall(path.read_text(encoding="utf-8")), [])
+
+    def test_hooks_that_block_or_run_for_every_tool_are_rejected(self):
+        # Hooks only record and add context: they never block, and the tool hooks
+        # run only for AskUserQuestion.
+        cases = (
+            ("onFailure", lambda hooks: hooks["PreToolUse"][0]["hooks"][0].update(onFailure="block"),
+             "never block on failure: PreToolUse"),
+            ("onFailure on the prompt hook", lambda hooks: hooks["UserPromptSubmit"][0]["hooks"][0].update(
+                onFailure="block"), "never block on failure: UserPromptSubmit"),
+            ("every tool", lambda hooks: hooks["PreToolUse"][0].update(matcher="*"),
+             "PreToolUse hook must match only AskUserQuestion"),
+            ("no matcher", lambda hooks: hooks["PostToolUse"][0].pop("matcher"),
+             "PostToolUse hook must match only AskUserQuestion"),
+            ("missing event", lambda hooks: hooks.pop("Stop"), "Hooks must be exactly"),
+        )
+        for name, change, message in cases:
+            with self.subTest(case=name):
+                cloned = self.clone()
+                path = cloned / "plugins" / "devflow" / "hooks" / "hooks.json"
+                package.validate(cloned)  # The shipped configuration itself is valid.
+                document = json.loads(path.read_text(encoding="utf-8"))
+                change(document["hooks"])
+                path.write_text(json.dumps(document), encoding="utf-8")
+                with self.assertRaisesRegex(package.PackagingError, message):
+                    package.validate(cloned)
+                shutil.rmtree(cloned)
 
     def test_potential_secret_file_is_never_packaged(self):
         cloned = self.clone()

@@ -1,19 +1,17 @@
-"""The plan workflow: statuses, guard rules, and how runs start and move."""
+"""The plan workflow: statuses and how runs start and move."""
 from __future__ import annotations
 
 from pathlib import Path
 import re
 
-from ..common.errors import DevFlowError, GuardError
+from ..common.errors import DevFlowError, UsageError
 from ..common.review import HARD_MAX_REVIEWS, check_review_config, review_budget
 from ..common.runs import TERMINAL
-from ..common.guard import draft_path
 from ..common.storage import json_bytes
 from ..common.workflow import Workflow
 from .commands import COMMANDS
 
 STACKED_COMMAND = re.compile(r"(?:\A|\n)\s*/[A-Za-z][A-Za-z0-9_:-]*(?:\s|\Z)")
-SKILL_NAME = re.compile(r"[a-zA-Z0-9_.:-]+\Z")
 
 
 class PlanWorkflow(Workflow):
@@ -25,15 +23,16 @@ class PlanWorkflow(Workflow):
     state_fields = frozenset({"config", "review_count", "plan_version", "plan_hash", "current_plan", "passes",
                               "transcript_marker", "resolved_escalations", "last_error", "last_review",
                               "final_plan_reviewed", "publication"})
-    guidance = "Write only to the current run's draft directory; do not implement source changes."
+    guidance = ("Planning does not change the project: write runner input files only to the run's draft "
+                "directory and leave source and documents unchanged. Ask the human from this conversation.")
 
     def normalize_args(self, raw: str, project: Path | None = None) -> str:
         request = raw.strip() if isinstance(raw, str) else ""
         if not request:
-            raise GuardError("Use /devflow:plan followed by the original planning request.")
+            raise UsageError("Use /devflow:plan followed by the original planning request.")
         # A slash-starting path with additional '/' is not interpreted as a skill.
         if STACKED_COMMAND.search(request):
-            raise GuardError("Start one workflow with one explicit command, not stacked skills.")
+            raise UsageError("Start one workflow with one explicit command, not stacked skills.")
         return request
 
     def build_start(self, project: Path, pending: dict, options: dict) -> tuple[dict, dict[str, bytes]]:
@@ -82,22 +81,6 @@ class PlanWorkflow(Workflow):
         state["last_error"] = {"review_number": number, "message": "Operator confirmed the interrupted reviewer "
                                "process is stopped; attempt remains consumed."}
         store.stage(state, f"reviews/{number:02d}/recovery.json", json_bytes(state["last_error"]))
-
-    def check_write(self, state: dict, project: Path, path: str, cwd: Path, plugin_root: Path) -> None:
-        if not draft_path(path, cwd, project / ".devflow" / "runs" / self.name / state["run_id"]):
-            raise GuardError("Write only to the current run's draft directory; source and audit files are read-only.")
-
-    def allow_tool(self, state: dict, tool: str, data: dict) -> bool:
-        if tool != "Skill":
-            return False
-        skill = state["config"].get("grill_skill")
-        requested = data.get("skill")
-        if not isinstance(skill, str) or not SKILL_NAME.fullmatch(skill):
-            raise GuardError("Active run has no configured interview skill.")
-        if isinstance(requested, str) and requested.lstrip("/") == skill.lstrip("/"):
-            return True
-        raise GuardError(f"Only the configured interview skill {skill!r} may be invoked during this workflow. "
-                         "An allowed name does not override Claude Code's skill permissions.")
 
     def context_fields(self, state: dict, run_dir: Path) -> dict:
         budget = self.summary(state)

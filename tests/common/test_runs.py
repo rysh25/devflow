@@ -31,6 +31,12 @@ def question(session="owner", use_id="q1", answer="yes"):
             "tool_use_id": use_id, "tool_input": {"questions": [{"question": "Q?"}]}, "tool_response": answer}
 
 
+def asked(session="owner", use_id="q1", **fields):
+    """An AskUserQuestion as Claude sent it, recorded at PreToolUse (an observation)."""
+    return {"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "session_id": session,
+            "tool_use_id": use_id, "tool_input": {"questions": [{"question": "Q?"}], **fields}}
+
+
 class RunStoreTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="devflow runs ")
@@ -100,6 +106,24 @@ class RunStoreTests(unittest.TestCase):
             self.store.save(state)
         other = self.store.append_event(self.run_id, question(session="next-owner"), "question")
         self.assertNotEqual(other, first)
+
+    def test_every_question_is_recorded_as_an_observation_once_per_tool_use(self):
+        # Ordinary and prefilled questions alike: the observation is the question as sent.
+        ordinary = self.store.append_event(self.run_id, asked(), "observation")
+        self.assertEqual(self.store.append_event(self.run_id, asked(), "observation"), ordinary)
+        prefilled = self.store.append_event(self.run_id, asked(use_id="q2", answers={"Q?": "Yes"}), "observation")
+        self.assertNotEqual(prefilled, ordinary)
+        with self.assertRaisesRegex(DevFlowError, "different content"):
+            self.store.append_event(self.run_id, asked(answers={"Q?": "No"}), "observation")
+        kinds = [event["kind"] for event in self.store.events(self.store.read(self.run_id))]
+        self.assertEqual(kinds, ["prompt", "observation", "observation"])
+
+    def test_an_observation_needs_its_tool_identity_and_input_and_the_owner(self):
+        for payload in (dict(asked(), tool_use_id=""), dict(asked(), tool_input="Q?")):
+            with self.subTest(payload=payload), self.assertRaisesRegex(DevFlowError, "Observation capture requires"):
+                self.store.append_event(self.run_id, payload, "observation")
+        with self.assertRaisesRegex(DevFlowError, "another session"):
+            self.store.append_event(self.run_id, asked(session="intruder"), "observation")
 
     def test_events_from_other_sessions_and_terminal_runs_are_not_recorded(self):
         with self.assertRaisesRegex(DevFlowError, "another session"):

@@ -134,18 +134,21 @@ def _validate_files(files: dict[str, bytes]) -> dict:
     _require('dependencies = []' in metadata, "Runner must not download Python packages")
     hooks = document(plugin + "/hooks/hooks.json").get("hooks")
     _require(isinstance(hooks, dict), "Missing unified hook map")
-    for event in ("UserPromptSubmit", "PreToolUse"):
-        _require(isinstance(hooks.get(event), list) and hooks[event], f"Missing safety hook {event}")
+    # Hooks only record and add context: they never block, and the tool hooks
+    # run only for AskUserQuestion (so other tool calls start no process).
+    _require(set(hooks) == {"UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"},
+             "Hooks must be exactly UserPromptSubmit, PreToolUse, PostToolUse and Stop")
     for event, matchers in hooks.items():
-        _require(isinstance(matchers, list), f"Invalid hook event {event}")
+        _require(isinstance(matchers, list) and matchers, f"Invalid hook event {event}")
         for matcher in matchers:
             _require(isinstance(matcher, dict) and isinstance(matcher.get("hooks"), list), "Invalid hook matcher")
+            if event in {"PreToolUse", "PostToolUse"}:
+                _require(matcher.get("matcher") == "AskUserQuestion", f"{event} hook must match only AskUserQuestion")
             for hook in matcher["hooks"]:
                 _require(isinstance(hook, dict) and hook.get("type") == "command" and hook.get("command") == "uv", "Unexpected unified hook command")
                 expected = ["run", "--offline", "--no-project", "--no-config", "--no-python-downloads", "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py", "hook"]
                 _require(hook.get("args") == expected, f"Hook must use exact portable exec argv: {event}")
-                if event in {"UserPromptSubmit", "PreToolUse"}:
-                    _require(hook.get("onFailure") == "block", f"Safety hook must fail closed: {event}")
+                _require(hook.get("onFailure") != "block", f"Hook must never block on failure: {event}")
     skill_prefix = plugin + "/skills/"
     skills = [path for path in files if path.startswith(skill_prefix) and path.endswith("/SKILL.md")]
     for required in ("plan", "implement", "resume", "status"):

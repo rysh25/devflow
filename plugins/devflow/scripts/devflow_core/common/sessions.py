@@ -129,7 +129,7 @@ class Binding:
     """What a session is looking at, judged against the run's real owner.
 
     ``supported`` is false for a run from an older DevFlow format: the session
-    is still bound (and guarded) until its next prompt releases the binding.
+    stays bound until its next prompt releases the binding.
     """
     session_id: str
     flow: str
@@ -236,21 +236,49 @@ def human_answer_text(value: Any) -> str:
     return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
 
 
+# Claude Code's question screen writes the human's choices and notes into these
+# AskUserQuestion input fields before the tool runs.
+SCREEN_FILLED_QUESTION_FIELDS = ("answers", "annotations")
+
+
+def prefilled_question(data: object) -> bool:
+    """True when the model itself filled the fields the question screen fills in.
+
+    Only meaningful at PreToolUse: by PostToolUse the screen has added the
+    human's answers and notes to these same fields.
+    """
+    return isinstance(data, dict) and any(data.get(field) for field in SCREEN_FILLED_QUESTION_FIELDS)
+
+
+def prefilled_question_events(events: list[dict]) -> list[str]:
+    """IDs of the main conversation's AskUserQuestion calls whose answers the model filled in itself
+    (a subagent's questions are not the interview's, as in ``approval_candidates``)."""
+    return [event["event_id"] for event in events
+            if event["kind"] == "observation" and not event["payload"].get("agent_id")
+            and prefilled_question(event["payload"].get("tool_input"))]
+
+
 def approval_candidates(state: dict, events: list[dict]) -> list[dict]:
     """Answers that may resolve the pending escalation, identical for status and resolve.
 
     Only successful AskUserQuestion results recorded after the escalation's
     boundary, from the current owner session, qualify. Ordinary prompts, the
     resume command and answers from before an ownership move never do.
+
+    Every AskUserQuestion is recorded at PreToolUse as an observation, before
+    the question screen adds the human's answers. An answer counts only when
+    that observation exists and shows the model did not fill the answers in
+    itself; when the hook could not record it, the answer is not evidence.
     """
     escalation = state.get("escalation")
     if not escalation:
         return []
-    # A question whose answers the model filled in before the screen (recorded as
-    # an observation at PreToolUse) is never a human answer. Observations are
-    # collected from every event, including those before the boundary.
-    prefilled = {(event["payload"].get("session_id"), event["payload"].get("tool_use_id"))
-                 for event in events if event["kind"] == "observation"}
+    asked = {}
+    for event in events:
+        if event["kind"] == "observation":
+            payload = event["payload"]
+            key = (payload.get("session_id"), payload.get("tool_use_id"))
+            asked[key] = asked.get(key, True) and not prefilled_question(payload.get("tool_input"))
     result = []
     for event in events[escalation["boundary"]:]:
         payload = event["payload"]
@@ -259,7 +287,7 @@ def approval_candidates(state: dict, events: list[dict]) -> list[dict]:
                 or payload.get("hook_event_name") != "PostToolUse" or payload.get("tool_name") != "AskUserQuestion"
                 # Only answers in the main conversation count, not a subagent's.
                 or payload.get("agent_id")
-                or (payload.get("session_id"), payload.get("tool_use_id")) in prefilled):
+                or not asked.get((payload.get("session_id"), payload.get("tool_use_id")), False)):
             continue
         try:
             text = human_answer_text(payload.get("tool_response"))

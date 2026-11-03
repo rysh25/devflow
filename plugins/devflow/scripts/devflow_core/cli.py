@@ -2,7 +2,8 @@
 
 Every runner error, including a malformed invocation, is one JSON object on
 stdout with exit status 2. ``--help`` and ``--version`` print text. Hook
-failures go to stderr; a failed Stop hook exits 0 so it never loops.
+failures go to stderr with exit status 1, which Claude Code shows without
+blocking the tool or the prompt; a failed Stop hook exits 0 so it never loops.
 """
 from __future__ import annotations
 
@@ -72,7 +73,7 @@ def claude_version() -> dict:
             value = tuple(int(part) for part in match.groups())
             minimum = tuple(int(part) for part in MINIMUM_CLAUDE_CODE.split("."))
             report.update(version=".".join(match.groups()), supported=value >= minimum,
-                          reason="Required fail-closed hook behavior is version-gated; real hook execution is not verified")
+                          reason="Hook input with agent_id is version-gated; real hook execution is not verified")
     except (OSError, subprocess.SubprocessError) as exc:
         report["reason"] = str(exc)
     return report
@@ -157,6 +158,8 @@ def main(argv=None) -> int:
     except Exception as exc:  # noqa: BLE001 - every failure is reported, never retried
         if command == "hook":
             print("DevFlow hook failed: " + str(exc), file=sys.stderr)
-            return 0 if isinstance(payload, dict) and payload.get("hook_event_name") == "Stop" else 2
+            # Exit status 2 would make Claude Code block the tool or the prompt. A failed
+            # Stop hook exits 0: a non-zero Stop exit can keep Claude from stopping.
+            return 0 if isinstance(payload, dict) and payload.get("hook_event_name") == "Stop" else 1
         emit({"error": type(exc).__name__, "message": str(exc), "automatic_retry": False})
         return 2

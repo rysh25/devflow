@@ -13,14 +13,10 @@ import sys
 from typing import Any, Callable
 
 from .environment import bash_timeout_ms, limit_warnings
-from .errors import DevFlowError, GuardError
+from .errors import DevFlowError
 
 RESOURCES = ("defaults.json", "reviewer.md", "review.schema.json")
-#: Option kinds Claude may pass to a runner action (each is checked by the guard).
-CLAUDE_KINDS = frozenset({"draft", "hash", "event", "decision", "text"})
-#: Option kinds only a human uses (actions the guard never permits).
-HUMAN_KINDS = frozenset({"int", "confirm"})
-READ_ONLY_COMMANDS = frozenset({"status", "doctor"})
+OPTION_KINDS = frozenset({"draft", "hash", "event", "decision", "text", "int", "confirm"})
 
 
 @dataclass(frozen=True)
@@ -35,23 +31,23 @@ class Option:
     required: bool = True
 
     def __post_init__(self):
-        if self.kind not in CLAUDE_KINDS | HUMAN_KINDS:
+        if self.kind not in OPTION_KINDS:
             raise ValueError(f"Unknown option kind {self.kind!r} for {self.flag}")
 
 
 @dataclass(frozen=True)
 class Command:
-    """One runner action: its options, handler and who may call it."""
+    """One runner action: its options and handler."""
     name: str
     help: str
     run: Callable[[Any, argparse.Namespace, str | None, str | None], Any]  # (engine, args, run_id, session)
     options: tuple[Option, ...] = ()
-    claude: bool = True       # False: only a human, from their own terminal (the guard refuses it).
     needs_run: bool = True
-
-    def __post_init__(self):
-        if self.claude and any(option.kind not in CLAUDE_KINDS for option in self.options):
-            raise ValueError(f"Action {self.name!r} available to Claude has an option the guard cannot check")
+    #: False for read-only actions (status, doctor) and for ``recover``, which a
+    #: human runs from their own terminal after checking that no process remains
+    #: (skills tell Claude not to run it; nothing else enforces that). Every
+    #: other action changes the run and needs the owning session.
+    needs_owner: bool = True
 
 
 def option_name(flag: str) -> str:
@@ -68,8 +64,8 @@ class Workflow:
     inflight_statuses: frozenset[str] = frozenset()
     #: Workflow-specific top-level state fields; anything else is rejected.
     state_fields: frozenset[str] = frozenset()
-    #: Every runner action of the workflow; the single source for the guard,
-    #: the CLI parser and dispatch. ``start`` is added from ``start_option``.
+    #: Every runner action of the workflow; the single source for the CLI
+    #: parser and dispatch. ``start`` is added from ``start_option``.
     commands: tuple[Command, ...] = ()
     #: Runner option of the ``start`` action that must match the pending
     #: request; ``None`` when the run is created inside the prompt hook.
@@ -77,22 +73,8 @@ class Workflow:
     #: Further ``start`` options, chosen by Claude rather than the user's
     #: command; never compared with the pending request.
     extra_start_options: tuple[Option, ...] = ()
-    #: True: DevFlow's PreToolUse guard limits tools while a run is active.
-    #: False: DevFlow never denies a tool; Claude Code's own settings and
-    #: permission mode decide, and DevFlow only records and verifies.
-    restricts_tools: bool = True
     #: Workflow-specific guidance added to hook context.
     guidance: str = ""
-
-    @property
-    def actions(self) -> dict[str, dict[str, str]]:
-        """Runner actions Claude may call while bound: option -> kind ("?" marks optional)."""
-        return {command.name: {option.flag: option.kind + ("" if option.required else "?") for option in command.options}
-                for command in self.commands if command.claude}
-
-    @property
-    def human_actions(self) -> frozenset[str]:
-        return frozenset(command.name for command in self.commands if not command.claude)
 
     @property
     def resource_dir(self) -> Path:
@@ -105,7 +87,7 @@ class Workflow:
 
     # -- starting and transferring runs -------------------------------------------------
     def normalize_args(self, raw: str, project: Path) -> str:
-        """Canonical start argument; the guard and the engine compare these."""
+        """Canonical start argument; the start hook and the runner compare these."""
         raise NotImplementedError
 
     def build_start(self, project: Path, pending: dict, options: dict) -> tuple[dict, dict[str, bytes]]:
@@ -138,14 +120,7 @@ class Workflow:
     def before_save(self, store: Any, state: dict) -> None:
         """Stage additional artifacts before every commit (optional)."""
 
-    # -- guard ---------------------------------------------------------------------------
-    def check_write(self, state: dict, project: Path, path: str, cwd: Path, plugin_root: Path) -> None:
-        raise GuardError("This workflow does not permit file writes.")
-
-    def allow_tool(self, state: dict, tool: str, data: dict) -> bool:
-        """Permit a workflow-specific tool (e.g. the plan interview Skill)."""
-        return False
-
+    # -- hook context ---------------------------------------------------------------------
     def context_fields(self, state: dict, run_dir: Path) -> dict:
         return {}
 
@@ -207,7 +182,11 @@ class Workflow:
         if command.needs_run and not run_id:
             raise DevFlowError(f"No {self.name} run is bound to this session; use /devflow:{self.name} "
                                "or /devflow:resume RUN_ID (or pass --run)")
+        owned = bool(run_id) and command.needs_owner
+        if owned and session is None:
+            raise DevFlowError(f"{command.name} changes the run; pass --session with the session that owns it "
+                               f"(or move the run to this session with /devflow:resume {run_id})")
         engine = self.engine(project, session)
-        if run_id and session is not None and command.name not in READ_ONLY_COMMANDS:
+        if owned:
             engine.require_owner(run_id, session)
         return command.run(engine, args, run_id, session)

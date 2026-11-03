@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 from .errors import DevFlowError
 from .runs import RUNNER_WAIT, RunStore
-from .sessions import approval_candidates
+from .sessions import approval_candidates, prefilled_question_events
 from .storage import read_json
 
 
@@ -136,9 +136,10 @@ class RunEngine:
         try:
             events = self._events(state)
             result.update(human_events=approval_candidates(state, events),
-                          observations=sum(1 for event in events if event["kind"] == "observation"), events_error=None)
+                          prefilled_questions=len(prefilled_question_events(events)), events_error=None)
         except (DevFlowError, OSError, ValueError) as exc:
-            result.update(human_events=[], observations=None, events_error=f"Human event records cannot be read: {exc}")
+            result.update(human_events=[], prefilled_questions=None,
+                          events_error=f"Human event records cannot be read: {exc}")
         self._status_details(state, result)
         return result
 

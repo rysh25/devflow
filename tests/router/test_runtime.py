@@ -6,7 +6,6 @@ import io
 import json
 import os
 from pathlib import Path
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -14,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 from devflow_core import __version__, cli, router as runtime
-from devflow_core.common import guard, sessions
+from devflow_core.common import sessions
 from devflow_core.common.errors import DevFlowError
 from devflow_core.common.runs import SCHEMA_VERSION, RunStore, make_event
 from devflow_core.common.storage import atomic_json, read_json, write_new
@@ -73,13 +72,6 @@ class RuntimeFixture(unittest.TestCase):
     def engine(self, flow):
         return WORKFLOWS[flow].engine(self.project)
 
-    def command(self, action="status", run_id=None, session=None, flow=None):
-        args = [*guard.RUNNER_PREFIX, str(SCRIPT), "--project", str(self.project), "--session", session or self.session]
-        if run_id:
-            args += ["--run", run_id]
-        args += ([flow] if flow else []) + action.split()
-        return " ".join(shlex.quote(x) for x in args)
-
     def invoke(self, *args):
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
@@ -93,8 +85,33 @@ class RuntimeFixture(unittest.TestCase):
         atomic_json(self.run_dir(flow, identifier) / "state.json", state)
         return identifier
 
-    def assert_denied(self, output):
-        self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "deny", output)
+    def bind_to_old_run(self, session=None, pending=False, identifier="20261101T123456Z-123456abcdef",
+                        flow="implement", version=2):
+        # An intentional old-run fixture: the version is always below SCHEMA_VERSION.
+        self.raw_run(flow, identifier, status="implementing" if flow == "implement" else "planning",
+                     schema_version=version)
+        record = sessions.empty_record(session or self.session)
+        if pending:
+            record = dict(record, pending_start={"flow": flow, "run_id": identifier, "args": "x",
+                                                 "created_at": "t",
+                                                 "event": make_event({"prompt": f"/devflow:{flow} x"}, "prompt")})
+        else:
+            record = dict(record, run={"flow": flow, "run_id": identifier})
+        sessions.write_record(self.project, record, WORKFLOWS)
+        return identifier
+
+    def ask(self, tool_use_id, session=None, **tool_input):
+        """PreToolUse of an AskUserQuestion, as Claude sent it."""
+        return runtime.handle_hook(self.payload(event="PreToolUse", session=session, tool_name="AskUserQuestion",
+                                                tool_use_id=tool_use_id, tool_input=tool_input), PLUGIN)
+
+    def assert_not_accepted(self, result, reason=""):
+        """A /devflow: command DevFlow did not act on: context for Claude, never an exception."""
+        self.assertIsInstance(result, dict, result)
+        context = result["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("did not accept", context)
+        self.assertIn(reason, context)
+        return context
 
 
 class UnifiedDispatchTests(RuntimeFixture):
@@ -122,11 +139,10 @@ class UnifiedDispatchTests(RuntimeFixture):
         self.assertEqual(pending["args"], str(self.plan_file))
         self.assertFalse((self.project / ".devflow" / "runs").exists())
 
-    def test_active_plan_blocks_implementation_without_recording_it_as_answer(self):
+    def test_active_plan_does_not_accept_implementation_or_record_it_as_answer(self):
         identifier = self.plan_start()
         before = read_json(self.run_dir("plan", identifier) / "state.json")
-        with self.assertRaises(DevFlowError):
-            self.prompt("/devflow:implement feature.md")
+        self.assert_not_accepted(self.prompt("/devflow:implement feature.md"), "Finish or cancel")
         after = read_json(self.run_dir("plan", identifier) / "state.json")
         self.assertEqual(before, after)
         self.assertEqual(self.record()["run"]["run_id"], identifier)
@@ -134,14 +150,16 @@ class UnifiedDispatchTests(RuntimeFixture):
     def test_one_unfinished_workflow_per_project_across_sessions(self):
         self.plan_start()
         for command in ("/devflow:plan Another request", "/devflow:implement feature.md"):
-            with self.subTest(command=command), self.assertRaises(DevFlowError):
-                self.prompt(command, session="second-human-session")
+            with self.subTest(command=command):
+                self.assert_not_accepted(self.prompt(command, session="second-human-session"),
+                                         "Another unfinished plan run")
+        self.assertIsNone(self.record("second-human-session"))
 
-    def test_pending_implementation_blocks_a_different_session(self):
+    def test_pending_implementation_is_not_accepted_from_a_different_session(self):
         self.prompt("/devflow:implement feature.md")
         for command in ("/devflow:plan Another request", "/devflow:implement feature.md"):
-            with self.subTest(command=command), self.assertRaisesRegex(DevFlowError, "pending implement start"):
-                self.prompt(command, session="other-session")
+            with self.subTest(command=command):
+                self.assert_not_accepted(self.prompt(command, session="other-session"), "pending implement start")
 
     def test_new_prompt_can_abandon_pending_implementation_before_plan(self):
         self.prompt("/devflow:implement feature.md")
@@ -161,16 +179,17 @@ class UnifiedDispatchTests(RuntimeFixture):
         self.prompt("/devflow:implement other.md")
         self.assertEqual(self.record()["pending_start"]["args"], str(other))
 
-    def test_terminal_guard_survives_current_turn_then_next_prompt_switches(self):
+    def test_finished_run_stays_bound_for_the_turn_then_next_prompt_switches(self):
         identifier = self.plan_start()
         self.engine("plan").cancel(identifier)
-        self.assert_denied(self.tool(file_path=str(self.project / "source.py")))
+        self.assertIsNone(self.tool(file_path=str(self.project / "source.py")))
+        self.assertEqual(self.record()["run"], {"flow": "plan", "run_id": identifier})
         self.prompt("/devflow:implement feature.md")
         record = self.record()
         self.assertIsNone(record["run"])
         self.assertEqual(record["pending_start"]["flow"], "implement")
 
-    def test_terminal_next_ordinary_prompt_releases_guard_without_new_run(self):
+    def test_terminal_next_ordinary_prompt_releases_binding_without_new_run(self):
         identifier = self.plan_start()
         self.engine("plan").cancel(identifier)
         before = read_json(self.run_dir("plan", identifier) / "state.json")
@@ -183,7 +202,7 @@ class UnifiedDispatchTests(RuntimeFixture):
     def test_cancelled_implementation_can_switch_to_plan_on_next_prompt(self):
         identifier = self.implement_start()
         self.engine("implement").cancel(identifier, self.session, "Human ended this attempt")
-        # Implement never denies (D1); the finished run stays bound until the next prompt.
+        # The finished run stays bound until the next prompt; no tool is stopped meanwhile.
         self.assertIsNone(self.tool(file_path=str(self.project / "source.py")))
         self.assertEqual(self.record()["run"], {"flow": "implement", "run_id": identifier})
         plan = self.plan_start()
@@ -205,8 +224,7 @@ class UnifiedDispatchTests(RuntimeFixture):
     def test_missing_or_ambiguous_run_id_is_not_guessed(self):
         identifier = self.raw_run("plan")
         self.raw_run("implement", identifier, "implementing")
-        with self.assertRaisesRegex(DevFlowError, "ambiguous"):
-            self.prompt("/devflow:resume " + identifier)
+        self.assert_not_accepted(self.prompt("/devflow:resume " + identifier), "ambiguous")
         with self.assertRaisesRegex(DevFlowError, "ambiguous"):
             runtime.status(self.project, None, identifier)
         with self.assertRaises(DevFlowError):
@@ -215,15 +233,14 @@ class UnifiedDispatchTests(RuntimeFixture):
     def test_invalid_start_or_resume_does_not_create_workspace(self):
         for prompt in ("/devflow:plan", "/devflow:implement", "/devflow:resume ../bad",
                        "/devflow:implement --plan other", "/devflow:plan /other:skill prompt"):
-            with self.subTest(prompt=prompt), self.assertRaises(Exception):
-                self.prompt(prompt)
+            with self.subTest(prompt=prompt):
+                self.assert_not_accepted(self.prompt(prompt))
             self.assertFalse((self.project / ".devflow").exists())
 
     def test_stale_dispatch_lock_is_not_deleted_or_ignored(self):
         lock = self.project / ".devflow" / "dispatch.lock"
         write_new(lock, b'{"token":"existing-lock"}\n')
-        with self.assertRaisesRegex(DevFlowError, "locked"):
-            self.plan_start()
+        self.assert_not_accepted(self.prompt("/devflow:plan REVIEW-10 の計画を作成して"), "locked")
         self.assertEqual(lock.read_bytes(), b'{"token":"existing-lock"}\n')
         self.assertFalse((self.project / ".devflow" / "runs").exists())
 
@@ -235,7 +252,6 @@ class UnifiedDispatchTests(RuntimeFixture):
         self.assertNotIn("run_status", value)
         listed = value["runs"][0]
         self.assertEqual((listed["run_id"], listed["status"], listed["review_count"]), (identifier, "interview", 0))
-        self.assertIsNone(self.tool("Bash", command=self.command("status", identifier)))
 
     def test_idle_status_is_nonmutating_and_pending_status_is_explicit(self):
         value = runtime.status(self.project, self.session, None)
@@ -249,32 +265,8 @@ class UnifiedDispatchTests(RuntimeFixture):
         other = runtime.status(self.project, "someone-else", None)
         self.assertEqual(other["sessions"]["pending_starts"][0]["flow"], "implement")
 
-    def test_global_runner_exemption_has_exact_context_and_no_shell_escape(self):
-        identifier = self.plan_start()
-        for action in ("status", "doctor"):
-            safe = self.command(action, identifier)
-            self.assertIsNone(self.tool("Bash", command=safe))
-            for command in (safe + "; echo bad", safe + " | other", safe + " > state.json",
-                            safe.replace("--offline ", ""), safe.replace(self.session, "someone-else"),
-                            safe.replace(shlex.quote(str(SCRIPT)), shlex.quote(str(self.project / "evil.py"))),
-                            safe.replace(shlex.quote(str(self.project)), shlex.quote(str(self.base))),
-                            safe + " --extra", safe.replace("--no-python-downloads", "--python 3.11")):
-                with self.subTest(command=command):
-                    self.assert_denied(self.tool("Bash", command=command))
-            self.assert_denied(self.tool("Bash", command=safe, run_in_background=True))
-            self.assert_denied(self.tool("Bash", command=safe, dangerouslyDisableSandbox=True))
-            # Diagnostics only read, so they may name any run (README: from any session).
-            self.assertIsNone(self.tool("Bash", command=safe.replace(identifier, OTHER_ID)))
-        self.assert_denied(self.tool("Bash", command=self.command("cancel", OTHER_ID, flow="plan")))
-
-    def test_pending_implement_never_denies_and_the_runner_still_checks_its_input(self):
+    def test_runner_start_cannot_target_an_existing_run(self):
         self.prompt("/devflow:implement feature.md")
-        for name, command in (("PowerShell", self.command("status")), ("Bash", self.command("status") + " && other"),
-                              ("Bash", self.command("status", OTHER_ID)),
-                              ("Bash", self.command("start --plan feature.md", OTHER_ID, flow="implement"))):
-            with self.subTest(name=name, command=command):
-                self.assertIsNone(self.tool(name, command=command))
-        # The guard no longer checks the start, but the runner itself does.
         code, output, _ = self.invoke("--session", self.session, "--run", OTHER_ID, "implement", "start",
                                       "--plan", "feature.md")
         self.assertEqual(code, 2)
@@ -285,8 +277,8 @@ class UnifiedDispatchTests(RuntimeFixture):
         reason = self.run_dir("plan", identifier) / "draft" / "pause.json"
         atomic_json(reason, {"reason": "Need the human first", "questions": ["Which scope?"]})
         self.assertEqual(self.engine("plan").pause(identifier, reason)["status"], "awaiting_human")
-        with self.assertRaisesRegex(DevFlowError, "unsealed interview"):
-            self.prompt("/devflow:resume " + identifier, session="other-session")
+        self.assert_not_accepted(self.prompt("/devflow:resume " + identifier, session="other-session"),
+                                 "unsealed interview")
         self.assertEqual(self.engine("plan").status(identifier)["owner_session"], self.session)
 
     def test_resume_of_a_finished_run_records_the_request(self):
@@ -302,16 +294,142 @@ class UnifiedDispatchTests(RuntimeFixture):
         self.session = "fresh-resume-session"
         self.prompt("/devflow:resume " + identifier)
         self.assertEqual(self.record()["run"], {"flow": "implement", "run_id": identifier})
-        self.assertIsNone(self.tool("Bash", command=self.command("status", identifier)))
         code, output, error = self.invoke("--session", self.session, "--run", identifier, "status")
         self.assertEqual((code, error), (0, ""), output)
         value = json.loads(output)
         self.assertEqual((value["flow"], value["owner_session"], value["review_count"]),
                          ("implement", self.session, 0))
-        self.assertIsNone(self.tool("Bash", command=self.command("status", OTHER_ID)))
-        self.assertIsNone(self.tool("Bash", command=self.command("cancel --reason x", OTHER_ID, flow="implement")))
         code, output, _ = self.invoke("--session", self.session, "--run", identifier, "implement", "resume")
         self.assertEqual((code, json.loads(output)["error"]), (2, "UsageError"))
+
+
+class ToolCallsAreNeverStopped:
+    """DevFlow never stops a tool call: Claude Code's settings and permission mode decide.
+
+    Mixed into one test class per workflow; PreToolUse returns None for every
+    call below whether the session owns the run, does not own it, has only a
+    pending start, or is bound to a run of an unsupported (older) format.
+    """
+    flow = ""
+
+    def calls(self):
+        return (("Write", {"file_path": str(self.project / "src" / "feature.py"), "content": "x"}),
+                ("Bash", {"command": "rm -rf x"}),
+                ("PowerShell", {"command": "Remove-Item -Recurse -Force x"}),
+                ("Agent", {"subagent_type": "general-purpose", "prompt": "Implement it", "isolation": "worktree"}),
+                ("mcp__files__write", {"path": "x", "content": "y"}),
+                ("Skill", {"skill": "some-other-skill"}))
+
+    def assert_nothing_stopped(self, session=None):
+        for tool, data in self.calls():
+            with self.subTest(tool=tool, session=session):
+                self.assertIsNone(self.tool(tool, session=session, **data))
+
+    def start(self):
+        return self.plan_start() if self.flow == "plan" else self.implement_start()
+
+    def cancel(self, identifier):
+        if self.flow == "plan":
+            self.engine("plan").cancel(identifier)
+        else:
+            self.engine("implement").cancel(identifier, self.session, "Human ended this attempt")
+
+    def event_ids(self, identifier):
+        return read_json(self.run_dir(self.flow, identifier) / "state.json")["event_ids"]
+
+    def test_the_owner_is_never_stopped_and_its_tool_calls_are_not_recorded(self):
+        identifier = self.start()
+        before = self.event_ids(identifier)
+        self.assert_nothing_stopped()
+        self.assertEqual(self.event_ids(identifier), before)
+        self.cancel(identifier)
+        # A finished run stays bound for the rest of the turn; still nothing is stopped.
+        self.assertEqual(self.record()["run"], {"flow": self.flow, "run_id": identifier})
+        self.assert_nothing_stopped()
+
+    def test_a_session_that_does_not_own_the_run_is_never_stopped(self):
+        identifier = self.start()
+        sessions.write_record(self.project, dict(sessions.empty_record("other-session"),
+                                                 run={"flow": self.flow, "run_id": identifier}), WORKFLOWS)
+        self.assertEqual(runtime.status(self.project, "other-session", None)["status"], "stale")
+        before = self.event_ids(identifier)
+        self.assert_nothing_stopped("other-session")
+        self.assertIsNone(self.ask("other-question", session="other-session", questions=[{"question": "Q?"}]))
+        self.assertEqual(self.event_ids(identifier), before)
+
+    def test_a_pending_start_is_never_stopped(self):
+        if self.flow == "implement":
+            self.prompt("/devflow:implement feature.md")
+        else:
+            # Plan creates its run inside the prompt hook; a pending start remains only if that hook dies.
+            pending = {"flow": "plan", "run_id": OTHER_ID, "args": "Interrupted request",
+                       "created_at": "2026-11-01T00:00:00+00:00",
+                       "event": make_event(self.payload(prompt="/devflow:plan Interrupted request"), "prompt")}
+            (self.project / ".devflow").mkdir()
+            sessions.write_record(self.project, dict(sessions.empty_record(self.session), pending_start=pending),
+                                  WORKFLOWS)
+        self.assertEqual(self.record()["pending_start"]["flow"], self.flow)
+        self.assert_nothing_stopped()
+        self.assertIsNone(self.ask("pending-question", questions=[{"question": "Q?"}]))
+        self.assertFalse((self.project / ".devflow" / "runs").exists())  # Nothing to record into.
+
+    def test_a_session_bound_to_an_unsupported_run_is_never_stopped(self):
+        identifier = self.bind_to_old_run(flow=self.flow, version=4)  # Old-run fixture: format 4 was never released.
+        self.assertEqual(runtime.status(self.project, self.session, None)["status"], "unsupported")
+        before = read_json(self.run_dir(self.flow, identifier) / "state.json")
+        self.assert_nothing_stopped()
+        self.assertIsNone(self.ask("old-question", questions=[{"question": "Q?"}]))
+        self.assertEqual(read_json(self.run_dir(self.flow, identifier) / "state.json"), before)
+
+    def test_every_question_of_the_owner_is_recorded_as_an_observation(self):
+        identifier = self.start()
+        store = RunStore(self.project, WORKFLOWS[self.flow])
+        plain = {"questions": [{"question": "Scope?"}]}
+        asked = (("q-plain", plain), ("q-prefilled", dict(plain, answers={"Scope?": "All of it"})),
+                 ("q-annotated", dict(plain, annotations={"Scope?": {"notes": "Written by the model"}})),
+                 ("q-empty", dict(plain, answers={}, annotations={})))
+        for use_id, data in asked:
+            with self.subTest(tool_use_id=use_id):
+                self.assertIsNone(self.ask(use_id, **data))
+        observed = [event for event in store.events(store.read(identifier)) if event["kind"] == "observation"]
+        self.assertEqual([(event["payload"]["tool_use_id"], event["payload"]["tool_input"]) for event in observed],
+                         list(asked))
+        # A hook retry with the same tool_use_id is the same event; changed content is an error.
+        count = len(self.event_ids(identifier))
+        self.assertIsNone(self.ask("q-plain", **plain))
+        self.assertEqual(len(self.event_ids(identifier)), count)
+        with self.assertRaisesRegex(DevFlowError, "different content"):
+            self.ask("q-plain", questions=[{"question": "Another?"}])
+        self.assertEqual(len(self.event_ids(identifier)), count)
+
+
+class PlanToolCallTests(ToolCallsAreNeverStopped, RuntimeFixture):
+    flow = "plan"
+
+
+class ImplementToolCallTests(ToolCallsAreNeverStopped, RuntimeFixture):
+    flow = "implement"
+
+
+class CommandErrorTests(RuntimeFixture):
+    def test_a_devflow_command_with_an_error_is_context_never_an_exception(self):
+        for prompt, reason in (("/devflow:plan", "Use /devflow:plan followed by"),
+                               ("/devflow:plan request\n/other:skill", "not stacked skills"),
+                               ("/devflow:implement", "Use /devflow:implement followed by"),
+                               ("/devflow:implement --plan x", "Supply a plan file"),
+                               ("/devflow:resume ../bad", "")):
+            with self.subTest(prompt=prompt):
+                context = self.assert_not_accepted(self.prompt(prompt), reason)
+                self.assertIn("Check the runner's status before continuing", context)
+        self.assertFalse((self.project / ".devflow").exists())
+        identifier = self.plan_start()
+        for prompt in ("/devflow:plan Another request", "/devflow:implement feature.md"):
+            with self.subTest(prompt=prompt):
+                self.assert_not_accepted(self.prompt(prompt, session="second-session"), "Another unfinished plan run")
+                self.assert_not_accepted(self.prompt(prompt), "Finish or cancel this session's active workflow")
+        self.assertIsNone(self.record("second-session"))
+        self.assertEqual(self.record()["run"], {"flow": "plan", "run_id": identifier})
+        self.assertEqual([info.run_id for info in RunStore(self.project, WORKFLOWS["plan"]).scan()[0]], [identifier])
 
 
 class FrozenConfigurationTests(RuntimeFixture):
@@ -328,43 +446,23 @@ class FrozenConfigurationTests(RuntimeFixture):
         self.assertIn("Unknown devflow.config.json keys", output)
 
 
-class PendingStartGuardTests(RuntimeFixture):
+class PendingStartTests(RuntimeFixture):
     def setUp(self):
         super().setUp()
         self.prompt("/devflow:implement feature.md")
 
-    def test_pending_implement_permits_everything(self):
-        for name, data in (("Read", {"file_path": str(self.plan_file)}), ("Bash", {"command": "grep -rn 'a|b' ."}),
-                           ("Bash", {"command": self.command("status")}), ("Bash", {"command": self.command("doctor")}),
-                           ("Bash", {"command": self.command("start --help", flow="implement")}),
-                           ("Bash", {"command": self.command("hook --help")}),
-                           ("Bash", {"command": self.command("start --plan feature.md", flow="implement")}),
-                           ("Bash", {"command": self.command("start --plan ./feature.md", flow="implement")}),
-                           ("Bash", {"command": self.command("start", flow="implement") + " --plan " + shlex.quote(str(self.plan_file))})):
-            with self.subTest(name=name, data=data):
-                self.assertIsNone(self.tool(name, **data))
-        other = self.project / "other.md"
-        other.write_text("x\n", encoding="utf-8")
-        # Implement never denies before its start either (D1).
-        for name, data in (("AskUserQuestion", {"questions": [{"question": "Q?"}]}),
-                           ("Write", {"file_path": str(self.project / "source.py")}),
-                           ("Bash", {"command": "rm -rf build"}),
-                           ("Bash", {"command": self.command("start --plan other.md", flow="implement")}),
-                           ("Bash", {"command": self.command("checkpoint --summary-file x.md", flow="implement")}),
-                           ("Skill", {"skill": "grilling"})):
-            with self.subTest(name=name, data=data):
-                self.assertIsNone(self.tool(name, **data))
-
-    def test_plan_crash_window_before_creation_keeps_its_guard(self):
+    def test_plan_crash_window_before_creation_leaves_a_pending_start_that_stops_nothing(self):
         # A Plan start that dies between the pending record and the run (here a
         # SystemExit, which _start does not catch) leaves the pending record;
-        # Plan still restricts tools in that window.
+        # no tool is stopped in that window and the next prompt drops it.
         with patch.object(runtime, "_create", side_effect=SystemExit(1)):
             with self.assertRaises(SystemExit):
                 self.prompt("/devflow:plan REVIEW-10 の計画を作成して")
         self.assertEqual(self.record()["pending_start"]["flow"], "plan")
-        self.assert_denied(self.tool("Write", file_path=str(self.project / "source.py")))
+        self.assertIsNone(self.tool("Write", file_path=str(self.project / "source.py")))
         self.assertIsNone(self.tool("Read", file_path=str(self.plan_file)))
+        self.assertIsNone(self.prompt("Never mind"))
+        self.assertIsNone(self.record())
 
     def test_stop_and_answers_are_not_recorded_while_pending(self):
         self.assertIsNone(runtime.handle_hook(self.payload(event="Stop"), PLUGIN))
@@ -395,8 +493,7 @@ class RunFormatTests(RuntimeFixture):
         self.assertEqual(selected["format"], "unsupported")
         self.assertIn("0.1.x", selected["message"])
         self.assertEqual(selected["project"], str(self.project))
-        with self.assertRaisesRegex(DevFlowError, "0.1.x"):
-            self.prompt("/devflow:resume " + identifier)
+        self.assert_not_accepted(self.prompt("/devflow:resume " + identifier), "0.1.x")
         self.plan_start()  # An unsupported run never blocks a new one.
 
     def test_broken_frozen_configuration_is_listed_as_invalid_without_breaking_status(self):
@@ -435,52 +532,50 @@ class RunFormatTests(RuntimeFixture):
         self.assertEqual((info.format, info.schema_version), ("unsupported", 2))
         selected = runtime.status(self.project, None, identifier)
         self.assertEqual(selected["message"], "Started with DevFlow 0.2.x; this version cannot continue it")
-        with self.assertRaisesRegex(DevFlowError, f"Run {identifier} was started with DevFlow 0.2.x; "
-                                                  "this version cannot continue it"):
-            self.prompt("/devflow:resume " + identifier)
+        self.assert_not_accepted(self.prompt("/devflow:resume " + identifier),
+                                 f"Run {identifier} was started with DevFlow 0.2.x; this version cannot continue it")
         self.plan_start()
         current = RunStore(self.project, WORKFLOWS["plan"]).inspect(self.record()["run"]["run_id"])
         self.assertEqual(current.schema_version, SCHEMA_VERSION)
 
-    def bind_to_old_run(self, session=None, pending=False, identifier="20261101T123456Z-123456abcdef",
-                        flow="implement", version=2):
-        self.raw_run(flow, identifier, status="implementing" if flow == "implement" else "planning",
-                     schema_version=version)
-        record = sessions.empty_record(session or self.session)
-        if pending:
-            record = dict(record, pending_start={"flow": flow, "run_id": identifier, "args": "x",
-                                                 "created_at": "t",
-                                                 "event": make_event({"prompt": f"/devflow:{flow} x"}, "prompt")})
-        else:
-            record = dict(record, run={"flow": flow, "run_id": identifier})
-        sessions.write_record(self.project, record, WORKFLOWS)
-        return identifier
+    @staticmethod
+    def old_id(flow, version):
+        return f"20261101T12345{version}Z-{'a' if flow == 'plan' else 'b'}23456abcdef"
 
-    def test_session_bound_to_an_old_plan_run_stays_guarded_until_released(self):
-        identifier = self.bind_to_old_run(flow="plan")
-        # Plan restricts tools: before any prompt the session is still guarded.
-        self.assert_denied(self.tool("Write", file_path=str(self.project / "x.py")))
-        self.assert_denied(self.tool("Bash", command=self.command("cancel --reason x", flow="plan")))
-        self.assertIsNone(self.tool("Read", file_path=str(self.plan_file)))
-        self.assertIsNone(self.prompt("hello"))
-        self.assertIsNone(self.record())  # Released by the next prompt.
-        self.assertTrue(self.run_dir("plan", identifier).exists())
+    def test_session_bound_to_an_old_run_is_released_by_the_next_prompt(self):
+        for flow in ("plan", "implement"):
+            for version, release in ((2, "0.2.x"), (3, "0.3.x"), (4, "an older version (run format 4)")):
+                with self.subTest(flow=flow, version=version):
+                    identifier = self.bind_to_old_run(identifier=self.old_id(flow, version), flow=flow,
+                                                      version=version)
+                    self.assertIsNone(self.tool("Write", file_path=str(self.project / "x.py")))
+                    value = runtime.status(self.project, self.session, None)
+                    self.assertEqual((value["status"], value["owner_matches"]), ("unsupported", False))
+                    self.assertIn(release, value["message"])
+                    self.assertIsNone(self.prompt("hello"))
+                    self.assertIsNone(self.record())  # Released by the next prompt.
+                    self.assertFalse(runtime.status(self.project, None, None)["sessions"]["pending_starts"])
+                    self.assertTrue(self.run_dir(flow, identifier).exists())  # Never touched.
 
-    def test_session_bound_to_an_old_implement_run_is_never_denied_until_released(self):
-        for version, release in ((2, "0.2.x"), (3, "0.3.x")):
-            with self.subTest(version=version):
-                identifier = self.bind_to_old_run(identifier=f"20261101T12345{version}Z-123456abcdef", version=version)
-                self.assertIsNone(self.tool("Write", file_path=str(self.project / "x.py")))
-                self.assertIsNone(self.tool("Bash", command=self.command("cancel --reason x", flow="implement")))
-                value = runtime.status(self.project, self.session, None)
-                self.assertEqual((value["status"], value["owner_matches"]), ("unsupported", False))
-                self.assertIn(release, value["message"])
-                self.assertIsNone(self.prompt("hello"))
-                self.assertIsNone(self.record())
-                self.assertIsNone(self.tool("Write", file_path=str(self.project / "x.py")))
-                self.assertFalse(runtime.status(self.project, None, None)["sessions"]["pending_starts"])
-                # An old run never blocks a new start.
-                self.assertTrue(self.run_dir("implement", identifier).exists())
+    def test_unreleased_and_last_released_formats_are_unsupported(self):
+        # Format 4 was never released and format 3 is 0.3.x: neither is continued.
+        for version, release in ((3, "0.3.x"), (4, "an older version (run format 4)")):
+            for flow in ("plan", "implement"):
+                with self.subTest(version=version, flow=flow):
+                    identifier = self.bind_to_old_run(identifier=self.old_id(flow, version), flow=flow,
+                                                      version=version)
+                    info = RunStore(self.project, WORKFLOWS[flow]).inspect(identifier)
+                    self.assertEqual((info.format, info.schema_version), ("unsupported", version))
+                    self.assertEqual(runtime.status(self.project, None, identifier)["message"],
+                                     f"Started with DevFlow {release}; this version cannot continue it")
+                    # Resuming it is not accepted, and the binding is released anyway.
+                    self.assert_not_accepted(self.prompt("/devflow:resume " + identifier),
+                                             f"Run {identifier} was started with DevFlow {release}")
+                    self.assertIsNone(self.record())
+                    # It never blocks a new start, in this session or another.
+                    current = self.plan_start(session="new-" + flow + str(version))
+                    self.engine("plan").cancel(current)
+                    self.assertTrue(self.run_dir(flow, identifier).exists())
 
     def test_session_bound_to_a_0_2_run_reports_unsupported_until_released(self):
         identifier = self.bind_to_old_run()
@@ -494,10 +589,9 @@ class RunFormatTests(RuntimeFixture):
         self.assertIsNone(self.prompt("hello"))
         self.assertIsNone(self.record())  # Released by the next prompt.
 
-    def test_resuming_a_0_2_run_is_refused_but_releases_the_binding(self):
+    def test_resuming_a_0_2_run_is_not_accepted_and_releases_the_binding(self):
         identifier = self.bind_to_old_run()
-        with self.assertRaisesRegex(DevFlowError, "0.2.x"):
-            self.prompt("/devflow:resume " + identifier)
+        self.assert_not_accepted(self.prompt("/devflow:resume " + identifier), "0.2.x")
         self.assertIsNone(self.record())
 
     def test_pending_starts_of_0_2_runs(self):
@@ -526,8 +620,9 @@ class RunFormatTests(RuntimeFixture):
                 self.assertIn("error", listed[identifier])
                 with self.assertRaises(DevFlowError):
                     runtime.status(self.project, None, identifier)
-                with self.assertRaisesRegex(DevFlowError, "cannot be read"):
-                    self.prompt("/devflow:plan Another request", session="new-session")
+                self.assert_not_accepted(self.prompt("/devflow:plan Another request", session="new-session"),
+                                         "cannot be read")
+                self.assertIsNone(self.record("new-session"))
                 path.unlink()
                 path.parent.rmdir()
 
@@ -545,8 +640,8 @@ class RunFormatTests(RuntimeFixture):
         self.assertTrue(overview["runs"][0]["recovery_required"])
         self.assertTrue(runtime.status(self.project, None, identifier)["recovery_required"])
         self.assertEqual(sorted(p.name for p in self.run_dir("plan", identifier).iterdir()), before)
-        with self.assertRaisesRegex(DevFlowError, "interrupted transaction"):
-            self.prompt("/devflow:implement feature.md", session="other-session")
+        self.assert_not_accepted(self.prompt("/devflow:implement feature.md", session="other-session"),
+                                 "interrupted transaction")
         self.prompt("/devflow:resume " + identifier)
         self.assertFalse((self.run_dir("plan", identifier) / "transaction.json").exists())
         self.assertEqual(self.engine("plan").status(identifier)["last_error"], {"message": "interrupted"})
@@ -566,13 +661,13 @@ class RunFormatTests(RuntimeFixture):
         identifier = self.plan_start()
         (self.run_dir("plan", identifier) / "transaction.json").write_text(
             json.dumps({"schema_version": SCHEMA_VERSION}), encoding="utf-8")
-        with self.assertRaisesRegex(DevFlowError, "pending transaction"):
-            self.prompt("/devflow:resume " + identifier)
+        self.assert_not_accepted(self.prompt("/devflow:resume " + identifier), "pending transaction")
         self.assertTrue((self.run_dir("plan", identifier) / "transaction.json").exists())
 
     def test_old_per_workflow_session_directories_do_not_block_starts(self):
         old = self.project / ".devflow" / "sessions"
         (old / "plan").mkdir(parents=True)
+        # The shape of a 0.1.x per-workflow session record, field names included.
         atomic_json(old / "plan" / ("a" * 64 + ".json"), {"run_id": "x", "guard_active": True})
         (old / "implement").mkdir()
         self.assertEqual(runtime.status(self.project, self.session, None)["sessions"]["invalid_records"], [])
@@ -587,10 +682,10 @@ class RunFormatTests(RuntimeFixture):
                 raise OSError("simulated stop after creation")
             return original(project, record, workflows)
 
-        with patch.object(sessions, "write_record", side_effect=fail_on_binding), self.assertRaises(OSError):
-            self.prompt("/devflow:plan Interrupted request")
+        with patch.object(sessions, "write_record", side_effect=fail_on_binding):
+            self.assert_not_accepted(self.prompt("/devflow:plan Interrupted request"), "simulated stop")
         identifier = self.record()["pending_start"]["run_id"]
-        atomic_json(self.run_dir("plan", identifier) / "state.json", {"schema_version": 4, "status": []})
+        atomic_json(self.run_dir("plan", identifier) / "state.json", {"schema_version": SCHEMA_VERSION, "status": []})
         overview = runtime.status(self.project, "other-session", None)
         self.assertEqual(overview["runs"][0]["format"], "invalid")
         self.assertEqual(overview["sessions"]["pending_starts"], [])
@@ -600,9 +695,8 @@ class RunFormatTests(RuntimeFixture):
             code, output, _ = self.invoke("doctor")
         self.assertEqual(code, 0, output)
 
-    def test_oversized_start_prompt_is_rejected_before_anything_is_written(self):
-        with self.assertRaisesRegex(DevFlowError, "4 MiB"):
-            self.prompt("/devflow:plan " + "x" * (4 * 1024 * 1024))
+    def test_oversized_start_prompt_is_not_accepted_before_anything_is_written(self):
+        self.assert_not_accepted(self.prompt("/devflow:plan " + "x" * (4 * 1024 * 1024)), "4 MiB")
         self.assertFalse((self.project / ".devflow").exists())
 
     def test_incomplete_creation_is_listed_but_not_a_run(self):
@@ -627,18 +721,16 @@ class InterruptionTests(RuntimeFixture):
             return original(project, record, workflows)
 
         with patch.object(sessions, "write_record", side_effect=fail_on_binding):
-            with self.assertRaises(OSError):
-                self.prompt("/devflow:plan Interrupted request")
+            self.assert_not_accepted(self.prompt("/devflow:plan Interrupted request"), "simulated stop")
         pending = self.record()["pending_start"]
         self.assertTrue(self.run_dir("plan", pending["run_id"]).is_dir())
-        self.assert_denied(self.tool(file_path=str(self.project / "x.md")))  # Pending: still guarded.
+        self.assertIsNone(self.tool(file_path=str(self.project / "x.md")))  # Pending: nothing stopped or recorded.
         self.prompt("first answer")
         self.assertEqual(self.record()["run"], {"flow": "plan", "run_id": pending["run_id"]})
 
     def test_failed_in_hook_creation_clears_its_pending_start(self):
         atomic_json(self.project / "devflow.config.json", {"schema_version": 1, "plan": {"max_reviews": 7}})
-        with self.assertRaises(DevFlowError):
-            self.prompt("/devflow:plan Request with an invalid configuration")
+        self.assert_not_accepted(self.prompt("/devflow:plan Request with an invalid configuration"), "max_reviews")
         self.assertIsNone(self.record())
         self.assertEqual(runtime.status(self.project, "other", None)["sessions"]["pending_starts"], [])
 
@@ -649,8 +741,8 @@ class InterruptionTests(RuntimeFixture):
                    "event": make_event(self.payload(prompt="/devflow:plan Interrupted request"), "prompt")}
         (self.project / ".devflow").mkdir()
         sessions.write_record(self.project, dict(sessions.empty_record(self.session), pending_start=pending), WORKFLOWS)
-        with self.assertRaisesRegex(DevFlowError, "pending plan start"):
-            self.prompt("/devflow:plan Another request", session="other-session")
+        self.assert_not_accepted(self.prompt("/devflow:plan Another request", session="other-session"),
+                                 "pending plan start")
         self.assertIsNone(self.prompt("Hello again"))
         self.assertIsNone(self.record())
 
@@ -675,11 +767,11 @@ class InterruptionTests(RuntimeFixture):
     def test_resume_interrupted_before_ownership_moves_asks_to_resend(self):
         identifier = self.implement_start()
         with patch.object(RunStore, "transfer", side_effect=OSError("simulated stop")):
-            with self.assertRaises(OSError):
-                self.prompt("/devflow:resume " + identifier, session="new-session")
+            self.assert_not_accepted(self.prompt("/devflow:resume " + identifier, session="new-session"),
+                                     "simulated stop")
         self.assertEqual(self.record("new-session")["run"]["run_id"], identifier)
         self.assertEqual(self.engine("implement").status(identifier)["owner_session"], self.session)
-        # Not the owner yet: implement never denies it, and nothing is recorded.
+        # Not the owner yet: no tool is stopped and nothing is recorded.
         self.assertIsNone(self.tool(file_path=str(self.project / "x.py"), session="new-session"))
         context = self.prompt("continue", session="new-session")["hookSpecificOutput"]["additionalContext"]
         self.assertIn("/devflow:resume " + identifier, context)
@@ -690,8 +782,7 @@ class InterruptionTests(RuntimeFixture):
     def test_same_session_resume_interrupted_keeps_ownership(self):
         identifier = self.implement_start()
         with patch.object(RunStore, "transfer", side_effect=OSError("simulated stop")):
-            with self.assertRaises(OSError):
-                self.prompt("/devflow:resume " + identifier)
+            self.assert_not_accepted(self.prompt("/devflow:resume " + identifier), "simulated stop")
         self.assertEqual(self.record()["run"]["run_id"], identifier)
         self.assertIsNone(self.tool("Read", file_path=str(self.plan_file)))
 
@@ -700,10 +791,9 @@ class InterruptionTests(RuntimeFixture):
         self.engine("plan").cancel(finished)
         self.prompt("next")
         active = self.implement_start()
-        with self.assertRaisesRegex(DevFlowError, "unfinished implement"):
-            self.prompt("/devflow:resume " + finished, session="other-session")
-        with self.assertRaisesRegex(DevFlowError, "Finish or cancel"):
-            self.prompt("/devflow:resume " + finished)
+        self.assert_not_accepted(self.prompt("/devflow:resume " + finished, session="other-session"),
+                                 "unfinished implement")
+        self.assert_not_accepted(self.prompt("/devflow:resume " + finished), "Finish or cancel")
         self.assertEqual(self.engine("plan").status(finished)["owner_session"], self.session)
         self.assertIsNone(self.record("other-session"))
         self.assertEqual(self.record()["run"]["run_id"], active)
@@ -729,8 +819,7 @@ class SessionRecordTests(RuntimeFixture):
                 atomic_json(path, record)
                 overview = runtime.status(self.project, self.session, None)
                 self.assertEqual(overview["sessions"]["invalid_records"][0]["record"], path.name)
-                with self.assertRaisesRegex(DevFlowError, "invalid"):
-                    self.prompt("/devflow:plan New request")
+                self.assert_not_accepted(self.prompt("/devflow:plan New request"), "invalid")
                 path.unlink()
         misplaced = directory / ("0" * 64 + ".json")
         atomic_json(misplaced, good | {"run": {"flow": "plan", "run_id": OTHER_ID}})
@@ -775,14 +864,14 @@ class SessionRecordTests(RuntimeFixture):
         context = self.prompt("What does the plan say?")["hookSpecificOutput"]["additionalContext"]
         self.assertIn("no longer owns DevFlow run " + identifier, context)
         self.assertEqual(len(read_json(self.run_dir("implement", identifier) / "state.json")["event_ids"]), events)
+        # A stale session is never stopped and never recorded, not even its questions or stops.
         self.assertIsNone(self.tool("Read", file_path=str(self.plan_file)))
-        self.assertIsNone(self.tool("WebSearch", query="x"))
         self.assertIsNone(self.tool("Bash", command="grep -rn VALUE ."))
-        self.assertIsNone(self.tool("Bash", command=self.command("status", identifier)))
-        # A stale implement session is never denied (D1) and never recorded.
         self.assertIsNone(self.tool("Write", file_path=str(self.project / "x.py")))
-        self.assertIsNone(self.tool("AskUserQuestion", questions=[{"question": "q?"}]))
-        self.assertIsNone(self.tool("Bash", command=self.command("cancel --reason x", flow="implement")))
+        self.assertIsNone(self.ask("stale-q", questions=[{"question": "q?"}]))
+        self.assertIsNone(runtime.handle_hook(self.payload(event="PostToolUse", tool_name="AskUserQuestion",
+                                                           tool_use_id="stale-q", tool_input={"questions": []},
+                                                           tool_response="Yes"), PLUGIN))
         self.assertIsNone(runtime.handle_hook(self.payload(event="Stop"), PLUGIN))
         self.assertEqual(len(read_json(self.run_dir("implement", identifier) / "state.json")["event_ids"]), events)
 
@@ -810,10 +899,11 @@ class ProjectResolutionTests(RuntimeFixture):
                                  prompt="Continue planning")
         self.assertIn("recorded_event_id", context["hookSpecificOutput"]["additionalContext"])
         self.assertEqual(self.recorded(identifier), before + 1)
-        # The Plan guard still applies to the session, wherever its cwd went.
-        denied = self.hook_from(self.elsewhere(), {"CLAUDE_PROJECT_DIR": str(self.project)}, event="PreToolUse",
-                                tool_name="Write", tool_input={"file_path": str(self.project / "source.py")})
-        self.assert_denied(denied)
+        # A question asked from that cwd is recorded in the project's run too.
+        self.assertIsNone(self.hook_from(self.elsewhere(), {"CLAUDE_PROJECT_DIR": str(self.project)},
+                                         event="PreToolUse", tool_name="AskUserQuestion", tool_use_id="q-elsewhere",
+                                         tool_input={"questions": [{"question": "Scope?"}]}))
+        self.assertEqual(self.recorded(identifier), before + 2)
         # Without the variable, the foreign cwd is a different (inert) project.
         self.assertIsNone(self.hook_from(self.elsewhere(), {}, prompt="Continue planning"))
 
@@ -839,6 +929,35 @@ class ProjectResolutionTests(RuntimeFixture):
         before = self.recorded(identifier)
         self.assertIsNotNone(self.hook_from(sub, {"CLAUDE_PROJECT_DIR": str(sub)}, prompt="Look here"))
         self.assertEqual(self.recorded(identifier), before + 1)
+
+    def test_a_hook_that_cannot_find_its_project_or_session_record_exits_1_and_stops_nothing(self):
+        self.plan_start()
+        record = next((self.project / ".devflow" / "sessions").glob("*.json"))
+        original = record.read_bytes()
+
+        def run_hook(env: dict) -> subprocess.CompletedProcess:
+            payload = json.dumps(dict(self.payload(prompt="Hello"), cwd=str(self.project)))
+            return subprocess.run([sys.executable, "-B", str(SCRIPT), "hook"], input=payload, capture_output=True,
+                                  encoding="utf-8", timeout=30, shell=False, env=dict(os.environ, **env))
+
+        cases = (("a broken session record", {"CLAUDE_PROJECT_DIR": str(self.project)}, b"{", record.name),
+                 ("a relative CLAUDE_PROJECT_DIR", {"CLAUDE_PROJECT_DIR": "relative/dir"}, None,
+                  "CLAUDE_PROJECT_DIR must be an absolute directory"),
+                 ("a missing CLAUDE_PROJECT_DIR", {"CLAUDE_PROJECT_DIR": str(self.project / "missing")}, None,
+                  "CLAUDE_PROJECT_DIR does not name an existing directory"))
+        for name, env, damaged, reason in cases:
+            with self.subTest(case=name):
+                record.write_bytes(damaged if damaged is not None else original)
+                try:
+                    result = run_hook(env)
+                finally:
+                    record.write_bytes(original)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("DevFlow hook failed", result.stderr)
+                self.assertIn(reason, result.stderr)
+        # Each case starts from the intact record: the same hook succeeds with it.
+        self.assertEqual(run_hook({"CLAUDE_PROJECT_DIR": str(self.project)}).returncode, 0)
 
     def test_the_real_hook_entry_point_reads_the_environment(self):
         identifier = self.plan_start()
@@ -883,13 +1002,35 @@ class UnifiedCliTests(RuntimeFixture):
         self.assertEqual(json.loads(output)["status"], "idle")
         self.assertFalse((self.project / ".devflow").exists())
 
-    def test_real_hook_failure_is_closed_but_stop_does_not_loop(self):
-        malformed = self.process("hook", payload="not json")
-        self.assertEqual(malformed.returncode, 2)
-        self.assertIn("DevFlow hook failed", malformed.stderr)
+    def test_real_hook_failure_exits_1_and_a_failed_stop_exits_0(self):
+        # Exit status 2 would make Claude Code block the tool or the prompt.
+        for payload in ("not json", "[]", json.dumps({"hook_event_name": "PreToolUse"}),
+                        json.dumps(self.payload(prompt=None)),
+                        json.dumps(self.payload(event="PreToolUse", session="../bad session", tool_name="Write"))):
+            with self.subTest(payload=payload):
+                failed = self.process("hook", payload=payload)
+                self.assertEqual((failed.returncode, failed.stdout), (1, ""))
+                self.assertIn("DevFlow hook failed", failed.stderr)
         stopped = self.process("hook", payload=json.dumps({"hook_event_name": "Stop"}))
-        self.assertEqual(stopped.returncode, 0)
+        self.assertEqual((stopped.returncode, stopped.stdout), (0, ""))
         self.assertIn("DevFlow hook failed", stopped.stderr)
+
+    def test_in_process_hook_failure_exits_1_never_2(self):
+        for payload, expected in (("{", 1), (json.dumps({"hook_event_name": "PostToolUse"}), 1),
+                                  (json.dumps({"hook_event_name": "Stop", "cwd": 3}), 0)):
+            with self.subTest(payload=payload):
+                out, err = io.StringIO(), io.StringIO()
+                with patch.object(sys, "stdin", io.StringIO(payload)), redirect_stdout(out), redirect_stderr(err):
+                    code = cli.main(["hook"])
+                self.assertEqual((code, out.getvalue()), (expected, ""))
+                self.assertIn("DevFlow hook failed", err.getvalue())
+
+    def test_real_hook_reports_a_command_error_as_context_with_exit_0(self):
+        result = self.process("hook", payload=json.dumps(self.payload(prompt="/devflow:implement")))
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertIn("DevFlow did not accept /devflow:implement",
+                      json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"])
+        self.assertFalse((self.project / ".devflow").exists())
 
     def test_real_unrelated_hook_is_silent(self):
         result = self.process("hook", payload=json.dumps(self.payload(prompt="ordinary conversation")))

@@ -80,15 +80,43 @@ class EngineTests(unittest.TestCase):
     def hook(self, payload):
         return router.handle_hook(payload, PLUGIN_ROOT)
 
+    def ask(self, payload):
+        """The PreToolUse call before an AskUserQuestion result: the question as
+        Claude sent it, before the question screen fills in the human's answers."""
+        question = {key: value for key, value in payload["tool_input"].items()
+                    if key not in sessions.SCREEN_FILLED_QUESTION_FIELDS}
+        pre = {key: value for key, value in payload.items() if key not in {"tool_response", "is_error"}}
+        self.assertIsNone(self.hook(dict(pre, hook_event_name="PreToolUse", tool_input=question)))
+
     def record(self, payload):
-        """Send a human event through the router and return the event ID it reports."""
+        """Send a human event through the router and return the event ID it reports.
+
+        An AskUserQuestion result is preceded by its PreToolUse call, as in Claude Code."""
+        if payload["hook_event_name"] == "PostToolUse" and payload.get("tool_name") == "AskUserQuestion":
+            self.ask(payload)
         context = self.hook(payload)["hookSpecificOutput"]["additionalContext"]
         return re.search(r'(?:as event |"recorded_event_id": ")([a-f0-9]{32})', context).group(1)
 
+    def assertNotAccepted(self, result, command, reason):
+        """A DevFlow command the hook did not accept: a context message, never an exception."""
+        context = result["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(f"DevFlow did not accept /devflow:{command}", context)
+        self.assertIn(reason, context)
+
+    def assertUnrecorded(self, result, reason):
+        """A human event DevFlow could not record goes through with a warning."""
+        context = result["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("could not read or record", context)
+        self.assertIn("was not recorded", context)
+        self.assertIn(reason, context)
+
+    def resume_prompt(self, session):
+        return self.hook(self.event(prompt=f"/devflow:resume {self.run_id}", session=session))
+
     def resume(self, session):
         """``/devflow:resume RUN`` from ``session``; the hook performs the whole move."""
-        result = self.hook(self.event(prompt=f"/devflow:resume {self.run_id}", session=session))
-        self.assertIn("additionalContext", result["hookSpecificOutput"])
+        result = self.resume_prompt(session)
+        self.assertNotIn("did not accept", result["hookSpecificOutput"]["additionalContext"])
         return self.engine.status(self.run_id)
 
     def bound_run(self, session=None):
@@ -113,7 +141,7 @@ class EngineTests(unittest.TestCase):
     def start_interview(self, answer=True, request=None):
         self.raw_request = request or "/devflow:plan 実装せず、移行計画を作る。\nKeep exact wording."
         result = self.hook(self.event(prompt=self.raw_request))
-        self.assertIn("additionalContext", result["hookSpecificOutput"])
+        self.assertNotIn("did not accept", result["hookSpecificOutput"]["additionalContext"])
         self.run_id = router.status(self.project, self.session, None)["run"]["run_id"]
         self.assertEqual(self.bound_run(), self.run_id)
         self.run = Path(self.engine.status(self.run_id)["run_dir"])
@@ -379,8 +407,7 @@ class EngineTests(unittest.TestCase):
         interrupted = self.engine.status(self.run_id)
         self.assertEqual(interrupted["status"], "reviewing")
         self.assertEqual(interrupted["inflight"]["number"], 1)
-        with self.assertRaisesRegex(DevFlowError, "recover"):
-            self.resume("new-session")
+        self.assertNotAccepted(self.resume_prompt("new-session"), "resume", "recover")
         self.assertEqual(self.engine.status(self.run_id)["owner_session"], self.session)
         with self.assertRaises(DevFlowError):
             self.engine.recover(self.run_id, confirmed=True, expected_review=2)
@@ -601,7 +628,9 @@ class EngineTests(unittest.TestCase):
 
     def test_answer_filled_in_by_question_screen_can_resolve_escalation(self):
         # Claude Code's question screen writes the human's choice into
-        # tool_input before PostToolUse; model prefills are denied at PreToolUse.
+        # tool_input before PostToolUse; record() first sends the PreToolUse
+        # call without answers, which is how DevFlow knows the model did not
+        # fill them in itself.
         self.ready()
         self.submit(review_value("human_required", human=True))
         answered = {"questions": [{"question": "Scope?"}], "answers": {"Scope?": "Yes"}, "annotations": {}}
@@ -636,12 +665,12 @@ class EngineTests(unittest.TestCase):
         identifier = self.record(payload)
         before = (self.run / "state.json").read_bytes()
         for change in ({"tool_response": "Different answer"}, {"tool_input": {"questions": [{"question": "Other Q"}]}}, {"is_error": True}):
-            with self.subTest(change=change), self.assertRaisesRegex(DevFlowError, "replayed with different content"):
-                self.hook(dict(payload, **change))
+            with self.subTest(change=change):
+                self.assertUnrecorded(self.hook(dict(payload, **change)), "replayed with different content")
         self.assertEqual((self.run / "state.json").read_bytes(), before)
         self.assertEqual(read_json(self.run / "events" / (identifier + ".json"))["payload"]["tool_response"], "Original answer")
 
-    def test_question_ids_are_scoped_to_owner_session_and_stale_payload_is_rejected(self):
+    def test_question_ids_are_scoped_to_owner_session_and_stale_payload_is_not_recorded(self):
         self.ready()
         old = self.event("PostToolUse", tool_name="AskUserQuestion", tool_use_id="same-local-id",
             tool_input={"questions": [{"question": "Q"}]}, tool_response="Old answer")
@@ -649,8 +678,10 @@ class EngineTests(unittest.TestCase):
         self.submit(review_value("human_required", human=True))
         self.resume("new-owner")
         before = (self.run / "state.json").read_bytes()
-        with self.assertRaisesRegex(DevFlowError, "stale session"):
-            self.hook(old)
+        # The former owner's hooks record nothing: its question, its answer and its stop.
+        self.assertIsNone(self.hook(dict(old, hook_event_name="PreToolUse")))
+        self.assertIsNone(self.hook(old))
+        self.assertIsNone(self.hook(self.event("Stop")))
         with self.assertRaisesRegex(DevFlowError, "stale-session"):
             self.engine.store.append_event(self.run_id, old, "question")
         self.assertEqual((self.run / "state.json").read_bytes(), before)
@@ -671,8 +702,8 @@ class EngineTests(unittest.TestCase):
         invalid = [dict(good, tool_use_id=value) for value in (None, "", "  ", "a" * 513)]
         invalid += [dict(good, tool_input=None), {key: value for key, value in good.items() if key != "tool_response"}]
         for payload in invalid:
-            with self.subTest(payload=payload), self.assertRaisesRegex(DevFlowError, "actual tool identity"):
-                self.hook(payload)
+            with self.subTest(payload=payload):
+                self.assertUnrecorded(self.hook(payload), "actual tool identity")
         self.assertEqual((self.run / "state.json").read_bytes(), before)
 
     def test_state_lock_fails_safely_without_dispatch(self):
@@ -696,8 +727,7 @@ class EngineTests(unittest.TestCase):
     def test_unsealed_interview_cannot_move_sessions(self):
         self.start_interview()
         before = (self.run / "state.json").read_bytes()
-        with self.assertRaisesRegex(DevFlowError, "original Claude session"):
-            self.resume("other-session")
+        self.assertNotAccepted(self.resume_prompt("other-session"), "resume", "original Claude session")
         self.assertEqual((self.run / "state.json").read_bytes(), before)
         self.assertIsNone(self.bound_run("other-session"))
         self.assertEqual(self.bound_run(), self.run_id)
@@ -710,8 +740,8 @@ class EngineTests(unittest.TestCase):
 
     def test_maximum_seven_is_rejected_before_run_creation(self):
         (self.project / "devflow.config.json").write_text('{"max_reviews":7}', encoding="utf-8")
-        with self.assertRaisesRegex(DevFlowError, "hard ceiling"):
-            self.start_interview()
+        self.assertNotAccepted(self.hook(self.event(prompt="/devflow:plan A request")), "plan", "hard ceiling")
+        self.assertIsNone(self.bound_run())
         self.assertEqual(list((self.project / ".devflow" / "runs" / "plan").glob("*")), [])
 
     def test_oversized_packet_does_not_consume_attempt(self):
@@ -747,39 +777,37 @@ class EngineTests(unittest.TestCase):
         with self.assertRaisesRegex(DevFlowError, "Symlink"):
             self.engine.plan(self.run_id, link)
 
-    def test_terminal_guard_stays_until_next_real_human_prompt(self):
+    def test_finished_run_stays_bound_until_next_real_human_prompt(self):
         self.ready()
         self.submit(review_value())
         self.submit(review_value())
         self.assertEqual(self.bound_run(), self.run_id)
-        write = self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(self.project / "app.py"), "content": "unauthorized implementation"})
-        denied = self.hook(write)
-        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        write = self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(self.project / "app.py"), "content": "implementation"})
         events_before = read_json(self.run / "state.json")["event_ids"]
+        # DevFlow does not stop the tool; the finished run stays bound for the rest of the turn.
+        self.assertIsNone(self.hook(write))
+        self.assertEqual(self.bound_run(), self.run_id)
         self.assertIsNone(self.hook(self.event(prompt="Now I have a separate request.")))
         self.assertIsNone(self.bound_run())
         self.assertEqual(router.status(self.project, self.session, None)["status"], "idle")
         # The prompt that released the finished run is not recorded in it.
         self.assertEqual(read_json(self.run / "state.json")["event_ids"], events_before)
         self.assertIsNone(self.hook(write))
-        self.assertFalse((self.project / "app.py").exists())
 
-    def test_terminal_resume_rebinds_owner_and_guard_without_resetting_budget(self):
+    def test_terminal_resume_rebinds_owner_without_resetting_budget(self):
         self.ready()
         self.submit(review_value())
         self.submit(review_value())
         self.session = "new-report-session"
-        result = self.hook(self.event(prompt=f"/devflow:resume {self.run_id}"))
-        self.assertIn("additionalContext", result["hookSpecificOutput"])
-        state = self.engine.status(self.run_id)
+        state = self.resume(self.session)
         self.assertEqual(state["owner_session"], self.session)
         self.assertEqual(state["status"], "completed")
         self.assertEqual(state["review_count"], 2)
         self.assertEqual(self.bound_run(), self.run_id)
         self.engine.require_owner(self.run_id, self.session)
         self.assertTrue(self.engine.report(self.run_id)["converged"])
-        denied = self.hook(self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(self.project / "app.py"), "content": "not authorized"}))
-        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIsNone(self.hook(self.event("PreToolUse", tool_name="Write",
+                                               tool_input={"file_path": str(self.project / "app.py"), "content": "x"})))
         with patch(RUN_REVIEW) as call:
             with self.assertRaises(DevFlowError):
                 self.engine.review(self.run_id)
@@ -787,10 +815,10 @@ class EngineTests(unittest.TestCase):
 
     def test_no_second_active_run_and_no_double_seal(self):
         self.start_interview()
-        with self.assertRaisesRegex(DevFlowError, "Finish or cancel"):
-            self.hook(self.event(prompt="/devflow:plan a different request"))
-        with self.assertRaisesRegex(DevFlowError, "unfinished plan run"):
-            self.hook(self.event(prompt="/devflow:plan a different request", session="another-session"))
+        self.assertNotAccepted(self.hook(self.event(prompt="/devflow:plan a different request")),
+                               "plan", "Finish or cancel")
+        self.assertNotAccepted(self.hook(self.event(prompt="/devflow:plan a different request", session="another-session")),
+                               "plan", "unfinished plan run")
         self.assertEqual([path.name for path in self.run.parent.iterdir()], [self.run_id])
         self.assertEqual(self.bound_run(), self.run_id)
         self.seal()
@@ -839,7 +867,7 @@ class EngineTests(unittest.TestCase):
         result = self.engine.publish(self.run_id)
         self.assertEqual(result["publication"]["path"], f"docs/plans/plan-{self.run_id}.md")
 
-    def test_publish_before_second_approval_is_refused(self):
+    def test_publish_before_second_approval_is_not_published(self):
         self.ready()
         self.submit(review_value())
         with self.assertRaisesRegex(DevFlowError, "both reviewers"):
@@ -847,7 +875,7 @@ class EngineTests(unittest.TestCase):
         self.assertFalse((self.project / "docs").exists())
         self.assertEqual(self.engine.status(self.run_id)["review_count"], 1)
 
-    def test_publish_exhausted_last_revision_is_refused(self):
+    def test_publish_exhausted_last_revision_is_not_published(self):
         (self.project / "devflow.config.json").write_text('{"max_reviews":2}', encoding="utf-8")
         self.ready()
         self.reflect(self.submit(review_value("changes_required")))
@@ -974,8 +1002,10 @@ class EngineTests(unittest.TestCase):
     def test_unsafe_publish_directory_rejected_before_model_calls(self):
         for path in ("../outside", "/absolute", "C:/absolute", "docs/../src", ".git/hooks", ".devflow/runs", "docs/CON", "docs/has space", "docs\\plans"):
             (self.project / "devflow.config.json").write_text(json.dumps({"plan":{"publish":{"directory":path}}}), encoding="utf-8")
-            with self.subTest(path=path), self.assertRaisesRegex(DevFlowError, "publish.directory"):
-                self.start_interview()
+            with self.subTest(path=path):
+                self.assertNotAccepted(self.hook(self.event(prompt="/devflow:plan A request")), "plan",
+                                       "publish.directory")
+                self.assertIsNone(self.bound_run())
 
     # -- interrupted transactions: display reads never repair; resume completes them ------
     def test_seal_partial_commit_recovers_frozen_capture_without_recapturing(self):
@@ -1121,8 +1151,7 @@ class EngineTests(unittest.TestCase):
             self.assertFalse((self.run / "transaction.json").exists())
             with self.assertRaises(DevFlowError):
                 self.engine.review(self.run_id)
-            with self.assertRaises(DevFlowError):
-                self.resume(self.session)
+            self.assertNotAccepted(self.resume_prompt(self.session), "resume", "recover")
             provider.assert_not_called()
         self.engine.recover(self.run_id, confirmed=True, expected_review=1)
         self.resume(self.session)

@@ -1,13 +1,14 @@
-"""The implement workflow: statuses, guard rules, and how runs start and move."""
+"""The implement workflow: statuses and how runs start and move."""
 from __future__ import annotations
 
 import os
 from pathlib import Path
 
-from ..common.errors import DevFlowError, GuardError
+from ..common.errors import DevFlowError, UsageError
 from ..common.environment import bash_timeout_ms
 from ..common.review import HARD_MAX_REVIEWS, check_review_config, review_budget
 from ..common.runs import TERMINAL
+from ..common.sessions import prefilled_question_events
 from ..common.storage import digest, json_bytes, no_symlinks, now
 from ..common.workflow import Option, Workflow
 from .commands import COMMANDS
@@ -22,14 +23,14 @@ def _checks_timeout_ms(config: dict) -> int:
 def plan_argument(argument: str) -> str:
     """The plan path exactly as the user typed it (quotes and '@' removed)."""
     if not isinstance(argument, str) or not argument or any(ord(ch) < 32 for ch in argument):
-        raise GuardError("Use /devflow:implement followed by one plan-file path.")
+        raise UsageError("Use /devflow:implement followed by one plan-file path.")
     if argument[0] in {"\"", "'"}:
         if len(argument) < 3 or argument[-1] != argument[0]:
-            raise GuardError("The plan path has unmatched quotes.")
+            raise UsageError("The plan path has unmatched quotes.")
         argument = argument[1:-1]
     argument = argument.removeprefix("@")
     if not argument or argument.startswith("--"):
-        raise GuardError("Supply a plan file, not runner options or stacked skills.")
+        raise UsageError("Supply a plan file, not runner options or stacked skills.")
     return argument
 
 
@@ -46,10 +47,7 @@ class ImplementWorkflow(Workflow):
                               "workspace"})
     start_option = "--plan"
     extra_start_options = (Option("--workspace", "text", required=False),)
-    # DevFlow never denies a tool here: the session's own settings and permission
-    # mode decide. Runs record and verify instead (snapshots, hashes, events).
-    restricts_tools = False
-    guidance = ("DevFlow records and verifies this run but does not restrict tools. Write runner input files "
+    guidance = ("DevFlow records and verifies this run. Write runner input files "
                 "to the run's draft directory, preserve pre-existing changes, and use the runner's checks "
                 "as the validation evidence.")
 
@@ -58,7 +56,7 @@ class ImplementWorkflow(Workflow):
         path = Path(argument)
         if not path.is_absolute():
             if project is None:
-                raise GuardError("A relative plan path needs its project directory.")
+                raise UsageError("A relative plan path needs its project directory.")
             path = Path(project) / path
         return os.path.normpath(str(path))
 
@@ -134,7 +132,7 @@ class ImplementWorkflow(Workflow):
             # Ending a run must not depend on every event file being readable;
             # a damaged one is reported instead of blocking cancel or recover.
             try:
-                observed = [event["event_id"] for event in store.events(state) if event["kind"] == "observation"]
+                observed = prefilled_question_events(store.events(state))
                 observed_error = None
             except (DevFlowError, OSError, ValueError) as exc:
                 observed, observed_error = None, str(exc)

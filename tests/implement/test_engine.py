@@ -100,11 +100,18 @@ class EngineFixture(unittest.TestCase):
         fields, _ = json.JSONDecoder().raw_decode(context, context.index('{"'))
         return fields.get("recorded_event_id")
 
+    def ask(self, session=None, **fields):
+        """A human AskUserQuestion: the question as Claude sent it (PreToolUse, recorded as an
+        observation without answers), then the answered result (PostToolUse); returns the latter's output."""
+        asked = {key: value for key, value in fields["tool_input"].items() if key not in sessions.SCREEN_FILLED_QUESTION_FIELDS}
+        self.hook("PreToolUse", session, tool_name="AskUserQuestion", tool_use_id=fields["tool_use_id"], tool_input=asked)
+        return self.hook("PostToolUse", session, tool_name="AskUserQuestion", **fields)
+
     def answer(self, text="Yes, I independently verified this version.", session=None):
         self.questions += 1
-        result = self.hook("PostToolUse", session, tool_name="AskUserQuestion", tool_use_id=f"question-{self.questions}",
-                           tool_input={"questions": [{"question": "Continue with this exact version?"}]},
-                           tool_response={"answers": {"Continue with this exact version?": text}})
+        result = self.ask(session, tool_use_id=f"question-{self.questions}",
+                          tool_input={"questions": [{"question": "Continue with this exact version?"}]},
+                          tool_response={"answers": {"Continue with this exact version?": text}})
         return re.search(r"as event ([a-f0-9]{32})", result["hookSpecificOutput"]["additionalContext"]).group(1)
 
     def start(self, session=None):
@@ -187,8 +194,11 @@ class EngineFixture(unittest.TestCase):
     def tool(self, name="Write", **tool_input):
         return self.hook("PreToolUse", tool_name=name, tool_input=tool_input)
 
-    def assertDenied(self, result):
-        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny", result)
+    def assertNotAccepted(self, text, reason, session=None):
+        """Submit a /devflow: command DevFlow does not accept: it adds context naming the reason, never raises."""
+        context = self.hook("UserPromptSubmit", session, prompt=text)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("did not accept", context)
+        self.assertIn(reason, context)
 
     def assertFinalReportSaved(self, status):
         path = self.run / status["report_path"]
@@ -473,10 +483,8 @@ class EngineFlowTests(EngineFixture):
         self.assertEqual(self.state()["status"], "reviewing")
         self.assertIsNotNone(self.state()["inflight"])
         self.assertEqual(len(self.state()["attempts"]), 1)
-        with self.assertRaisesRegex(DevFlowError, "may still be running"):
-            self.prompt(f"/devflow:resume {self.run_id}")
-        with self.assertRaisesRegex(DevFlowError, "may still be running"):
-            self.prompt(f"/devflow:resume {self.run_id}", "new-claude-session")
+        self.assertNotAccepted(f"/devflow:resume {self.run_id}", "may still be running")
+        self.assertNotAccepted(f"/devflow:resume {self.run_id}", "may still be running", "new-claude-session")
         with self.assertRaisesRegex(DevFlowError, "confirm"):
             self.engine.recover(self.run_id)
         recovered = self.engine.recover(self.run_id, confirmed=True)
@@ -664,8 +672,8 @@ class HumanEvidenceTests(EngineFixture):
     def test_string_answer_text_is_the_exact_human_text(self):
         self.start()
         self.escalate()
-        self.hook("PostToolUse", tool_name="AskUserQuestion", tool_use_id="string-answer",
-                  tool_input={"questions": [{"question": "Which VALUE?"}]}, tool_response="Use VALUE = 3, please.")
+        self.ask(tool_use_id="string-answer", tool_input={"questions": [{"question": "Which VALUE?"}]},
+                 tool_response="Use VALUE = 3, please.")
         self.assertEqual([item["answer_text"] for item in self.engine.status(self.run_id)["human_events"]],
                          ["Use VALUE = 3, please."])
 
@@ -696,12 +704,12 @@ class HumanEvidenceTests(EngineFixture):
                          f"/devflow:resume {self.run_id}")
         with self.assertRaises(DevFlowError):
             self.engine.resolve(self.run_id, self.session, resume_event, "continue", "Resume is not an answer.")
-        # A stale implement session is neither denied nor recorded: its answer
-        # never reaches the run (no event, no hook context).
+        # A stale session's question is never recorded: neither the question
+        # (PreToolUse) nor its answer reaches the run (no event, no hook context).
         events_before = read_json(self.run / "state.json")["event_ids"]
-        self.assertIsNone(self.hook("PostToolUse", old_session, tool_name="AskUserQuestion", tool_use_id="stale-1",
-                                    tool_input={"questions": [{"question": "Continue with this exact version?"}]},
-                                    tool_response={"answers": {"Continue with this exact version?": "Yes"}}))
+        self.assertIsNone(self.ask(old_session, tool_use_id="stale-1",
+                                   tool_input={"questions": [{"question": "Continue with this exact version?"}]},
+                                   tool_response={"answers": {"Continue with this exact version?": "Yes"}}))
         self.assertEqual(read_json(self.run / "state.json")["event_ids"], events_before)
         event = self.answer("New owner confirms VALUE = 1 after seeing the question.")
         self.assertEqual([item["event_id"] for item in self.engine.status(self.run_id)["human_events"]], [event])
@@ -751,6 +759,23 @@ class HumanEvidenceTests(EngineFixture):
         self.assertFalse(result["report"]["all_reviewers_approved"])
         self.assertFinalReportSaved(result)
 
+    def test_the_final_report_lists_only_questions_the_model_prefilled(self):
+        self.start()
+        self.answer()  # An ordinary question: recorded at PreToolUse without answers.
+        prefilled = {"questions": [{"question": "Ship it?"}], "answers": {"Ship it?": "Yes"}}
+        self.hook("PreToolUse", None, tool_name="AskUserQuestion", tool_use_id="prefilled-1", tool_input=prefilled)
+        observed = [json.loads((self.run / "events" / f"{event_id}.json").read_text(encoding="utf-8"))
+                    for event_id in self.state()["event_ids"]]
+        events = {event["payload"].get("tool_use_id"): event["event_id"] for event in observed
+                  if event["kind"] == "observation"}
+        # A subagent's prefilled question is not the interview's.
+        self.hook("PreToolUse", None, tool_name="AskUserQuestion", tool_use_id="subagent-1", agent_id="agent-1",
+                  tool_input=prefilled)
+        self.assertEqual(self.engine.status(self.run_id)["prefilled_questions"], 1)
+        result = self.engine.cancel(self.run_id, self.session, "Stop here.")
+        self.assertEqual(result["report"]["prefilled_question_events"], [events["prefilled-1"]])
+        self.assertNotIn(events["question-1"], result["report"]["prefilled_question_events"])
+
     def test_cancel_is_saved_even_if_an_event_file_is_damaged(self):
         # Review finding: the final report lists prefilled questions; a damaged
         # event file is reported there instead of blocking the cancellation.
@@ -765,9 +790,9 @@ class HumanEvidenceTests(EngineFixture):
         self.assertFinalReportSaved(result)
         # Status is display only: it reports the unreadable events instead of failing.
         self.assertEqual(result["human_events"], [])
-        self.assertIsNone(result["observations"])
+        self.assertIsNone(result["prefilled_questions"])
         self.assertIn("Invalid human event record", result["events_error"])
-        self.assertIsNone(self.engine.status(self.run_id)["observations"])
+        self.assertIsNone(self.engine.status(self.run_id)["prefilled_questions"])
 
 
 class RecoveryAndIntegrityTests(EngineFixture):
@@ -818,8 +843,7 @@ class RecoveryAndIntegrityTests(EngineFixture):
         second = self.start()
         self.assertNotEqual(second["run_id"], first_id)
         other_session = "separate-session"
-        with self.assertRaisesRegex(DevFlowError, "unfinished"):
-            self.prompt(f"/devflow:resume {first_id}", other_session)
+        self.assertNotAccepted(f"/devflow:resume {first_id}", "unfinished", other_session)
         self.assertFalse(sessions.session_path(self.project, other_session).exists())
         self.assertEqual(read_json(sessions.session_path(self.project, self.session))["run"],
                          {"flow": "implement", "run_id": second["run_id"]})
@@ -834,8 +858,7 @@ class RecoveryAndIntegrityTests(EngineFixture):
         # session record moved away by a human); the run itself remains.
         sessions.session_path(self.project, self.session).unlink()
         identity = "another-start-session"
-        with self.assertRaisesRegex(DevFlowError, "unfinished"):
-            self.prompt(f'/devflow:implement "{self.plan}"', identity)
+        self.assertNotAccepted(f'/devflow:implement "{self.plan}"', "unfinished", identity)
         with self.assertRaises(DevFlowError):
             router.runner_start(self.project, identity, "implement", str(self.plan))
         self.assertEqual(self.runs(), [original_id])
@@ -975,8 +998,7 @@ class RecoveryAndIntegrityTests(EngineFixture):
         path.parent.mkdir()
         path.write_bytes(b"Conflicting bytes must be retained.")
         self.assertEqual(self.engine.status(self.run_id)["state_revision"], current["state_revision"])
-        with self.assertRaisesRegex(DevFlowError, "Divergent artifact"):
-            self.prompt(f"/devflow:resume {self.run_id}")
+        self.assertNotAccepted(f"/devflow:resume {self.run_id}", "Divergent artifact")
         with self.assertRaisesRegex(DevFlowError, "Divergent artifact"):
             self.engine.cancel(self.run_id, self.session, "Cancel cannot hide the conflict.")
         self.assertEqual(self.state(), current)
@@ -1003,14 +1025,14 @@ class RecoveryAndIntegrityTests(EngineFixture):
         self.assertEqual(self.engine.status(self.run_id)["state_revision"], current["state_revision"])
         with self.assertRaisesRegex(DevFlowError, "locked"):
             Engine(self.project, lock_wait=0.2).cancel(self.run_id, self.session, "Blocked by the lock.")
-        with patch("devflow_core.router.HOOK_WAIT", 0.2), self.assertRaisesRegex(DevFlowError, "locked"):
-            self.prompt(f"/devflow:resume {self.run_id}")
+        with patch("devflow_core.router.HOOK_WAIT", 0.2):
+            self.assertNotAccepted(f"/devflow:resume {self.run_id}", "locked")
         self.assertEqual(self.state(), current)
         self.assertTrue((self.run / "transaction.json").exists())
         self.assertTrue(lock.exists())
 
-    def test_source_edits_are_never_denied_but_invalidate_stale_results(self):
-        # Decision D1: implement never denies a tool. Changed code is detected
+    def test_source_edits_are_never_stopped_but_invalidate_stale_results(self):
+        # Decision D1: DevFlow does not stop any tool. Changed code is detected
         # by the snapshot hash instead, before and after every check and review.
         self.start()
         for path in (self.source, self.plan, self.run / "state.json", self.draft / "notes.md"):
@@ -1152,8 +1174,7 @@ class RecoveryAndIntegrityTests(EngineFixture):
         with self.run_checks_with(interrupted), self.assertRaises(KeyboardInterrupt):
             self.engine.check(self.run_id, self.session)
         self.assertEqual(self.state()["status"], "checking")
-        with self.assertRaisesRegex(DevFlowError, "may still be running"):
-            self.prompt(f"/devflow:resume {self.run_id}")
+        self.assertNotAccepted(f"/devflow:resume {self.run_id}", "may still be running")
         with self.assertRaisesRegex(DevFlowError, "child processes"):
             self.engine.cancel(self.run_id, self.session, "Cannot cancel while a check may run.")
         recovered = self.engine.recover(self.run_id, confirmed=True)
