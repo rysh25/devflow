@@ -26,13 +26,20 @@ RUN_REVIEW = "devflow_core.plan.engine.run_review"
 PREFLIGHT = "devflow_core.plan.engine.preflight"
 # What a successful local CLI probe returns; reviews never call a real CLI here.
 PROBE = {"kind": "fixture", "executable": "/fixture/reviewer", "cli_version": "fixture 1.0.0",
-         "protocol_version": None, "requested_model": "fixture", "requested_effort": "high",
-         "effective_model_attested": False}
+         "requested_model": "fixture", "requested_effort": "high", "effective_model_attested": False}
 LEGACY = "plan" + "flow"  # A pre-DevFlow name, assembled so no tracked file spells it.
 
 
 class InjectedCrash(RuntimeError):
     """A deterministic crash boundary, not an actual killed process."""
+
+
+ACTIVITY = {"tool_call_count": 3, "tool_calls": {"read": 2, "websearch": 1}, "other_events": {}}
+
+
+def adapter_result(value):
+    """What run_review returns: the validated review and what the reviewer did."""
+    return {"review": value, "activity": dict(ACTIVITY)}
 
 
 def review_value(verdict="pass", *, human=False, severity="medium"):
@@ -178,8 +185,8 @@ class EngineTests(unittest.TestCase):
 
     def submit(self, value):
         # Like the real run_review, return only what the workflow's validator accepts.
-        def reviewer(provider, packet, work_dir, schema, instructions, validate, probe):
-            return validate(value)
+        def reviewer(provider, packet, work_dir, schema, instructions, validate, probe, *, cwd):
+            return adapter_result(validate(value))
         with patch(RUN_REVIEW, side_effect=reviewer) as call:
             result = self.engine.review(self.run_id)
         self.assertEqual(call.call_count, 1)
@@ -199,7 +206,7 @@ class EngineTests(unittest.TestCase):
 
     def test_two_independent_passes_same_hash_complete(self):
         initial = self.ready()
-        with patch(RUN_REVIEW, side_effect=[review_value(), review_value()]) as call:
+        with patch(RUN_REVIEW, side_effect=[adapter_result(review_value()), adapter_result(review_value())]) as call:
             first = self.engine.review(self.run_id)
             second = self.engine.review(self.run_id)
         self.assertEqual(first["status"], "ready")
@@ -216,28 +223,63 @@ class EngineTests(unittest.TestCase):
         self.append("user", "PREVIOUS SESSION SECRET")
         initial = self.ready()
         captured = {}
-        def reviewer(provider, packet, work_dir, schema, instructions, validate, probe):
+        def reviewer(provider, packet, work_dir, schema, instructions, validate, probe, *, cwd):
             captured["packet"] = packet.read_text(encoding="utf-8")
             captured["work_dir"] = work_dir
-            return review_value()
+            captured["cwd"] = cwd
+            return adapter_result(review_value())
         with patch(RUN_REVIEW, side_effect=reviewer):
-            self.engine.review(self.run_id)
+            reviewed = self.engine.review(self.run_id)
         packet = captured["packet"]
         payload = json.loads(packet)
+        self.assertEqual(payload["schema_version"], 2)
         self.assertEqual(payload["original_request"]["raw_prompt"], self.raw_request)
         self.assertEqual(payload["interview_verbatim"]["messages"][-1]["content"], self.answer)
+        self.assertEqual(payload["decisions_and_constraints"]["summary"], read_json(self.run / "decisions.json")["summary"])
         self.assertEqual(payload["plan_sha256"], initial["plan_hash"])
+        self.assertEqual(payload["revision_history"], [])
+        self.assertEqual(payload["previous_reviews"], [])
         self.assertNotIn("PREVIOUS SESSION SECRET", packet)
-        # The reviewer works in this run's own review directory.
-        self.assertEqual(captured["work_dir"], self.run / "reviews" / "01")
+        # The reviewer reads the project itself: it starts there and the packet names it.
+        self.assertEqual(payload["project"], str(self.project))
+        self.assertEqual(captured["cwd"], self.project)
+        self.assertNotIn("repository_context", payload)
+        self.assertNotIn("source", payload)
+        # Its input, logs and raw output go to the process directory, as in implement;
+        # reviews/NN keeps the run's own records.
+        self.assertEqual(captured["work_dir"], self.run / "review-processes" / "01")
+        # Each round shows what the reviewer did.
+        self.assertEqual(reviewed["reviews"], [{"number": 1, "reviewer_id": "codex", "status": "succeeded",
+                                                "verdict": "pass", "plan_hash": initial["plan_hash"], **ACTIVITY}])
+        self.assertEqual(read_json(self.run / "reviews" / "01" / "review.json")["activity"], ACTIVITY)
+
+    def test_a_later_packet_carries_each_earlier_review_in_full(self):
+        """As in implement: the next reviewer sees each earlier round's findings and
+        evidence, not only how they were dispositioned."""
+        self.ready()
+        first = self.submit(review_value("changes_required"))
+        self.reflect(first)
+        captured = {}
+
+        def reviewer(provider, packet, work_dir, schema, instructions, validate, probe, *, cwd):
+            captured["packet"] = json.loads(packet.read_text(encoding="utf-8"))
+            return adapter_result(review_value())
+        with patch(RUN_REVIEW, side_effect=reviewer):
+            self.engine.review(self.run_id)
+        earlier = captured["packet"]["previous_reviews"]
+        self.assertEqual([(item["number"], item["reviewer_id"], item["status"]) for item in earlier],
+                         [(1, "codex", "succeeded")])
+        self.assertEqual(earlier[0]["plan_hash"], first["plan_hash"])
+        self.assertEqual(earlier[0]["review"], review_value("changes_required"))
+        self.assertEqual(captured["packet"]["revision_history"][0]["decisions"][0]["finding_id"], "F1")
 
     def test_packet_is_review_data_without_reviewer_instructions(self):
         self.ready()
         captured = {}
-        def reviewer(provider, packet, work_dir, schema, instructions, validate, probe):
+        def reviewer(provider, packet, work_dir, schema, instructions, validate, probe, *, cwd):
             captured.update(packet=packet.read_text(encoding="utf-8"), schema=schema,
                             instructions=instructions, validate=validate, probe=probe)
-            return review_value()
+            return adapter_result(review_value())
         with patch(RUN_REVIEW, side_effect=reviewer):
             self.engine.review(self.run_id)
         packet = captured["packet"]
@@ -257,9 +299,9 @@ class EngineTests(unittest.TestCase):
     def test_alternation_six_changed_last_revision_stops_unreviewed(self):
         self.ready()
         seen = []
-        def reviewer(provider, *args):
+        def reviewer(provider, *args, **kwargs):
             seen.append(provider["id"])
-            return review_value("changes_required")
+            return adapter_result(review_value("changes_required"))
         with patch(RUN_REVIEW, side_effect=reviewer) as call:
             for index in range(1, 7):
                 reviewed = self.engine.review(self.run_id)
@@ -306,7 +348,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(resumed["owner_session"], "second-session")
         with self.assertRaises(DevFlowError):
             self.engine.require_owner(self.run_id, self.session)
-        with patch(RUN_REVIEW, return_value=review_value()) as call:
+        with patch(RUN_REVIEW, return_value=adapter_result(review_value())) as call:
             next_state = self.engine.review(self.run_id)
         self.assertEqual(call.call_args.args[0]["id"], "opencode")
         self.assertEqual(next_state["review_count"], 2)
@@ -314,8 +356,8 @@ class EngineTests(unittest.TestCase):
 
     def test_reviewer_failure_keeps_other_passes_for_the_same_plan(self):
         initial = self.ready()
-        outcomes = [review_value(), ReviewerError("malformed opencode reply"),
-                    ReviewerError("malformed codex reply"), review_value()]
+        outcomes = [adapter_result(review_value()), ReviewerError("malformed opencode reply"),
+                    ReviewerError("malformed codex reply"), adapter_result(review_value())]
         with patch(RUN_REVIEW, side_effect=outcomes) as call:
             self.assertEqual(self.engine.review(self.run_id)["status"], "ready")
             self.assertEqual(self.engine.review(self.run_id)["status"], "paused_error")
@@ -359,7 +401,7 @@ class EngineTests(unittest.TestCase):
         after = self.engine.status(self.run_id)
         self.assertEqual((after["status"], after["review_count"], after["next_reviewer"]), ("ready", 0, "codex"))
         self.assertIsNone(after["inflight"])
-        with patch(RUN_REVIEW, return_value=review_value()) as call:
+        with patch(RUN_REVIEW, return_value=adapter_result(review_value())) as call:
             reviewed = self.engine.review(self.run_id)
         self.assertEqual(call.call_args.args[0]["id"], "codex")
         self.assertEqual(reviewed["review_count"], 1)
@@ -373,7 +415,7 @@ class EngineTests(unittest.TestCase):
 
     def test_sixth_failed_attempt_is_exhausted_not_retryable(self):
         self.ready()
-        with patch(RUN_REVIEW, return_value=review_value("changes_required")):
+        with patch(RUN_REVIEW, return_value=adapter_result(review_value("changes_required"))):
             for _ in range(5):
                 self.reflect(self.engine.review(self.run_id))
         with patch(RUN_REVIEW, side_effect=RuntimeError("sixth call failed")):
@@ -393,7 +435,7 @@ class EngineTests(unittest.TestCase):
         self.ready()
         (self.project / "devflow.config.json").write_text('{"max_reviews":2}', encoding="utf-8")
         self.assertEqual(self.engine.status(self.run_id)["config"]["max_reviews"], 6)
-        with patch(RUN_REVIEW, return_value=review_value("changes_required")):
+        with patch(RUN_REVIEW, return_value=adapter_result(review_value("changes_required"))):
             for _ in range(2):
                 self.reflect(self.engine.review(self.run_id))
         self.assertEqual(self.engine.status(self.run_id)["status"], "ready")
@@ -1155,7 +1197,7 @@ class EngineTests(unittest.TestCase):
             provider.assert_not_called()
         self.engine.recover(self.run_id, confirmed=True, expected_review=1)
         self.resume(self.session)
-        with patch(RUN_REVIEW, return_value=review_value()) as provider:
+        with patch(RUN_REVIEW, return_value=adapter_result(review_value())) as provider:
             next_review = self.engine.review(self.run_id)
         self.assertEqual(next_review["review_count"], 2)
         self.assertEqual(provider.call_args.args[0]["id"], "opencode")
@@ -1183,7 +1225,7 @@ class EngineTests(unittest.TestCase):
         self.ready()
         newer_state = {}
         calls = []
-        def reviewer(provider, *args):
+        def reviewer(provider, *args, **kwargs):
             calls.append(provider["id"])
             if len(calls) == 2:
                 # A separate newer dispatch is now durably reserved. It remains
@@ -1242,11 +1284,11 @@ class EngineTests(unittest.TestCase):
     def test_stale_success_after_recover_is_kept_late_without_changing_state(self):
         self.ready()
         after_recover = {}
-        def reviewer(provider, *args):
+        def reviewer(provider, *args, **kwargs):
             # A human confirmed the process stopped, but its result still arrives.
             self.engine.recover(self.run_id, confirmed=True, expected_review=1)
             after_recover.update(read_json(self.run / "state.json"))
-            return review_value()
+            return adapter_result(review_value())
         with patch(RUN_REVIEW, side_effect=reviewer):
             with self.assertRaisesRegex(DevFlowError, "stale review"):
                 self.engine.review(self.run_id)
@@ -1260,7 +1302,7 @@ class EngineTests(unittest.TestCase):
         late = list((self.run / "late").glob("review-001-*.json"))
         self.assertEqual(len(late), 1)
         value = read_json(late[0])
-        self.assertEqual(value["result"], review_value())
+        self.assertEqual(value["result"], adapter_result(review_value()))
         self.assertIsNone(value["error"])
         self.assertEqual(value["reservation"]["reviewer_id"], "codex")
 

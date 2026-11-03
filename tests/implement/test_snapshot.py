@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from devflow_core.implement.snapshot import capture, compare, path_in_scope, validate_relative
+from devflow_core.implement.snapshot import capture, change_list, compare, diff_text, path_in_scope, validate_relative
 from devflow_core.implement import snapshot as snapshot_module
 from devflow_core.common.errors import DevFlowError
 
@@ -80,7 +80,8 @@ class SnapshotTests(unittest.TestCase):
         self.assertIsNone(current["files"]["image.png"]["text"])
         delta = compare(baseline, current)
         self.assertEqual(delta["binary_changes"], ["image.png"])
-        self.assertIsNone(delta["changed_files"][0]["diff"])
+        self.assertEqual(delta["changed_files"][0]["diff"],
+                         "diff --git a/image.png b/image.png\nBinary files a/image.png and b/image.png differ\n")
 
     def test_missing_final_newline_is_explicit_in_diff(self):
         self.write("app.txt", "old")
@@ -88,6 +89,68 @@ class SnapshotTests(unittest.TestCase):
         self.write("app.txt", "new")
         delta = compare(baseline, self.snapshot())
         self.assertIn("-old\n\\ No newline at end of file\n+new\n", delta["changed_files"][0]["diff"])
+
+    def test_diff_file_headers_match_git_for_every_kind_of_change(self):
+        """Every change appears with Git's header lines, even when its body is empty."""
+        self.init_git()
+        self.write("modified.txt", "old\n")
+        self.write("emptied-later.txt", "")
+        self.write("image.bin", b"\x89PNG\0a")
+        self.write("tool.sh", "echo hi\n")
+        self.write("removed.txt", "bye\n")
+        self.commit_all()
+        config = {"snapshot": {"mode": "git"}}
+        baseline = capture(self.project, config)
+        self.write("modified.txt", "new\n")
+        self.write("added-empty.txt", "")
+        self.write("added.txt", "hello\n")
+        (self.project / "emptied-later.txt").unlink()
+        self.write("image.bin", b"\x89PNG\0b")
+        (self.project / "removed.txt").unlink()
+        modes = os.name != "nt"
+        if modes:
+            (self.project / "tool.sh").chmod(0o755)
+        delta = compare(baseline, capture(self.project, config))
+        ours = diff_text(delta)
+        self.git("add", "--all")
+        theirs = self.git("-c", "core.quotepath=false", "diff", "--cached", "--no-renames", "--no-color") + "\n"
+        heads = ("diff --git ", "new file mode ", "deleted file mode ", "old mode ", "new mode ", "--- ", "+++ ",
+                 "Binary files ", "@@ ", "+", "-", " ")
+
+        def headers(text):
+            return [line for line in text.splitlines() if line.startswith(heads) and not line.startswith("index ")]
+
+        self.assertEqual(headers(ours), headers(theirs))
+        for line in ("diff --git a/added-empty.txt b/added-empty.txt\nnew file mode 100644\n",
+                     "diff --git a/emptied-later.txt b/emptied-later.txt\ndeleted file mode 100644\n",
+                     "Binary files a/image.bin and b/image.bin differ\n", "--- /dev/null\n+++ b/added.txt\n",
+                     "--- a/removed.txt\n+++ /dev/null\n"):
+            self.assertIn(line, ours)
+        if modes:
+            self.assertIn("diff --git a/tool.sh b/tool.sh\nold mode 100644\nnew mode 100755\n", ours)
+        # The change list names each change without its contents.
+        listed = {item["path"]: item for item in change_list(delta)}
+        self.assertEqual(listed["added.txt"], {"path": "added.txt", "change": "added", "binary": False, "before": None,
+                                               "after": {"mode": "100644", "size": 6, "sha256": listed["added.txt"]["after"]["sha256"]}})
+        self.assertTrue(listed["image.bin"]["binary"])
+        self.assertNotIn("hello", repr(change_list(delta)))
+
+    def test_diff_file_starts_at_the_baseline_and_stays_in_scope(self):
+        self.init_git()
+        self.write("app.py", "VALUE = 0\n")
+        self.commit_all()
+        self.write("app.py", "VALUE = 'before the run'\n")  # An uncommitted change made before the run.
+        config = {"snapshot": {"mode": "git", "exclude": ["notes/"]}}
+        baseline = capture(self.project, config)
+        self.write("app.py", "VALUE = 1\n")
+        self.write(".env", "TOKEN=secret\n")
+        self.write("notes/private.txt", "excluded\n")
+        ours = diff_text(compare(baseline, capture(self.project, config)))
+        self.assertIn("-VALUE = 'before the run'\n+VALUE = 1\n", ours)
+        self.assertNotIn("VALUE = 0", ours)
+        self.assertNotIn(".env", ours)
+        self.assertNotIn("TOKEN", ours)
+        self.assertNotIn("private.txt", ours)
 
     def test_concurrent_change_detected_before_snapshot_finishes(self):
         self.write("a.txt", "before")
@@ -140,7 +203,7 @@ class SnapshotTests(unittest.TestCase):
         for path in (".git/config", ".devflow/state", "sub/.DEVFLOW/state", "devflow.config.json", "sub/DEVFLOW.CONFIG.JSON", "SUB/.ENV.local", "src/secrets/passwords.json"):
             self.assertFalse(path_in_scope(path, {"include": ["**"], "exclude": []}))
 
-    def test_context_file_requires_captured_scope(self):
+    def test_context_paths_must_be_in_the_captured_scope(self):
         self.write("app.py", "pass")
         with self.assertRaises(DevFlowError):
             self.snapshot(context_paths=["missing.py"])

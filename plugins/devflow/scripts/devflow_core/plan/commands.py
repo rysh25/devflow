@@ -11,16 +11,17 @@ def doctor(engine, args, run_id, session) -> dict:
     frozen = engine.read_frozen_config(run_id) if run_id else None
     report = diagnose(engine.project, engine.workflow, effective_config=frozen)
     errors = python_errors()
-    return {**report, "run_id": run_id or None, "warnings": engine.workflow.timeout_warnings(report["config"]),
-            "errors": errors, "ready": report["ready"] and not errors}
+    warnings = engine.workflow.doctor(engine.project, report["config"])["warnings"]
+    return {**report, "run_id": run_id or None, "warnings": warnings, "errors": errors,
+            "ready": report["ready"] and not errors}
 
 
 COMMANDS = (
     Command("status", "Inspect the bound or named plan run", lambda e, a, run, s: e.status(run), needs_owner=False),
     Command("doctor", "Offline config/PATH checks only; no model calls", doctor, needs_run=False, needs_owner=False),
     Command("seal", "Freeze the verbatim interview and human decisions",
-            lambda e, a, run, s: e.seal(run, a.decisions_file, a.context_file),
-            (Option("--decisions-file", "draft"), Option("--context-file", "draft", required=False))),
+            lambda e, a, run, s: e.seal(run, a.decisions_file),
+            (Option("--decisions-file", "draft"),)),
     Command("plan", "Commit the initial plan from the draft directory",
             lambda e, a, run, s: e.plan(run, a.file), (Option("--file", "draft"),)),
     Command("review", "Dispatch exactly the next reviewer and reserve one attempt",

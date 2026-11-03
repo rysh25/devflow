@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 
+from ..common.environment import GIT_FACT_SECONDS
 from ..common.errors import DevFlowError
 from ..common.git import git_environment, git_executable, run_git
 from ..common.paths import msys_path, same_path
@@ -133,3 +134,11 @@ def verify_workspace(project: Path, frozen: dict, mode: str) -> Path:
     if frozen["identity"] is not None and identity(path) != frozen["identity"]:
         raise DevFlowError("The implementation workspace was removed and recreated since start; start a new run")
     return path
+
+
+def branch(path: Path, mode: str) -> str | None:
+    """The workspace's current branch, or None when detached or in files mode."""
+    if mode == "files":
+        return None
+    raw = run_git(path, "symbolic-ref", "--quiet", "--short", "HEAD", ok_codes=(0, 1), timeout=GIT_FACT_SECONDS)
+    return raw.decode("utf-8", "replace").strip() or None

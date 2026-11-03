@@ -153,21 +153,37 @@ class DistributionTests(unittest.TestCase):
             package.validate(cloned)
 
     def test_removed_mechanisms_leave_no_names_in_the_plugin_code(self):
-        # The tool limits and their helpers were removed in 0.4.0; none of their
-        # names may remain in the plugin's code, skills or references. Code
-        # names are matched as whole words; ``deny(`` and ``onFailure`` literally.
+        # The tool limits, the reviewer isolation and their helpers were removed in
+        # 0.4.0; none of their names may remain in the plugin's code, skills or
+        # references. Code names are matched as whole words, flags and the other
+        # literals as written.
         words = ("guard", "allowlist", "ShellPolicy", "ShellPolicyError", "shell_tokens", "split_words",
                  "powershell_tokens", "check_command", "restricts_tools", "allow_tool", "check_write",
                  "NON_WRITING_TOOLS", "PROTECTED_WRITE_NAMES", "GuardError", "permissionDecision", "SubagentHandback",
-                 "SKILL_NAME", "name_key", "CLAUDE_KINDS", "HUMAN_KINDS", "READ_ONLY_COMMANDS", "human_actions")
-        pattern = re.compile(r"\b(?:" + "|".join(map(re.escape, words)) + r")\b|deny\(|onFailure")
+                 "SKILL_NAME", "name_key", "CLAUDE_KINDS", "HUMAN_KINDS", "READ_ONLY_COMMANDS", "human_actions",
+                 # Reviewer isolation, its settings and the packet's file contents (stage 6).
+                 "protocol_version", "OPENCODE_PROTOCOL", "PROTOCOL_ONE_MESSAGE", "with_web_default", "web_enabled",
+                 "OPENCODE_WEB_TOOLS", "CODEX_DUPLICATE_ID_ITEMS", "web_search", "runtime_config", "_agent_id",
+                 "system_prompt", "SYSTEM_PACKET_ONLY", "SYSTEM_WITH_WEB", "_program", "SHELLS", "mcp_servers",
+                 "external_directory", "repository_context", "context_files", "file_manifest", "context_file",
+                 "new_session", "kill_group", "extra_env", "project_doc_max_bytes", "OPENCODE_PROJECT_OFF",
+                 "OPENCODE_DISABLE_PROJECT_CONFIG", "OPENCODE_CONFIG_PROJECT_DISABLE", "OPENCODE_DISABLE_CLAUDE_CODE",
+                 # Claude Code's foreground Bash limit, which background runs do not depend on.
+                 "bash_limit", "limit_warnings", "timeout_warnings", "bash_needs", "LIMIT_WARNING",
+                 "BASH_MAX_DEFAULT_MS", "BASH_DEFAULT_DEFAULT_MS")
+        literals = ("deny(", "onFailure", "--strict-config", "--ignore-user-config", "--ignore-rules", "--ephemeral",
+                    "--sandbox", "--yolo", "--dangerously", "--context-file", "context.md", "read-only")
+        names = re.compile(r"\b(?:" + "|".join(map(re.escape, words)) + r")\b")
+        # Wording is matched in any case ("Read-only" too).
+        texts = re.compile("|".join(map(re.escape, literals)), re.IGNORECASE)
         plugin = ROOT / "plugins" / "devflow"
         self.assertFalse((plugin / "scripts" / "devflow_core" / "common" / "guard.py").exists())
         self.assertFalse((plugin / "scripts" / "devflow_core" / "common" / "shell.py").exists())
         for path in sorted(plugin.rglob("*")):
             if path.is_file() and path.suffix in {".py", ".md", ".json"} and "__pycache__" not in path.parts:
                 with self.subTest(path=str(path.relative_to(ROOT))):
-                    self.assertEqual(pattern.findall(path.read_text(encoding="utf-8")), [])
+                    text = path.read_text(encoding="utf-8")
+                    self.assertEqual(names.findall(text) + texts.findall(text), [])
 
     def test_hooks_that_block_or_run_for_every_tool_are_rejected(self):
         # Hooks only record and add context: they never block, and the tool hooks

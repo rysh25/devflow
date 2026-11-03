@@ -46,19 +46,27 @@ def write_json(path: Path, value):
     path.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
 
 
-def review_pass(provider, packet_path, *_):
-    packet = json.loads(Path(packet_path).read_text(encoding="utf-8"))
-    return {"schema_version": 1, "snapshot_id": packet["snapshot_id"], "verdict": "pass",
-            "summary": "Synthetic review: no unresolved findings.", "findings": [], "questions": []}
+ACTIVITY = {"tool_call_count": 1, "tool_calls": {"read": 1}, "other_events": {}}
 
 
-def review_changes(provider, packet_path, *_):
+def adapter_result(review):
+    """What run_review returns: the validated review and what the reviewer did."""
+    return {"review": review, "activity": dict(ACTIVITY)}
+
+
+def review_pass(provider, packet_path, *_, **__):
     packet = json.loads(Path(packet_path).read_text(encoding="utf-8"))
-    return {"schema_version": 1, "snapshot_id": packet["snapshot_id"], "verdict": "changes_required",
+    return adapter_result({"schema_version": 1, "snapshot_id": packet["snapshot_id"], "verdict": "pass",
+                           "summary": "Synthetic review: no unresolved findings.", "findings": [], "questions": []})
+
+
+def review_changes(provider, packet_path, *_, **__):
+    packet = json.loads(Path(packet_path).read_text(encoding="utf-8"))
+    return adapter_result({"schema_version": 1, "snapshot_id": packet["snapshot_id"], "verdict": "changes_required",
             "summary": "Synthetic review: one fix needed.", "questions": [],
             "findings": [{"id": "F1", "severity": "medium", "category": "correctness", "file": "feature.py",
                           "line_start": 1, "line_end": 1, "evidence": "VALUE is wrong.",
-                          "recommendation": "Fix VALUE.", "requires_human": False}]}
+                          "recommendation": "Fix VALUE.", "requires_human": False}]})
 
 
 class BundleContractTests(unittest.TestCase):
@@ -264,7 +272,7 @@ class FlowFixture(unittest.TestCase):
         plan.write_text("# Feature\nImplement a pure function. Preserve its API. Add a regression test.\n", encoding="utf-8")
         self.plan_engine.plan(run_id, plan)
         reviewed = {"schema_version": 1, "verdict": "pass", "summary": "Synthetic planning review passed.", "findings": [], "questions": []}
-        with patch("devflow_core.plan.engine.run_review", return_value=reviewed):
+        with patch("devflow_core.plan.engine.run_review", return_value=adapter_result(reviewed)):
             self.plan_engine.review(run_id)
             state = self.plan_engine.review(run_id)
         self.assertEqual(state["status"], "completed")
@@ -307,12 +315,12 @@ class HookCliEngineTests(FlowFixture):
         packets = []
         providers = []
 
-        def review_with_one_correction(provider, packet_path, *args):
+        def review_with_one_correction(provider, packet_path, *args, **kwargs):
             packets.append(read_json(Path(packet_path)))
             providers.append(provider["id"])
             review = review_pass(provider, packet_path, *args)
             if len(providers) == 1:
-                review.update(verdict="changes_required", findings=[{
+                review["review"].update(verdict="changes_required", findings=[{
                     "id": "F1", "severity": "high", "category": "correctness", "file": "feature.py",
                     "line_start": 1, "line_end": 1, "evidence": "The synthetic value needs correction.",
                     "recommendation": "Correct the value and rerun the configured regression check.", "requires_human": False,
@@ -477,6 +485,25 @@ class WorkflowIndependenceTests(FlowFixture):
         self.assertIsNone(hook(payload, PLUGIN))
         self.assertFalse((self.project / ".devflow" / "runs" / "plan").exists())
 
+    def test_a_background_reviews_completion_notice_releases_the_binding_but_run_actions_still_work(self):
+        """The last review ran in the background; its completion notice arrives as a prompt
+        and releases the finished run, so later actions name it with --run."""
+        plan_run, _ = self.plan_complete()
+        self.submit("<task-notification><task-id>b1</task-id><status>completed</status></task-notification>")
+        self.assertIsNone((self.record() or {}).get("run"))
+
+        def plan(action, *selector, expect=0):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                result = cli.main(["--project", str(self.project), "--session", self.session, *selector, "plan", action])
+            self.assertEqual(result, expect, stdout.getvalue() + stderr.getvalue())
+            return json.loads(stdout.getvalue())
+
+        self.assertIn("No plan run is bound", plan("publish", expect=2)["message"])
+        published = plan("publish", "--run", plan_run)
+        self.assertEqual(published["publication"]["status"], "published")
+        self.assertTrue(plan("report", "--run", plan_run)["converged"])
+
     def test_completed_plan_next_prompt_starts_independent_implementation(self):
         plan_run, plan_file = self.plan_complete()
         # The finished plan stays bound until the next real prompt, which
@@ -495,16 +522,11 @@ class WorkflowIndependenceTests(FlowFixture):
 
 
 
-def without_bash_settings(**values):
-    """os.environ without Claude Code's Bash settings, plus ``values``."""
-    env = {key: value for key, value in os.environ.items() if not key.startswith("BASH_")}
-    env.update(values)
-    return patch.dict(os.environ, env, clear=True)
-
-
 class BashTimeoutTests(FlowFixture):
-    """Every runner result and the status context carry the Bash timeout the
-    next long actions need; DevFlow warns when Claude Code's limit is shorter."""
+    """Every runner result and the status context carry the timeout the next long
+    actions need. When it is larger than Claude Code's foreground limit
+    (BASH_MAX_TIMEOUT_MS), Claude runs the call in the background with that
+    timeout, so DevFlow does not check that limit."""
 
     def setUp(self):
         super().setUp()
@@ -516,29 +538,26 @@ class BashTimeoutTests(FlowFixture):
         write_json(self.project / "devflow.config.json", {"schema_version": 1, "implement": self.config})
 
     def test_results_follow_the_next_reviewer_and_drop_finished_actions(self):
-        with without_bash_settings(BASH_MAX_TIMEOUT_MS="2000000"):
-            started = self.start()
-        self.assertEqual(started["bash_timeout_ms"], {"review": 360000, "check": 70000})
+        started = self.start()
+        self.assertEqual(started["bash_timeout_ms"], {"review": 400000, "check": 70000})
         self.assertNotIn("warnings", started)
-        self.assertIs(read_json(Path(started["run_dir"]) / "config.json")["reviewers"][0]["web"], True)
         self.edit(self.source, "VALUE = 2\n")
         self.checkpoint()
-        self.assertEqual(self.invoke("check")["bash_timeout_ms"]["review"], 360000)
+        self.assertEqual(self.invoke("check")["bash_timeout_ms"]["review"], 400000)
         with patch("devflow_core.implement.engine.run_review", side_effect=review_pass):
             first = self.invoke("review")
         # Same turn, next reviewer: the value changes with it.
-        self.assertEqual(first["bash_timeout_ms"], {"review": 960000, "check": 70000})
+        self.assertEqual(first["bash_timeout_ms"], {"review": 1000000, "check": 70000})
         self.assertEqual(self.invoke("status")["bash_timeout_ms"], first["bash_timeout_ms"])
         context = self.submit("continue")["hookSpecificOutput"]["additionalContext"]
-        self.assertIn('"bash_timeout_ms": {"review": 960000, "check": 70000}', context)
+        self.assertIn('"bash_timeout_ms": {"review": 1000000, "check": 70000}', context)
         with patch("devflow_core.implement.engine.run_review", side_effect=review_changes):
             second = self.invoke("review")
         self.assertEqual(second["status"], "needs_revision")
-        self.assertEqual(second["bash_timeout_ms"], {"review": 360000, "check": 70000})  # codex is next again
+        self.assertEqual(second["bash_timeout_ms"], {"review": 400000, "check": 70000})  # codex is next again
 
     def test_a_finished_run_has_no_review_or_check_timeout(self):
-        with without_bash_settings(BASH_MAX_TIMEOUT_MS="2000000"):
-            self.start()
+        self.start()
         self.edit(self.source, "VALUE = 2\n")
         self.checkpoint()
         self.invoke("check")
@@ -551,37 +570,31 @@ class BashTimeoutTests(FlowFixture):
     def test_no_check_timeout_without_checks_and_nothing_once_finished(self):
         self.config["checks"] = []
         write_json(self.project / "devflow.config.json", {"schema_version": 1, "implement": self.config})
-        with without_bash_settings(BASH_MAX_TIMEOUT_MS="2000000"):
-            started = self.start()
-        self.assertEqual(started["bash_timeout_ms"], {"review": 360000})
+        started = self.start()
+        self.assertEqual(started["bash_timeout_ms"], {"review": 400000})
         state = read_json(Path(started["run_dir"]) / "state.json")
         for status in ("completed", "exhausted", "cancelled"):
             with self.subTest(status=status):
                 self.assertEqual(WORKFLOWS["implement"].bash_timeouts(dict(state, status=status)), {})
 
-    def test_limit_warnings_in_doctor_and_start(self):
-        warning = "is shorter than DevFlow needs for review (960000 ms)"
-        for env, warned in (({}, True), ({"BASH_MAX_TIMEOUT_MS": "960000"}, False),
-                            ({"BASH_DEFAULT_TIMEOUT_MS": "1800000"}, False),
-                            ({"BASH_MAX_TIMEOUT_MS": "700000", "BASH_DEFAULT_TIMEOUT_MS": "650000"}, True)):
-            with self.subTest(env=env), without_bash_settings(**env):
+    def test_doctor_and_start_do_not_depend_on_claude_codes_bash_limit(self):
+        for env in ({}, {"BASH_MAX_TIMEOUT_MS": "60000"}, {"BASH_MAX_TIMEOUT_MS": "700000", "BASH_DEFAULT_TIMEOUT_MS": "650000"}):
+            with self.subTest(env=env), patch.dict(os.environ, env):
                 doctor = self.invoke("doctor", run=False)
-                self.assertEqual(any(warning in item for item in doctor["warnings"]), warned, doctor["warnings"])
-                overall = cli.doctor(self.project)
-                self.assertEqual(any(warning in item for item in overall["warnings"]), warned)
-                if env.get("BASH_DEFAULT_TIMEOUT_MS") == "650000":
-                    self.assertTrue(any("BASH_MAX_TIMEOUT_MS=700000 and BASH_DEFAULT_TIMEOUT_MS=650000" in item
-                                        for item in doctor["warnings"]))
-        with without_bash_settings():
+                self.assertFalse([item for item in doctor["warnings"] if "BASH_" in item], doctor["warnings"])
+                self.assertFalse([item for item in cli.doctor(self.project)["warnings"] if "BASH_" in item])
+        with patch.dict(os.environ, {"BASH_MAX_TIMEOUT_MS": "60000"}):
             started = self.start()
-        self.assertTrue(any(warning in item for item in started["warnings"]))
+        self.assertNotIn("warnings", started)
+        self.assertEqual(started["bash_timeout_ms"]["review"], 400000)
 
-    def test_plan_start_context_warns_and_finished_plan_has_no_review_timeout(self):
-        with without_bash_settings():
-            context = hook(self.event(prompt="/devflow:plan Make a tested pure function."), PLUGIN)
+    def test_plan_start_context_gives_the_review_timeout_and_finished_plan_has_none(self):
+        context = hook(self.event(prompt="/devflow:plan Make a tested pure function."), PLUGIN)
         text = context["hookSpecificOutput"]["additionalContext"]
-        self.assertIn('"bash_timeout_ms": {"review": 960000}', text)
-        self.assertIn("is shorter than DevFlow needs for review (960000 ms)", text)
+        self.assertIn('"bash_timeout_ms": {"review": 1000000}', text)
+        self.assertIn("pass bash_timeout_ms as the Bash timeout, unchanged", text)
+        self.assertIn("run the call in the background with that timeout", text)
+        self.assertNotIn("shorter than", text)
         run_id = self.record()["run"]["run_id"]
         state = read_json(self.plan_engine.store.run_dir(run_id) / "state.json")
         for status, count in (("completed", 2), ("exhausted", 6), ("ready", 6)):

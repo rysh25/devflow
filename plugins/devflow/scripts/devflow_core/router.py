@@ -114,11 +114,9 @@ def _settle(project: Path, record: dict, all_stores: dict[str, RunStore]) -> dic
     return record
 
 
-def _context(event: str, flow: str, state: dict, store: RunStore, plugin_root: Path, event_id: str | None,
-             warnings: list[str] | None = None) -> dict:
+def _context(event: str, flow: str, state: dict, store: RunStore, plugin_root: Path, event_id: str | None) -> dict:
     run_dir = store.run_dir(state["run_id"])
-    return notices.context(event, notices.status_context(WORKFLOWS[flow], state, run_dir, plugin_root, event_id,
-                                                         warnings))
+    return notices.context(event, notices.status_context(WORKFLOWS[flow], state, run_dir, plugin_root, event_id))
 
 
 def _inactive_reason(current: sessions.Binding) -> str:
@@ -154,8 +152,7 @@ def _start(project: Path, session: str, flow: str, argument: str, payload: dict,
         sessions.write_record(project, dict(record, pending_start=None), WORKFLOWS)
         raise
     sessions.write_record(project, _bound(record, flow, state["run_id"]), WORKFLOWS)
-    return _context("UserPromptSubmit", flow, state, all_stores[flow], plugin_root, pending["event"]["event_id"],
-                    workflow.timeout_warnings(workflow.frozen_config(state)))
+    return _context("UserPromptSubmit", flow, state, all_stores[flow], plugin_root, pending["event"]["event_id"])
 
 
 def _resume(project: Path, session: str, argument: str, payload: dict, record: dict,
@@ -198,9 +195,7 @@ def runner_start(project: Path, session: str | None, flow: str, raw: str, option
         assert_available(project, session, all_stores)
         state = _create(project, session, pending, all_stores, options)
         sessions.write_record(project, _bound(record, flow, state["run_id"]), WORKFLOWS)
-    result = workflow.engine(project).status(state["run_id"])
-    warnings = workflow.timeout_warnings(workflow.frozen_config(state))
-    return {**result, "warnings": warnings} if warnings else result
+    return workflow.engine(project).status(state["run_id"])
 
 
 def selected_run(project: Path, session: str | None, flow: str, explicit: str | None) -> str | None:
@@ -368,7 +363,7 @@ def _overview(project: Path, all_stores: dict[str, RunStore], session: str | Non
 
 
 def status(project: Path, session: str | None, run_id: str | None) -> dict:
-    """Read-only: never creates, repairs or releases anything."""
+    """Changes nothing: never creates, repairs or releases anything."""
     all_stores = stores(project)
     if run_id:
         flow, info = resolve_run(project, run_id, all_stores)
@@ -400,7 +395,7 @@ def status(project: Path, session: str | None, run_id: str | None) -> dict:
 
 
 def blocking_warnings(project: Path) -> list[str]:
-    """What would stop a start, for doctor; read-only."""
+    """What would stop a start, for doctor; changes nothing."""
     if not data_root(project).exists():
         return []
     overview = _overview(project, stores(project))

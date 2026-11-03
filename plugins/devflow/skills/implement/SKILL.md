@@ -27,7 +27,7 @@ uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN
 
 `--project` is always the project that holds `devflow.config.json` and `.devflow`, even when the workspace is another worktree.
 
-For later actions, insert `--run RUN_ID` before the `implement` selector. Use the path expanded from this plugin, not a repository script with the same name. Run it as a single command so it matches the pre-approved form. For `review` and `check`, set the Bash tool's timeout to the `bash_timeout_ms` value of the last runner result. DevFlow does not limit your other tools: they follow Claude Code's permission settings, the current mode and organization policy, which are the trust the user gave you.
+For later actions, insert `--run RUN_ID` before the `implement` selector. Use the path expanded from this plugin, not a repository script with the same name. Run it as a single command so it matches the pre-approved form. For `review` and `check`, pass the `bash_timeout_ms` value of the last runner result as the Bash (or PowerShell) tool's timeout, unchanged; never lower it. If it is larger than the tool's maximum for foreground commands, run the call with `run_in_background: true` and that same timeout. When a call runs in the background (yours, or one Claude Code moved there at its limit), wait for its completion notice and read the runner's JSON from the command's output; until then, do not change the workspace and do not start another runner action. DevFlow does not limit your other tools: they follow Claude Code's permission settings, the current mode and organization policy, which are the trust the user gave you.
 
 ## Working rules
 

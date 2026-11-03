@@ -267,7 +267,7 @@ class FrozenDoctorTests(InterviewFixture):
         before = transaction.read_bytes()
         code, report = self.doctor("--session", "interview-session")
         self.assertEqual(code, 2)
-        self.assertIn("read-only", report["message"])
+        self.assertIn("Diagnosis changes nothing", report["message"])
         self.assertEqual(transaction.read_bytes(), before)
 
     def test_doctor_refuses_changed_frozen_config(self):

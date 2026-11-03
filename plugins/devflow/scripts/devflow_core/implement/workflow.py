@@ -159,14 +159,7 @@ class ImplementWorkflow(Workflow):
 
     def doctor(self, project: Path, config: dict) -> dict:
         return {"warnings": ([] if config["checks"] else
-                             ["No implementation checks configured; every revised snapshot requires actual human validation"])
-                + self.timeout_warnings(config)}
-
-    def bash_needs(self, config: dict) -> dict[str, int]:
-        value = super().bash_needs(config)
-        if config["checks"]:
-            value["check"] = _checks_timeout_ms(config)
-        return value
+                             ["No implementation checks configured; every revised snapshot requires actual human validation"])}
 
     def bash_timeouts(self, state: dict) -> dict[str, int]:
         value = super().bash_timeouts(state)

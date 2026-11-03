@@ -33,13 +33,31 @@ class Engine(RunEngine):
         result["current_plan"] = str(run / state["current_plan"]) if state["current_plan"] else None
         if state["last_review"]:
             result["review"] = read_json(run / state["last_review"])
+        result["reviews"] = self._reviews(state)
+
+    def _reviews(self, state: dict) -> list[dict]:
+        """Each review round: its reviewer, outcome and, when it succeeded, its tool calls."""
+        run, config, entries = self._run(state["run_id"]), state["config"], []
+        for number in range(1, state["review_count"] + 1):
+            base = f"reviews/{number:02d}"
+            entry = {"number": number, "reviewer_id": next_reviewer(config["reviewers"], number - 1, config["max_reviews"])["id"]}
+            if f"{base}/review.json" in state["artifacts"]:
+                wrapper = read_json(run / base / "review.json")
+                entry.update(status="succeeded", verdict=wrapper["result"]["verdict"], plan_hash=wrapper["plan_hash"],
+                             **wrapper["activity"])
+            elif f"{base}/error.json" in state["artifacts"] or f"{base}/recovery.json" in state["artifacts"]:
+                entry["status"] = "failed"
+            else:
+                entry["status"] = "reviewing"
+            entries.append(entry)
+        return entries
 
     def _draft(self, run_id: str, path: Path) -> Path:
         if not path.is_absolute():
             path = self.project / path
         return within(path, self._run(run_id) / "draft")
 
-    def seal(self, run_id: str, decisions_file: Path, context_file: Path | None = None) -> dict:
+    def seal(self, run_id: str, decisions_file: Path) -> dict:
         with self._lock(run_id):
             state = self._state(run_id)
             self._verify(state)
@@ -60,11 +78,8 @@ class Engine(RunEngine):
                 raise DevFlowError(f"Cannot certify complete interview capture: {exc}. Do not replace it with a summary.") from exc
             if interview.get("coverage", {}).get("human_response_count", 0) < 1:
                 raise DevFlowError("At least one recorded human answer is required after the original request.")
-            context = checked_text(self._draft(run_id, context_file)) if context_file else None
             self._artifact(state, "interview.json", json_bytes(interview))
             self._artifact(state, "decisions.json", json_bytes(decisions))
-            if context is not None:
-                self._artifact(state, "context.md", context.encode("utf-8"))
             state["status"] = "planning"
             self._save(state)
         return self.status(run_id)
@@ -92,18 +107,25 @@ class Engine(RunEngine):
         return self.status(run_id)
 
     def _packet(self, state: dict, number: int, provider: dict) -> bytes:
+        """Review data only: the reviewer reads the project itself, from its path."""
         run = self._run(state["run_id"])
         data = {
-            "schema_version": 1, "run_id": state["run_id"], "review_number": number,
+            "schema_version": 2, "run_id": state["run_id"], "review_number": number,
             "reviewer": {k: provider[k] for k in ("id", "model", "effort")},
+            "project": str(self.project),
             "plan_sha256": state["plan_hash"],
             "original_request": read_json(run / "request.json"),
             "interview_verbatim": read_json(run / "interview.json"),
             "decisions_and_constraints": read_json(run / "decisions.json"),
             "plan_markdown": checked_text(run / state["current_plan"]),
-            "revision_history": [], "human_resolutions": [],
-            "repository_context": checked_text(run / "context.md") if "context.md" in state["artifacts"] else None,
+            "previous_reviews": [], "revision_history": [], "human_resolutions": [],
         }
+        for entry in self._reviews(state):
+            # Each earlier round in full, as in implement: the findings, their evidence and the verdict.
+            relative = f"reviews/{entry['number']:02d}/review.json"
+            review = read_json(run / relative)["result"] if relative in state["artifacts"] else None
+            data["previous_reviews"].append({**{key: entry[key] for key in ("number", "reviewer_id", "status")},
+                                             "plan_hash": entry.get("plan_hash"), "review": review})
         for relative in sorted(state["artifacts"]):
             if re.fullmatch(r"reviews/\d{2}/reflection.json", relative):
                 data["revision_history"].append(read_json(run / relative))
@@ -135,20 +157,24 @@ class Engine(RunEngine):
             relative_dir = f"reviews/{number:02d}"
             packet_path = self._artifact(state, f"{relative_dir}/packet.md", self._packet(state, number, provider))
             state["review_count"] = number
-            return number, state["plan_hash"], provider["id"], {"packet": packet_path, "dir": relative_dir}
+            return number, state["plan_hash"], provider["id"], {"packet": packet_path, "dir": relative_dir,
+                                                                "number": number}
 
         def execute(work):
-            return run_review(provider, work["packet"], self._run(run_id) / work["dir"],
-                              self.resources / "review.schema.json", self.resources / "reviewer.md",
-                              validate_review, probe)
+            # As in implement: the process's input, logs and raw output go to
+            # review-processes/NN; reviews/NN keeps the run's own records.
+            process_dir = self._run(run_id) / "review-processes" / f"{work['number']:02d}"
+            return run_review(provider, work["packet"], process_dir, self.resources / "review.schema.json",
+                              self.resources / "reviewer.md", validate_review, probe, cwd=self.project)
 
         return self._dispatch(run_id, "reviewing", "review", prepare, execute,
-                              lambda state, reservation, work, review, error:
-                              self._finish_review(state, reservation, work["dir"], provider, review, error))
+                              lambda state, reservation, work, result, error:
+                              self._finish_review(state, reservation, work["dir"], provider, result, error))
 
     def _finish_review(self, state: dict, reservation: dict, relative_dir: str, provider: dict,
-                       review: dict | None, error: BaseException | None) -> None:
+                       result: dict | None, error: BaseException | None) -> None:
         number = reservation["number"]
+        review = result["review"] if error is None else None
         self._verify(state)
         if error is None and state["plan_hash"] != reservation["target"]:
             error = DevFlowError("The plan changed while it was being reviewed.")
@@ -160,7 +186,8 @@ class Engine(RunEngine):
             return
         providers = state["config"]["reviewers"]
         wrapper = {"schema_version": 1, "number": number, "provider": provider["id"], "plan_hash": state["plan_hash"],
-                   "requested_model": provider["model"], "requested_effort": provider["effort"], "result": review}
+                   "requested_model": provider["model"], "requested_effort": provider["effort"], "result": review,
+                   "activity": result["activity"]}
         relative = f"{relative_dir}/review.json"
         self._artifact(state, relative, json_bytes(wrapper))
         state["last_review"] = relative

@@ -8,7 +8,8 @@ from devflow_core.common.storage import (DevFlowError, atomic_json, checked_text
 from devflow_core.common.errors import ReviewerError
 from devflow_core.common.review import all_approved, check_fields, next_reviewer, review_budget, validate_limit
 from devflow_core.common.settings import validate_document, workflow_overlay
-from devflow_core.common.environment import bash_limit, bash_timeout_ms, limit_warnings, python_errors
+from devflow_core.common.environment import (GIT_FACT_SECONDS, PROBE_SECONDS, REVIEW_SETUP_SECONDS, bash_timeout_ms,
+                                              python_errors, review_timeout_ms)
 from devflow_core.common.paths import msys_path
 from devflow_core.common import runs
 
@@ -272,34 +273,34 @@ class PathTests(unittest.TestCase):
 
 
 class EnvironmentTests(unittest.TestCase):
-    def test_bash_limit_is_the_larger_setting(self):
-        self.assertEqual(bash_limit({}), (600000, "unset", "unset"))
-        self.assertEqual(bash_limit({"BASH_MAX_TIMEOUT_MS": "960000"})[0], 960000)
-        self.assertEqual(bash_limit({"BASH_DEFAULT_TIMEOUT_MS": "1800000"}), (1800000, "unset", "1800000"))
-        self.assertEqual(bash_limit({"BASH_MAX_TIMEOUT_MS": "300000", "BASH_DEFAULT_TIMEOUT_MS": "200000"})[0], 300000)
+    def test_bash_timeout_is_the_process_limit_plus_the_runners_margin(self):
         self.assertEqual(bash_timeout_ms(900), 960000)
+        # The longest review (3600 s) stays inside the 2-hour cap Claude Code puts on
+        # an unattended background command's timeout.
+        self.assertLess(review_timeout_ms(3600), 7200000)
+
+    def test_review_timeout_covers_the_work_before_the_reviewer(self):
+        # Two CLI probes (version, then the subcommand's help) and the git call that
+        # describes the workspace run before the reviewer, in the same Bash call.
+        self.assertEqual(REVIEW_SETUP_SECONDS, 2 * PROBE_SECONDS + GIT_FACT_SECONDS)
+        self.assertEqual((PROBE_SECONDS, GIT_FACT_SECONDS), (15, 10))
+        self.assertEqual(review_timeout_ms(900), 1000000)
+        from devflow_core.common import reviewers
+        from devflow_core.implement import workspace
+        import inspect
+        self.assertEqual(inspect.signature(reviewers._capture).parameters["timeout"].default, PROBE_SECONDS)
+        self.assertIn("timeout=GIT_FACT_SECONDS", inspect.getsource(workspace.branch))
 
     def test_released_run_formats_have_names_and_unreleased_ones_are_generic(self):
         self.assertEqual(runs.RELEASES, {1: "0.1.x", 2: "0.2.x", 3: "0.3.x"})
         for version, release in runs.RELEASES.items():
             with self.subTest(version=version):
                 self.assertEqual(runs.release_name(version), release)
-        # Format 4 was never released; it is named generically.
-        self.assertGreater(runs.SCHEMA_VERSION, 4)
+        # Formats 4 and 5 were never released (0.4.0 development); they are named generically.
+        self.assertGreater(runs.SCHEMA_VERSION, 5)
         self.assertEqual(runs.release_name(4), "an older version (run format 4)")
+        self.assertEqual(runs.release_name(5), "an older version (run format 5)")
         self.assertEqual(runs.release_name(9), "an older version (run format 9)")
-
-    def test_limit_warnings_name_both_settings(self):
-        needs = {"review": bash_timeout_ms(900)}
-        self.assertEqual(limit_warnings(needs, {"BASH_MAX_TIMEOUT_MS": "960000"}), [])
-        self.assertEqual(limit_warnings(needs, {"BASH_DEFAULT_TIMEOUT_MS": "1800000"}), [])
-        self.assertEqual(limit_warnings(needs, {}), [
-            "Claude Code's Bash limit (600000 ms = max of BASH_MAX_TIMEOUT_MS=unset and BASH_DEFAULT_TIMEOUT_MS=unset) "
-            "is shorter than DevFlow needs for review (960000 ms). Set BASH_MAX_TIMEOUT_MS to at least 960000 in "
-            "Claude Code settings (env), or lower timeout_seconds."])
-        both = limit_warnings(needs, {"BASH_MAX_TIMEOUT_MS": "700000", "BASH_DEFAULT_TIMEOUT_MS": "650000"})
-        self.assertEqual(len(both), 1)
-        self.assertIn("BASH_MAX_TIMEOUT_MS=700000 and BASH_DEFAULT_TIMEOUT_MS=650000", both[0])
 
 
 if __name__ == "__main__":

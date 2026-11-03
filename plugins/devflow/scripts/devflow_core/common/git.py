@@ -3,8 +3,7 @@
 The environment drops every ``GIT_*`` variable and ignores the system and
 global configuration, so the user's environment cannot redirect the
 repository or enable programs through those files. Repository configuration
-still applies; callers that must not start programs add their own ``-c``
-overrides and command flags.
+still applies, as it does for any git command run in the project.
 """
 from __future__ import annotations
 
@@ -20,11 +19,10 @@ BASE_ARGS = ("--no-pager", "--no-optional-locks", "-c", "core.fsmonitor=false", 
 DEFAULT_LIMIT = 8 * 1024 * 1024
 
 
-def git_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
+def git_environment() -> dict[str, str]:
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0",
                 "GIT_OPTIONAL_LOCKS": "0"})
-    env.update(extra or {})
     return env
 
 
@@ -38,19 +36,10 @@ def git_executable() -> str:
 
 
 def run_git(root: Path, *args: str, ok_codes: tuple[int, ...] = (0,), timeout: float = 30,
-            limit: int = DEFAULT_LIMIT, extra_env: dict[str, str] | None = None,
-            config: tuple[str, ...] = (), new_session: bool = True) -> bytes:
-    """Run ``git -C root ARGS`` and return stdout; any failure raises DevFlowError.
-
-    ``config`` holds extra ``key=value`` settings passed as ``-c``.
-    ``new_session`` is passed to ``run_bounded`` (see there).
-    """
-    command = [git_executable(), *BASE_ARGS]
-    for setting in config:
-        command.extend(["-c", setting])
-    command.extend(["-C", str(root), *args])
-    result = run_bounded(command, cwd=Path(root), timeout=timeout, limit=limit,
-                         env=git_environment(extra_env), new_session=new_session)
+            limit: int = DEFAULT_LIMIT) -> bytes:
+    """Run ``git -C root ARGS`` and return stdout; any failure raises DevFlowError."""
+    command = [git_executable(), *BASE_ARGS, "-C", str(root), *args]
+    result = run_bounded(command, cwd=Path(root), timeout=timeout, limit=limit, env=git_environment())
     if result.timed_out:
         raise DevFlowError(f"Cannot inspect Git repository: git exceeded {timeout:g} seconds")
     if result.output_limit_exceeded:

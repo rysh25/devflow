@@ -15,6 +15,7 @@ import json
 import re
 from pathlib import Path
 from typing import Any
+from ..common.counts import tally
 from ..common.errors import CaptureError
 from ..common.sessions import SCREEN_FILLED_QUESTION_FIELDS, answer_content as _answer_content, prefilled_question
 
@@ -37,7 +38,6 @@ _IGNORED_RECORDS = {
 # capture. Human words cannot vanish this way: every raw UserPromptSubmit is
 # matched with the transcript, and the hook records alone are used if the
 # prompts cannot be placed.
-MAX_UNKNOWN_TYPES = 32
 # Every transcript item falls into one class:
 # 1. the human's words: user records and queued_command from a human (kept);
 # 2. Claude Code-generated: the record/attachment types and user-role texts
@@ -284,11 +284,7 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
             omitted_attachments[kind] = omitted_attachments.get(kind, 0) + count
 
     def skip_unknown(group: str, name: object) -> None:
-        counts = unknown[group]
-        label = name[:64] if isinstance(name, str) and name else "(untyped)"
-        if label not in counts and len(counts) >= MAX_UNKNOWN_TYPES:
-            label = "(other)"
-        counts[label] = counts.get(label, 0) + 1
+        tally(unknown[group], name, "(untyped)")
 
     def duplicate(record: dict, value: Any) -> bool:
         uuid = record.get("uuid")
@@ -339,10 +335,10 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
                     if matching:
                         matching["used"] = True
                         source.update(origin="UserPromptSubmit", hook_event_index=matching["event_index"])
-                    elif prompts:
+                    else:
                         source["hook_record"] = False
                     message = add("user", text, source)
-                    if not matching and prompts:
+                    if not matching:
                         unhooked.append(message)
                     # Claude Code's own human mark makes it a response even without a hook record.
                     transcript_human_prompts += 1
@@ -477,14 +473,13 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
             elif not _scaffolding("\n".join(text_parts), record):
                 # Kept, but marked: no hook recorded it (the hook may have failed).
                 # It counts as a response only when Claude Code marks its origin
-                # human (or no prompt was hooked at all); otherwise its origin is unknown.
-                marked = (record.get("origin") or {}).get("kind") == "human"
-                transcript_human_prompts += marked or not prompts
+                # human; otherwise its origin is unknown.
+                origin = record.get("origin")
+                marked = isinstance(origin, dict) and origin.get("kind") == "human"
+                transcript_human_prompts += marked
                 for part in text_parts:
-                    message = add("user", part, {**source, "kind": "prompt", "hook_record": False if prompts else None,
-                                                 **({"origin_kind": "human"} if marked else {})})
-                    if prompts:
-                        unhooked.append(message)
+                    unhooked.append(add("user", part, {**source, "kind": "prompt", "hook_record": False,
+                                                       **({"origin_kind": "human"} if marked else {})}))
         visible_records += 1
 
     # The original slash command may not be serialized as literal text. Its raw
@@ -584,8 +579,8 @@ EXCLUDED = [
 
 
 def _coverage(mode: str, marker: dict, captured_bytes: int, scan: dict, messages: list[dict], *, answered: int,
-              unanswered: int, prefilled: int, user_responses: int, unhooked: int, reason: str | None = None,
-              excluded: tuple[str, ...] = ()) -> dict:
+              unanswered: int, prefilled: int, user_responses: int, unhooked: int, unverified: int = 0,
+              reason: str | None = None, excluded: tuple[str, ...] = ()) -> dict:
     """The same coverage fields for every way the interview is built."""
     value = {"mode": mode}
     if reason:
@@ -599,6 +594,7 @@ def _coverage(mode: str, marker: dict, captured_bytes: int, scan: dict, messages
         "answered_questions": answered,
         "unanswered_questions": unanswered,
         "prefilled_questions": prefilled,
+        "unverified_questions": unverified,
         "user_responses": user_responses,
         "human_response_count": answered + user_responses,
         "user_texts_without_hook_record": unhooked,
@@ -628,32 +624,40 @@ def _hooks_only(marker: dict, events: list[dict], prompts: list[dict], post_ques
             asked[key] = asked.get(key, False) or prefilled_question(event.get("tool_input"))
     items = [(p["event_index"], "prompt", p) for p in prompts] + [(i, "question", e) for i, e in post_questions]
     messages: list[dict] = []
-    answered = prefilled_questions = 0
+    answered = prefilled_questions = unverified = 0
     for index, kind, item in sorted(items, key=lambda entry: entry[0]):
         if kind == "prompt":
             messages.append({"role": "user", "content": item["text"], "source": {
                 "origin": "UserPromptSubmit", "hook_event_index": index, "kind": "prompt"}})
             continue
         tool_id = item.get("tool_use_id")
-        prefilled = asked.get(tool_id, True)  # Without its PreToolUse record, never a human answer.
-        prefilled_questions += prefilled
-        answered += not prefilled
+        # Only the PreToolUse record shows whether the model filled in the answers.
+        # Without it the question is kept as unverified and is not counted.
+        prefilled = asked.get(tool_id)
+        prefilled_questions += prefilled is True
+        answered += prefilled is False
+        unverified += prefilled is None
+        name = {True: "questionnaire_prefilled", False: "questionnaire", None: "questionnaire_unverified"}[prefilled]
         source = {"origin": "PostToolUse", "hook_event_index": index, "tool_use_id": tool_id}
         messages.append({"role": "assistant", "content": _json(_asked_input(item["tool_input"])), "source": {
-            **source, "kind": "questionnaire_prefilled" if prefilled else "questionnaire", "encoding": "json-values"}})
+            **source, "kind": name, "encoding": "json-values"}})
         messages.append({"role": "user", "content": _answer_content(item["tool_response"]), "source": {
-            **source, "kind": "questionnaire_prefilled_answer" if prefilled else "questionnaire_answer",
+            **source, "kind": name + "_answer",
             "encoding": "string" if isinstance(item["tool_response"], str) else "json-values"}})
     messages.extend(unhooked)
     if not prompts and not unhooked:
         raise CaptureError("No human input was captured")
     # As on the transcript path, a text without a hook record is a response only
-    # when Claude Code marked its origin human.
-    marked = sum(1 for message in unhooked if message["source"].get("origin_kind") == "human")
+    # when Claude Code marked its origin human; one message counts once, however
+    # many text blocks it has.
+    marked = len({message["source"]["segment_line"] for message in unhooked
+                  if message["source"].get("origin_kind") == "human"})
     return {"schema_version": 1, "messages": messages, "coverage": _coverage(
         "hook-records-only", marker, captured_bytes, scan, messages, answered=answered, unanswered=0,
         prefilled=prefilled_questions, user_responses=max(0, len(prompts) - 1) + marked, unhooked=len(unhooked),
+        unverified=unverified,
         reason="The transcript's form did not let every human prompt be placed; Claude's messages other than "
-               "its AskUserQuestion questions are not included, and human texts without a hook record are "
-               "kept at the end and counted as responses only when Claude Code marked them human.",
+               "its AskUserQuestion questions are not included, human texts without a hook record are kept at "
+               "the end and counted as responses only when Claude Code marked them human, and questions without "
+               "their PreToolUse record are kept as unverified and not counted.",
         excluded=("assistant-messages",))}

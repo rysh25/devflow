@@ -5,7 +5,7 @@ from pathlib import Path
 from ..common.errors import DevFlowError
 from ..common.storage import read_json
 from ..common.review import validate_limit
-from ..common.settings import validate_reviewers, with_web_default, workflow_overlay
+from ..common.settings import validate_reviewers, workflow_overlay
 from .checks import validate_checks
 
 
@@ -49,5 +49,4 @@ def load_config(project: Path, workflow) -> dict:
         if "snapshot" in overlay and isinstance(overlay["snapshot"], dict):
             overlay["snapshot"] = {**value["snapshot"], **overlay["snapshot"]}
         value.update(overlay)
-    with_web_default(value.get("reviewers"))
     return validate_config(value)

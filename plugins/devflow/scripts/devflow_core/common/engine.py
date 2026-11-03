@@ -76,7 +76,7 @@ class RunEngine:
     def read_frozen_config(self, run_id: str) -> dict | None:
         """The run's frozen configuration (None if its workflow has none); repairs nothing."""
         if (self._run(run_id) / "transaction.json").exists():
-            raise DevFlowError("Diagnosis is read-only; complete the pending run transaction with /devflow:resume "
+            raise DevFlowError("Diagnosis changes nothing; complete the pending run transaction with /devflow:resume "
                                "or cancel first.")
         return self._check_frozen_config(self.store.read(run_id))
 
@@ -131,7 +131,7 @@ class RunEngine:
         run = self._run(run_id)
         result.update(run_dir=str(run), draft_dir=str(run / "draft"), **self.workflow.summary(state),
                       bash_timeout_ms=self.workflow.bash_timeouts(state))
-        # Status is read-only display: unreadable event records are reported,
+        # Status only displays: unreadable event records are reported,
         # not raised. Acting on an event (resolve) still reads them strictly.
         try:
             events = self._events(state)

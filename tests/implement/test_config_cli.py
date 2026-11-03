@@ -59,7 +59,6 @@ class ConfigCliTests(unittest.TestCase):
     def test_two_or_more_reviewers_of_different_kinds_required(self):
         config = copy.deepcopy(self.config)
         config["reviewers"][1]["kind"] = "codex"
-        config["reviewers"][1].pop("protocol_version")
         with self.assertRaisesRegex(DevFlowError, "different reviewer kinds"):
             validate_config(config)
         config["reviewers"] = config["reviewers"][:1]

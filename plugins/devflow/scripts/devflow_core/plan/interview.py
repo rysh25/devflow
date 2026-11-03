@@ -1,4 +1,4 @@
-"""Bounded, read-only inspection of a configured local interview skill.
+"""Bounded inspection of a configured local interview skill; it changes nothing.
 
 This is intentionally not Claude Code's skill loader or a general YAML parser.
 It never invokes a skill, executes frontmatter, reads settings/credentials, or

@@ -11,7 +11,7 @@ from ..common.errors import DevFlowError
 from ..common.storage import read_json
 from .interview import inspect_interview_skill
 from ..common.review import validate_limit
-from ..common.settings import validate_reviewers, with_web_default, workflow_overlay
+from ..common.settings import validate_reviewers, workflow_overlay
 
 
 def validate_config(config: dict) -> dict:
@@ -55,7 +55,6 @@ def load_config(project: Path, workflow) -> dict:
         overlay["publish"] = {**value["publish"], **overlay["publish"]}
     # Lists replace in full. Review order is an explicit, immutable contract.
     value.update(overlay)
-    with_web_default(value.get("reviewers"))
     return validate_config(value)
 
 

@@ -9,18 +9,11 @@ from .errors import DevFlowError
 from .storage import no_symlinks, read_json
 
 
-SHELLS = frozenset({"sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "cmd", "powershell", "pwsh"})
 REVIEWER_KINDS = frozenset({"codex", "opencode"})
-REVIEWER_FIELDS = frozenset({"id", "kind", "command", "model", "effort", "timeout_seconds", "protocol_version",
-                             "max_output_bytes", "web"})
+REVIEWER_FIELDS = frozenset({"id", "kind", "command", "model", "effort", "timeout_seconds", "max_output_bytes"})
 REVIEWER_REQUIRED = frozenset({"id", "kind", "command", "model", "effort", "timeout_seconds"})
+#: The largest reviewer output DevFlow reads, and the default.
 MAX_OUTPUT_BYTES = 16 * 1024 * 1024
-# Web results and fetched pages enlarge reviewer output; the default is the ceiling.
-DEFAULT_OUTPUT_BYTES = MAX_OUTPUT_BYTES
-#: The only supported OpenCode protocol (OpenCode 2.x).
-OPENCODE_PROTOCOL = 2
-PROTOCOL_ONE_MESSAGE = ("OpenCode protocol 1 (OpenCode 1.x) is no longer supported. Upgrade OpenCode to 2.x, then "
-                        'remove "protocol_version" or set it to 2 in devflow.config.json.')
 
 
 def _document(project: Path) -> dict:
@@ -53,27 +46,11 @@ def workflow_overlay(project: Path, workflow: str) -> dict:
     return result
 
 
-def _program(value: str) -> str:
-    name = re.split(r"[\\/]", value)[-1].casefold()
-    for suffix in (".exe", ".cmd", ".bat", ".ps1"):
-        name = name.removesuffix(suffix)
-    return name
-
-
-def with_web_default(reviewers: object) -> object:
-    """Record ``web`` explicitly (default true) so a run's frozen settings show it."""
-    if isinstance(reviewers, list):
-        for reviewer in reviewers:
-            if isinstance(reviewer, dict):
-                reviewer.setdefault("web", True)
-    return reviewers
-
-
 def validate_reviewers(reviewers: object, max_reviews: int) -> list:
     """One rule set for the shared reviewer list, used by every workflow.
 
-    Reviewer settings are trusted human configuration; the command checks are
-    defense in depth against accidents, not a sandbox.
+    Reviewer settings are trusted human configuration. DevFlow checks only what
+    it needs to start each CLI and read its answer, never how the user runs it.
     """
     if not isinstance(reviewers, list) or len(reviewers) < 2 or len(reviewers) > max_reviews:
         raise DevFlowError("Configure from two reviewers up to max_reviews; every reviewer must be able to approve")
@@ -90,8 +67,14 @@ def validate_reviewers(reviewers: object, max_reviews: int) -> list:
 
 def validate_reviewer(reviewer: object) -> dict:
     """The rules for one reviewer entry (shared by settings and the CLI adapters)."""
-    if not isinstance(reviewer, dict) or set(reviewer) - REVIEWER_FIELDS or not REVIEWER_REQUIRED <= set(reviewer):
-        raise DevFlowError("Invalid reviewer fields")
+    if not isinstance(reviewer, dict):
+        raise DevFlowError("Each reviewer must be an object")
+    unknown, missing = set(reviewer) - REVIEWER_FIELDS, REVIEWER_REQUIRED - set(reviewer)
+    if unknown or missing:
+        raise DevFlowError("Invalid reviewer fields"
+                           + (" (unknown: " + ", ".join(sorted(unknown)) + ")" if unknown else "")
+                           + (" (missing: " + ", ".join(sorted(missing)) + ")" if missing else "")
+                           + "; see the reviewer settings in the DevFlow README")
     identifier = reviewer["id"]
     if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", identifier):
         raise DevFlowError("Reviewer IDs must be unique lowercase names")
@@ -100,26 +83,13 @@ def validate_reviewer(reviewer: object) -> dict:
     command = reviewer["command"]
     if (not isinstance(command, list) or not command or len(command) > 128
             or any(not isinstance(x, str) or not x or "\x00" in x for x in command)):
-        raise DevFlowError("Reviewer command must be a nonempty argv array, never a shell string")
-    if any(_program(item) in SHELLS for item in command):
-        raise DevFlowError("Reviewer commands must invoke the reviewer CLI directly, never through a shell")
-    if any(item == "--yolo" or item.startswith("--dangerously") for item in command):
-        raise DevFlowError("Reviewer commands must not disable the CLI's own safety controls")
+        raise DevFlowError("Reviewer command must be a nonempty argv array of strings")
     for field in ("model", "effort"):
         if not isinstance(reviewer[field], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./:-]*", reviewer[field]):
             raise DevFlowError(f"Invalid reviewer {field}")
     timeout = reviewer["timeout_seconds"]
     if type(timeout) is not int or not 5 <= timeout <= 3600:
         raise DevFlowError("timeout_seconds must be an integer between 5 and 3600")
-    if "protocol_version" in reviewer:
-        if reviewer["kind"] != "opencode" or type(reviewer["protocol_version"]) is not int:
-            raise DevFlowError("protocol_version is an OpenCode setting and must be 2")
-        if reviewer["protocol_version"] == 1:
-            raise DevFlowError(PROTOCOL_ONE_MESSAGE)
-        if reviewer["protocol_version"] != OPENCODE_PROTOCOL:
-            raise DevFlowError("protocol_version is an OpenCode setting and must be 2")
-    if "web" in reviewer and type(reviewer["web"]) is not bool:
-        raise DevFlowError("web must be true or false")
     if "max_output_bytes" in reviewer:
         limit = reviewer["max_output_bytes"]
         if type(limit) is not int or not 1024 <= limit <= MAX_OUTPUT_BYTES:

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from . import checks, snapshot
 from .review import validate_review
-from .workspace import verify_workspace
+from .workspace import branch, verify_workspace
 from ..common.errors import DevFlowError
 from ..common.review import all_approved, next_reviewer
 from ..common.reviewers import preflight, run_review
@@ -156,27 +156,35 @@ class Engine(RunEngine):
             if state["check_attempts"] >= state["config"]["max_check_attempts"]:
                 self._escalate(state,"check_budget",["Checks continue to fail. Determine the cause and authorize another bounded attempt, or cancel."],"implementing","Check attempt limit reached")
 
-    def _packet(self,state,current):
+    def _packet(self,state,current,workspace,diff_path):
+        """Review data only: the reviewer reads the code itself, from the workspace and the diff file."""
         run = self._run(state["run_id"])
         delta = read_json(run/state["candidate"]["diff"])
-        context = {}
         for path in state["config"]["snapshot"]["context_paths"]:
             if path not in current["files"] or current["files"][path].get("binary"):
                 raise DevFlowError(f"Context path must name an included text file: {path}")
-            context[path] = current["files"][path]
         history = []
         for item in state["attempts"]:
             entry = {k:item[k] for k in ("number","reviewer_id","snapshot_id","status")}
             if item.get("review_path"):
                 entry["review"] = read_json(run/item["review_path"])
             history.append(entry)
-        value = {"schema_version":1,"kind":"code_review","snapshot_id":current["snapshot_id"],
-            "plan":(run/"plan.md").read_bytes().decode("utf-8"),
+        checks = read_json(run/state["validation"]["path"]) if state["validation"].get("path") else None
+        if checks is not None:
+            # The logs stay in their files; the packet gives their paths.
+            checks = {**checks, "results":[{k:v for k,v in result.items() if k not in ("stdout","stderr")}
+                                           for result in checks["results"]]}
+        mode = state["config"]["snapshot"]["mode"]
+        value = {"schema_version":2,"kind":"code_review","snapshot_id":current["snapshot_id"],
+            "workspace":{"path":str(workspace),"mode":mode,"branch":branch(workspace,mode),
+                         "start_commit":(read_json(run/"baseline.json").get("git") or {}).get("head")},
+            "plan":(run/"plan.md").read_bytes().decode("utf-8"),"plan_path":str(run/"plan.md"),
             "plan_sha256":state["artifacts"]["plan.md"],"baseline_id":state["baseline_id"],
-            "implementation_summary":checked_text(run/state["candidate"]["summary"]),"changes":delta,
-            "context_files":context,"file_manifest":{p:{k:v[k] for k in ("sha256","size","mode","binary") if k in v} for p,v in current["files"].items()},
-            "scope":{"mode":current["mode"],"excluded":current.get("excluded",[]),"limitations":current.get("coverage", "Only included files; ignored/excluded files are outside coverage")},
-            "validation":state["validation"],"check_results":read_json(run/state["validation"]["path"]) if state["validation"].get("path") else None,
+            "implementation_summary":checked_text(run/state["candidate"]["summary"]),
+            "changes":snapshot.change_list(delta),"diff_path":str(diff_path),
+            "context_paths":list(state["config"]["snapshot"]["context_paths"]),
+            "scope":{"mode":current["mode"],"excluded":current.get("excluded",[]),"limitations":current.get("scope_note")},
+            "validation":state["validation"],"check_results":checks,
             "binary_attestation":state.get("binary_attestation"),"previous_reviews":history,
             "reflections":[read_json(run/p) for p in state["reflections"]],
             "human_resolutions":[read_json(run/p) for p in state["resolutions"]]}
@@ -202,30 +210,35 @@ class Engine(RunEngine):
                 raise DevFlowError("Fresh successful checks or explicit human validation are required")
             if next_reviewer(state["config"]["reviewers"],len(state["attempts"]),state["config"]["max_reviews"]) != provider:
                 raise DevFlowError("The run changed during the reviewer check; inspect status and retry")
-            packet = self._packet(state,current)
             number = len(state["attempts"]) + 1
+            delta = read_json(self._run(run_id)/state["candidate"]["diff"])
+            diff_path = self._artifact(state,f"reviews/{number:02}/changes.diff",snapshot.diff_text(delta).encode("utf-8"))
+            # _current has just verified the workspace.
+            workspace = Path(state["workspace"]["path"])
+            packet = self._packet(state,current,workspace,diff_path)
             packet_relative = f"reviews/{number:02}/packet.json"
             self._artifact(state,packet_relative,packet)
             state["attempts"].append({"number":number,"reviewer_id":provider["id"],"snapshot_id":current["snapshot_id"],
                 "packet_path":packet_relative,"packet_sha256":digest(packet),"status":"dispatched","started_at":now()})
             # Reserved BEFORE dispatch, including unknown-outcome failures.
-            return number, current["snapshot_id"], provider["id"], {"number": number, "packet": packet_relative}
+            return number, current["snapshot_id"], provider["id"], {
+                "number": number, "packet": packet_relative, "workspace": str(workspace)}
 
         def execute(work):
-            review = run_review(provider,self._run(run_id)/work["packet"],
+            return run_review(provider,self._run(run_id)/work["packet"],
                 self._run(run_id)/"review-processes"/f"{work['number']:02}",self.resources/"review.schema.json",
-                self.resources/"reviewer.md",validate_review,probe)
-            return review
+                self.resources/"reviewer.md",validate_review,probe,cwd=Path(work["workspace"]))
 
-        def finish(state, reservation, work, review, error):
-            if error is None and review["snapshot_id"] != reservation["target"]:
+        def finish(state, reservation, work, result, error):
+            if error is None and result["review"]["snapshot_id"] != reservation["target"]:
                 error = DevFlowError("Reviewer response is for a different snapshot")
-            self._finish_review(state, reservation, provider, review, error)
+            self._finish_review(state, reservation, provider, result, error)
 
         return self._dispatch(run_id, "reviewing", "review", prepare, execute, finish)
 
-    def _finish_review(self,state,reservation,provider,review,error):
+    def _finish_review(self,state,reservation,provider,result,error):
         number = reservation["number"]
+        review = result["review"] if error is None else None
         current = None
         if error is None:
             try:
@@ -240,7 +253,7 @@ class Engine(RunEngine):
             return
         review_path = f"reviews/{number:02}/review.json"
         self._artifact(state,review_path,json_bytes(review))
-        state["attempts"][-1].update(status="succeeded",review_path=review_path,finished_at=now())
+        state["attempts"][-1].update(status="succeeded",review_path=review_path,activity=result["activity"],finished_at=now())
         critical = any(f["severity"] == "critical" for f in review["findings"])
         if review["verdict"] == "human_required" or critical:
             questions = review["questions"] or ["A critical issue was reported. Confirm the safe scope and remediation before continuing."]
@@ -390,6 +403,8 @@ def terminal_report(project, state, observed=(), observed_error=None):
         "workspace_capture_error":capture_error,"final_snapshot_reviewed":reviewed,
         "unreviewed_final_changes":(actual != state["baseline_id"] and not reviewed) if actual else None,
         "workspace":state["workspace"],
+        "reviews":[{"number":a["number"],"reviewer_id":a["reviewer_id"],"snapshot_id":a["snapshot_id"],"status":a["status"],
+                    **(a.get("activity") or {})} for a in state["attempts"]],
         "prefilled_question_events":None if observed is None else list(observed),
         "prefilled_question_events_error":observed_error,
         "reported_at":now(),"automatic_commit_push_deploy":False,

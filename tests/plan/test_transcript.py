@@ -390,6 +390,50 @@ class TranscriptTests(unittest.TestCase):
         kinds = [m["source"]["kind"] for m in out["messages"]]
         self.assertEqual(kinds, ["prompt", "questionnaire_prefilled", "questionnaire_prefilled_answer", "prompt"])
 
+    def test_a_question_without_its_pre_tool_use_record_is_kept_as_unverified(self):
+        """Only the PreToolUse record shows whether the model filled in the answers; without it
+        the answer is neither a human answer nor a prefilled one."""
+        marker = transcript_marker(str(self.path))
+        question = {"questions": [{"question": "Q?"}]}
+        self.write(entry("user", "request"), entry("assistant", "Question?"))
+        events = [self.prompt("request"),
+                  {"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_use_id": "q",
+                   "tool_input": question, "tool_response": {"answers": {"Q?": "Human?"}}},
+                  self.prompt("a prompt the transcript lacks")]
+        out = capture_interview(marker, events)
+        self.assertEqual(out["coverage"]["mode"], "hook-records-only")
+        kinds = [m["source"]["kind"] for m in out["messages"]]
+        self.assertEqual(kinds, ["prompt", "questionnaire_unverified", "questionnaire_unverified_answer", "prompt"])
+        coverage = out["coverage"]
+        self.assertEqual((coverage["answered_questions"], coverage["prefilled_questions"],
+                          coverage["unverified_questions"]), (0, 0, 1))
+        self.assertEqual(coverage["human_response_count"], 1)  # Only the hooked follow-up prompt.
+        self.assertIn("unverified", coverage["reason"])
+        # The transcript path reads the question as Claude sent it, so it never needs the hook.
+        main = capture_interview(marker, [self.prompt("request")])["coverage"]
+        self.assertEqual(main["unverified_questions"], 0)
+
+    def test_a_human_message_in_several_text_blocks_counts_once_on_the_hook_records_path(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), entry("assistant", "Question?"),
+                   entry("user", [{"type": "text", "text": "part one"}, {"type": "text", "text": "part two"}],
+                         origin={"kind": "human"}))
+        out = capture_interview(marker, [self.prompt("request"), self.prompt("a prompt the transcript lacks")])
+        self.assertEqual(out["coverage"]["mode"], "hook-records-only")
+        self.assertEqual([m["content"] for m in out["messages"]][-2:], ["part one", "part two"])
+        # The extra hooked prompt and this one message (not one per block).
+        self.assertEqual(out["coverage"]["human_response_count"], 2)
+
+    def test_an_origin_in_a_form_this_version_does_not_know_is_not_human(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), entry("assistant", "Question?"),
+                   entry("user", "Text with a string origin", origin="human"))
+        out = capture_interview(marker, [self.prompt("request")])
+        kept = [m for m in out["messages"] if m["content"] == "Text with a string origin"]
+        self.assertIs(kept[0]["source"]["hook_record"], False)
+        self.assertNotIn("origin_kind", kept[0]["source"])
+        self.assertEqual(out["coverage"]["human_response_count"], 0)
+
     def test_a_queued_message_from_claude_code_in_block_form_is_not_human_words(self):
         marker = transcript_marker(str(self.path))
         report = "[Subagent hand-back] REPORT"

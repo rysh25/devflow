@@ -31,6 +31,7 @@ from devflow_core.implement.engine import Engine
 from devflow_core.implement.review import validate_review
 from devflow_core.workflows import WORKFLOWS
 
+ACTIVITY = {"tool_call_count": 2, "tool_calls": {"command_execution": 2}, "other_events": {}}
 EVENT_ID = r"\A[a-f0-9]{32}\Z"
 
 
@@ -151,11 +152,13 @@ class EngineFixture(unittest.TestCase):
         self.session = identity
         return self.engine.status(self.run_id)
 
-    def respond(self, config, packet_path, work_dir, schema_path, instructions_path, validate, probe):
+    def respond(self, config, packet_path, work_dir, schema_path, instructions_path, validate, probe, *, cwd):
         packet = read_json(packet_path)
         self.packets.append(packet)
         self.reviewers.append(copy.deepcopy(config))
         self.assertNotEqual(Path(work_dir).resolve(), self.project)
+        # The reviewer starts in the workspace and reads the code itself.
+        self.assertEqual(Path(cwd), Path(packet["workspace"]["path"]))
         self.assertTrue(Path(schema_path).is_file())
         self.assertTrue(Path(instructions_path).is_file())
         self.assertIs(validate, validate_review)
@@ -171,7 +174,7 @@ class EngineFixture(unittest.TestCase):
         if self.alter:
             self.alter(review)
         # The real adapter validates with the workflow's validator before returning.
-        return validate(review)
+        return {"review": validate(review), "activity": dict(ACTIVITY)}
 
     def review(self):
         return self.engine.review(self.run_id, self.session)
@@ -341,12 +344,26 @@ class EngineFlowTests(EngineFixture):
         self.assertEqual(first["kind"], "code_review")
         self.assertEqual(first["plan"], self.plan.read_text(encoding="utf-8"))
         self.assertIn("Implemented VALUE", first["implementation_summary"])
-        changed = next(x for x in first["changes"]["changed_files"] if x["path"] == "module.py")
-        self.assertEqual(changed["before"]["text"], "VALUE = 0\n")
-        self.assertEqual(changed["after"]["text"], "VALUE = 1\n")
-        self.assertIn("+VALUE = 1", changed["diff"])
-        self.assertEqual(first["context_files"]["unchanged.txt"]["text"], context.read_text(encoding="utf-8"))
+        self.assertEqual(first["schema_version"], 2)
+        changed = next(x for x in first["changes"] if x["path"] == "module.py")
+        # Only where the change is: mode, size and hash, never the contents.
+        self.assertEqual(changed["change"], "modified")
+        self.assertEqual(set(changed["before"]), {"mode", "size", "sha256"})
+        self.assertEqual(changed["after"]["size"], len("VALUE = 1\n"))
+        self.assertNotIn("VALUE = 1", json.dumps(first["changes"]))
+        diff = Path(first["diff_path"]).read_text(encoding="utf-8")
+        self.assertEqual(Path(first["diff_path"]), self.run / "reviews" / "01" / "changes.diff")
+        self.assertIn("diff --git a/module.py b/module.py\n", diff)
+        self.assertIn("+VALUE = 1", diff)
+        self.assertEqual(first["context_paths"], ["unchanged.txt"])
+        self.assertNotIn("This stable API contract", json.dumps(first))
+        self.assertEqual(first["workspace"]["path"], str(self.project.resolve()))
+        self.assertEqual(first["plan_path"], str(self.run / "plan.md"))
         self.assertEqual(first["check_results"]["status"], "passed")
+        result = first["check_results"]["results"][0]
+        self.assertNotIn("stdout", result)
+        self.assertTrue(Path(result["stdout_path"]).is_file())
+        self.assertEqual(self.state()["attempts"][0]["activity"], ACTIVITY)
         self.assertEqual(first["previous_reviews"], [])
         self.assertEqual(second["previous_reviews"][0]["review"]["verdict"], "pass")
         self.assertEqual(second["snapshot_id"], first["snapshot_id"])
@@ -392,7 +409,7 @@ class EngineFlowTests(EngineFixture):
         self.start()
         self.ready()
 
-        def observe(*args):
+        def observe(*args, **kwargs):
             stored = self.state()
             self.assertEqual(stored["status"], "reviewing")
             self.assertEqual(len(stored["attempts"]), 1)
@@ -407,7 +424,7 @@ class EngineFlowTests(EngineFixture):
             self.assertFalse((self.run / "transaction.json").exists())
             # No lock is held while the external reviewer runs.
             self.assertFalse((self.run / "state.lock").exists())
-            return self.respond(*args)
+            return self.respond(*args, **kwargs)
 
         self.reviewer.side_effect = observe
         result = self.review()
@@ -627,7 +644,8 @@ class HumanEvidenceTests(EngineFixture):
         self.assertEqual(result["binary_attestation"]["snapshot_id"], result["candidate"]["snapshot_id"])
         self.engine.check(self.run_id, self.session)
         self.review()
-        self.assertEqual(self.packets[-1]["changes"]["binary_changes"], ["asset.bin"])
+        self.assertEqual([x["path"] for x in self.packets[-1]["changes"] if x["binary"]], ["asset.bin"])
+        self.assertIn("Binary files", Path(self.packets[-1]["diff_path"]).read_text(encoding="utf-8"))
         self.assertIsNotNone(self.packets[-1]["binary_attestation"])
 
     def test_changed_snapshot_cannot_reuse_manual_answer(self):
@@ -1046,10 +1064,10 @@ class RecoveryAndIntegrityTests(EngineFixture):
         self.source.write_text("VALUE = 1\n", encoding="utf-8")
         self.assertEqual(self.engine.check(self.run_id, self.session)["status"], "ready_review")
 
-        def edit_during_review(*args):
+        def edit_during_review(*args, **kwargs):
             self.assertIsNone(self.tool(file_path=str(self.source)))
             self.source.write_text("VALUE = 2\n", encoding="utf-8")
-            return self.respond(*args)
+            return self.respond(*args, **kwargs)
 
         self.reviewer.side_effect = edit_during_review
         result = self.review()
@@ -1072,12 +1090,12 @@ class RecoveryAndIntegrityTests(EngineFixture):
         self.ready()
         recorded = []
 
-        def dispatch(*args):
+        def dispatch(*args, **kwargs):
             recorded.append(in_thread(lambda: self.prompt("A note typed while the reviewer runs.")))
             recorded.append(in_thread(lambda: self.engine.store.append_event(
                 self.run_id, {"session_id": self.session, "hook_event_name": "Stop"}, "stop")))
             self.assertEqual(self.state()["status"], "reviewing")
-            return self.respond(*args)
+            return self.respond(*args, **kwargs)
 
         self.reviewer.side_effect = dispatch
         result = self.review()
@@ -1111,13 +1129,13 @@ class RecoveryAndIntegrityTests(EngineFixture):
         self.ready()
         refusals = []
 
-        def dispatch(*args):
+        def dispatch(*args, **kwargs):
             for action in (lambda other: other.review(self.run_id, self.session),
                            lambda other: other.check(self.run_id, self.session)):
                 with self.assertRaisesRegex(DevFlowError, "reviewing") as caught:
                     in_thread(lambda: action(Engine(self.project)))
                 refusals.append(str(caught.exception))
-            return self.respond(*args)
+            return self.respond(*args, **kwargs)
 
         self.reviewer.side_effect = dispatch
         result = self.review()
@@ -1204,11 +1222,11 @@ class RecoveryAndIntegrityTests(EngineFixture):
         self.ready()
         frozen = {}
 
-        def recover_meanwhile(*args):
+        def recover_meanwhile(*args, **kwargs):
             # A human wrongly recovers while the reviewer is still running.
             in_thread(lambda: Engine(self.project).recover(self.run_id, confirmed=True))
             frozen["state"] = (self.run / "state.json").read_bytes()
-            return self.respond(*args)
+            return self.respond(*args, **kwargs)
 
         self.reviewer.side_effect = recover_meanwhile
         with self.assertRaisesRegex(DevFlowError, "stale review"):
@@ -1216,11 +1234,11 @@ class RecoveryAndIntegrityTests(EngineFixture):
         self.assertEqual((self.run / "state.json").read_bytes(), frozen["state"])
         self.assertEqual(self.state()["status"], "paused_error")
         self.assertFalse((self.run / "reviews" / "01" / "review.json").exists())
-        self.assertEqual(self.assertLate("review", 1, error=False)["result"]["verdict"], "pass")
+        self.assertEqual(self.assertLate("review", 1, error=False)["result"]["review"]["verdict"], "pass")
 
         self.resume()
 
-        def recover_and_cancel_meanwhile(*args):
+        def recover_and_cancel_meanwhile(*args, **kwargs):
             in_thread(lambda: Engine(self.project).recover(self.run_id, confirmed=True))
             in_thread(lambda: Engine(self.project).cancel(self.run_id, self.session, "Stop this run."))
             frozen["state"] = (self.run / "state.json").read_bytes()

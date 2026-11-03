@@ -12,7 +12,7 @@ from pathlib import Path
 import sys
 from typing import Any, Callable
 
-from .environment import bash_timeout_ms, limit_warnings
+from .environment import review_timeout_ms
 from .errors import DevFlowError
 
 RESOURCES = ("defaults.json", "reviewer.md", "review.schema.json")
@@ -43,7 +43,7 @@ class Command:
     run: Callable[[Any, argparse.Namespace, str | None, str | None], Any]  # (engine, args, run_id, session)
     options: tuple[Option, ...] = ()
     needs_run: bool = True
-    #: False for read-only actions (status, doctor) and for ``recover``, which a
+    #: False for actions that change nothing (status, doctor) and for ``recover``, which a
     #: human runs from their own terminal after checking that no process remains
     #: (skills tell Claude not to run it; nothing else enforces that). Every
     #: other action changes the run and needs the owning session.
@@ -133,23 +133,15 @@ class Workflow:
         """The configuration frozen at start (compared with ``config.json``), if any."""
         return None
 
-    # -- long runner actions and Claude Code's Bash limit -----------------------------------
-    def bash_needs(self, config: dict) -> dict[str, int]:
-        """Worst-case Bash timeouts (ms) of the long actions this configuration allows."""
-        reviewers = config.get("reviewers") or []
-        return {"review": bash_timeout_ms(max(r["timeout_seconds"] for r in reviewers))} if reviewers else {}
-
+    # -- long runner actions, run as background Bash commands ------------------------------
     def bash_timeouts(self, state: dict) -> dict[str, int]:
         """Bash timeouts (ms) for the next long actions, from the current state only."""
         next_id = self.summary(state).get("next_reviewer")
         config = self.frozen_config(state) or {}
         for reviewer in config.get("reviewers") or []:
             if reviewer["id"] == next_id:
-                return {"review": bash_timeout_ms(reviewer["timeout_seconds"])}
+                return {"review": review_timeout_ms(reviewer["timeout_seconds"])}
         return {}
-
-    def timeout_warnings(self, config: dict) -> list[str]:
-        return limit_warnings(self.bash_needs(config))
 
     def load_config(self, project: Path) -> dict:
         raise NotImplementedError

@@ -352,8 +352,30 @@ def capture(project: Path, config: dict) -> dict:
     }
 
 
+def _file_diff(path: str, before: dict | None, after: dict | None, binary: bool) -> str:
+    """One file's change in Git's unified diff form, with its header even when the body is empty."""
+    lines = [f"diff --git a/{path} b/{path}\n"]
+    if before is None:
+        lines.append(f"new file mode {after['mode']}\n")
+    elif after is None:
+        lines.append(f"deleted file mode {before['mode']}\n")
+    elif before["mode"] != after["mode"]:
+        lines += [f"old mode {before['mode']}\n", f"new mode {after['mode']}\n"]
+    old_name = f"a/{path}" if before is not None else "/dev/null"
+    new_name = f"b/{path}" if after is not None else "/dev/null"
+    if binary:
+        if (before or {}).get("sha256") != (after or {}).get("sha256"):
+            lines.append(f"Binary files {old_name} and {new_name} differ\n")
+        return "".join(lines)
+    body = difflib.unified_diff((before or {}).get("text", "").splitlines(keepends=True),
+                                (after or {}).get("text", "").splitlines(keepends=True),
+                                fromfile=old_name, tofile=new_name)
+    lines += [line if line.endswith("\n") else line + "\n\\ No newline at end of file\n" for line in body]
+    return "".join(lines)
+
+
 def compare(baseline: dict, current: dict) -> dict:
-    """Return full changed file records and an exact textual unified diff."""
+    """Changed file records, each with its exact Git-style unified diff."""
     old, new = baseline["files"], current["files"]
     changes = []
     binary_changes = []
@@ -367,11 +389,19 @@ def compare(baseline: dict, current: dict) -> dict:
         is_binary = any(item is not None and item.get("binary") for item in (before, after))
         if is_binary:
             binary_changes.append(path)
-            diff = None
-        else:
-            before_text = before["text"] if before is not None else ""
-            after_text = after["text"] if after is not None else ""
-            lines = difflib.unified_diff(before_text.splitlines(keepends=True), after_text.splitlines(keepends=True), fromfile=f"a/{path}" if before else "/dev/null", tofile=f"b/{path}" if after else "/dev/null")
-            diff = "".join(line if line.endswith("\n") else line + "\n\\ No newline at end of file\n" for line in lines)
-        changes.append({"path": path, "change": kind, "before": before, "after": after, "diff": diff})
+        changes.append({"path": path, "change": kind, "before": before, "after": after,
+                        "diff": _file_diff(path, before, after, is_binary)})
     return {"baseline_id": baseline["snapshot_id"], "snapshot_id": current["snapshot_id"], "changed_files": changes, "binary_changes": binary_changes, "unchanged_count": unchanged}
+
+
+def diff_text(delta: dict) -> str:
+    """All changes of a ``compare`` result as one unified diff."""
+    return "".join(change["diff"] for change in delta["changed_files"])
+
+
+def change_list(delta: dict) -> list[dict]:
+    """Each changed path with its mode, size and hash before and after; never the contents."""
+    def brief(record: dict | None) -> dict | None:
+        return None if record is None else {key: record[key] for key in ("mode", "size", "sha256")}
+    return [{"path": change["path"], "change": change["change"], "binary": change["path"] in delta["binary_changes"],
+             "before": brief(change["before"]), "after": brief(change["after"])} for change in delta["changed_files"]]

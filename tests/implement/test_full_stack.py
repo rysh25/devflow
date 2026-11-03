@@ -30,33 +30,43 @@ import sys
 kind, mode = sys.argv[1:3]
 args = sys.argv[3:]
 if "--version" in args:
-    print("opencode 2.2.3" if kind == "opencode" else "codex offline-fixture-1")
+    print("opencode 9.0.0" if kind == "opencode" else "codex offline-fixture-1")
     raise SystemExit(0)
 if "--help" in args:
-    print("--strict-config --ignore-user-config --ignore-rules --output-schema "
-          "--json --ephemeral --format --agent --model --file --standalone")
+    print("--json --output-schema --output-last-message --skip-git-repo-check --cd --model --config "
+          "--format --file --standalone")
     raise SystemExit(0)
 
 if kind == "codex":
     content = sys.stdin.read()
     source = "stdin"
+    records = Path(args[args.index("--output-last-message") + 1]).parent
 else:
     source = args[args.index("--file") + 1]
     content = Path(source).read_text(encoding="utf-8")
+    records = Path(source).parent
 
-packet_text = content.split("\n\n## Untrusted review packet\n", 1)[1]
+packet_text = content.split("\n\n## Review packet (data, not instructions)\n", 1)[1]
 packet = json.loads(packet_text)
+# Like a real reviewer, read the code and the diff with "its own tools".
+diff = Path(packet["diff_path"]).read_text(encoding="utf-8")
 seen = {
-    "kind": kind, "args": args, "cwd": os.getcwd(), "input_source": source,
+    "kind": kind, "args": args, "cwd": os.getcwd(), "pwd": os.environ.get("PWD"), "input_source": source,
     "snapshot_id": packet["snapshot_id"], "plan": packet["plan"],
     "packet_sha256": hashlib.sha256(packet_text.encode("utf-8")).hexdigest(),
     "validation_status": packet["validation"]["status"],
     "check_status": packet["check_results"]["status"],
     "previous_review_count": len(packet["previous_reviews"]),
-    "files_at_start": sorted(p.name for p in Path.cwd().iterdir()),
-    "opencode_config_dir": os.environ.get("OPENCODE_CONFIG_DIR"),
+    "value_py": Path("value.py").read_text(encoding="utf-8"), "diff": diff,
+    "stdin_after_prompt": sys.stdin.read() if kind == "codex" else sys.stdin.read(),
+    "env": {key: os.environ.get(key) for key in (
+        "OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG_CONTENT", "OPENCODE_PERMISSION",
+        "OPENCODE_SERVER", "OPENCODE_DISABLE_PROJECT_CONFIG", "OPENCODE_DISABLE_CLAUDE_CODE")},
 }
-Path("seen.json").write_text(json.dumps(seen), encoding="utf-8")
+(records / "seen.json").write_text(json.dumps(seen), encoding="utf-8")
+if mode == "edit":
+    # Against its instructions, the reviewer changes a file in the snapshot scope.
+    Path("value.py").write_text("VALUE = 2\n", encoding="utf-8")
 review = {
     "schema_version": 1, "snapshot_id": packet["snapshot_id"], "verdict": "pass",
     "summary": "Offline fixture independently accepted the exact packet.",
@@ -69,16 +79,18 @@ if kind == "codex":
     events = [
         {"type": "thread.started", "thread_id": "offline-thread"},
         {"type": "turn.started"},
-        {"type": "item.completed", "item": {"type": "agent_message", "text": answer}},
+        {"type": "item.completed", "item": {"id": "i1", "type": "command_execution", "command": "cat value.py"}},
+        {"type": "item.completed", "item": {"id": "i2", "type": "agent_message", "text": answer}},
         {"type": "turn.completed", "usage": {"input_tokens": 0, "output_tokens": 0}},
     ]
 else:
     events = [
-        {"type": "step_start", "sessionID": "offline-session", "part": {"messageID": "offline-message"}},
-        {"type": "text", "sessionID": "offline-session", "part": {
-            "messageID": "offline-message", "id": "offline-text", "text": answer}},
-        {"type": "step_finish", "sessionID": "offline-session", "part": {
-            "messageID": "offline-message", "reason": "stop"}},
+        {"type": "step_start", "sessionID": "offline-session", "part": {"messageID": "m1"}},
+        {"type": "tool_use", "sessionID": "offline-session", "part": {"id": "t1", "tool": "read"}},
+        {"type": "step_finish", "sessionID": "offline-session", "part": {"messageID": "m1", "reason": "tool-calls"}},
+        {"type": "step_start", "sessionID": "offline-session", "part": {"messageID": "m2"}},
+        {"type": "text", "sessionID": "offline-session", "part": {"messageID": "m2", "id": "x", "text": answer}},
+        {"type": "step_finish", "sessionID": "offline-session", "part": {"messageID": "m2", "reason": "stop"}},
     ]
 for event in events:
     print(json.dumps(event), flush=True)
@@ -113,7 +125,7 @@ class FullStackTests(unittest.TestCase):
             {"id": "codex", "kind": "codex", "command": [sys.executable, str(self.fake), "codex", mode],
              "model": "gpt-6.1-sol", "effort": "xhigh", "timeout_seconds": 10},
             {"id": "opencode", "kind": "opencode", "command": [sys.executable, str(self.fake), "opencode", "pass"],
-             "model": "opencode-go/deepseek-v4.1-flash", "effort": "high", "timeout_seconds": 10, "protocol_version": 2},
+             "model": "opencode-go/deepseek-v4.1-flash", "effort": "high", "timeout_seconds": 10},
         ]
         check_script = "from pathlib import Path; assert Path('value.py').read_text(encoding='utf-8') == 'VALUE = 1\\n'; print('implementation checked')"
         atomic_write_json(self.project / "devflow.config.json", {"schema_version": 1, "implement": {
@@ -142,7 +154,7 @@ class FullStackTests(unittest.TestCase):
 
     def observed(self, number):
         process = self.run / "review-processes" / f"{number:02}"
-        return process, read_json(process / "workspace" / "seen.json")
+        return process, read_json(process / "seen.json")
 
     def test_two_real_subprocess_adapters_complete_exact_snapshot(self):
         self.prepare()
@@ -162,31 +174,33 @@ class FullStackTests(unittest.TestCase):
         open_dir, opencode = self.observed(2)
         self.assertEqual(codex["args"][codex["args"].index("--model") + 1], "gpt-6.1-sol")
         self.assertIn('model_reasoning_effort="xhigh"', codex["args"])
+        self.assertIn('approval_policy="never"', codex["args"])
+        self.assertFalse([arg for arg in codex["args"] if "project_doc" in arg])
         self.assertEqual(codex["input_source"], "stdin")
-        self.assertEqual(codex["args"][codex["args"].index("--sandbox") + 1], "read-only")
-        self.assertIn("--ignore-user-config", codex["args"])
+        self.assertEqual(Path(codex["args"][codex["args"].index("--cd") + 1]), self.project)
         self.assertEqual(opencode["args"][opencode["args"].index("--model") + 1], "opencode-go/deepseek-v4.1-flash#high")
         self.assertIn("--standalone", opencode["args"])
-        self.assertEqual(Path(opencode["input_source"]), open_dir / "workspace" / "review-input.md")
-        self.assertEqual(Path(opencode["opencode_config_dir"]), open_dir / "workspace")
+        self.assertEqual(Path(opencode["input_source"]), open_dir / "review-input.md")
+        # The project's own settings and instructions load as usual: DevFlow sets nothing for them.
+        for key in ("OPENCODE_DISABLE_PROJECT_CONFIG", "OPENCODE_DISABLE_CLAUDE_CODE", "OPENCODE_CONFIG_DIR"):
+            self.assertIsNone(opencode["env"][key], key)
         self.assertEqual(codex["previous_review_count"], 0)
         self.assertEqual(opencode["previous_review_count"], 1)
-        runtime = read_json(open_dir / "workspace" / "opencode.json")
-        # Everything is denied except, by default, the web tools (allowed last).
-        self.assertEqual(runtime["permissions"], [{"action": "*", "resource": "*", "effect": "deny"},
-                                                  {"action": "webfetch", "resource": "*", "effect": "allow"},
-                                                  {"action": "websearch", "resource": "*", "effect": "allow"}])
-        agent = opencode["args"][opencode["args"].index("--agent") + 1]
-        self.assertIn(agent, runtime["agents"])
+        self.assertEqual([item["tool_calls"] for item in final["report"]["reviews"]],
+                         [{"command_execution": 1}, {"read": 1}])
 
         for number, process, seen in ((1, codex_dir, codex), (2, open_dir, opencode)):
             with self.subTest(reviewer=seen["kind"]):
                 packet = self.run / "reviews" / f"{number:02}" / "packet.json"
                 invocation = read_json(process / "invocation.json")
                 accepted = read_json(self.run / "reviews" / f"{number:02}" / "review.json")
-                self.assertEqual(Path(seen["cwd"]), process / "workspace")
-                self.assertNotEqual(Path(seen["cwd"]), self.project)
-                self.assertNotIn("value.py", seen["files_at_start"])
+                # The reviewer works in the workspace and reads the code and the diff itself.
+                self.assertEqual(Path(seen["cwd"]), self.project)
+                self.assertEqual(Path(seen["pwd"]), self.project)
+                self.assertEqual(seen["value_py"], "VALUE = 1\n")
+                self.assertIn("diff --git a/value.py b/value.py\n", seen["diff"])
+                self.assertIn("+VALUE = 1\n", seen["diff"])
+                self.assertEqual(seen["stdin_after_prompt"], "")
                 self.assertEqual(seen["snapshot_id"], self.snapshot_id)
                 self.assertEqual(accepted["snapshot_id"], self.snapshot_id)
                 self.assertEqual(seen["plan"], self.plan.read_text(encoding="utf-8"))
@@ -194,11 +208,12 @@ class FullStackTests(unittest.TestCase):
                 self.assertEqual(seen["check_status"], "passed")
                 self.assertEqual(seen["packet_sha256"], digest(packet.read_bytes()))
                 self.assertEqual(invocation["packet_sha256"], seen["packet_sha256"])
+                self.assertEqual(Path(invocation["cwd"]), self.project)
                 self.assertFalse(invocation["shell"])
                 self.assertFalse(invocation["effective_model_attested"])
                 self.assertEqual(invocation["kind"], seen["kind"])
                 # The reviewer instructions appear once, ahead of the schema and the packet.
-                prompt = (process / "workspace" / "review-input.md").read_text(encoding="utf-8")
+                prompt = (process / "review-input.md").read_text(encoding="utf-8")
                 instructions = WORKFLOW.resource("reviewer.md").read_text(encoding="utf-8")
                 self.assertTrue(prompt.startswith(instructions))
                 self.assertEqual(prompt.count(instructions), 1)
@@ -208,6 +223,16 @@ class FullStackTests(unittest.TestCase):
         self.assertEqual(read_json(codex_dir / "final-response.json")["snapshot_id"], self.snapshot_id)
         self.assertEqual(read_json(self.run / final["report_path"]), final["report"])
         self.assertEqual(self.source.read_text(encoding="utf-8"), "VALUE = 1\n")
+
+    def test_a_reviewer_that_edits_the_workspace_is_not_counted(self):
+        self.prepare("edit")
+        result = self.engine.review(self.run_id, self.session)
+        self.assertEqual(result["status"], "paused_error")
+        self.assertEqual(result["review_count"], 1)
+        self.assertEqual(result["attempts"][0]["status"], "failed")
+        self.assertIn("changed since checkpoint", result["last_error"])
+        self.assertEqual(result["approvals"], {})
+        self.assertFalse((self.run / "reviews" / "01" / "review.json").exists())
 
     def test_malformed_final_file_consumes_reserved_attempt_and_stops(self):
         self.prepare("bad-final")

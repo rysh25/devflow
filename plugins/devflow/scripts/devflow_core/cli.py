@@ -40,7 +40,7 @@ def parser() -> Parser:
     result.add_argument("--session", help="Actual Claude Code session ID")
     result.add_argument("--run", help="Existing run ID; required to inspect or act on a particular run")
     commands = result.add_subparsers(dest="command", required=True, parser_class=Parser)
-    commands.add_parser("status", help="Read-only overview, or the bound/selected run")
+    commands.add_parser("status", help="Overview, or the bound/selected run; changes nothing")
     commands.add_parser("doctor", help="Offline prerequisites for every workflow; never calls a model")
     commands.add_parser("hook", help="Claude Code hook entry; reads one JSON object from stdin")
     for name, workflow in WORKFLOWS.items():
