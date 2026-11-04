@@ -380,7 +380,8 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
             elif attachment_type == "queued_command":
                 if not duplicate(record, attachment):
                     # Images in a notice belong to the skipped message, not to the human's attachments.
-                    automated(read_text(attachment.get("prompt"), _QUEUED_IN_ANOTHER_FORM)[0])
+                    automated(read_text(attachment.get("prompt"), _QUEUED_IN_ANOTHER_FORM)[0],
+                              record.get("promptId"))
             elif attachment_type not in _IGNORED_ATTACHMENTS:
                 skip_unknown("attachments", attachment_type)
             # Other queued messages (subagent reports, task notifications) are tool output.
@@ -554,7 +555,9 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
         linked.append((event_index, event, tool_id))
     # Notices take, from the hook prompts left, the one with their prompt ID (the
     # transcript may word a notice differently from its hook prompt), or else the
-    # only one with the same text (several: none, a human's may be among them).
+    # only one with the same text. With several and no ID to tell them apart, any
+    # of them may be the notice: each is kept, with an unknown origin, and none
+    # counts as the human's.
     automated_events: set[int] = set()
     for text, prompt_id in notices:
         left = [p for p in prompts if not p["used"]]
@@ -565,6 +568,9 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
         if matching:
             matching["used"] = True
             automated_events.add(matching["event_index"])
+        else:
+            for prompt in same_text:
+                prompt["origin_unknown"] = True
     unused = [p for p in prompts if not p["used"]]
     scan = {"visible_records": visible_records, "ignored_records": ignored_records,
             "omitted_attachments": omitted_attachments, "unknown_types": unknown}

@@ -636,6 +636,32 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(out["coverage"]["mode"], "bounded-transcript-with-hook-provenance")
         self.assertEqual([m["content"] for m in out["messages"]], ["request", "Question?", "Answer"])
 
+    def queued_notice(self, text, prompt_id=None):
+        return {"type": "attachment", "attachment": {"type": "queued_command", "commandMode": "task-notification",
+                                                     "origin": {"kind": "task-notification"}, "prompt": text},
+                **({"promptId": prompt_id} if prompt_id else {})}
+
+    def test_notices_alike_in_text_take_their_hook_prompts_by_prompt_id(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), entry("assistant", "Question?"),
+                   self.queued_notice("Task done", "p-1"), self.queued_notice("Task done", "p-2"))
+        out = capture_interview(marker, [self.prompt("request"), dict(self.prompt("Task done"), prompt_id="p-1"),
+                                         dict(self.prompt("Task done"), prompt_id="p-2")])
+        self.assertEqual(out["coverage"]["mode"], "bounded-transcript-with-hook-provenance")
+        self.assertEqual([m["content"] for m in out["messages"]], ["request", "Question?"])
+        self.assertEqual(out["coverage"]["human_response_count"], 0)
+
+    def test_notices_alike_in_text_without_prompt_ids_are_kept_but_never_counted(self):
+        # Which hook prompt is which notice cannot be told: none counts as the human's.
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), entry("assistant", "Question?"),
+                   self.queued_notice("Task done"), self.queued_notice("Task done"))
+        out = capture_interview(marker, [self.prompt("request"), self.prompt("Task done"), self.prompt("Task done")])
+        self.assertEqual(out["coverage"]["mode"], "hook-records-only")
+        kept = [m for m in out["messages"] if m["content"] == "Task done"]
+        self.assertEqual([m["source"].get("origin_kind") for m in kept], ["unknown", "unknown"])
+        self.assertEqual(out["coverage"]["human_response_count"], 0)
+
     def test_a_human_reply_with_the_same_text_as_a_notice_is_kept_when_using_the_hook_records(self):
         marker = transcript_marker(str(self.path))
         self.write(entry("user", "request"), entry("assistant", "Question?"),
@@ -646,6 +672,9 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(out["coverage"]["mode"], "hook-records-only")
         self.assertEqual([m["content"] for m in out["messages"]], ["request", "Done", "a prompt the transcript lacks"])
         self.assertEqual(out["messages"][1]["source"]["hook_event_index"], 2)
+        # The notice took its own prompt by ID, so the human's "Done" still counts.
+        self.assertNotIn("origin_kind", out["messages"][1]["source"])
+        self.assertEqual(out["coverage"]["human_response_count"], 2)
 
     def test_an_exchange_whose_questions_are_only_in_unknown_blocks_keeps_the_human_words(self):
         marker = transcript_marker(str(self.path))
