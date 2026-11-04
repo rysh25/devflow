@@ -8,7 +8,9 @@ from unittest.mock import patch
 from devflow_core.common.storage import (DevFlowError, atomic_json, checked_text, digest,
     file_lock, json_bytes, no_symlinks, read_json, within, write_new)
 from devflow_core.common.errors import ReviewerError
-from devflow_core.common.review import all_approved, check_fields, next_reviewer, review_budget, validate_limit
+from devflow_core.common.review import (REVIEW_LIMIT_REASON, all_approved, ask_at_limit, check_fields,
+                                        check_review_budget, decide_at_limit, next_reviewer, review_budget,
+                                        validate_limit)
 from devflow_core.common.settings import validate_document, workflow_overlay
 from devflow_core.common.environment import (GIT_FACT_SECONDS, PROBE_SECONDS, REVIEW_SETUP_SECONDS, bash_timeout_ms,
                                               python_errors, review_timeout_ms)
@@ -17,6 +19,11 @@ from devflow_core.common import runs
 
 # The one canonical field error; the plan and implement validator tests share it.
 FIELD_ERROR = 'findings[0] has missing or unknown fields (missing: none; unknown: "consequence")'
+# The one canonical review limit question (default settings, 6 used, opencode approving);
+# the plan and implement engine tests share it.
+LIMIT_QUESTION = ("Review limit reached: 6 of 6 reviews used. Reviewers approving the current version: opencode. "
+                  "Continue with 2 more reviews (new limit 8; next reviewers in order: codex, opencode), "
+                  "or stop and end the run as exhausted?")
 
 
 class SharedStorageTests(unittest.TestCase):
@@ -168,13 +175,19 @@ class SharedReviewTests(unittest.TestCase):
                     validate_limit(value)
         self.assertEqual(validate_limit(6), 6)
 
-    def test_alternating_schedule_cannot_dispatch_seventh(self):
+    def test_alternating_schedule_stays_within_the_limit(self):
         self.assertEqual([next_reviewer(self.reviewers, used, 6)["id"] for used in range(6)],
                          ["codex", "opencode", "codex", "opencode", "codex", "opencode"])
         for used in (-1, 6, True, "0"):
             with self.subTest(used=used):
                 with self.assertRaises(DevFlowError):
                     next_reviewer(self.reviewers, used, 6)
+        # A raised limit continues the same alternation.
+        self.assertEqual([next_reviewer(self.reviewers, used, 8)["id"] for used in (6, 7)], ["codex", "opencode"])
+        for limit in (True, "8", 100):
+            with self.subTest(limit=limit):
+                with self.assertRaises(DevFlowError):
+                    next_reviewer(self.reviewers, 0, limit)
 
     def test_same_digest_required_from_every_reviewer(self):
         self.assertFalse(all_approved(self.reviewers, {"codex": "A"}, "A"))
@@ -248,13 +261,74 @@ class SharedSettingsTests(unittest.TestCase):
 class ReviewBudgetTests(unittest.TestCase):
     def test_the_listed_next_reviewer_is_the_one_that_will_be_dispatched(self):
         config = {"max_reviews": 6, "reviewers": [{"id": "codex"}, {"id": "opencode"}, {"id": "second"}]}
-        for used in range(6):
+        state = {"config": config, "review_limit": 9, "status": "ready"}
+        for used in range(9):
             with self.subTest(used=used):
-                budget = review_budget(used, config, "ready")
-                self.assertEqual(budget["next_reviewer"], next_reviewer(config["reviewers"], used, 6)["id"])
-                self.assertEqual((budget["review_count"], budget["remaining_reviews"]), (used, 6 - used))
-        self.assertIsNone(review_budget(6, config, "ready")["next_reviewer"])
-        self.assertIsNone(review_budget(2, config, "completed")["next_reviewer"])
+                budget = review_budget(state, used)
+                self.assertEqual(budget["next_reviewer"], next_reviewer(config["reviewers"], used, 9)["id"])
+                self.assertEqual((budget["review_count"], budget["review_limit"], budget["remaining_reviews"]),
+                                 (used, 9, 9 - used))
+        self.assertIsNone(review_budget(state, 9)["next_reviewer"])
+        self.assertIsNone(review_budget(dict(state, status="completed"), 2)["next_reviewer"])
+
+
+class ReviewLimitTests(unittest.TestCase):
+    """The question at the review limit and the human's answer (shared by both flows)."""
+
+    def state(self, limit=6, reviewers=("codex", "opencode")):
+        return {"config": {"max_reviews": 6, "reviewers": [{"id": name} for name in reviewers]},
+                "review_limit": limit, "status": "ready"}
+
+    def ask(self, state, used, approved=()):
+        asked = []
+        reached = ask_at_limit(state, used, set(approved), lambda reason, questions: asked.append((reason, questions)))
+        return reached, asked
+
+    def test_reviews_left_change_nothing(self):
+        state = self.state()
+        self.assertEqual(self.ask(state, 5, {"codex"}), (False, []))
+        self.assertEqual(state, self.state())
+
+    def test_the_limit_asks_the_canonical_question(self):
+        state = self.state()
+        self.assertEqual(self.ask(state, 6, {"opencode"}), (True, [(REVIEW_LIMIT_REASON, [LIMIT_QUESTION])]))
+        self.assertEqual(state["status"], "ready")  # The flow's escalate callback sets awaiting_human.
+        reached, asked = self.ask(self.state(), 6)
+        self.assertIn("Reviewers approving the current version: none.", asked[0][1][0])
+
+    def test_one_round_is_every_configured_reviewer(self):
+        reached, asked = self.ask(self.state(reviewers=("codex", "opencode", "second")), 6, {"second", "codex"})
+        self.assertEqual(asked[0][1][0],
+                         "Review limit reached: 6 of 6 reviews used. Reviewers approving the current version: "
+                         "codex, second. Continue with 3 more reviews (new limit 9; next reviewers in order: "
+                         "codex, opencode, second), or stop and end the run as exhausted?")
+
+    def test_a_round_past_the_ceiling_ends_without_a_question(self):
+        state = self.state(limit=98)
+        self.assertEqual(self.ask(state, 98), (True, []))
+        self.assertEqual(state["status"], "exhausted")
+        state = self.state(limit=96)
+        self.assertEqual(self.ask(state, 96)[0], True)
+        self.assertEqual(state["status"], "ready")  # 96 + 2 = 98 still fits: asked.
+
+    def test_answers(self):
+        state = self.state()
+        decide_at_limit(state, "continue", "ready_review")
+        self.assertEqual((state["review_limit"], state["status"]), (8, "ready_review"))
+        state = self.state()
+        decide_at_limit(state, "stop", "ready")
+        self.assertEqual((state["review_limit"], state["status"]), (6, "exhausted"))
+        for decision in ("cancel", "", None):
+            with self.subTest(decision=decision):
+                with self.assertRaises(DevFlowError):
+                    decide_at_limit(self.state(), decision, "ready")
+
+    def test_corrupt_limits_are_never_reset(self):
+        check_review_budget(self.state(limit=8), 8)
+        for limit, used in ((5, 0), (100, 0), (7, 0), (8, 9), (True, 0), ("6", 0), (6, -1), (6, True)):
+            with self.subTest(limit=limit, used=used):
+                with self.assertRaisesRegex(DevFlowError, "never reset"):
+                    check_review_budget(self.state(limit=limit), used)
 
 
 class PathTests(unittest.TestCase):
@@ -334,12 +408,12 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(git.call_args.kwargs["timeout"], GIT_FACT_SECONDS)
 
     def test_released_run_formats_have_names_and_unreleased_ones_are_generic(self):
-        self.assertEqual(runs.RELEASES, {1: "0.1.x", 2: "0.2.x", 3: "0.3.x"})
+        self.assertEqual(runs.RELEASES, {1: "0.1.x", 2: "0.2.x", 3: "0.3.x", 6: "0.4.x"})
         for version, release in runs.RELEASES.items():
             with self.subTest(version=version):
                 self.assertEqual(runs.release_name(version), release)
         # Formats 4 and 5 were never released (0.4.0 development); they are named generically.
-        self.assertGreater(runs.SCHEMA_VERSION, 5)
+        self.assertGreater(runs.SCHEMA_VERSION, 6)
         self.assertEqual(runs.release_name(4), "an older version (run format 4)")
         self.assertEqual(runs.release_name(5), "an older version (run format 5)")
         self.assertEqual(runs.release_name(9), "an older version (run format 9)")

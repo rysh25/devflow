@@ -12,11 +12,11 @@ Use the bundled runner, with the exact expanded plugin, project, and session pat
 uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" --project "${CLAUDE_PROJECT_DIR}" --session "${CLAUDE_SESSION_ID}" plan COMMAND
 ```
 
-Quote arguments for the current shell; never interpolate user requests, reviewer text, or human answers into a shell command. Pass all such content through files. Run the runner as a single command so it matches the pre-approved form. For `review`, pass `bash_timeout_ms.review` from the last runner result or the status context as the Bash (or PowerShell) tool's timeout, unchanged; never lower it; reviewers may take many minutes. If it is larger than the tool's maximum for foreground commands, run the call with `run_in_background: true` and that same timeout. When a call runs in the background (yours, or one Claude Code moved there at its limit), wait for its completion notice and read the runner's JSON from the command's output; until then, do not change the draft or start another runner action. The runner returns JSON. Read it after every command; never infer that a failed command succeeded. Global selectors (`--project`, `--session`, `--run`) always precede the `plan` workflow selector.
+Quote arguments for the current shell; never interpolate user requests, reviewer text, or human answers into a shell command. Pass all such content through files. Run the runner as a single command so it matches the pre-approved form. For `review`, pass `bash_timeout_ms.review` from the last runner result or the status context as the Bash (or PowerShell) tool's timeout, unchanged; never lower it; reviewers may take many minutes. If it is larger than the tool's maximum for foreground commands, run the call with `run_in_background: true` and that same timeout. When `bash_timeout_ms` has no `review` value (at the review limit), call `review` with the normal Bash timeout: it starts no reviewer. When a call runs in the background (yours, or one Claude Code moved there at its limit), wait for its completion notice and read the runner's JSON from the command's output; until then, do not change the draft or start another runner action. The runner returns JSON. Read it after every command; never infer that a failed command succeeded. Global selectors (`--project`, `--session`, `--run`) always precede the `plan` workflow selector.
 
 1. Run `status`, then `doctor`. A `UserPromptSubmit` hook must already have captured the explicit `/devflow:plan` request. If no run exists, the request is empty, hooks failed, or mandatory prerequisites are missing, stop and explain the repair needed. The flow-specific `plan doctor` checks config, executable discovery, and the configured interview skill's local metadata offline; it does not execute the skill or verify CLI version support, authentication, model availability, or reasoning variants. Read its `interview_skill` report, including checked locations and limitations. Do not synthesize a new original request or transcript. Do not manually edit persisted state.
 2. Use the returned `run_id`, absolute `draft_dir`, and effective configuration. For every later action, insert `--run RUN_ID` before the `plan` selector: the session's binding to a finished run ends at the next prompt, and the completion notice of a call that runs in the background counts as one. Keep every file you write inside that `draft_dir`. Do not modify `.devflow` files outside it; the runner owns them.
-3. If the state is not `interview`, continue from the state table below. Never reset the run to obtain a fresh review allowance.
+3. If the state is not `interview`, continue from the state table below. Never reset the count or start a replacement run to obtain more reviews; at the review limit the runner asks the human whether to add them.
 
 Only the bundled runner prefix above is pre-approved (for Bash and PowerShell) while this skill is active. DevFlow does not limit other tools; they follow your Claude Code settings and permission mode.
 
@@ -46,7 +46,7 @@ When invoking the configured Skill, pass two points in its arguments: questions 
 
 ## Review and revision loop
 
-Follow the runner's state rather than keeping a separate counter. Call one reviewer at a time. The default order is Codex, OpenCode, Codex, OpenCode, Codex, OpenCode; if the user explicitly configured another supported order, follow the frozen run configuration. A dispatched call consumes a slot even if it fails. Never invoke providers directly, retry outside the runner, switch models silently, or start a replacement run to evade the limit.
+Follow the runner's state rather than keeping a separate counter. Call one reviewer at a time. The default order alternates Codex and OpenCode up to the initial limit (`max_reviews`, six by default) and continues the same way after the human adds reviews; if the user explicitly configured another supported order, follow the frozen run configuration. A dispatched call consumes a slot even if it fails. At the review limit, `review` starts no reviewer: it asks the human (`awaiting_human`, question kind `review_budget`) whether to add one review per configured reviewer. Never invoke providers directly, retry outside the runner, switch models silently, or start a replacement run to obtain more reviews.
 
 | State | Action |
 |---|---|
@@ -54,11 +54,11 @@ Follow the runner's state rather than keeping a separate counter. Call one revie
 | `planning` | Create and submit the initial plan. |
 | `ready` | Run `review`; inspect the returned state and saved review. |
 | `awaiting_revision` | Evaluate every finding, write the revised draft and disposition ledger, then run `apply`. |
-| `awaiting_human` | Present the pending question(s), wait for an actual human response, record/resolve it, then continue. |
+| `awaiting_human` | Present the pending question(s), wait for an actual human response, record/resolve it, then continue. For the review limit question (`escalation.detail.kind` is `review_budget`), first summarize in the conversation the findings still open in the latest reviews and any failure in `last_error`, then ask its exact question. |
 | `paused_error` | Explain the technical blocker. Do not retry/fallback automatically; repair/resume only with the human's direction. |
 | `reviewing` | Do not launch a second call. If the review runs in the background, wait for its completion notice. Otherwise report the interrupted invocation. Only the human uses `recover`, from their own terminal after confirming all associated processes stopped; do not run it yourself. A result that arrives after recovery is kept under `late/` and never changes the run. |
 | `completed` | Run `publish`, inspect `publication.status`, then `report`. Stop without implementing. Publication errors are not a saved plan. |
-| `exhausted` | Report the remaining issues and validation coverage; stop at the limit. |
+| `exhausted` | Report the remaining issues and validation coverage; stop. A run ends here only when the human chose `stop` at the review limit, or when adding one round of reviewers would pass 99 reviews in total (98 with the default settings). |
 | `cancelled` | Stop. |
 
 For `awaiting_revision`:
@@ -80,7 +80,7 @@ For `awaiting_revision`:
 ```
 
 4. Run `apply --plan-file "ABSOLUTE_DRAFT_PATH/plan.md" --decisions-file "ABSOLUTE_DRAFT_PATH/revision.json" --expected-hash CURRENT_PLAN_HASH`. Use the hash returned immediately before this revision. If stale, reload status and reassess; do not force it.
-5. Continue the state table without requesting human confirmation for routine, requirement-preserving edits. Successful early completion requires clean reviews by both providers of the **same plan content**. A revised sixth-round plan is not automatically considered reviewed or approved.
+5. Continue the state table without requesting human confirmation for routine, requirement-preserving edits. Successful early completion requires clean reviews by both providers of the **same plan content**. A revision made after the last review is not reviewed until another review runs; if the human stops at the review limit, it stays unreviewed and is not approved.
 
 ## Human escalation
 
@@ -88,7 +88,7 @@ Escalate new or changed requirements, scope/priority trade-offs, overriding a co
 
 Write `escalation.json` in `draft_dir` as `{"reason":"Why autonomous continuation is unsafe","questions":["Specific choice with options and trade-offs"]}` and run `pause --reason-file "ABSOLUTE_DRAFT_PATH/escalation.json"` unless the runner has already paused. Ask the human with AskUserQuestion, without prefilled answers. Only a successful recorded answer from this tool can resolve escalation; an ordinary chat message remains context, not approval. Do not resolve the pause in the same turn without an actual recorded response.
 
-After the human responds, run `status` and use its `human_events` array. Create `human-answer.json` as `{"answer":"The actual human response","event_ids":["RECORDED_EVENT_ID"]}`. Copy `answer_text` exactly for the selected `event_id`; for several events, join their `answer_text` values with a single newline in the same order as `event_ids`. This includes the canonical JSON string returned for an `AskUserQuestion` response; do not paraphrase it. Run `resolve --answer-file "ABSOLUTE_DRAFT_PATH/human-answer.json"`. Use only matching real events; never invent IDs, infer consent from silence, or attribute a reviewer/Claude statement to the human. Read `--help` and the error if the response format is rejected.
+After the human responds, run `status` and use its `human_events` array. Create `human-answer.json` as `{"answer":"The actual human response","event_ids":["RECORDED_EVENT_ID"]}`. Copy `answer_text` exactly for the selected `event_id`; for several events, join their `answer_text` values with a single newline in the same order as `event_ids`. This includes the canonical JSON string returned for an `AskUserQuestion` response; do not paraphrase it. For the review limit question only, also add `"decision": "continue"` (add one review per configured reviewer and keep reviewing) or `"decision": "stop"` (end the run as `exhausted`), following the human's actual answer; if the answer does not say which, ask again. Other questions take no `decision`. Run `resolve --answer-file "ABSOLUTE_DRAFT_PATH/human-answer.json"`. Use only matching real events; never invent IDs, infer consent from silence, or attribute a reviewer/Claude statement to the human. Read `--help` and the error if the response format is rejected.
 
 ## Handoff
 

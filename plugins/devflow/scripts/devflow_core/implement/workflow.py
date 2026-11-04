@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ..common.errors import DevFlowError, UsageError
 from ..common.environment import bash_timeout_ms
-from ..common.review import HARD_MAX_REVIEWS, after_failed_review, check_review_config, review_budget
+from ..common.review import after_failed_review, check_review_budget, check_review_config, review_budget
 from ..common.runs import TERMINAL
 from ..common.sessions import prefilled_question_events
 from ..common.storage import digest, json_bytes, no_symlinks, now
@@ -40,8 +40,8 @@ class ImplementWorkflow(Workflow):
     statuses = frozenset({"implementing", "needs_revision", "ready_check", "checking", "ready_review",
                           "reviewing", "awaiting_human", "paused_error", "completed", "exhausted", "cancelled"})
     inflight_statuses = frozenset({"checking", "reviewing"})
-    state_fields = frozenset({"config", "plan_source", "source_digest", "attempts", "approvals", "revision",
-                              "checkpoint_count", "check_attempts", "check_dispatch_count", "check_history",
+    state_fields = frozenset({"config", "plan_source", "source_digest", "attempts", "review_limit", "approvals",
+                              "revision", "checkpoint_count", "check_attempts", "check_dispatch_count", "check_history",
                               "escalations", "resolutions", "reflections", "candidate", "validation",
                               "binary_attestation", "last_error", "baseline_id", "report_path", "resume_status",
                               "workspace"})
@@ -78,7 +78,8 @@ class ImplementWorkflow(Workflow):
             raise DevFlowError("Input plan changed during startup; no run was created. Confirm the plan and invoke implement again")
         fields = {
             "status": "implementing", "plan_source": str(plan.resolve()), "source_digest": digest(data),
-            "config": config, "attempts": [], "approvals": {}, "revision": 0, "checkpoint_count": 0,
+            "config": config, "attempts": [], "review_limit": config["max_reviews"], "approvals": {},
+            "revision": 0, "checkpoint_count": 0,
             "check_attempts": 0, "check_dispatch_count": 0, "check_history": [], "escalations": [],
             "resolutions": [], "reflections": [], "candidate": None, "validation": None,
             "binary_attestation": None, "last_error": None, "baseline_id": baseline["snapshot_id"],
@@ -102,8 +103,9 @@ class ImplementWorkflow(Workflow):
         from .workspace import check_frozen
         check_review_config(state["config"])
         check_frozen(state["workspace"])
-        if not isinstance(state["attempts"], list) or len(state["attempts"]) > HARD_MAX_REVIEWS:
+        if not isinstance(state["attempts"], list):
             raise DevFlowError("Incompatible/corrupt run state; never reset the review count")
+        check_review_budget(state, len(state["attempts"]))
 
     def on_recover(self, store, state: dict) -> None:
         if state["status"] == "checking":
@@ -114,15 +116,15 @@ class ImplementWorkflow(Workflow):
             # An interrupted review is a reviewer failure: other approvals stay.
             state["attempts"][-1].update(status="failed", error="Human-confirmed interrupted dispatch; outcome unknown",
                                          finished_at=now())
-            state.update(status=after_failed_review(len(state["attempts"]), state["config"]), resume_status="ready_review")
+            state.update(status=after_failed_review(len(state["attempts"]), state, "ready_review"),
+                         resume_status="ready_review")
         state.update(last_error="Recovered interrupted operation after human process confirmation")
 
     def on_transfer(self, state: dict) -> None:
         if state["status"] == "paused_error":
+            # At the review limit, the next review request asks the human.
             state["status"] = state.get("resume_status") or "implementing"
             state["resume_status"] = None
-            if len(state["attempts"]) >= state["config"]["max_reviews"]:
-                state["status"] = "exhausted"
 
     def before_save(self, store, state: dict) -> None:
         if state["status"] in {"completed", "exhausted", "cancelled"}:
@@ -147,7 +149,7 @@ class ImplementWorkflow(Workflow):
                 "workspace": {"path": workspace["path"], "identity_verified": workspace["identity"] is not None}}
 
     def summary(self, state: dict) -> dict:
-        return review_budget(len(state["attempts"]), state["config"], state["status"])
+        return review_budget(state, len(state["attempts"]))
 
     def frozen_config(self, state: dict) -> dict:
         return state["config"]

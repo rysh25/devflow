@@ -10,7 +10,7 @@ allowed-tools: Bash(uv run --offline --no-project --no-config --no-python-downlo
 
 Selected run ID: $ARGUMENTS
 
-The user must provide exactly one existing ID. The prompt hook has already handled `/devflow:resume RUN_ID`: it selected the workflow from the stored run, made this session the run's owner, and recorded the request (which is never an answer to a pending question). If the hook did not accept the resume, its notice says why (for example a run started with an older DevFlow such as 0.1.x or 0.2.x, a damaged or ambiguous run, another unfinished run, a process that may still be running, or an unsealed plan interview from another conversation): report that message and stop. Never create a replacement run to obtain more review attempts. Do not manually edit session records, counters, locks, or audit records.
+The user must provide exactly one existing ID. The prompt hook has already handled `/devflow:resume RUN_ID`: it selected the workflow from the stored run, made this session the run's owner, and recorded the request (which is never an answer to a pending question). If the hook did not accept the resume, its notice says why (for example a run started with an older DevFlow such as 0.1.x, 0.2.x or 0.4.x, a damaged or ambiguous run, another unfinished run, a process that may still be running, or an unsealed plan interview from another conversation): report that message and stop. Never create a replacement run to obtain more review attempts; more come only from the human's answer at the review limit. Do not manually edit session records, counters, locks, or audit records.
 
 1. Run the following status command with the exact ID. Read the returned `flow` field; do not guess from filenames.
 
@@ -24,4 +24,4 @@ uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN
 5. For an in-flight/recovery error, stop and ask the human to inspect associated processes. Do not remove locks or run the operator-only recovery action yourself.
 6. For completed Plan reviews with pending/error publication, follow the Plan publication/report instructions; no reviewer is called again. For any terminal Implement state, report the stored outcome and stop without edits.
 
-The same six-attempt ceiling and frozen plan/settings remain in effect across sessions. Technical failure is not permission to switch model, skip checks, or silently repeat a consumed attempt.
+The same review count, review limit (`review_limit`) and frozen plan/settings remain in effect across sessions. Technical failure is not permission to switch model, skip checks, or silently repeat a consumed attempt.

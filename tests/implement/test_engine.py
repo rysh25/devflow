@@ -30,6 +30,8 @@ from devflow_core.implement import checks as checks_module
 from devflow_core.implement.engine import Engine
 from devflow_core.implement.review import validate_review
 from devflow_core.workflows import WORKFLOWS
+from devflow_core.common.review import REVIEW_LIMIT_REASON
+from tests.common.test_common import LIMIT_QUESTION
 
 ACTIVITY = {"tool_call_count": 2, "tool_calls": {"command_execution": 2}, "other_events": {}}
 EVENT_ID = r"\A[a-f0-9]{32}\Z"
@@ -188,6 +190,19 @@ class EngineFixture(unittest.TestCase):
         path = self.draft / "decisions.json"
         atomic_write_json(path, value)
         return self.engine.reflect(self.run_id, self.session, path)
+
+    def at_limit(self, decision, reason="The user chose this at the review limit question."):
+        """Answer the pending review limit question on the question screen and resolve it."""
+        evidence = self.answer("Continue with two more reviews." if decision == "continue" else "Stop here.")
+        return self.engine.resolve(self.run_id, self.session, evidence, decision, reason)
+
+    def fail_until_last(self):
+        """Use five attempts on reviewer failures (each resumed), leaving one."""
+        self.reviewer.side_effect = DevFlowError("Unsuccessful independent review")
+        for _ in range(5):
+            self.review()
+            self.resume()
+        self.reviewer.side_effect = self.respond
 
     def escalate(self):
         path = self.draft / "questions.json"
@@ -484,14 +499,19 @@ class EngineFlowTests(EngineFixture):
         for number in range(1, 7):
             result = self.review()
             self.assertEqual(result["review_count"], number)
-            self.assertEqual(result["status"], "exhausted" if number == 6 else "paused_error")
+            # The last failure leaves no attempt to retry: the next review request asks the human.
+            self.assertEqual(result["status"], "ready_review" if number == 6 else "paused_error")
             if number != 6:
                 resumed = self.resume()
                 self.assertEqual(resumed["review_count"], number)
                 self.assertEqual(resumed["status"], "ready_review")
         self.assertEqual([call.args[0]["kind"] for call in self.reviewer.call_args_list], ["codex", "opencode"] * 3)
-        self.assertEqual(result["remaining_reviews"], 0)
-        self.assertFalse(result["report"]["all_reviewers_approved"])
+        self.assertEqual((result["remaining_reviews"], result["next_reviewer"]), (0, None))
+        self.assertEqual(self.review()["status"], "awaiting_human")
+        self.assertEqual(self.reviewer.call_count, 6)
+        stopped = self.at_limit("stop")
+        self.assertEqual(stopped["status"], "exhausted")
+        self.assertFalse(stopped["report"]["all_reviewers_approved"])
         with self.assertRaises(DevFlowError):
             self.review()
         self.assertEqual(self.reviewer.call_count, 6)
@@ -559,7 +579,7 @@ class EngineFlowTests(EngineFixture):
         self.assertEqual([a["status"] for a in final["attempts"]], ["succeeded", "failed", "failed", "succeeded"])
         self.assertEqual(final["approvals"], {"codex": snapshot, "opencode": snapshot})
 
-    def test_sixth_correction_is_checked_but_marked_unreviewed_and_exhausted(self):
+    def test_sixth_correction_is_checked_then_stopping_at_the_limit_leaves_it_unreviewed(self):
         self.start()
         self.ready()
         self.response_kind = "changes_required"
@@ -569,8 +589,13 @@ class EngineFlowTests(EngineFixture):
             self.assertEqual(result["review_count"], number)
             self.assertEqual(self.reflect()["status"], "implementing")
             result = self.ready(number + 1)
-            self.assertEqual(result["status"], "exhausted" if number == 6 else "ready_review")
+            self.assertEqual(result["status"], "ready_review")
         self.assertEqual(self.source.read_text(encoding="utf-8"), "VALUE = 7\n")
+        self.assertEqual(self.review()["status"], "awaiting_human")
+        self.assertEqual(self.reviewer.call_count, 6)
+        result = self.at_limit("stop")
+        self.assertEqual(result["status"], "exhausted")
+        self.assertEqual(result["report"]["review_limit"], 6)
         self.assertEqual(result["review_count"], 6)
         self.assertEqual(result["remaining_reviews"], 0)
         self.assertEqual(result["validation"]["status"], "passed")
@@ -585,15 +610,102 @@ class EngineFlowTests(EngineFixture):
     def test_single_pass_at_sixth_attempt_is_not_completion(self):
         self.start()
         self.ready()
-        self.reviewer.side_effect = DevFlowError("Unsuccessful independent review")
-        for _ in range(5):
-            self.review()
-            self.resume()
-        self.reviewer.side_effect = self.respond
+        self.fail_until_last()
         result = self.review()
-        self.assertEqual(result["status"], "exhausted")
+        self.assertEqual(result["status"], "ready_review")
         self.assertEqual(set(result["approvals"]), {"opencode"})
+        self.assertEqual(self.review()["status"], "awaiting_human")
+        result = self.at_limit("stop")
+        self.assertEqual(result["status"], "exhausted")
         self.assertFalse(result["report"]["all_reviewers_approved"])
+
+    def test_the_limit_question_keeps_approvals_and_continue_dispatches_the_seventh_review(self):
+        self.start()
+        self.ready()
+        self.fail_until_last()
+        passed = self.review()  # the sixth review: opencode approves
+        snapshot = passed["candidate"]["snapshot_id"]
+        self.assertEqual(passed["approvals"], {"opencode": snapshot})
+        self.preflight.reset_mock()
+        asked = self.review()
+        # No reviewer starts and no CLI is probed at the limit.
+        self.preflight.assert_not_called()
+        self.assertEqual(self.reviewer.call_count, 6)
+        self.assertEqual(asked["status"], "awaiting_human")
+        self.assertEqual(asked["escalation"]["detail"]["kind"], "review_budget")
+        self.assertEqual((asked["escalation"]["reason"], asked["escalation"]["questions"]),
+                         (REVIEW_LIMIT_REASON, [LIMIT_QUESTION]))
+        self.assertEqual(read_json(self.run / asked["escalations"][-1])["detail"]["kind"], "review_budget")
+        self.assertEqual(asked["approvals"], {"opencode": snapshot})
+        # The resume command is never the answer.
+        self.resume()
+        self.assertEqual(self.engine.status(self.run_id)["human_events"], [])
+        evidence = self.answer("Continue with two more reviews.")
+        with self.assertRaisesRegex(DevFlowError, "continue/stop"):
+            self.engine.resolve(self.run_id, self.session, evidence, "cancel", "Cancel is not this question's answer.")
+        continued = self.engine.resolve(self.run_id, self.session, evidence, "continue", "The user chose two more reviews.")
+        self.assertEqual((continued["status"], continued["review_limit"], continued["remaining_reviews"],
+                          continued["next_reviewer"]), ("ready_review", 8, 2, "codex"))
+        self.assertEqual(continued["approvals"], {"opencode": snapshot})
+        self.assertEqual(continued["config"]["max_reviews"], 6)
+        self.assertEqual(read_json(self.run / continued["resolutions"][-1])["decision"], "continue")
+        final = self.review()  # the seventh review: codex approves the same snapshot
+        self.assertEqual(self.reviewers[-1]["id"], "codex")
+        self.assertEqual(self.reviewer.call_count, 7)
+        self.assertEqual((final["status"], final["review_count"]), ("completed", 7))
+        self.assertEqual(final["report"]["review_limit"], 8)
+
+    def test_stop_answers_only_the_limit_question(self):
+        self.start()
+        self.escalate()
+        evidence = self.answer("Implement VALUE = 1.")
+        with self.assertRaisesRegex(DevFlowError, "continue/cancel"):
+            self.engine.resolve(self.run_id, self.session, evidence, "stop", "Stop is only for the review limit.")
+        self.assertEqual(self.engine.resolve(self.run_id, self.session, evidence, "continue", "Use 1.")["status"],
+                         "implementing")
+
+    def test_a_code_change_during_the_last_review_is_checked_before_the_question(self):
+        self.config["max_reviews"] = 2
+        self.write_config()
+        self.start()
+        self.ready()
+        self.assertEqual(self.review()["status"], "ready_review")  # codex approves
+
+        def edit_during_review(*args, **kwargs):
+            self.source.write_text("VALUE = 2\n", encoding="utf-8")
+            return self.respond(*args, **kwargs)
+
+        self.reviewer.side_effect = edit_during_review
+        failed = self.review()
+        self.assertEqual((failed["status"], failed["review_count"]), ("ready_review", 2))
+        self.assertIn("changed since checkpoint", failed["last_error"])
+        self.reviewer.side_effect = self.respond
+        with self.assertRaisesRegex(DevFlowError, "changed since checkpoint"):
+            self.review()
+        self.assertIsNone(self.state()["escalation"])
+        self.assertEqual(self.reviewer.call_count, 2)
+        self.assertEqual(self.checkpoint()["approvals"], {})
+        self.assertEqual(self.engine.check(self.run_id, self.session)["status"], "ready_review")
+        asked = self.review()
+        self.assertEqual(asked["status"], "awaiting_human")
+        self.assertIn("2 of 2 reviews used. Reviewers approving the current version: none.", asked["escalation"]["questions"][0])
+
+    def test_manual_validation_at_the_limit_leads_to_the_question(self):
+        self.config.update(checks=[], max_reviews=2)
+        self.write_config()
+        self.start()
+        self.response_kind = "changes_required"
+        for value in (1, 2):
+            self.assertEqual(self.ready(value)["status"], "awaiting_human")
+            evidence = self.answer(f"I validated VALUE = {value}.")
+            self.engine.resolve(self.run_id, self.session, evidence, "continue", "Manually validated.")
+            self.assertEqual(self.review()["status"], "needs_revision")
+            self.reflect()
+        self.assertEqual(self.ready(3)["status"], "awaiting_human")
+        evidence = self.answer("I validated VALUE = 3.")
+        validated = self.engine.resolve(self.run_id, self.session, evidence, "continue", "Manually validated.")
+        self.assertEqual((validated["status"], validated["review_count"]), ("ready_review", 2))
+        self.assertEqual(self.review()["escalation"]["detail"]["kind"], "review_budget")
 
     def test_reflection_requires_one_explicit_disposition_per_finding(self):
         self.start()
@@ -953,6 +1065,18 @@ class RecoveryAndIntegrityTests(EngineFixture):
         self.plan.write_bytes(original)
         self.assertEqual(self.checkpoint()["status"], "ready_check")
 
+    def test_a_review_limit_edit_outside_whole_rounds_is_corrupt(self):
+        self.start()
+        for limit in (7, 5, 100, "8"):
+            with self.subTest(limit=limit):
+                stored = self.state()
+                stored["review_limit"] = limit
+                atomic_write_json(self.run / "state.json", stored)
+                with self.assertRaisesRegex(DevFlowError, "never reset"):
+                    self.engine.status(self.run_id)
+                stored["review_limit"] = 6
+                atomic_write_json(self.run / "state.json", stored)
+
     def test_state_configuration_drift_cannot_expand_budget(self):
         self.start()
         stored = self.state()
@@ -962,7 +1086,7 @@ class RecoveryAndIntegrityTests(EngineFixture):
             self.checkpoint()
         self.reviewer.assert_not_called()
 
-    def test_more_than_six_recorded_attempts_is_corrupt_not_reset(self):
+    def test_more_attempts_than_the_review_limit_is_corrupt_not_reset(self):
         self.start()
         stored = self.state()
         stored["attempts"] = [{} for _ in range(7)]
@@ -1172,24 +1296,23 @@ class RecoveryAndIntegrityTests(EngineFixture):
         self.assertEqual(result["check_attempts"], 1)
         self.assertEqual(sorted(path.name for path in (self.run / "check-processes").iterdir()), ["001"])
 
-    def test_recover_at_review_budget_gives_exhausted(self):
+    def test_recover_at_the_review_limit_leads_to_the_question(self):
         self.start()
         self.ready()
-        self.reviewer.side_effect = DevFlowError("Unsuccessful independent review")
-        for _ in range(5):
-            self.review()
-            self.resume()
+        self.fail_until_last()
         self.reviewer.side_effect = KeyboardInterrupt("simulated caller interruption")
         with self.assertRaises(KeyboardInterrupt):
             self.review()
         self.assertEqual((self.state()["status"], len(self.state()["attempts"])), ("reviewing", 6))
         recovered = self.engine.recover(self.run_id, confirmed=True)
-        self.assertEqual(recovered["status"], "exhausted")
+        self.assertEqual(recovered["status"], "ready_review")
         self.assertIsNone(recovered["inflight"])
         self.assertEqual(recovered["review_count"], 6)
         self.assertEqual(recovered["attempts"][-1]["status"], "failed")
-        self.assertFalse(recovered["report"]["all_reviewers_approved"])
-        self.assertFinalReportSaved(recovered)
+        self.assertEqual(self.review()["status"], "awaiting_human")
+        stopped = self.at_limit("stop")
+        self.assertFalse(stopped["report"]["all_reviewers_approved"])
+        self.assertFinalReportSaved(stopped)
 
     def test_recover_during_check_gives_paused_error_and_resumes_to_implementing(self):
         self.start()

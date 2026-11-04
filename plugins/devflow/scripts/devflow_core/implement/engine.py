@@ -7,7 +7,8 @@ from . import checks, snapshot
 from .review import validate_review
 from .workspace import branch, verify_workspace
 from ..common.errors import DevFlowError
-from ..common.review import after_failed_review, all_approved, next_reviewer
+from ..common.review import (REVIEW_BUDGET, after_failed_review, all_approved, ask_at_limit, decide_at_limit,
+                             next_reviewer)
 from ..common.reviewers import preflight, run_review
 from ..common.engine import RunEngine
 from ..common.runs import RUNNER_WAIT, TERMINAL, open_escalation
@@ -75,7 +76,11 @@ class Engine(RunEngine):
         path = f"escalations/{index:03}.json"
         self._artifact(state, path, json_bytes({**value, "created_at": now()}))
         state["escalations"].append(path)
-        state.update(status="awaiting_human", approvals={})
+        state["status"] = "awaiting_human"
+        if kind != REVIEW_BUDGET:
+            # The review limit question changes neither the code nor the plan, so
+            # approvals of the current snapshot stay (as in plan); others clear them.
+            state["approvals"] = {}
 
     def checkpoint(self, run_id, session_id, summary_file):
         with self._lock(run_id):
@@ -150,7 +155,7 @@ class Engine(RunEngine):
         if result["status"] == "not_configured":
             self._escalate(state,"manual_validation",["No project checks are configured. Provide actual manual validation evidence for this exact code version, or cancel and configure checks for a new run."],"ready_review","No checks configured")
         elif result["status"] == "passed":
-            state["status"] = "exhausted" if len(state["attempts"]) >= state["config"]["max_reviews"] else "ready_review"
+            state["status"] = "ready_review"  # At the review limit, the next review request asks the human.
         else:
             state.update(status="implementing",approvals={})
             if state["check_attempts"] >= state["config"]["max_check_attempts"]:
@@ -197,18 +202,27 @@ class Engine(RunEngine):
         state = self._state(run_id)
         self._owner(state,session_id)
         self._require(state,{"ready_review"})
-        provider = next_reviewer(state["config"]["reviewers"],len(state["attempts"]),state["config"]["max_reviews"])
+        # At the review limit no reviewer starts; the request asks the human instead.
+        provider = (next_reviewer(state["config"]["reviewers"],len(state["attempts"]),state["review_limit"])
+                    if len(state["attempts"]) < state["review_limit"] else None)
         # A missing or unsupported reviewer CLI must not consume an attempt.
-        probe = preflight(provider)
+        probe = preflight(provider) if provider else None
 
         def prepare(state):
             self._owner(state,session_id)
             self._require(state,{"ready_review"})
+            # The workspace is verified first, so the question names only approvals
+            # of the code that is actually there.
             current = self._current(state)
+            approved = {reviewer for reviewer, snapshot_id in state["approvals"].items()
+                        if snapshot_id == current["snapshot_id"]}
+            if ask_at_limit(state,len(state["attempts"]),approved,
+                            lambda reason, questions: self._escalate(state,REVIEW_BUDGET,questions,"ready_review",reason)):
+                return None
             validation = state.get("validation") or {}
             if validation.get("snapshot_id") != current["snapshot_id"] or validation.get("status") not in {"passed","human_attested"}:
                 raise DevFlowError("Fresh successful checks or explicit human validation are required")
-            if next_reviewer(state["config"]["reviewers"],len(state["attempts"]),state["config"]["max_reviews"]) != provider:
+            if next_reviewer(state["config"]["reviewers"],len(state["attempts"]),state["review_limit"]) != provider:
                 raise DevFlowError("The run changed during the reviewer check; inspect status and retry")
             number = len(state["attempts"]) + 1
             delta = read_json(self._run(run_id)/state["candidate"]["diff"])
@@ -251,7 +265,7 @@ class Engine(RunEngine):
                                          **({"activity":result["activity"]} if result is not None else {}))
             # A reviewer failure says nothing about the code: approvals for this
             # snapshot stay (as in plan); this attempt never adds one.
-            state.update(status=after_failed_review(number,state["config"]),resume_status="ready_review",last_error=str(error))
+            state.update(status=after_failed_review(number,state,"ready_review"),resume_status="ready_review",last_error=str(error))
             return
         review_path = f"reviews/{number:02}/review.json"
         self._artifact(state,review_path,json_bytes(review))
@@ -264,10 +278,9 @@ class Engine(RunEngine):
             state.update(status="needs_revision",approvals={})
         else:
             state["approvals"][provider["id"]] = current["snapshot_id"]
-            if all_approved(state["config"]["reviewers"],state["approvals"],current["snapshot_id"]):
-                state["status"] = "completed"
-            else:
-                state["status"] = "exhausted" if number >= state["config"]["max_reviews"] else "ready_review"
+            # At the review limit, the next review request asks the human.
+            done = all_approved(state["config"]["reviewers"],state["approvals"],current["snapshot_id"])
+            state["status"] = "completed" if done else "ready_review"
 
     def reflect(self,run_id,session_id,decisions_file):
         with self._lock(run_id):
@@ -325,9 +338,12 @@ class Engine(RunEngine):
             if len(matches) != 1:
                 raise DevFlowError("Use the event ID of a successful AskUserQuestion answer recorded AFTER this escalation, "
                                    "in the session that owns the run; ordinary prompts and the resume command are not answers")
-            if decision not in {"continue","cancel"} or not isinstance(reason,str) or not reason.strip():
-                raise DevFlowError("Supply continue/cancel and a faithful explanation of the human's decision")
             kind = esc["detail"]["kind"]
+            budget = kind == REVIEW_BUDGET
+            allowed = {"continue","stop"} if budget else {"continue","cancel"}
+            if decision not in allowed or not isinstance(reason,str) or not reason.strip():
+                raise DevFlowError("Supply continue/stop for the review limit question (continue/cancel otherwise) "
+                                   "and a faithful explanation of the human's decision")
             # Verify before queueing new immutable artifacts: _current checks
             # every committed artifact, not the next transaction's draft writes.
             if decision == "continue" and kind in {"manual_validation", "binary_changes"}:
@@ -339,12 +355,16 @@ class Engine(RunEngine):
             path = f"resolutions/{len(state['resolutions'])+1:03}.json"
             self._artifact(state,path,json_bytes(value))
             state["resolutions"].append(path)
-            state.update(status="cancelled" if decision=="cancel" else esc["return_status"],escalation=None,approvals={})
-            if decision == "continue":
+            if budget:
+                # Neither the code nor the plan changes: approvals of the current snapshot stay.
+                decide_at_limit(state,decision,esc["return_status"])
+                state["escalation"] = None
+            else:
+                state.update(status="cancelled" if decision=="cancel" else esc["return_status"],escalation=None,approvals={})
+            if decision == "continue" and not budget:
                 if kind == "manual_validation":
+                    # At the review limit, the next review request asks the human.
                     state["validation"] = {"snapshot_id":state["candidate"]["snapshot_id"],"kind":"manual","status":"human_attested","resolution":path}
-                    if len(state["attempts"]) >= state["config"]["max_reviews"]:
-                        state["status"] = "exhausted"
                 elif kind == "binary_changes":
                     state["binary_attestation"] = {"snapshot_id":state["candidate"]["snapshot_id"],"resolution":path}
                 elif kind == "check_budget":
@@ -406,6 +426,7 @@ def terminal_report(project, state, observed=(), observed_error=None):
     reviewed = bool(actual) and any(a["status"] == "succeeded" and a["snapshot_id"] == actual for a in state["attempts"])
     validation = state.get("validation") or {}
     return {"run_id":state["run_id"],"status":state["status"],"review_count":len(state["attempts"]),
+        "review_limit":state["review_limit"],
         "snapshot_id":candidate.get("snapshot_id"),"all_reviewers_approved":bool(matches) and all_approved(state["config"]["reviewers"],state["approvals"],candidate["snapshot_id"]),
         "validation":state.get("validation"),"binary_attestation":state.get("binary_attestation"),
         "workspace_snapshot_id_at_report":actual,"workspace_matches_checkpoint_at_report":matches,

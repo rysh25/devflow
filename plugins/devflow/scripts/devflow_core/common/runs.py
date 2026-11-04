@@ -22,10 +22,10 @@ from .errors import DevFlowError
 from .storage import (atomic_json, digest, file_lock, json_bytes, no_symlinks, now,
                       read_json, within, write_new)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 # Older run formats and the releases that wrote them; they are never continued.
 # A format that was never released has no name and is shown generically.
-RELEASES = {1: "0.1.x", 2: "0.2.x", 3: "0.3.x"}
+RELEASES = {1: "0.1.x", 2: "0.2.x", 3: "0.3.x", 6: "0.4.x"}
 
 
 def release_name(version: int) -> str:

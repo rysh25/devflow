@@ -1,6 +1,6 @@
 ---
 name: plan
-description: Create a plan from an explicit user request, interview the human with the configured model-invocable skill, alternate independent reviews up to six attempts, and export only a fully reviewed Markdown plan. Never implement code.
+description: Create a plan from an explicit user request, interview the human with the configured model-invocable skill, alternate independent reviews up to max_reviews attempts (more only with the human's approval at the limit), and export only a fully reviewed Markdown plan. Never implement code.
 argument-hint: "<request>"
 disable-model-invocation: true
 allowed-tools: Bash(uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *) PowerShell(uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *)
@@ -30,4 +30,4 @@ Pass two points in the interview Skill call's arguments: questions to the human 
 
 The runner, not memory or a task list, owns the review count, ordering, approved hash, and human decision records. Keep ordinary requirement-preserving revisions automatic. Escalate new scope, unsafe actions, and decisions requiring the human.
 
-On completed reviews, run `plan publish` and inspect publication status before reporting a formal plan as saved. A sixth-round revision is not automatically approved. Never start implementation from this skill; offer the exact `/devflow:implement PATH` for a separate user turn.
+On completed reviews, run `plan publish` and inspect publication status before reporting a formal plan as saved. A revision made after the last allowed review is not automatically approved. Never start implementation from this skill; offer the exact `/devflow:implement PATH` for a separate user turn.
