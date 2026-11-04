@@ -670,8 +670,8 @@ class RunFormatTests(RuntimeFixture):
     def test_old_per_workflow_session_directories_do_not_block_starts(self):
         old = self.project / ".devflow" / "sessions"
         (old / "plan").mkdir(parents=True)
-        # The shape of a 0.1.x per-workflow session record, field names included.
-        atomic_json(old / "plan" / ("a" * 64 + ".json"), {"run_id": "x", "guard_active": True})
+        # A 0.1.x per-workflow session record; its content is never read.
+        atomic_json(old / "plan" / ("a" * 64 + ".json"), {"run_id": "x"})
         (old / "implement").mkdir()
         self.assertEqual(runtime.status(self.project, self.session, None)["sessions"]["invalid_records"], [])
         self.plan_start()

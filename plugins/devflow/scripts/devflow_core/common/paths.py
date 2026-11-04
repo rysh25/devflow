@@ -12,7 +12,6 @@ from .errors import DevFlowError
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = PACKAGE_ROOT.parents[1]
-RUNNER = PLUGIN_ROOT / "scripts" / "devflow.py"
 #: What marks a project root.
 PROJECT_MARKERS = (".devflow", "devflow.config.json", ".git")
 _MSYS_DRIVE = re.compile(r"/([A-Za-z])(?=/|\Z)")

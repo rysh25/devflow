@@ -18,6 +18,33 @@ package = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(package)
 
 
+REMOVED_NAMES = ("guard", "allowlist", "ShellPolicy", "ShellPolicyError", "shell_tokens", "split_words",
+                 "powershell_tokens", "check_command", "restricts_tools", "allow_tool", "check_write",
+                 "NON_WRITING_TOOLS", "PROTECTED_WRITE_NAMES", "GuardError", "permissionDecision", "SubagentHandback",
+                 "SKILL_NAME", "name_key", "CLAUDE_KINDS", "HUMAN_KINDS", "READ_ONLY_COMMANDS", "human_actions",
+                 # Reviewer isolation, its settings and the packet's file contents (stage 6).
+                 "protocol_version", "OPENCODE_PROTOCOL", "PROTOCOL_ONE_MESSAGE", "with_web_default", "web_enabled",
+                 "OPENCODE_WEB_TOOLS", "CODEX_DUPLICATE_ID_ITEMS", "web_search", "runtime_config", "_agent_id",
+                 "system_prompt", "SYSTEM_PACKET_ONLY", "SYSTEM_WITH_WEB", "_program", "SHELLS", "mcp_servers",
+                 "external_directory", "repository_context", "context_files", "file_manifest", "context_file",
+                 "new_session", "kill_group", "extra_env", "project_doc_max_bytes", "OPENCODE_PROJECT_OFF",
+                 "OPENCODE_DISABLE_PROJECT_CONFIG", "OPENCODE_CONFIG_PROJECT_DISABLE", "OPENCODE_DISABLE_CLAUDE_CODE",
+                 # Checks of Claude Code's Bash limit, which DevFlow no longer depends on.
+                 "bash_limit", "limit_warnings", "timeout_warnings", "bash_needs", "LIMIT_WARNING",
+                 "BASH_MAX_DEFAULT_MS", "BASH_DEFAULT_DEFAULT_MS")
+REMOVED_WORDING = ("deny(", "onFailure", "--strict-config", "--ignore-user-config", "--ignore-rules", "--ephemeral",
+                   "--sandbox", "--yolo", "--dangerously", "--context-file", "context.md", "read-only")
+#: Wording of the removed limits in the Japanese documents.
+JAPANESE_WORDING = ("ガード", "許可されたコマンド", "書き込まないツール", "読み取り専用", "ランナーだけを通", "拒否")
+
+
+def removed_patterns(extra_wording=()):
+    """Removed code names (whole words) and wording (any case)."""
+    names = re.compile(r"\b(?:" + "|".join(map(re.escape, REMOVED_NAMES)) + r")\b")
+    texts = re.compile("|".join(map(re.escape, (*REMOVED_WORDING, *extra_wording))), re.IGNORECASE)
+    return names, texts
+
+
 class DistributionTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="devflow distribution ")
@@ -25,18 +52,19 @@ class DistributionTests(unittest.TestCase):
         self.base = Path(temporary.name).resolve()
 
     def clone(self):
-        destination = self.base / "repository"
+        # A new directory for every copy, so a failed case never leaves one in the next one's way.
+        destination = Path(tempfile.mkdtemp(dir=self.base)) / "repository"
         return Path(shutil.copytree(ROOT, destination, ignore=shutil.ignore_patterns(
             "__pycache__", "*.pyc", "dist", ".git", ".devflow")))
 
     def test_static_validate_current_bundle(self):
         result = package.validate(ROOT)
         self.assertEqual(result["marketplace"], "devflow-marketplace")
-        self.assertEqual(result["plugins"], {"devflow": "0.3.0"})
+        self.assertEqual(result["plugins"], {"devflow": "0.4.0"})
 
     def test_release_versions_are_consistent(self):
         manifest = json.loads((ROOT / "plugins/devflow/.claude-plugin/plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.3.0")
+        self.assertEqual(manifest["version"], "0.4.0")
         package = ROOT / "plugins/devflow/scripts/devflow_core"
         defining = []
         for source in sorted(package.rglob("*.py")):
@@ -126,7 +154,6 @@ class DistributionTests(unittest.TestCase):
                 source.write_text(source.read_text(encoding="utf-8") + line, encoding="utf-8")
                 with self.assertRaisesRegex(package.PackagingError, message):
                     package.validate(cloned)
-                shutil.rmtree(cloned)
 
     def test_registry_matches_workflow_packages_and_a_new_workflow_is_validated(self):
         cloned = self.clone()
@@ -152,30 +179,32 @@ class DistributionTests(unittest.TestCase):
         with self.assertRaisesRegex(package.PackagingError, "Missing implement/reviewer.md"):
             package.validate(cloned)
 
+    def test_the_rules_for_every_reviewer_ship_in_one_place(self):
+        cloned = self.clone()
+        (cloned / "plugins" / "devflow" / "scripts" / "devflow_core" / "common" / "reviewer-rules.md").unlink()
+        with self.assertRaisesRegex(package.PackagingError, "Missing common/reviewer-rules.md"):
+            package.validate(cloned)
+
+    def test_no_workflow_repeats_the_rules_for_every_reviewer(self):
+        # common/reviewer-rules.md is the one place for what every reviewer is asked;
+        # a workflow's reviewer.md holds only its own instructions.
+        core = ROOT / "plugins" / "devflow" / "scripts" / "devflow_core"
+        rules = " ".join((core / "common" / "reviewer-rules.md").read_text(encoding="utf-8").split())
+        sentences = [part.strip() for part in re.split(r"(?<=[.:])\s+", rules) if len(part.strip()) >= 30]
+        self.assertGreaterEqual(len(sentences), 5)
+        for flow in ("plan", "implement"):
+            text = " ".join((core / flow / "reviewer.md").read_text(encoding="utf-8").split())
+            self.assertIn("The rules for every DevFlow reviewer come after these instructions.", text)
+            for sentence in sentences:
+                with self.subTest(flow=flow, sentence=sentence[:40]):
+                    self.assertNotIn(sentence, text)
+
     def test_removed_mechanisms_leave_no_names_in_the_plugin_code(self):
         # The tool limits, the reviewer isolation and their helpers were removed in
         # 0.4.0; none of their names may remain in the plugin's code, skills or
         # references. Code names are matched as whole words, flags and the other
-        # literals as written.
-        words = ("guard", "allowlist", "ShellPolicy", "ShellPolicyError", "shell_tokens", "split_words",
-                 "powershell_tokens", "check_command", "restricts_tools", "allow_tool", "check_write",
-                 "NON_WRITING_TOOLS", "PROTECTED_WRITE_NAMES", "GuardError", "permissionDecision", "SubagentHandback",
-                 "SKILL_NAME", "name_key", "CLAUDE_KINDS", "HUMAN_KINDS", "READ_ONLY_COMMANDS", "human_actions",
-                 # Reviewer isolation, its settings and the packet's file contents (stage 6).
-                 "protocol_version", "OPENCODE_PROTOCOL", "PROTOCOL_ONE_MESSAGE", "with_web_default", "web_enabled",
-                 "OPENCODE_WEB_TOOLS", "CODEX_DUPLICATE_ID_ITEMS", "web_search", "runtime_config", "_agent_id",
-                 "system_prompt", "SYSTEM_PACKET_ONLY", "SYSTEM_WITH_WEB", "_program", "SHELLS", "mcp_servers",
-                 "external_directory", "repository_context", "context_files", "file_manifest", "context_file",
-                 "new_session", "kill_group", "extra_env", "project_doc_max_bytes", "OPENCODE_PROJECT_OFF",
-                 "OPENCODE_DISABLE_PROJECT_CONFIG", "OPENCODE_CONFIG_PROJECT_DISABLE", "OPENCODE_DISABLE_CLAUDE_CODE",
-                 # Claude Code's foreground Bash limit, which background runs do not depend on.
-                 "bash_limit", "limit_warnings", "timeout_warnings", "bash_needs", "LIMIT_WARNING",
-                 "BASH_MAX_DEFAULT_MS", "BASH_DEFAULT_DEFAULT_MS")
-        literals = ("deny(", "onFailure", "--strict-config", "--ignore-user-config", "--ignore-rules", "--ephemeral",
-                    "--sandbox", "--yolo", "--dangerously", "--context-file", "context.md", "read-only")
-        names = re.compile(r"\b(?:" + "|".join(map(re.escape, words)) + r")\b")
-        # Wording is matched in any case ("Read-only" too).
-        texts = re.compile("|".join(map(re.escape, literals)), re.IGNORECASE)
+        # wording in any case ("Read-only" too).
+        names, texts = removed_patterns()
         plugin = ROOT / "plugins" / "devflow"
         self.assertFalse((plugin / "scripts" / "devflow_core" / "common" / "guard.py").exists())
         self.assertFalse((plugin / "scripts" / "devflow_core" / "common" / "shell.py").exists())
@@ -184,6 +213,30 @@ class DistributionTests(unittest.TestCase):
                 with self.subTest(path=str(path.relative_to(ROOT))):
                     text = path.read_text(encoding="utf-8")
                     self.assertEqual(names.findall(text) + texts.findall(text), [])
+
+    def test_removed_mechanisms_leave_nothing_in_the_documents(self):
+        """README, docs, examples, CI and tools name a removed mechanism only where the
+        0.4.0 plan allows it, and only the allowed words there: the migration notes,
+        the per-tool settings for secrets, the recorded CLI facts, and the packaging
+        check that hooks never block. Every section is searched."""
+        allowed = {("README.md", "## 0.4.0 への更新"): {"protocol_version"},
+                   ("docs/security.md", "## 秘密を守りたいとき"): {"拒否"},
+                   ("docs/validation.md", "## 実際の CLI で確かめたこと"): {"read-only", "読み取り専用"},
+                   ("tools/package.py", None): {"onfailure"}}
+        names, texts = removed_patterns(JAPANESE_WORDING)
+        paths = [ROOT / "README.md", *(ROOT / "docs").glob("*.md"), *(ROOT / "examples").iterdir(),
+                 *(path for path in (ROOT / ".github").rglob("*") if path.is_file()), *(ROOT / "tools").glob("*.py")]
+        for path in sorted(paths):
+            relative = path.relative_to(ROOT).as_posix()
+            text = path.read_text(encoding="utf-8")
+            headings = [(m.start(), m.group(0)) for m in re.finditer(r"(?m)^## .*$", text)]
+            found = []
+            for match in [*names.finditer(text), *texts.finditer(text)]:
+                section = next((heading for at, heading in reversed(headings) if at < match.start()), None)
+                if match.group(0).casefold() not in allowed.get((relative, section), set()):
+                    found.append((section, match.group(0)))
+            with self.subTest(path=relative):
+                self.assertEqual(found, [])
 
     def test_hooks_that_block_or_run_for_every_tool_are_rejected(self):
         # Hooks only record and add context: they never block, and the tool hooks
@@ -209,7 +262,6 @@ class DistributionTests(unittest.TestCase):
                 path.write_text(json.dumps(document), encoding="utf-8")
                 with self.assertRaisesRegex(package.PackagingError, message):
                     package.validate(cloned)
-                shutil.rmtree(cloned)
 
     def test_potential_secret_file_is_never_packaged(self):
         cloned = self.clone()
@@ -234,14 +286,14 @@ class DistributionTests(unittest.TestCase):
             # All paths were generated and checked in this test, not untrusted ZIP input.
             archive.extractall(extracted)
         release = extracted / "devflow"
-        self.assertEqual(package.validate(release)["version"], "0.3.0")
+        self.assertEqual(package.validate(release)["version"], "0.4.0")
         independent = self.base / "devflow-only"
         shutil.copytree(release / "plugins" / "devflow", independent)
         self.assertFalse((independent / "shared").exists())
         result = subprocess.run([sys.executable, "-B", str(independent / "scripts" / "devflow.py"), "--version"],
             cwd=self.base, capture_output=True, encoding="utf-8", timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("0.3.0", result.stdout)
+        self.assertIn("0.4.0", result.stdout)
         for flow in ("plan", "implement"):
             with self.subTest(flow=flow):
                 result = subprocess.run([sys.executable, "-B", str(independent / "scripts" / "devflow.py"), flow, "--help"],
@@ -261,11 +313,12 @@ class DistributionTests(unittest.TestCase):
         code = ("import sys; sys.path.insert(0, sys.argv[1]); from devflow_core.workflows import WORKFLOWS; "
                 "[w.resource(n).read_bytes() for w in WORKFLOWS.values() "
                 "for n in ('defaults.json', 'reviewer.md', 'review.schema.json')]; "
-                "print(sorted(str(w.resource_dir) for w in WORKFLOWS.values()))")
+                "import json; print(json.dumps(sorted(str(w.resource_dir) for w in WORKFLOWS.values())))")
         result = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(independent / "scripts")],
                                 cwd=self.base, capture_output=True, encoding="utf-8", timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(str(independent), result.stdout)
+        for directory in json.loads(result.stdout):
+            self.assertTrue(Path(directory).is_relative_to(independent), directory)
 
     def test_runtime_history_is_excluded_even_when_present(self):
         cloned = self.clone()

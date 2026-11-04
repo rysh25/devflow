@@ -25,7 +25,8 @@ class CheckTests(unittest.TestCase):
         return {"id": "unit-tests", "argv": [sys.executable, "-c", source], **kwargs}
 
     def test_success_saves_stdout_and_stderr(self):
-        result = run_checks(self.project, [self.check("import sys; print('hello'); print('warning', file=sys.stderr)")], self.logs)
+        source = "import sys; sys.stdout.buffer.write(b'hello\\n'); sys.stderr.buffer.write(b'warning\\n')"
+        result = run_checks(self.project, [self.check(source)], self.logs)
         self.assertEqual(result["status"], "passed")
         check = result["results"][0]
         self.assertEqual(check["exit_code"], 0)

@@ -309,6 +309,26 @@ class SnapshotTests(unittest.TestCase):
         self.assertNotIn("ignored-untracked.txt", result["files"])
         self.assertIn("ignored untracked", result["git"]["scope"])
 
+    def test_the_users_own_git_configuration_applies_and_git_dir_does_not_redirect(self):
+        """DevFlow's git sees the repository as the user's git does (here a global
+        excludes file), and a GIT_DIR in the environment cannot point it elsewhere."""
+        self.init_git()
+        self.write("app.py", "pass\n")
+        self.commit_all()
+        excludes = self.base / "global ignore"
+        excludes.write_text("personal-notes.txt\n", encoding="utf-8")
+        config = self.base / "global gitconfig"
+        config.write_text(f"[core]\n\texcludesFile = {excludes.as_posix()}\n", encoding="utf-8")
+        self.write("personal-notes.txt", "mine\n")
+        other = self.base / "other repository"
+        other.mkdir()
+        subprocess.run(["git", "init", "--quiet", str(other)], check=True, capture_output=True)
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(config), "GIT_DIR": str(other / ".git")}):
+            result = capture(self.project, {"snapshot": {"mode": "git"}})
+        self.assertNotIn("personal-notes.txt", result["files"])
+        self.assertIn("app.py", result["files"])
+        self.assertFalse(result["git"]["dirty"])
+
     def test_git_rename_reports_source_and_destination(self):
         self.init_git()
         self.write("old.txt", "hello")

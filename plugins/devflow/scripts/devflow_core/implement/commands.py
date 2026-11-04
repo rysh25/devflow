@@ -25,7 +25,8 @@ def doctor(engine, args, run_id, session) -> dict:
             "project": str(engine.project), "run_id": run_id, "config": config, "reviewers": results,
             "executables": {name: shutil.which(name) for name in ("uv", "claude", "git")},
             "ready": all(item["ready"] for item in results) and not errors, "errors": errors,
-            "warnings": workflow.doctor(engine.project, config).get("warnings", []),
+            "warnings": workflow.doctor(engine.project, config).get("warnings", [])
+                        + [text for item in results for text in item.get("details", {}).get("version_warnings", [])],
             "not_verified": ["CLI authentication and model access", "Actual model used by provider",
                              "Real Claude Code hook execution", "Native Windows/macOS behavior"],
             "note": "Offline help/version probes only. Does not install tools, authenticate, or incur model usage."}

@@ -1,4 +1,4 @@
-"""Read-only interview diagnostics with isolated local skill fixtures."""
+"""Interview diagnostics that change nothing, with isolated local skill fixtures."""
 from __future__ import annotations
 
 from contextlib import redirect_stdout

@@ -203,7 +203,7 @@ class FullStackTests(unittest.TestCase):
                 self.assertEqual(seen["stdin_after_prompt"], "")
                 self.assertEqual(seen["snapshot_id"], self.snapshot_id)
                 self.assertEqual(accepted["snapshot_id"], self.snapshot_id)
-                self.assertEqual(seen["plan"], self.plan.read_text(encoding="utf-8"))
+                self.assertEqual(seen["plan"], self.plan.read_bytes().decode("utf-8"))
                 self.assertEqual(seen["validation_status"], "passed")
                 self.assertEqual(seen["check_status"], "passed")
                 self.assertEqual(seen["packet_sha256"], digest(packet.read_bytes()))

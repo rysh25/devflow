@@ -4,14 +4,16 @@ Only user-visible text and AskUserQuestion inputs/results leave this adapter.
 Thinking blocks, unrelated tool results, and earlier session history never do.
 Claude's JSONL format is not a public stable schema and changes between
 versions: what this adapter does not know is skipped and counted, never a
-reason to stop. The human's words are cross-checked with the hook records; it
-stops only when the record is provably broken (corrupt or truncated JSONL,
-conflicting records, a question hook that contradicts the transcript).
+reason to stop. The human's words are cross-checked with the hook records
+(without a transcript, they come from the hook records alone); it stops only
+when the record is provably broken (corrupt or truncated JSONL, conflicting
+records, a question hook that contradicts the transcript).
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -72,14 +74,41 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)
 
 
+def _name(value: Any) -> str | None:
+    """A type name or ID as this version reads it: a string, or None for any other form."""
+    return value if isinstance(value, str) else None
+
+
+def _read_answer(value: Any) -> str | None:
+    """A question's answer, or None when there is none this version reads."""
+    try:
+        return _answer_content(value)
+    except CaptureError:
+        return None
+
+
+def _invalid_constant(name: str) -> None:
+    raise ValueError(f"{name} is not JSON")
+
+
+def _finite(text: str) -> float:
+    """A JSON number that stays a JSON number (1e999 would become infinity)."""
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"{text} is out of range")
+    return value
+
+
 def transcript_marker(path: str | None) -> dict:
     """Mark an append boundary without copying earlier conversation content.
 
     Claude may not have created its transcript when UserPromptSubmit fires.
     The tail fingerprint detects truncation/rewrite/rotation before sealing.
+    Without a transcript path (or if the file is never written) the interview
+    is built from the hook records alone.
     """
-    if path is None or not isinstance(path, str) or not path.strip():
-        raise CaptureError("Claude did not supply transcript_path; full capture is unavailable")
+    if not isinstance(path, str) or not path.strip():
+        return {"path": None, "offset": 0}
     p = Path(path).expanduser().resolve(strict=False)
     try:
         stat = p.stat()
@@ -158,32 +187,14 @@ def _claude_code_text(content: Any) -> bool:
     return content.strip() in _CLAUDE_CODE_TEXTS or content.lstrip().startswith(_CLAUDE_CODE_TEXT_PREFIXES)
 
 
-def _queued_human_prompt(attachment: dict) -> tuple[str, int, list] | None:
-    """Text, image count and unknown block types of a message the human typed while Claude worked."""
+def _queued_by_human(attachment: dict) -> bool:
+    """A message the human typed while Claude worked: Claude Code marks its origin human."""
     origin = attachment.get("origin")
-    if (attachment.get("commandMode") != "prompt" or attachment.get("isMeta")
-            or not isinstance(origin, dict) or origin.get("kind") != "human"):
-        return None
-    return _queued_text(attachment.get("prompt"))
+    return (attachment.get("commandMode") == "prompt" and not attachment.get("isMeta")
+            and isinstance(origin, dict) and origin.get("kind") == "human")
 
 
-def _queued_text(prompt: Any) -> tuple[str, int, list]:
-    """Text, image count and unknown block types of a queued message's prompt."""
-    if isinstance(prompt, str):
-        return prompt, 0, []
-    if not isinstance(prompt, list):
-        raise CaptureError("Unsupported queued human message")
-    texts: list[str] = []
-    images = 0
-    unknown: list = []
-    for block in prompt:
-        if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
-            texts.append(block["text"])
-        elif isinstance(block, dict) and block.get("type") == "image":
-            images += 1
-        else:
-            unknown.append(block.get("type") if isinstance(block, dict) else None)
-    return "\n".join(texts), images, unknown
+_QUEUED_IN_ANOTHER_FORM = ("attachments", "queued_command (prompt in another form)")
 
 
 def _prompt_matches(prompt: str, parts: list[str], record: dict) -> bool:
@@ -211,12 +222,8 @@ def _unanswered_content(value: Any) -> str:
     """Exact text of a cancelled or failed question result; never a human answer."""
     if isinstance(value, str):
         return value
-    if isinstance(value, list) and all(
-        isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)
-        for block in value
-    ):
-        return _json(value)
-    raise CaptureError("Unsupported content in a cancelled or failed AskUserQuestion result")
+    # Any other form is kept as JSON: it is never a human answer either way.
+    return _json(value)
 
 
 def capture_interview(marker: dict, events: list[dict]) -> dict:
@@ -234,9 +241,9 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
             raise CaptureError("Interview hook log exceeds the 16 MiB capture limit")
     except (TypeError, ValueError) as exc:
         raise CaptureError(f"Invalid hook event data: {exc}") from exc
-    segment = _read_segment(marker)
     prompts: list[dict] = []
     post_questions: list[tuple[int, dict]] = []
+    unknown: dict[str, dict[str, int]] = {"records": {}, "attachments": {}, "blocks": {}, "hooks": {}}
     for index, event in enumerate(events):
         event_name = event.get("hook_event_name")
         if event_name == "UserPromptSubmit":
@@ -246,10 +253,15 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
                             "prompt_id": event.get("prompt_id")})
         elif event_name == "PostToolUse" and event.get("tool_name") == "AskUserQuestion" and not event.get("agent_id"):
             if not isinstance(event.get("tool_input"), dict) or "tool_response" not in event:
-                raise CaptureError("AskUserQuestion hook is missing question input or answer output")
+                # A hook input in a form this version does not read: counted, never a stop.
+                tally(unknown["hooks"], "PostToolUse AskUserQuestion (in another form)", "(untyped)")
+                continue
             if event.get("is_error"):
                 continue  # An unsuccessful AskUserQuestion is not human evidence.
             post_questions.append((index, event))
+    # No transcript (no path, or a file Claude Code never wrote): the hook records alone.
+    missing = marker["path"] is None or not (marker.get("existed") or Path(marker["path"]).exists())
+    segment = "" if missing else _read_segment(marker)
 
     messages: list[dict] = []
     questions: dict[str, dict] = {}
@@ -258,7 +270,6 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
     ignored_records = 0
     transcript_human_prompts = 0
     omitted_attachments: dict[str, int] = {}
-    unknown: dict[str, dict[str, int]] = {"records": {}, "attachments": {}, "blocks": {}}
     unhooked: list[dict] = []
     # Claude Code also sends its own messages (task notifications, subagent
     # reports) through UserPromptSubmit. The transcript marks their origin. They
@@ -266,9 +277,31 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
     # taken theirs, so a human prompt with the same text is never taken for one.
     notices: list[tuple[str, object]] = []
 
-    def automated(text: object, prompt_id: object = None) -> None:
-        if isinstance(text, str):
+    def automated(text: str, prompt_id: object = None) -> None:
+        if text:
             notices.append((text, prompt_id))
+
+    def read_text(content: Any, other_form: tuple[str, str]) -> tuple[str, int]:
+        """The text and image count of a message's content (a string or blocks); other forms counted."""
+        if isinstance(content, str):
+            return content, 0
+        if not isinstance(content, list):
+            skip_unknown(*other_form)
+            return "", 0
+        texts: list[str] = []
+        images = 0
+        for block in content:
+            if not isinstance(block, dict):
+                skip_unknown("blocks", "(block in another form)")
+            elif block.get("type") == "image":
+                images += 1
+            elif block.get("type") != "text":
+                skip_unknown("blocks", block.get("type"))
+            elif isinstance(block.get("text"), str):
+                texts.append(block["text"])
+            else:
+                skip_unknown("blocks", "text (in another form)")
+        return "\n".join(texts), images
 
     def take(candidates: list[dict], prompt_id: object) -> dict | None:
         """The hook prompt with this prompt ID among the candidates, else the first."""
@@ -288,10 +321,8 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
 
     def duplicate(record: dict, value: Any) -> bool:
         uuid = record.get("uuid")
-        if uuid is None:
-            return False
         if not isinstance(uuid, str):
-            raise CaptureError("Unsupported transcript UUID")
+            return False  # No UUID, or one in a form this version does not read: nothing to compare.
         fingerprint = _digest(_json(value).encode("utf-8"))
         if uuid in seen_uuids:
             if seen_uuids[uuid] != fingerprint:
@@ -304,29 +335,28 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
         if not line.strip():
             continue
         try:
-            record = json.loads(line)
-        except json.JSONDecodeError as exc:
+            record = json.loads(line, parse_constant=_invalid_constant, parse_float=_finite)
+        except ValueError as exc:
             raise CaptureError(f"Malformed or incomplete transcript JSONL at segment line {number}") from exc
         if not isinstance(record, dict):
-            raise CaptureError(f"Transcript line {number} is not an object")
-        kind = record.get("type")
+            skip_unknown("records", "(line in another form)")
+            ignored_records += 1
+            continue
+        kind = _name(record.get("type"))
         if (record.get("isSidechain") or kind == "summary" or record.get("isCompactSummary")
-                or record.get("subtype") in {"compact_boundary", "compaction"}):
+                or _name(record.get("subtype")) in {"compact_boundary", "compaction"}):
             # A subagent's own records, and compaction: the boundary and its
             # summary are Claude Code's; the original exchange stays earlier in the file.
             ignored_records += 1
             continue
         if kind == "attachment":
             attachment = record.get("attachment")
-            attachment_type = attachment.get("type") if isinstance(attachment, dict) else None
-            queued = _queued_human_prompt(attachment) if attachment_type == "queued_command" else None
-            if queued is not None:
+            attachment_type = _name(attachment.get("type")) if isinstance(attachment, dict) else None
+            if attachment_type == "queued_command" and _queued_by_human(attachment):
                 if duplicate(record, attachment):
                     continue
-                text, images, unknown_blocks = queued
+                text, images = read_text(attachment.get("prompt"), _QUEUED_IN_ANOTHER_FORM)
                 omit("image", images)
-                for block_type in unknown_blocks:
-                    skip_unknown("blocks", block_type)
                 if text.strip():
                     # Claude Code marks the origin human; link a matching hook event if any.
                     matching = take([p for p in prompts if not p["used"] and p["text"] == text], record.get("promptId"))
@@ -348,8 +378,9 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
                 if not duplicate(record, attachment):
                     omit(attachment_type)
             elif attachment_type == "queued_command":
-                prompt = attachment.get("prompt")
-                automated(_queued_text(prompt)[0] if isinstance(prompt, (str, list)) else None)
+                if not duplicate(record, attachment):
+                    # Images in a notice belong to the skipped message, not to the human's attachments.
+                    automated(read_text(attachment.get("prompt"), _QUEUED_IN_ANOTHER_FORM)[0])
             elif attachment_type not in _IGNORED_ATTACHMENTS:
                 skip_unknown("attachments", attachment_type)
             # Other queued messages (subagent reports, task notifications) are tool output.
@@ -363,10 +394,12 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
             ignored_records += 1
             continue
         message = record.get("message")
-        if not isinstance(message, dict) or "content" not in message:
-            raise CaptureError(f"Transcript message missing content at line {number}")
-        if message.get("role", kind) != kind:
-            raise CaptureError(f"Mismatched transcript role at line {number}")
+        if not isinstance(message, dict) or "content" not in message or message.get("role", kind) != kind:
+            # A form this version does not read: counted, never a stop. Human words it
+            # may hold are still in the hook records, which are used if they cannot be placed.
+            skip_unknown("records", f"{kind} (message in another form)")
+            ignored_records += 1
+            continue
         if duplicate(record, message):
             continue
         if kind == "user" and _claude_code_text(message["content"]):
@@ -375,10 +408,8 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
         origin = record.get("origin")
         if kind == "user" and isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
             # A message Claude Code delivered as a prompt (e.g. a task notification).
-            content = message["content"]
-            automated(content if isinstance(content, str) else "\n".join(
-                block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text")
-                if isinstance(content, list) else None, record.get("promptId"))
+            automated(read_text(message["content"], ("records", "user (content in another form)"))[0],
+                      record.get("promptId"))
             ignored_records += 1
             continue
         uuid = record.get("uuid")
@@ -391,16 +422,20 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
         elif isinstance(content, list):
             blocks = content
         else:
-            raise CaptureError(f"Unsupported transcript content at line {number}")
+            skip_unknown("records", f"{kind} (content in another form)")
+            ignored_records += 1
+            continue
         text_parts: list[str] = []
         for block_index, block in enumerate(blocks):
             if not isinstance(block, dict):
-                raise CaptureError(f"Unsupported content block at line {number}")
-            block_type = block.get("type")
+                skip_unknown("blocks", "(block in another form)")
+                continue
+            block_type = _name(block.get("type"))
             block_source = {**source, "block_index": block_index}
             if block_type == "text":
                 if not isinstance(block.get("text"), str):
-                    raise CaptureError("Text block is missing a string")
+                    skip_unknown("blocks", "text (in another form)")
+                    continue
                 if kind == "assistant":
                     add("assistant", block["text"], {**block_source, "kind": "text"})
                 else:
@@ -413,14 +448,14 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
                 if block.get("name") != "AskUserQuestion":
                     continue
                 tool_id, question_input = block.get("id"), block.get("input")
-                if not isinstance(tool_id, str) or not tool_id or not isinstance(question_input, dict):
-                    raise CaptureError("AskUserQuestion tool use lacks an ID or structured input")
-                items = question_input.get("questions")
-                if not isinstance(items, list) or not items or any(
-                    not isinstance(item, dict) or not isinstance(item.get("question"), str)
-                    or not item["question"].strip() for item in items
-                ):
-                    raise CaptureError("AskUserQuestion has no supported nonempty questions")
+                items = question_input.get("questions") if isinstance(question_input, dict) else None
+                if (not isinstance(tool_id, str) or not tool_id or not isinstance(items, list) or not items or any(
+                        not isinstance(item, dict) or not isinstance(item.get("question"), str)
+                        or not item["question"].strip() for item in items)):
+                    # A question in a form this version does not read is counted; its
+                    # hook record then cannot be placed, so the hook records are used.
+                    skip_unknown("blocks", "AskUserQuestion (input in another form)")
+                    continue
                 if tool_id in questions:
                     raise CaptureError("Repeated AskUserQuestion ID is ambiguous")
                 # The model may have filled in the answers itself; such a question is
@@ -433,7 +468,7 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
                 questions[tool_id] = {"input": question_input, "question": question_message, "answer": None,
                                       "prefilled": prefilled}
             elif block_type == "tool_result" and kind == "user":
-                tool_id = block.get("tool_use_id")
+                tool_id = _name(block.get("tool_use_id"))
                 if tool_id not in questions:
                     # Unrelated command output, files, Skill expansion, etc.
                     continue
@@ -453,7 +488,13 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
                         "user", _unanswered_content(block.get("content")), unanswered_source)
                     questions[tool_id]["unanswered"] = True
                     continue
-                answer = add("user", _answer_content(block.get("content")), {
+                content = _read_answer(block.get("content"))
+                if content is None:
+                    # Claude Code's rendering of the answer, with none this version reads:
+                    # counted; the PostToolUse record, if any, gives the answer.
+                    skip_unknown("blocks", "tool_result (no answer this version reads)")
+                    continue
+                answer = add("user", content, {
                     **block_source, "kind": "questionnaire_answer", "tool_use_id": tool_id,
                     "encoding": "string" if isinstance(block.get("content"), str) else "json-values",
                 })
@@ -465,10 +506,15 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
                             record.get("promptId"))
             if matching:
                 matching["used"] = True
-                transcript_human_prompts += 1
+                # The hook record is the evidence, unless the transcript gives the
+                # origin in a form this version does not know (then it is not counted).
+                origin = record.get("origin")
+                known = origin is None or isinstance(origin, dict)
+                matching["origin_unknown"] = not known
+                transcript_human_prompts += known
                 add("user", matching["text"], {
                     **source, "kind": "prompt", "origin": "UserPromptSubmit",
-                    "hook_event_index": matching["event_index"],
+                    "hook_event_index": matching["event_index"], **({} if known else {"origin_kind": "unknown"}),
                 })
             elif not _scaffolding("\n".join(text_parts), record):
                 # Kept, but marked: no hook recorded it (the hook may have failed).
@@ -490,13 +536,12 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
     linked: list[tuple[int, dict, str]] = []
     unplaced_question = False
     for event_index, event in post_questions:
-        tool_id = event.get("tool_use_id")
+        tool_id = _name(event.get("tool_use_id"))
         if not tool_id:
             matches = [key for key, q in questions.items()
                        if _asked_input(q["input"]) == _asked_input(event["tool_input"])]
-            if len(matches) > 1:
-                raise CaptureError("Cannot link an AskUserQuestion hook to one transcript question")
-            tool_id = matches[0] if matches else None
+            # Without an ID, a hook that fits several questions cannot be placed.
+            tool_id = matches[0] if len(matches) == 1 else None
         if tool_id not in questions:
             unplaced_question = True
             continue
@@ -521,11 +566,16 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
     unused = [p for p in prompts if not p["used"]]
     scan = {"visible_records": visible_records, "ignored_records": ignored_records,
             "omitted_attachments": omitted_attachments, "unknown_types": unknown}
-    if unplaced_question or (unused and (len(unused) != 1 or unused[0] is not prompts[0])):
-        # The transcript's form is not understood well enough to place the
-        # human's words: use the hook records, in their order.
+    if missing or unplaced_question or (unused and (len(unused) != 1 or unused[0] is not prompts[0])):
+        # No transcript, or one whose form is not understood well enough to place
+        # the human's words: use the hook records, in their order.
+        if missing:
+            # A notice cannot be told from the human's prompt: those after the request are not counted.
+            for prompt in prompts[1:]:
+                prompt["origin_unknown"] = True
         return _hooks_only(marker, events, [p for p in prompts if p["event_index"] not in automated_events],
-                           post_questions, len(segment.encode("utf-8")), scan, unhooked)
+                           post_questions, questions, len(segment.encode("utf-8")), scan, unhooked,
+                           _NO_TRANSCRIPT if missing else _UNPLACED)
     if unused:
         first = unused[0]
         messages.insert(0, {"role": "user", "content": first["text"], "source": {
@@ -535,8 +585,13 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
 
     for event_index, event, tool_id in linked:
         item = questions[tool_id]
+        content = _read_answer(event["tool_response"])
+        if content is None:
+            # No answer this version reads: counted; the transcript's answer, if any, stays.
+            skip_unknown("hooks", "PostToolUse AskUserQuestion (no answer this version reads)")
+            continue
         hook_answer = {
-            "role": "user", "content": _answer_content(event["tool_response"]),
+            "role": "user", "content": content,
             "source": {"origin": "PostToolUse", "hook_event_index": event_index,
                        "kind": "questionnaire_prefilled_answer" if item["prefilled"] else "questionnaire_answer",
                        "tool_use_id": tool_id,
@@ -606,45 +661,94 @@ def _coverage(mode: str, marker: dict, captured_bytes: int, scan: dict, messages
     return value
 
 
+_UNPLACED = "The transcript's form did not let every human prompt be placed; "
+_NO_TRANSCRIPT = ("There was no Claude Code transcript; messages Claude Code sent as prompts (such as task "
+                  "notifications) cannot be told from the human's, so the prompts after the request are kept "
+                  "with an unknown origin; ")
+
+
 def _hooks_only(marker: dict, events: list[dict], prompts: list[dict], post_questions: list[tuple[int, dict]],
-                captured_bytes: int, scan: dict, unhooked: list[dict]) -> dict:
+                questions: dict[str, dict], captured_bytes: int, scan: dict, unhooked: list[dict], why: str) -> dict:
     """The interview from the hook records, in their order.
 
-    Used when the transcript's form does not let every human prompt be placed.
-    The human's prompts and the AskUserQuestion questions and answers are
-    complete; Claude's other messages are not included. Visible human texts
-    the hooks did not record are kept at the end (their place is unknown).
-    The coverage says all of this.
+    Used when the transcript's form does not let every human prompt be placed,
+    or when there is no transcript (``why`` says which). The human's prompts and
+    the AskUserQuestion questions and answers are complete; Claude's other
+    messages are not included. An answer the hook gives in a form this version
+    does not read is taken from the transcript (``questions``) when it has one.
+    Visible human texts and questions the hooks did not record are kept at the
+    end, in transcript order (their place is unknown). The coverage says all of this.
     """
     asked = {}
     for event in events:
         if (event.get("hook_event_name") == "PreToolUse" and event.get("tool_name") == "AskUserQuestion"
                 and not event.get("agent_id")):
-            key = event.get("tool_use_id")
+            key = _name(event.get("tool_use_id"))
             asked[key] = asked.get(key, False) or prefilled_question(event.get("tool_input"))
+    counts = {"answered": 0, "prefilled": 0, "unverified": 0, "unanswered": 0}
+
+    def question(tool_id: str | None, tool_input: dict, source: dict, answer: dict | None) -> list[dict]:
+        """A question and its answer (``content`` and ``source``), named by its PreToolUse record.
+
+        Only that record shows whether the model filled in the answers; without
+        it the question is kept as unverified and is not counted.
+        """
+        prefilled = asked.get(tool_id)
+        counts["prefilled"] += prefilled is True
+        counts["unverified"] += prefilled is None
+        name = {True: "questionnaire_prefilled", False: "questionnaire", None: "questionnaire_unverified"}[prefilled]
+        result = [{"role": "assistant", "content": _json(_asked_input(tool_input)), "source": {
+            **source, "kind": name, "encoding": "json-values"}}]
+        if answer is None:
+            counts["unanswered"] += 1
+        else:
+            counts["answered"] += prefilled is False
+            result.append({"role": "user", "content": answer["content"],
+                           "source": {**answer["source"], "kind": name + "_answer"}})
+        return result
+
+    def transcript_answer(tool_id: str | None) -> dict | None:
+        item = questions.get(tool_id) if tool_id else None
+        return item["answer"] if item and item["answer"] is not None and not item.get("unanswered") else None
+
     items = [(p["event_index"], "prompt", p) for p in prompts] + [(i, "question", e) for i, e in post_questions]
     messages: list[dict] = []
-    answered = prefilled_questions = unverified = 0
+    hooked: set = set()
     for index, kind, item in sorted(items, key=lambda entry: entry[0]):
         if kind == "prompt":
+            # A prompt whose origin is unknown keeps that mark.
             messages.append({"role": "user", "content": item["text"], "source": {
-                "origin": "UserPromptSubmit", "hook_event_index": index, "kind": "prompt"}})
+                "origin": "UserPromptSubmit", "hook_event_index": index, "kind": "prompt",
+                **({"origin_kind": "unknown"} if item.get("origin_unknown") else {})}})
             continue
-        tool_id = item.get("tool_use_id")
-        # Only the PreToolUse record shows whether the model filled in the answers.
-        # Without it the question is kept as unverified and is not counted.
-        prefilled = asked.get(tool_id)
-        prefilled_questions += prefilled is True
-        answered += prefilled is False
-        unverified += prefilled is None
-        name = {True: "questionnaire_prefilled", False: "questionnaire", None: "questionnaire_unverified"}[prefilled]
+        tool_id = _name(item.get("tool_use_id"))
+        hooked.add(tool_id)
         source = {"origin": "PostToolUse", "hook_event_index": index, "tool_use_id": tool_id}
-        messages.append({"role": "assistant", "content": _json(_asked_input(item["tool_input"])), "source": {
-            **source, "kind": name, "encoding": "json-values"}})
-        messages.append({"role": "user", "content": _answer_content(item["tool_response"]), "source": {
-            **source, "kind": name + "_answer",
-            "encoding": "string" if isinstance(item["tool_response"], str) else "json-values"}})
-    messages.extend(unhooked)
+        content = _read_answer(item["tool_response"])
+        if content is not None:
+            answer = {"content": content, "source": {
+                **source, "encoding": "string" if isinstance(item["tool_response"], str) else "json-values"}}
+        else:
+            # No answer this version reads: counted; the transcript's answer, if any, is used.
+            tally(scan["unknown_types"]["hooks"], "PostToolUse AskUserQuestion (no answer this version reads)", "(untyped)")
+            answer = transcript_answer(tool_id)
+        messages.extend(question(tool_id, item["tool_input"], source, answer))
+    # What the hooks did not record, in transcript order: visible human texts and questions.
+    tail = [(message["source"]["segment_line"], message.get("source", {}).get("block_index", -1), [message])
+            for message in unhooked]
+    for tool_id, item in questions.items():
+        if tool_id in hooked:
+            continue
+        source = {**item["question"]["source"], "hook_record": False}
+        answer = transcript_answer(tool_id)
+        if answer is not None:
+            answer = {**answer, "source": {**answer["source"], "hook_record": False}}
+        kept = question(tool_id, item["input"], source, answer)
+        if item.get("unanswered"):
+            kept.append({**item["answer"], "source": {**item["answer"]["source"], "hook_record": False}})
+        tail.append((source["segment_line"], source["block_index"], kept))
+    for _, _, kept in sorted(tail, key=lambda entry: entry[:2]):
+        messages.extend(kept)
     if not prompts and not unhooked:
         raise CaptureError("No human input was captured")
     # As on the transcript path, a text without a hook record is a response only
@@ -652,12 +756,15 @@ def _hooks_only(marker: dict, events: list[dict], prompts: list[dict], post_ques
     # many text blocks it has.
     marked = len({message["source"]["segment_line"] for message in unhooked
                   if message["source"].get("origin_kind") == "human"})
+    # The first prompt is the request; a prompt whose origin is unknown is not counted.
+    responses = sum(1 for prompt in prompts[1:] if not prompt.get("origin_unknown"))
     return {"schema_version": 1, "messages": messages, "coverage": _coverage(
-        "hook-records-only", marker, captured_bytes, scan, messages, answered=answered, unanswered=0,
-        prefilled=prefilled_questions, user_responses=max(0, len(prompts) - 1) + marked, unhooked=len(unhooked),
-        unverified=unverified,
-        reason="The transcript's form did not let every human prompt be placed; Claude's messages other than "
-               "its AskUserQuestion questions are not included, human texts without a hook record are kept at "
-               "the end and counted as responses only when Claude Code marked them human, and questions without "
-               "their PreToolUse record are kept as unverified and not counted.",
+        "hook-records-only", marker, captured_bytes, scan, messages, answered=counts["answered"],
+        unanswered=counts["unanswered"], prefilled=counts["prefilled"], user_responses=responses + marked,
+        unhooked=len(unhooked), unverified=counts["unverified"],
+        reason=why + "Claude's messages other than its AskUserQuestion questions are not included; human "
+               "texts and questions without a hook record are kept at the end, in transcript order; a text counts "
+               "as a response only when Claude Code marked it human, a prompt whose origin is unknown is not "
+               "counted, and a question without its PreToolUse record is kept as unverified and not counted; an "
+               "answer the hook gives in a form this version does not read is taken from the transcript.",
         excluded=("assistant-messages",))}

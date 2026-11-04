@@ -1,9 +1,12 @@
 """One bounded way to run DevFlow's own git commands, shared by every caller.
 
-The environment drops every ``GIT_*`` variable and ignores the system and
-global configuration, so the user's environment cannot redirect the
-repository or enable programs through those files. Repository configuration
-still applies, as it does for any git command run in the project.
+DevFlow's git commands see the repository as the user's own git does: the
+user's system, global and repository configuration all apply (for example
+``core.autocrlf``, ``core.excludesFile`` and ``safe.directory``), including
+configuration files the user selects with ``GIT_CONFIG_GLOBAL``,
+``GIT_CONFIG_SYSTEM`` or ``GIT_CONFIG_NOSYSTEM``. The other ``GIT_*``
+variables are dropped, so one such as ``GIT_DIR`` (set inside git hooks, for
+example) cannot point a command at another repository than the one named.
 """
 from __future__ import annotations
 
@@ -19,10 +22,14 @@ BASE_ARGS = ("--no-pager", "--no-optional-locks", "-c", "core.fsmonitor=false", 
 DEFAULT_LIMIT = 8 * 1024 * 1024
 
 
+#: The variables that choose the user's configuration files; they are kept.
+CONFIG_FILE_VARIABLES = frozenset({"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"})
+
+
 def git_environment() -> dict[str, str]:
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0",
-                "GIT_OPTIONAL_LOCKS": "0"})
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith("GIT_") or key in CONFIG_FILE_VARIABLES}
+    env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"})
     return env
 
 

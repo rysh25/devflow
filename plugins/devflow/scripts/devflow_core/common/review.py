@@ -30,6 +30,12 @@ def all_approved(reviewers: list, approvals: dict, artifact_digest: str) -> bool
     return bool(reviewers) and all(approvals.get(r["id"]) == artifact_digest for r in reviewers)
 
 
+def after_failed_review(used: int, config: dict) -> str:
+    """The status after a failed or interrupted round, which used its attempt:
+    paused for a retry, or exhausted when no attempt is left."""
+    return "paused_error" if used < config["max_reviews"] else "exhausted"
+
+
 VERDICTS = ("pass", "changes_required", "human_required")
 
 

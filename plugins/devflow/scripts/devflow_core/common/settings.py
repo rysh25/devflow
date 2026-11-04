@@ -84,8 +84,11 @@ def validate_reviewer(reviewer: object) -> dict:
     if (not isinstance(command, list) or not command or len(command) > 128
             or any(not isinstance(x, str) or not x or "\x00" in x for x in command)):
         raise DevFlowError("Reviewer command must be a nonempty argv array of strings")
+    # DevFlow writes these into its own arguments (``--model M``, Codex's
+    # ``model_reasoning_effort="E"`` and OpenCode's ``M#E``), so they must not start
+    # with "-" (an option), or hold spaces, double quotes, backslashes or "#" (the separator).
     for field in ("model", "effort"):
-        if not isinstance(reviewer[field], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./:-]*", reviewer[field]):
+        if not isinstance(reviewer[field], str) or not re.fullmatch(r'(?!-)[^\x00-\x20\x7f"\\#]+', reviewer[field]):
             raise DevFlowError(f"Invalid reviewer {field}")
     timeout = reviewer["timeout_seconds"]
     if type(timeout) is not int or not 5 <= timeout <= 3600:

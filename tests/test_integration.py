@@ -397,13 +397,13 @@ class HookCliEngineTests(FlowFixture):
         self.invoke("resolve", "--event-id", event_id, "--decision", "continue", "--reason", "Resume is not an approval", expect=2)
         self.assertEqual(self.engine.status(self.run_id)["status"], "awaiting_human")
 
-    def test_new_session_resume_moves_ownership_without_resetting_count(self):
+    def test_resuming_in_another_session_moves_ownership_without_resetting_count(self):
         self.ready_review()
         with patch("devflow_core.implement.engine.run_review", side_effect=review_pass):
             self.invoke("review")
-        new_session = "integration-session-2"
-        self.submit("/devflow:resume " + self.run_id, session=new_session)
-        resumed = self.invoke("status", session=new_session)
+        other_session = "integration-session-2"
+        self.submit("/devflow:resume " + self.run_id, session=other_session)
+        resumed = self.invoke("status", session=other_session)
         self.assertEqual(resumed["review_count"], 1)
         self.assertEqual(resumed["next_reviewer"], "opencode")
         # The previous session no longer owns the run. DevFlow does not stop its
@@ -418,7 +418,7 @@ class HookCliEngineTests(FlowFixture):
         self.assertEqual(len(read_json(Path(self.engine.status(self.run_id)["run_dir"]) / "state.json")["event_ids"]),
                          before)
         with patch("devflow_core.implement.engine.run_review", side_effect=review_pass):
-            result = self.invoke("review", session=new_session)
+            result = self.invoke("review", session=other_session)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["review_count"], 2)
 

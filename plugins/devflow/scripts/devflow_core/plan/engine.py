@@ -8,7 +8,7 @@ import re
 from uuid import uuid4
 
 from ..common.errors import CaptureError, DevFlowError
-from ..common.review import all_approved, next_reviewer
+from ..common.review import after_failed_review, all_approved, next_reviewer
 from ..common.reviewers import preflight, run_review
 from ..common.engine import RunEngine
 from ..common.runs import RUNNER_WAIT, TERMINAL, open_escalation
@@ -35,20 +35,28 @@ class Engine(RunEngine):
             result["review"] = read_json(run / state["last_review"])
         result["reviews"] = self._reviews(state)
 
-    def _reviews(self, state: dict) -> list[dict]:
-        """Each review round: its reviewer, outcome and, when it succeeded, its tool calls."""
-        run, config, entries = self._run(state["run_id"]), state["config"], []
+    def _reviews(self, state: dict, with_reviews: bool = False) -> list[dict]:
+        """Each review round, from its records: the reviewer, the plan hash it reviewed, the
+        outcome and, when it succeeded, the verdict and tool calls (and with ``with_reviews``
+        the review)."""
+        run, entries = self._run(state["run_id"]), []
         for number in range(1, state["review_count"] + 1):
             base = f"reviews/{number:02d}"
-            entry = {"number": number, "reviewer_id": next_reviewer(config["reviewers"], number - 1, config["max_reviews"])["id"]}
             if f"{base}/review.json" in state["artifacts"]:
                 wrapper = read_json(run / base / "review.json")
-                entry.update(status="succeeded", verdict=wrapper["result"]["verdict"], plan_hash=wrapper["plan_hash"],
-                             **wrapper["activity"])
-            elif f"{base}/error.json" in state["artifacts"] or f"{base}/recovery.json" in state["artifacts"]:
-                entry["status"] = "failed"
+                entry = {"number": number, "reviewer_id": wrapper["provider"], "status": "succeeded",
+                         "verdict": wrapper["result"]["verdict"], "plan_hash": wrapper["plan_hash"],
+                         **wrapper["activity"], **({"review": wrapper["result"]} if with_reviews else {})}
             else:
-                entry["status"] = "reviewing"
+                # A failed or recovered round has its record; the round in flight, its reservation.
+                ended = next((read_json(run / base / name) for name in ("error.json", "recovery.json")
+                              if f"{base}/{name}" in state["artifacts"]), None)
+                inflight = state["inflight"] or {}
+                entry = {"number": number,
+                         "reviewer_id": ended["provider"] if ended else inflight.get("reviewer_id"),
+                         "status": "failed" if ended else "dispatched",
+                         "plan_hash": ended["plan_hash"] if ended else inflight.get("target"),
+                         **({"review": None} if with_reviews else {})}
             entries.append(entry)
         return entries
 
@@ -118,14 +126,11 @@ class Engine(RunEngine):
             "interview_verbatim": read_json(run / "interview.json"),
             "decisions_and_constraints": read_json(run / "decisions.json"),
             "plan_markdown": checked_text(run / state["current_plan"]),
-            "previous_reviews": [], "revision_history": [], "human_resolutions": [],
-        }
-        for entry in self._reviews(state):
             # Each earlier round in full, as in implement: the findings, their evidence and the verdict.
-            relative = f"reviews/{entry['number']:02d}/review.json"
-            review = read_json(run / relative)["result"] if relative in state["artifacts"] else None
-            data["previous_reviews"].append({**{key: entry[key] for key in ("number", "reviewer_id", "status")},
-                                             "plan_hash": entry.get("plan_hash"), "review": review})
+            "previous_reviews": [{key: entry.get(key) for key in ("number", "reviewer_id", "status", "plan_hash", "review")}
+                                 for entry in self._reviews(state, with_reviews=True)],
+            "revision_history": [], "human_resolutions": [],
+        }
         for relative in sorted(state["artifacts"]):
             if re.fullmatch(r"reviews/\d{2}/reflection.json", relative):
                 data["revision_history"].append(read_json(run / relative))
@@ -179,9 +184,10 @@ class Engine(RunEngine):
         if error is None and state["plan_hash"] != reservation["target"]:
             error = DevFlowError("The plan changed while it was being reviewed.")
         if error is not None:
-            state["last_error"] = {"review_number": number, "provider": provider["id"], "message": str(error),
+            state["last_error"] = {"review_number": number, "provider": provider["id"],
+                                   "plan_hash": reservation["target"], "message": str(error),
                                    "retry_consumes_another_attempt": True}
-            state["status"] = "paused_error" if number < state["config"]["max_reviews"] else "exhausted"
+            state["status"] = after_failed_review(number, state["config"])
             self._artifact(state, f"{relative_dir}/error.json", json_bytes(state["last_error"]))
             return
         providers = state["config"]["reviewers"]

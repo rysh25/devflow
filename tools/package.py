@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PLUGINS = ("devflow",)
 PACKAGE = "plugins/devflow/scripts/devflow_core"
 WORKFLOW_RESOURCES = ("defaults.json", "reviewer.md", "review.schema.json")
+COMMON_RESOURCES = ("reviewer-rules.md",)
 COORDINATORS = ("router", "cli", "workflows")
 SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv", "node_modules", "dist", ".devflow"}
 SKIP_SUFFIXES = {".pyc", ".pyo", ".zip", ".log", ".tmp"}
@@ -208,6 +209,8 @@ def _validate_package(files: dict[str, bytes]) -> list[str]:
     for name in workflows:
         for resource in WORKFLOW_RESOURCES:
             _require(f"{PACKAGE}/{name}/{resource}" in files, f"Missing {name}/{resource}")
+    for resource in COMMON_RESOURCES:
+        _require(f"{PACKAGE}/common/{resource}" in files, f"Missing common/{resource}")
     def area(module: str) -> str | None:
         parts = module.split(".")
         return parts[1] if len(parts) > 1 and parts[0] == root else None

@@ -7,7 +7,7 @@ from . import checks, snapshot
 from .review import validate_review
 from .workspace import branch, verify_workspace
 from ..common.errors import DevFlowError
-from ..common.review import all_approved, next_reviewer
+from ..common.review import after_failed_review, all_approved, next_reviewer
 from ..common.reviewers import preflight, run_review
 from ..common.engine import RunEngine
 from ..common.runs import RUNNER_WAIT, TERMINAL, open_escalation
@@ -169,11 +169,11 @@ class Engine(RunEngine):
             if item.get("review_path"):
                 entry["review"] = read_json(run/item["review_path"])
             history.append(entry)
-        checks = read_json(run/state["validation"]["path"]) if state["validation"].get("path") else None
-        if checks is not None:
+        check_results = read_json(run/state["validation"]["path"]) if state["validation"].get("path") else None
+        if check_results is not None:
             # The logs stay in their files; the packet gives their paths.
-            checks = {**checks, "results":[{k:v for k,v in result.items() if k not in ("stdout","stderr")}
-                                           for result in checks["results"]]}
+            check_results = {**check_results, "results":[{k:v for k,v in result.items() if k not in ("stdout","stderr")}
+                                                         for result in check_results["results"]]}
         mode = state["config"]["snapshot"]["mode"]
         value = {"schema_version":2,"kind":"code_review","snapshot_id":current["snapshot_id"],
             "workspace":{"path":str(workspace),"mode":mode,"branch":branch(workspace,mode),
@@ -184,7 +184,7 @@ class Engine(RunEngine):
             "changes":snapshot.change_list(delta),"diff_path":str(diff_path),
             "context_paths":list(state["config"]["snapshot"]["context_paths"]),
             "scope":{"mode":current["mode"],"excluded":current.get("excluded",[]),"limitations":current.get("scope_note")},
-            "validation":state["validation"],"check_results":checks,
+            "validation":state["validation"],"check_results":check_results,
             "binary_attestation":state.get("binary_attestation"),"previous_reviews":history,
             "reflections":[read_json(run/p) for p in state["reflections"]],
             "human_resolutions":[read_json(run/p) for p in state["resolutions"]]}
@@ -249,11 +249,11 @@ class Engine(RunEngine):
             state["attempts"][-1].update(status="failed",error=str(error),finished_at=now())
             # A reviewer failure says nothing about the code: approvals for this
             # snapshot stay (as in plan); this attempt never adds one.
-            state.update(status="paused_error" if number < state["config"]["max_reviews"] else "exhausted",resume_status="ready_review",last_error=str(error))
+            state.update(status=after_failed_review(number,state["config"]),resume_status="ready_review",last_error=str(error))
             return
         review_path = f"reviews/{number:02}/review.json"
         self._artifact(state,review_path,json_bytes(review))
-        state["attempts"][-1].update(status="succeeded",review_path=review_path,activity=result["activity"],finished_at=now())
+        state["attempts"][-1].update(status="succeeded",verdict=review["verdict"],review_path=review_path,activity=result["activity"],finished_at=now())
         critical = any(f["severity"] == "critical" for f in review["findings"])
         if review["verdict"] == "human_required" or critical:
             questions = review["questions"] or ["A critical issue was reported. Confirm the safe scope and remediation before continuing."]
@@ -364,12 +364,19 @@ class Engine(RunEngine):
         state["last_error"] = None
 
     def _status_details(self, state, result):
+        result["reviews"] = review_rounds(state)
         if state["status"] in TERMINAL:
             run = self._run(state["run_id"])
             report_path = within(run / state["report_path"], run)
             if digest(report_path.read_bytes()) != state["artifacts"][state["report_path"]]:
                 raise DevFlowError("The recorded terminal report was modified")
             result["report"] = read_json(report_path)
+
+def review_rounds(state):
+    """Each review attempt: its reviewer, snapshot, outcome and, when it succeeded, its verdict and tool calls."""
+    return [{"number":a["number"],"reviewer_id":a["reviewer_id"],"snapshot_id":a["snapshot_id"],"status":a["status"],
+             **({"verdict":a["verdict"]} if "verdict" in a else {}),**(a.get("activity") or {})} for a in state["attempts"]]
+
 
 def verify_source(state):
     """The original plan file must still be exactly the one this run started from."""
@@ -403,8 +410,7 @@ def terminal_report(project, state, observed=(), observed_error=None):
         "workspace_capture_error":capture_error,"final_snapshot_reviewed":reviewed,
         "unreviewed_final_changes":(actual != state["baseline_id"] and not reviewed) if actual else None,
         "workspace":state["workspace"],
-        "reviews":[{"number":a["number"],"reviewer_id":a["reviewer_id"],"snapshot_id":a["snapshot_id"],"status":a["status"],
-                    **(a.get("activity") or {})} for a in state["attempts"]],
+        "reviews":review_rounds(state),
         "prefilled_question_events":None if observed is None else list(observed),
         "prefilled_question_events_error":observed_error,
         "reported_at":now(),"automatic_commit_push_deploy":False,

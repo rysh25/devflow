@@ -84,6 +84,15 @@ class DispatchTests(PlanHookFixture):
         self.assertIsNone(self.hook(self.payload(prompt="Hello")))
         self.assertFalse((self.project / ".devflow").exists())
 
+    def test_a_prompt_without_a_transcript_path_still_starts_the_plan(self):
+        payload = self.payload(prompt="/devflow:plan Build a planner")
+        del payload["transcript_path"]
+        self.hook(payload)
+        self.run_id = self.bound_run()
+        self.run = self.store.run_dir(self.run_id)
+        # The interview is then built from the hook records alone.
+        self.assertEqual(self.state()["transcript_marker"], {"path": None, "offset": 0})
+
     def test_explicit_trigger_preserves_raw_original(self):
         original = "/devflow:plan 日本語の依頼\n詳しい条件を追加"
         result = self.hook(self.payload(prompt=original))

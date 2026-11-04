@@ -119,10 +119,14 @@ class TranscriptTests(unittest.TestCase):
         marker = transcript_marker(str(self.path))
         q = {"questions": [{"question": "Q?"}]}
         self.write(entry("user", "req"), entry("assistant", [{"type": "tool_use", "id": "q", "name": "AskUserQuestion", "input": q}]))
-        with self.assertRaises(CaptureError):
-            capture_interview(marker, [self.prompt("req"), {
-                "hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_input": q, "tool_response": {"answers": {}},
-            }])
+        out = capture_interview(marker, [self.prompt("req"), {
+            "hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_input": q, "tool_response": {"answers": {}},
+        }])
+        # Kept unanswered and counted, never a stop.
+        self.assertEqual([m["source"]["kind"] for m in out["messages"]], ["prompt", "questionnaire"])
+        coverage = out["coverage"]
+        self.assertEqual((coverage["unanswered_questions"], coverage["human_response_count"]), (1, 0))
+        self.assertEqual(coverage["unknown_types"]["hooks"], {"PostToolUse AskUserQuestion (no answer this version reads)": 1})
 
     def test_prefilled_question_is_kept_but_never_counts_as_human_participation(self):
         marker = transcript_marker(str(self.path))
@@ -180,7 +184,7 @@ class TranscriptTests(unittest.TestCase):
         self.assertIn("Transcript answer", [m["content"] for m in out["messages"]])
         self.assertNotIn("Changed answer", json.dumps(out))
 
-    def test_unanswered_question_is_kept_and_empty_question_fails(self):
+    def test_unanswered_question_is_kept_and_a_question_in_another_form_is_counted(self):
         marker = transcript_marker(str(self.path))
         self.write(entry("user", "request"),
                    entry("assistant", [{"type": "tool_use", "id": "q", "name": "AskUserQuestion",
@@ -192,8 +196,182 @@ class TranscriptTests(unittest.TestCase):
         marker = transcript_marker(str(self.path))
         self.write(entry("user", "request"),
                    entry("assistant", [{"type": "tool_use", "id": "q", "name": "AskUserQuestion", "input": {"questions": []}}]))
-        with self.assertRaisesRegex(CaptureError, "no supported nonempty questions"):
-            capture_interview(marker, [self.prompt("request")])
+        out = capture_interview(marker, [self.prompt("request")])
+        self.assertEqual(out["coverage"]["unknown_types"]["blocks"], {"AskUserQuestion (input in another form)": 1})
+        self.assertEqual(out["coverage"]["unanswered_questions"], 0)
+
+    def test_forms_this_version_does_not_read_are_counted_never_a_stop(self):
+        """R4: a future Claude Code may change how records, content and hook inputs look;
+        only a transcript shown to be broken stops the capture."""
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), ["a", "line", "that", "is", "an", "array"],
+                   {"type": "user", "message": "message as a string"},
+                   {"type": "assistant", "message": {"role": "user", "content": "role and type differ"}},
+                   {"type": "assistant", "message": {"role": "assistant", "content": {"text": "an object"}}},
+                   entry("assistant", ["a bare string block", {"type": "text", "text": 7},
+                                       {"type": "text", "text": "Question?"}]),
+                   {"type": "attachment", "attachment": {"type": "queued_command", "commandMode": "prompt",
+                                                         "origin": {"kind": "human"}, "prompt": {"text": "x"}}},
+                   dict(entry("user", "Answer"), uuid=12345))
+        hook_in_another_form = {"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion",
+                                "tool_use_id": "q", "tool_input": "not an object", "tool_response": {}}
+        out = capture_interview(marker, [self.prompt("request"), hook_in_another_form, self.prompt("Answer")])
+        self.assertEqual([m["content"] for m in out["messages"]], ["request", "Question?", "Answer"])
+        unknown = out["coverage"]["unknown_types"]
+        self.assertEqual(unknown["records"], {"(line in another form)": 1, "assistant (content in another form)": 1,
+                                              "assistant (message in another form)": 1,
+                                              "user (message in another form)": 1})
+        self.assertEqual(unknown["blocks"], {"(block in another form)": 1, "text (in another form)": 1})
+        self.assertEqual(unknown["attachments"], {"queued_command (prompt in another form)": 1})
+        self.assertEqual(unknown["hooks"], {"PostToolUse AskUserQuestion (in another form)": 1})
+        self.assertEqual(out["coverage"]["human_response_count"], 1)
+
+    def question_turn(self, rendering):
+        """A request and one AskUserQuestion whose result Claude Code rendered as ``rendering``."""
+        question = {"questions": [{"question": "Q?"}]}
+        self.write(entry("user", "request"),
+                   entry("assistant", [{"type": "tool_use", "id": "q1", "name": "AskUserQuestion", "input": question}]),
+                   entry("user", [{"type": "tool_result", "tool_use_id": "q1", "content": rendering}]))
+        pre = {"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "tool_use_id": "q1", "tool_input": question}
+        post = {"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_use_id": "q1",
+                "tool_input": question, "tool_response": {"answers": {"Q?": "A"}}}
+        return pre, post
+
+    def test_an_answer_rendering_this_version_does_not_read_is_counted_and_the_hook_answer_used(self):
+        marker = transcript_marker(str(self.path))
+        pre, post = self.question_turn([{"type": "future-block", "data": 1}])
+        out = capture_interview(marker, [self.prompt("request"), pre, post])
+        self.assertEqual([(m["source"]["kind"], m["source"]["origin"]) for m in out["messages"]],
+                         [("prompt", "UserPromptSubmit"), ("questionnaire", "claude_transcript"),
+                          ("questionnaire_answer", "PostToolUse")])
+        coverage = out["coverage"]
+        self.assertEqual((coverage["answered_questions"], coverage["human_response_count"]), (1, 1))
+        self.assertEqual(coverage["unknown_types"]["blocks"], {"tool_result (no answer this version reads)": 1})
+        # Without the hook record the question stays unanswered; still not a stop.
+        out = capture_interview(marker, [self.prompt("request"), pre])
+        self.assertEqual((out["coverage"]["unanswered_questions"], out["coverage"]["human_response_count"]), (1, 0))
+
+    def test_a_hook_answer_this_version_does_not_read_is_counted_on_both_paths(self):
+        marker = transcript_marker(str(self.path))
+        pre, post = self.question_turn("User answered: Q?=A")
+        post = dict(post, tool_response={"future-shape": True})
+        expected = {"PostToolUse AskUserQuestion (no answer this version reads)": 1}
+        # The transcript's own answer stays.
+        out = capture_interview(marker, [self.prompt("request"), pre, post])
+        self.assertEqual(out["messages"][-1]["source"]["origin"], "claude_transcript")
+        self.assertEqual(out["coverage"]["unknown_types"]["hooks"], expected)
+        # The hook records path takes the transcript's answer too.
+        out = capture_interview(marker, [self.prompt("request"), pre, post, self.prompt("not in the transcript")])
+        coverage = out["coverage"]
+        self.assertEqual(coverage["mode"], "hook-records-only")
+        self.assertEqual([m["source"]["kind"] for m in out["messages"]],
+                         ["prompt", "questionnaire", "questionnaire_answer", "prompt"])
+        answer = out["messages"][2]
+        self.assertEqual((answer["content"], answer["source"]["origin"]), ("User answered: Q?=A", "claude_transcript"))
+        self.assertEqual((coverage["answered_questions"], coverage["unanswered_questions"]), (1, 0))
+        self.assertEqual(coverage["unknown_types"]["hooks"], expected)
+        # Neither readable: kept without an answer.
+        self.path.unlink()
+        marker = transcript_marker(str(self.path))
+        self.question_turn([{"type": "future-block"}])
+        out = capture_interview(marker, [self.prompt("request"), pre, post, self.prompt("not in the transcript")])
+        self.assertEqual([m["source"]["kind"] for m in out["messages"]], ["prompt", "questionnaire", "prompt"])
+        self.assertEqual((out["coverage"]["answered_questions"], out["coverage"]["unanswered_questions"]), (0, 1))
+
+    def test_the_hook_records_path_keeps_questions_only_the_transcript_shows(self):
+        # The question's hooks were not recorded (e.g. they failed); the capture uses
+        # the hook records for another reason, an unplaced prompt.
+        marker = transcript_marker(str(self.path))
+        pre, _ = self.question_turn("User answered: Q?=A")
+        self.write(entry("user", "a later text without a hook record"))
+        for events, kind, answered in (([self.prompt("request"), self.prompt("unplaced")], "questionnaire_unverified", 0),
+                                       ([self.prompt("request"), pre, self.prompt("unplaced")], "questionnaire", 1)):
+            with self.subTest(kind=kind):
+                out = capture_interview(marker, events)
+                self.assertEqual(out["coverage"]["mode"], "hook-records-only")
+                # Kept at the end, in transcript order, marked; counted only with its PreToolUse record.
+                self.assertEqual([(m["source"]["kind"], m["source"].get("hook_record")) for m in out["messages"]],
+                                 [("prompt", None), ("prompt", None), (kind, False), (kind + "_answer", False),
+                                  ("prompt", False)])
+                self.assertEqual(out["messages"][3]["content"], "User answered: Q?=A")
+                self.assertEqual(out["coverage"]["answered_questions"], answered)
+
+    def test_a_hook_without_an_id_that_fits_several_questions_uses_the_hook_records(self):
+        marker = transcript_marker(str(self.path))
+        question = {"questions": [{"question": "Again?"}]}
+        self.write(entry("user", "request"), entry("assistant", [
+            {"type": "tool_use", "id": "q1", "name": "AskUserQuestion", "input": question},
+            {"type": "tool_use", "id": "q2", "name": "AskUserQuestion", "input": question}]))
+        post = {"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_input": question,
+                "tool_response": {"answers": {"Again?": "Yes"}}}
+        out = capture_interview(marker, [self.prompt("request"), post])
+        self.assertEqual(out["coverage"]["mode"], "hook-records-only")
+        # The hook's question, and the transcript's two kept at the end.
+        self.assertEqual(out["coverage"]["unverified_questions"], 3)
+        self.assertEqual([m["source"].get("tool_use_id") for m in out["messages"] if m["role"] == "assistant"],
+                         [None, "q1", "q2"])
+
+    def test_names_and_ids_in_other_forms_are_read_as_missing(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), {"type": ["a list"]}, {"type": "system", "subtype": ["a list"]},
+                   {"type": "attachment", "attachment": {"type": {"an": "object"}}},
+                   entry("assistant", [{"type": ["a list"]}, {"type": "text", "text": "Question?"}]),
+                   entry("user", [{"type": "tool_result", "tool_use_id": ["a list"], "content": "output"}]),
+                   entry("user", "Answer"))
+        hook = {"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_use_id": ["a list"],
+                "tool_input": {"questions": [{"question": "Elsewhere?"}]}, "tool_response": {"answers": {"Elsewhere?": "x"}}}
+        out = capture_interview(marker, [self.prompt("request"), self.prompt("Answer")])
+        self.assertEqual([m["content"] for m in out["messages"]], ["request", "Question?", "Answer"])
+        self.assertEqual({group: counts for group, counts in out["coverage"]["unknown_types"].items() if counts},
+                         {"records": {"(untyped)": 1}, "attachments": {"(untyped)": 1}, "blocks": {"(untyped)": 1}})
+        # A hook with an ID in another form cannot be placed: the hook records are used.
+        out = capture_interview(marker, [self.prompt("request"), self.prompt("Answer"), hook])
+        self.assertEqual(out["coverage"]["mode"], "hook-records-only")
+        self.assertEqual(out["coverage"]["unverified_questions"], 1)
+
+    def test_a_notice_with_content_in_another_form_is_skipped_and_counted(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"),
+                   entry("user", [{"type": "text", "text": 7}, "a bare string", {"type": "text", "text": "NOTICE"}],
+                         origin={"kind": "task-notification"}),
+                   {"type": "attachment", "attachment": {"type": "queued_command", "commandMode": "prompt",
+                                                         "origin": {"kind": "peer"}, "prompt": [{"type": "text", "text": None}]}},
+                   entry("assistant", "Question?"))
+        out = capture_interview(marker, [self.prompt("request"), self.prompt("NOTICE")])
+        # The notice's readable text still takes its hook prompt.
+        self.assertEqual(out["coverage"]["mode"], "bounded-transcript-with-hook-provenance")
+        self.assertEqual([m["content"] for m in out["messages"]], ["request", "Question?"])
+        self.assertEqual(out["coverage"]["unknown_types"]["blocks"],
+                         {"text (in another form)": 2, "(block in another form)": 1})
+
+    def test_an_origin_in_another_form_stays_uncounted_when_the_hook_records_are_used(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), entry("assistant", "Question?"), entry("user", "Answer", origin="human"))
+        # A question the transcript does not show sends the capture to the hook records.
+        elsewhere = {"questions": [{"question": "Elsewhere?"}]}
+        hook = {"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_use_id": "zz",
+                "tool_input": elsewhere, "tool_response": {"answers": {"Elsewhere?": "x"}}}
+        out = capture_interview(marker, [self.prompt("request"), self.prompt("Answer"), hook])
+        coverage = out["coverage"]
+        self.assertEqual(coverage["mode"], "hook-records-only")
+        answer = [m for m in out["messages"] if m["content"] == "Answer"][0]
+        self.assertEqual(answer["source"]["origin_kind"], "unknown")
+        self.assertEqual((coverage["unverified_questions"], coverage["human_response_count"]), (1, 0))
+
+    def test_a_hooked_prompt_whose_origin_is_in_another_form_is_kept_but_not_counted(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), entry("assistant", "Question?"),
+                   entry("user", "Answer", origin="human"))
+        out = capture_interview(marker, [self.prompt("request"), self.prompt("Answer")])
+        kept = [m for m in out["messages"] if m["content"] == "Answer"][0]
+        self.assertEqual((kept["source"]["origin"], kept["source"]["origin_kind"]), ("UserPromptSubmit", "unknown"))
+        self.assertEqual(out["coverage"]["human_response_count"], 0)
+        # Without an origin (older transcripts), the hook record is the evidence.
+        self.path.unlink()
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "request"), entry("assistant", "Question?"), entry("user", "Answer"))
+        out = capture_interview(marker, [self.prompt("request"), self.prompt("Answer")])
+        self.assertEqual(out["coverage"]["human_response_count"], 1)
 
     def cancelled_question(self, **record_extra):
         question = {"questions": [{"question": "Q?"}]}
@@ -206,6 +384,16 @@ class TranscriptTests(unittest.TestCase):
                    entry("assistant", "What would you like to clarify?"),
                    entry("user", "What does Q mean?"))
         return question, cancel
+
+    def test_a_cancelled_question_only_the_transcript_shows_is_kept_on_the_hook_records_path(self):
+        marker = transcript_marker(str(self.path))
+        _, cancel = self.cancelled_question()
+        out = capture_interview(marker, [self.prompt("request"), self.prompt("What does Q mean?"),
+                                         self.prompt("unplaced")])
+        self.assertEqual(out["coverage"]["mode"], "hook-records-only")
+        tail = [(m["source"]["kind"], m["content"] if m["role"] == "user" else None) for m in out["messages"][3:]]
+        self.assertEqual(tail, [("questionnaire_unverified", None), ("questionnaire_unanswered", cancel)])
+        self.assertEqual((out["coverage"]["unanswered_questions"], out["coverage"]["answered_questions"]), (1, 0))
 
     def test_cancelled_question_is_kept_verbatim_but_not_counted_as_answer(self):
         marker = transcript_marker(str(self.path))
@@ -267,8 +455,10 @@ class TranscriptTests(unittest.TestCase):
                 out = capture_interview(marker, [self.prompt("request")])
                 self.assertEqual([m["content"] for m in out["messages"]], ["request", "Question?"])
                 self.assertNotIn("OTHER-SECRET", json.dumps(out))
-                if group:
-                    self.assertEqual(out["coverage"]["unknown_types"][group], {name: 1})
+                self.assertEqual(out["coverage"]["ignored_records"], 1)
+                # Known kinds left out of the interview are in the total only; unknown ones also by type.
+                self.assertEqual(out["coverage"]["unknown_types"], {
+                    key: ({name: 1} if key == group else {}) for key in ("records", "attachments", "blocks", "hooks")})
 
     def test_unknown_types_are_counted_with_a_bound(self):
         marker = transcript_marker(str(self.path))
@@ -612,6 +802,36 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual([m["content"] for m in out["messages"]],
                          ["request", "Question?", "Answer", "Next question?", "Next answer"])
         self.assertNotIn("COMPACT-SUMMARY", json.dumps(out))
+        # Skipped and counted: the boundary and the summary.
+        self.assertEqual(out["coverage"]["ignored_records"], 2)
+        self.assertEqual(out["coverage"]["unknown_types"], {"records": {}, "attachments": {}, "blocks": {}, "hooks": {}})
+
+    def test_without_a_transcript_path_the_hook_records_make_the_interview(self):
+        question = {"questions": [{"question": "Scope?"}]}
+        events = [self.prompt("request"),
+                  {"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "tool_use_id": "q1",
+                   "tool_input": question},
+                  {"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_use_id": "q1",
+                   "tool_input": question, "tool_response": {"answers": {"Scope?": "API"}}},
+                  self.prompt("One more thing")]
+        for path in (None, "", "  "):
+            with self.subTest(path=path):
+                marker = transcript_marker(path)
+                self.assertEqual(marker, {"path": None, "offset": 0})
+                out = capture_interview(marker, events)
+                self.assertEqual([m["source"]["kind"] for m in out["messages"]],
+                                 ["prompt", "questionnaire", "questionnaire_answer", "prompt"])
+                self.assertEqual(out["messages"][3]["content"], "One more thing")
+                coverage = out["coverage"]
+                self.assertEqual(coverage["mode"], "hook-records-only")
+                self.assertTrue(coverage["reason"].startswith("There was no Claude Code transcript"))
+                # Without a transcript a later prompt may be a notice: kept, not counted.
+                self.assertEqual(out["messages"][3]["source"]["origin_kind"], "unknown")
+                self.assertEqual((coverage["captured_bytes"], coverage["answered_questions"],
+                                  coverage["human_response_count"]), (0, 1, 1))
+                # A notice alone is no human response.
+                notice = capture_interview(marker, [self.prompt("request"), self.prompt("<task-notification>x")])
+                self.assertEqual(notice["coverage"]["human_response_count"], 0)
 
     def test_truncation_and_prefix_rewrite_fail(self):
         self.write(entry("user", "old"))
@@ -630,6 +850,14 @@ class TranscriptTests(unittest.TestCase):
             capture_interview(marker, [self.prompt("req")])
         with self.assertRaises(CaptureError):
             transcript_marker(str(self.path))
+        # NaN and Infinity are not JSON, and a number beyond a float's range would become one.
+        for value in ("NaN", "-Infinity", "1e999"):
+            with self.subTest(value=value):
+                self.path.unlink()
+                marker = transcript_marker(str(self.path))
+                self.path.write_text('{"type": "user", "n": %s}\n' % value, encoding="utf-8")
+                with self.assertRaisesRegex(CaptureError, "Malformed"):
+                    capture_interview(marker, [self.prompt("req")])
 
     def test_duplicate_uuid_exact_ignored_conflict_rejected(self):
         marker = transcript_marker(str(self.path))
@@ -640,12 +868,19 @@ class TranscriptTests(unittest.TestCase):
         with self.assertRaises(CaptureError):
             capture_interview(marker, [self.prompt("req")])
 
-    def test_missing_transcript_never_claims_hook_only_complete(self):
-        with self.assertRaises(CaptureError):
-            transcript_marker(None)
+    def test_a_transcript_never_written_uses_the_hook_records(self):
         marker = transcript_marker(str(self.path))
+        out = capture_interview(marker, [self.prompt("req"), {"hook_event_name": "Stop", "last_assistant_message": "Q?"}])
+        self.assertEqual(out["coverage"]["mode"], "hook-records-only")
+        self.assertTrue(out["coverage"]["reason"].startswith("There was no Claude Code transcript"))
+        # Claude's words are not taken from the Stop hook.
+        self.assertEqual([m["content"] for m in out["messages"]], ["req"])
+        # A transcript that existed and then vanished is a broken record.
+        self.write(entry("user", "req"))
+        marker = transcript_marker(str(self.path))
+        self.path.unlink()
         with self.assertRaises(CaptureError):
-            capture_interview(marker, [self.prompt("req"), {"hook_event_name": "Stop", "last_assistant_message": "Q?"}])
+            capture_interview(marker, [self.prompt("req")])
 
 
 if __name__ == "__main__":

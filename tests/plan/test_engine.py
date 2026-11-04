@@ -339,6 +339,8 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(failed["review_count"], 1)
         self.assertEqual(failed["next_reviewer"], "opencode")
         self.assertIsNone(failed["inflight"])
+        self.assertEqual([(r["status"], r["reviewer_id"], r["plan_hash"]) for r in failed["reviews"]],
+                         [("failed", "codex", failed["plan_hash"])])
         with patch(RUN_REVIEW) as no_call:
             with self.assertRaises(DevFlowError):
                 self.engine.review(self.run_id)
@@ -449,6 +451,9 @@ class EngineTests(unittest.TestCase):
         interrupted = self.engine.status(self.run_id)
         self.assertEqual(interrupted["status"], "reviewing")
         self.assertEqual(interrupted["inflight"]["number"], 1)
+        # A round's status uses the same words as implement's attempts; every round has its target.
+        self.assertEqual([(r["status"], r["reviewer_id"], r["plan_hash"]) for r in interrupted["reviews"]],
+                         [("dispatched", "codex", interrupted["plan_hash"])])
         self.assertNotAccepted(self.resume_prompt("new-session"), "resume", "recover")
         self.assertEqual(self.engine.status(self.run_id)["owner_session"], self.session)
         with self.assertRaises(DevFlowError):
@@ -456,6 +461,8 @@ class EngineTests(unittest.TestCase):
         recovered = self.engine.recover(self.run_id, confirmed=True, expected_review=1)
         self.assertEqual(recovered["status"], "paused_error")
         self.assertIsNone(recovered["inflight"])
+        self.assertEqual([(r["status"], r["reviewer_id"], r["plan_hash"]) for r in recovered["reviews"]],
+                         [("failed", "codex", interrupted["plan_hash"])])
         resumed = self.resume("new-session")
         self.assertEqual(resumed["review_count"], 1)
         self.assertEqual(resumed["next_reviewer"], "opencode")

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ..common.errors import DevFlowError, UsageError
 from ..common.environment import bash_timeout_ms
-from ..common.review import HARD_MAX_REVIEWS, check_review_config, review_budget
+from ..common.review import HARD_MAX_REVIEWS, after_failed_review, check_review_config, review_budget
 from ..common.runs import TERMINAL
 from ..common.sessions import prefilled_question_events
 from ..common.storage import digest, json_bytes, no_symlinks, now
@@ -114,8 +114,7 @@ class ImplementWorkflow(Workflow):
             # An interrupted review is a reviewer failure: other approvals stay.
             state["attempts"][-1].update(status="failed", error="Human-confirmed interrupted dispatch; outcome unknown",
                                          finished_at=now())
-            state.update(status="paused_error" if len(state["attempts"]) < state["config"]["max_reviews"] else "exhausted",
-                         resume_status="ready_review")
+            state.update(status=after_failed_review(len(state["attempts"]), state["config"]), resume_status="ready_review")
         state.update(last_error="Recovered interrupted operation after human process confirmation")
 
     def on_transfer(self, state: dict) -> None:

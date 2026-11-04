@@ -10,14 +10,13 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import sys
 
 from . import __version__, router
 from .common import paths
-from .common.environment import python_errors
+from .common.environment import python_errors, version_numbers, version_warnings
 from .common.errors import DevFlowError, UsageError
 from .common.reviewers import preflight
 from .common.settings import validate_document
@@ -66,13 +65,11 @@ def claude_version() -> dict:
                                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                                 timeout=10, shell=False, check=False)
         # A version probe is diagnostic only and does not authenticate or invoke a model.
-        match = re.search(r"(?<![0-9])([0-9]+)\.([0-9]+)\.([0-9]+)(?![0-9])", result.stdout[:8192])
-        if result.returncode != 0 or not match:
+        found = version_numbers(result.stdout[:8192])
+        if result.returncode != 0 or not found:
             report["reason"] = "Claude Code version could not be established"
         else:
-            value = tuple(int(part) for part in match.groups())
-            minimum = tuple(int(part) for part in MINIMUM_CLAUDE_CODE.split("."))
-            report.update(version=".".join(match.groups()), supported=value >= minimum,
+            report.update(version=".".join(map(str, found)), supported=found >= version_numbers(MINIMUM_CLAUDE_CODE),
                           reason="Hook input with agent_id is version-gated; real hook execution is not verified")
     except (OSError, subprocess.SubprocessError) as exc:
         report["reason"] = str(exc)
@@ -101,7 +98,10 @@ def doctor(project: Path) -> dict:
                          "reviewers_ready": all(item["ready"] for item in reviewers), "ready": ready,
                          **{key: value for key, value in extra.items() if key not in {"warnings", "ready"}}}
     warnings.extend(router.blocking_warnings(project))
+    for item in cache.values():
+        warnings.extend(item.get("details", {}).get("version_warnings", []))
     version = claude_version()
+    warnings.extend(version_warnings("claude", version["version"]))
     executables = {name: shutil.which(name) for name in ("uv", "claude", "git")}
     errors = python_errors()
     return {"plugin": "devflow", "version": __version__, "project": str(project),

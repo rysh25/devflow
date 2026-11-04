@@ -1,7 +1,9 @@
 """Portable contract tests for the single shared source of storage/budget logic."""
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from devflow_core.common.storage import (DevFlowError, atomic_json, checked_text, digest,
     file_lock, json_bytes, no_symlinks, read_json, within, write_new)
@@ -272,12 +274,40 @@ class PathTests(unittest.TestCase):
                                   "Python at /usr/bin/python3"])
 
 
+class GitEnvironmentTests(unittest.TestCase):
+    def test_the_users_configuration_files_are_kept_and_repository_variables_dropped(self):
+        from devflow_core.common.git import git_environment
+        with patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": "/home/u/.gitconfig-work", "GIT_CONFIG_NOSYSTEM": "1",
+                                     "GIT_DIR": "/elsewhere/.git", "GIT_INDEX_FILE": "/elsewhere/index"}):
+            env = git_environment()
+        self.assertEqual((env["GIT_CONFIG_GLOBAL"], env["GIT_CONFIG_NOSYSTEM"]), ("/home/u/.gitconfig-work", "1"))
+        self.assertNotIn("GIT_DIR", env)
+        self.assertNotIn("GIT_INDEX_FILE", env)
+        self.assertEqual((env["GIT_TERMINAL_PROMPT"], env["GIT_OPTIONAL_LOCKS"]), ("0", "0"))
+
+
 class EnvironmentTests(unittest.TestCase):
     def test_bash_timeout_is_the_process_limit_plus_the_runners_margin(self):
         self.assertEqual(bash_timeout_ms(900), 960000)
         # The longest review (3600 s) stays inside the 2-hour cap Claude Code puts on
         # an unattended background command's timeout.
         self.assertLess(review_timeout_ms(3600), 7200000)
+
+    def test_versions_newer_than_the_checked_ones_are_warned_about(self):
+        from devflow_core.common.environment import CHECKED_VERSIONS, version_warnings
+        self.assertEqual(set(CHECKED_VERSIONS), {"claude", "codex", "opencode"})
+        self.assertEqual(version_warnings("codex", "codex-cli 0.166.0"), [])
+        self.assertEqual(version_warnings("codex", "codex-cli 0.150.2"), [])
+        self.assertEqual(version_warnings("opencode", "opencode v2.2.5"), [])
+        self.assertEqual(version_warnings("claude", None), [])
+        self.assertEqual(version_warnings("claude", "not a version"), [])
+        newer = version_warnings("opencode", "opencode v3.0.0")
+        self.assertEqual(len(newer), 1)
+        self.assertTrue(newer[0].startswith("OpenCode 3.0.0 is newer than 2.2.5"))
+        self.assertIn("docs/validation.md", newer[0])
+        self.assertIn("Claude Code 2.2.0", version_warnings("claude", "2.2.0 (Claude Code)")[0])
+        # A reviewer CLI added later, with no checked version yet, gets no warning.
+        self.assertEqual(version_warnings("a-new-cli", "9.9.9"), [])
 
     def test_review_timeout_covers_the_work_before_the_reviewer(self):
         # Two CLI probes (version, then the subcommand's help) and the git call that
@@ -286,10 +316,22 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual((PROBE_SECONDS, GIT_FACT_SECONDS), (15, 10))
         self.assertEqual(review_timeout_ms(900), 1000000)
         from devflow_core.common import reviewers
+        from devflow_core.common.process import Completed
         from devflow_core.implement import workspace
-        import inspect
-        self.assertEqual(inspect.signature(reviewers._capture).parameters["timeout"].default, PROBE_SECONDS)
-        self.assertIn("timeout=GIT_FACT_SECONDS", inspect.getsource(workspace.branch))
+        # What the probes and the git call actually wait for.
+        waited = []
+
+        def bounded(argv, **options):
+            waited.append(options["timeout"])
+            text = " ".join(reviewers.CLIS["codex"].flags)
+            return Completed(0, f"codex 1.0.0 {text}".encode(), b"", False, False, False, None, 0.0)
+        with patch.object(reviewers, "run_bounded", bounded), patch.object(reviewers, "_resolve", lambda prefix: prefix):
+            reviewers.preflight({"id": "codex", "kind": "codex", "command": ["codex"], "model": "m", "effort": "e",
+                                 "timeout_seconds": 10})
+        self.assertEqual(waited, [PROBE_SECONDS, PROBE_SECONDS])
+        with patch.object(workspace, "run_git", return_value=b"main\n") as git:
+            self.assertEqual(workspace.branch(Path("."), "git"), "main")
+        self.assertEqual(git.call_args.kwargs["timeout"], GIT_FACT_SECONDS)
 
     def test_released_run_formats_have_names_and_unreleased_ones_are_generic(self):
         self.assertEqual(runs.RELEASES, {1: "0.1.x", 2: "0.2.x", 3: "0.3.x"})

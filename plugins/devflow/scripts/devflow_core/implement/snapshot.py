@@ -231,7 +231,17 @@ def _file_inventory(root: Path, settings: dict, excluded: list[dict]) -> list[tu
 
 
 def _fingerprint(info: os.stat_result) -> tuple:
+    """Everything that shows a change, for two results of the same call (lstat or fstat)."""
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode)
+
+
+def _content(info: os.stat_result) -> tuple:
+    """Size and modification time: what lstat and fstat both report the same way.
+
+    The other fields can differ between the two calls for an unchanged file
+    (for example on Windows with Python 3.12 and later).
+    """
+    return (info.st_size, info.st_mtime_ns)
 
 
 def _read_file(path: Path, limit: int, git_mode: str | None) -> dict:
@@ -244,12 +254,14 @@ def _read_file(path: Path, limit: int, git_mode: str | None) -> dict:
     descriptor = os.open(path, flags)
     with os.fdopen(descriptor, "rb") as stream:
         opened = os.fstat(stream.fileno())
-        if _fingerprint(opened) != _fingerprint(before):
+        if _content(opened) != _content(before):
             raise DevFlowError(f"File changed while snapshot opened it: {path}")
         data = stream.read(limit + 1)
         after_read = os.fstat(stream.fileno())
     after = path.lstat()
-    if len(data) > limit or _fingerprint(before) != _fingerprint(after_read) or _fingerprint(before) != _fingerprint(after):
+    # Each call is compared with itself in full, and across the two calls by content only.
+    if (len(data) > limit or _fingerprint(opened) != _fingerprint(after_read)
+            or _fingerprint(before) != _fingerprint(after) or _content(after_read) != _content(after)):
         raise DevFlowError(f"File changed while snapshot read it: {path}")
     try:
         text = data.decode("utf-8") if b"\0" not in data else None

@@ -12,10 +12,10 @@ import unittest
 from unittest.mock import patch
 
 from devflow_core import cli
-from devflow_core.common import paths, sessions
+from devflow_core.common import notices, paths, sessions
 from devflow_core.workflows import WORKFLOWS
 
-SCRIPT = paths.RUNNER
+SCRIPT = notices.runner_path(paths.PLUGIN_ROOT)
 
 
 class CliTests(unittest.TestCase):

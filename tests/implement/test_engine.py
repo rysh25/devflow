@@ -342,14 +342,14 @@ class EngineFlowTests(EngineFixture):
         self.review()
         first, second = self.packets
         self.assertEqual(first["kind"], "code_review")
-        self.assertEqual(first["plan"], self.plan.read_text(encoding="utf-8"))
+        self.assertEqual(first["plan"], self.plan.read_bytes().decode("utf-8"))
         self.assertIn("Implemented VALUE", first["implementation_summary"])
         self.assertEqual(first["schema_version"], 2)
         changed = next(x for x in first["changes"] if x["path"] == "module.py")
         # Only where the change is: mode, size and hash, never the contents.
         self.assertEqual(changed["change"], "modified")
         self.assertEqual(set(changed["before"]), {"mode", "size", "sha256"})
-        self.assertEqual(changed["after"]["size"], len("VALUE = 1\n"))
+        self.assertEqual(changed["after"]["size"], len(self.source.read_bytes()))
         self.assertNotIn("VALUE = 1", json.dumps(first["changes"]))
         diff = Path(first["diff_path"]).read_text(encoding="utf-8")
         self.assertEqual(Path(first["diff_path"]), self.run / "reviews" / "01" / "changes.diff")
@@ -364,6 +364,11 @@ class EngineFlowTests(EngineFixture):
         self.assertNotIn("stdout", result)
         self.assertTrue(Path(result["stdout_path"]).is_file())
         self.assertEqual(self.state()["attempts"][0]["activity"], ACTIVITY)
+        # status shows each round's tool calls, as the final report does.
+        rounds = self.engine.status(self.run_id)["reviews"]
+        self.assertEqual([(r["number"], r["reviewer_id"], r["status"], r["verdict"], r["tool_calls"]) for r in rounds],
+                         [(1, "codex", "succeeded", "pass", ACTIVITY["tool_calls"]),
+                          (2, "opencode", "succeeded", "pass", ACTIVITY["tool_calls"])])
         self.assertEqual(first["previous_reviews"], [])
         self.assertEqual(second["previous_reviews"][0]["review"]["verdict"], "pass")
         self.assertEqual(second["snapshot_id"], first["snapshot_id"])
@@ -500,6 +505,7 @@ class EngineFlowTests(EngineFixture):
         self.assertEqual(self.state()["status"], "reviewing")
         self.assertIsNotNone(self.state()["inflight"])
         self.assertEqual(len(self.state()["attempts"]), 1)
+        self.assertEqual([r["status"] for r in self.engine.status(self.run_id)["reviews"]], ["dispatched"])
         self.assertNotAccepted(f"/devflow:resume {self.run_id}", "may still be running")
         self.assertNotAccepted(f"/devflow:resume {self.run_id}", "may still be running", "new-claude-session")
         with self.assertRaisesRegex(DevFlowError, "confirm"):
@@ -509,6 +515,7 @@ class EngineFlowTests(EngineFixture):
         self.assertIsNone(recovered["inflight"])
         self.assertEqual(recovered["review_count"], 1)
         self.assertEqual(recovered["attempts"][0]["status"], "failed")
+        self.assertEqual([r["status"] for r in recovered["reviews"]], ["failed"])
         self.reviewer.side_effect = self.respond
         self.resume("new-claude-session")
         self.assertEqual(self.review()["attempts"][-1]["reviewer_id"], "opencode")
@@ -891,7 +898,7 @@ class RecoveryAndIntegrityTests(EngineFixture):
         self.assertFinalReportSaved(completed)
         original_path = self.run / completed["report_path"]
         original_bytes = original_path.read_bytes()
-        resumed = self.resume("read-only-terminal-session")
+        resumed = self.resume("terminal-report-session")
         self.assertEqual(resumed["status"], "completed")
         self.assertEqual(resumed["review_count"], 2)
         self.assertFinalReportSaved(resumed)

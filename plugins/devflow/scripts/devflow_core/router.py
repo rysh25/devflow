@@ -229,6 +229,8 @@ def handle_hook(payload: dict, plugin_root: Path, environ=None) -> dict | None:
     if not isinstance(payload, dict):
         raise DevFlowError("Hook input must be a JSON object")
     event = payload.get("hook_event_name")
+    # hooks.json registers these four events only (tools/package.py checks it):
+    # Claude Code sends no other event to this hook.
     if event not in {"UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"}:
         return None
     cwd, session = payload.get("cwd"), payload.get("session_id")

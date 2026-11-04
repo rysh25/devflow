@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 
 from ..common.errors import DevFlowError, UsageError
-from ..common.review import HARD_MAX_REVIEWS, check_review_config, review_budget
+from ..common.review import HARD_MAX_REVIEWS, after_failed_review, check_review_config, review_budget
 from ..common.runs import TERMINAL
 from ..common.storage import json_bytes
 from ..common.workflow import Workflow
@@ -77,9 +77,11 @@ class PlanWorkflow(Workflow):
 
     def on_recover(self, store, state: dict) -> None:
         number = state["review_count"]
-        state["status"] = "paused_error" if number < state["config"]["max_reviews"] else "exhausted"
-        state["last_error"] = {"review_number": number, "message": "Operator confirmed the interrupted reviewer "
-                               "process is stopped; attempt remains consumed."}
+        state["status"] = after_failed_review(number, state["config"])
+        inflight = state["inflight"]
+        state["last_error"] = {"review_number": number, "provider": inflight["reviewer_id"],
+                               "plan_hash": inflight["target"], "message": "Operator confirmed the interrupted "
+                               "reviewer process is stopped; attempt remains consumed."}
         store.stage(state, f"reviews/{number:02d}/recovery.json", json_bytes(state["last_error"]))
 
     def context_fields(self, state: dict, run_dir: Path) -> dict:
