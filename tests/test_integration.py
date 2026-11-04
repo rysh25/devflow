@@ -607,7 +607,7 @@ class BashTimeoutTests(FlowFixture):
     def test_plan_start_context_gives_the_review_timeout_and_finished_plan_has_none(self):
         context = hook(self.event(prompt="/devflow:plan Make a tested pure function."), PLUGIN)
         text = context["hookSpecificOutput"]["additionalContext"]
-        self.assertIn('"bash_timeout_ms": {"review": 1000000}', text)
+        self.assertIn('"bash_timeout_ms": {"review": 1900000}', text)
         self.assertIn("pass bash_timeout_ms as the Bash timeout, unchanged", text)
         self.assertIn("run the call in the background with that timeout", text)
         self.assertNotIn("shorter than", text)

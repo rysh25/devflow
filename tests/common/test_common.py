@@ -389,6 +389,7 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(REVIEW_SETUP_SECONDS, 2 * PROBE_SECONDS + GIT_FACT_SECONDS)
         self.assertEqual((PROBE_SECONDS, GIT_FACT_SECONDS), (15, 10))
         self.assertEqual(review_timeout_ms(900), 1000000)
+        self.assertEqual(review_timeout_ms(1800), 1900000)  # The default reviewer limit.
         from devflow_core.common import reviewers
         from devflow_core.common.process import Completed
         from devflow_core.implement import workspace

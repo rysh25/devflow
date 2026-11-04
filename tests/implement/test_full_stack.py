@@ -217,6 +217,9 @@ class FullStackTests(unittest.TestCase):
                 instructions = WORKFLOW.resource("reviewer.md").read_text(encoding="utf-8")
                 self.assertTrue(prompt.startswith(instructions))
                 self.assertEqual(prompt.count(instructions), 1)
+                # The rules for every reviewer carry this attempt's time budget here too.
+                self.assertRegex(prompt, r"DevFlow stops this review 10 seconds after it starts, at\n"
+                                         r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00;")
                 self.assertTrue(prompt.endswith(packet.read_text(encoding="utf-8")))
                 self.assertTrue((process / "stdout.jsonl").is_file())
                 self.assertTrue((process / "stderr.log").is_file())

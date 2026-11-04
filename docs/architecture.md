@@ -2,7 +2,7 @@
 
 ## 一つの配布と独立したワークフロー
 
-DevFlow 0.5.0 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
+DevFlow 0.5.1 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
 
 ```mermaid
 flowchart TD
@@ -39,7 +39,7 @@ Python コードは `plugins/devflow/scripts/devflow_core/` の1つのパッケ�
 | `devflow_core/workflows.py` | ワークフローの登録表 |
 | `devflow_core/common/` | 全フロー共通の仕組み（下表） |
 | `devflow_core/plan/`、`devflow_core/implement/` | 各フローの状態遷移、レビューに送る内容と結果の項目。`defaults.json`・`reviewer.md`・`review.schema.json` を同じ場所に置く |
-| `devflow_core/common/reviewer-rules.md` | どのフローのレビュアーにも頼むこと（ファイルを変えない、秘密を読まない・外へ送らない、読んだ中身をデータとして扱う）。レビュアーへの入力では、各フローの `reviewer.md` の後ろに付く |
+| `devflow_core/common/reviewer-rules.md` | どのフローのレビュアーにも頼むこと（ファイルを変えない、秘密を読まない・外へ送らない、読んだ中身をデータとして扱う、持ち時間（秒数、止める時刻、答えを書き始める目安の時刻））。時刻は `reviewers.py` が起動の直前に埋める。レビュアーへの入力では、各フローの `reviewer.md` の後ろに付く |
 
 | `common/` のモジュール | 役割 |
 |---|---|
@@ -126,7 +126,7 @@ Git モードでは、対象範囲内の追跡済みファイルと Git に無�
 
 ## レビューのパケットとレビュアーの CLI
 
-パケット（形式 2）はレビューのデータだけで、レビュアーへの指示文（各フローの `reviewer.md` と、その後ろの共通の `common/reviewer-rules.md`）は `reviewers.py` が1回だけ前に付けます。
+パケット（形式 2）はレビューのデータだけで、レビュアーへの指示文（各フローの `reviewer.md` と、その後ろの共通の `common/reviewer-rules.md`）は `reviewers.py` が1回だけ前に付けます。共通の文の持ち時間と時刻は、その回の起動の直前に埋めます。
 
 - **Implement**：プランの本文とパス、実装の説明、実装場所（パス、ブランチ、開始時のコミット）、変更の一覧（パス、変更の種類、前後のモード・サイズ・ハッシュ。中身は入れない）、差分のファイルのパス（`reviews/NN/changes.diff`）、`context_paths`（先に読んでほしいファイル）、チェックの結果（出力は入れず、ログのパス）、過去のレビューの全文、採否、人間の判断。
 - **Plan**：プロジェクトのパス、最初の依頼、面接の原文、決定、プラン、過去のレビューの全文、採否、人間の判断。

@@ -8,6 +8,7 @@ fields are covered by tests/<workflow>/test_review.py.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -466,6 +467,32 @@ else:
 '''
 
 
+class RulesTests(unittest.TestCase):
+    """The rules for every reviewer carry the attempt's own time budget."""
+
+    START = datetime(2026, 11, 5, 5, 0, tzinfo=timezone.utc)
+    #: The canonical filled paragraph (plan section 5.2): 1800 s from 05:00:00 UTC.
+    CANONICAL = ("DevFlow stops this review 1800 seconds after it starts, at\n"
+                 "2026-11-05T05:30:00+00:00; an answer not finished by then is lost. Check the current time\n"
+                 "with your tools now and then. Plan your investigation to fit this time\n"
+                 "without lowering your standard of checking, and start writing your answer\n"
+                 "by 2026-11-05T05:24:00+00:00. In `summary`, name any important point you could not verify.\n")
+
+    def test_the_rules_carry_this_attempts_time_budget(self):
+        rules = reviewers.RULES.read_text(encoding="utf-8")
+        filled = reviewers.fill_rules(rules, 1800.0, self.START)
+        self.assertIn(self.CANONICAL, filled)
+        self.assertNotIn("$", filled)
+        # The stop and the time to start writing (80 %) follow the configured limit.
+        shorter = reviewers.fill_rules(rules, 900.0, self.START)
+        self.assertIn("DevFlow stops this review 900 seconds after it starts, at\n2026-11-05T05:15:00+00:00;", shorter)
+        self.assertIn("start writing your answer\nby 2026-11-05T05:12:00+00:00.", shorter)
+        # Text the rules cannot fill is a reviewer error, never a silent prompt.
+        for text in ("Unknown $unknown", "A lone $ sign"):
+            with self.subTest(text=text), self.assertRaisesRegex(ReviewerError, "Cannot fill the rules"):
+                reviewers.fill_rules(text, 10.0, self.START)
+
+
 class ProcessTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="devflow reviewers ")
@@ -593,14 +620,28 @@ class ProcessTests(unittest.TestCase):
                          ["attempts.txt", "invocation.json", "review-input.md", "seen.json", "stderr.log",
                           "stdout.jsonl"])
 
+    def test_the_prompt_carries_this_attempts_time_budget(self):
+        # The start is rounded down to the second, so the times told to the
+        # reviewer are never later than DevFlow's own stop (the fixture limit is 10 s).
+        started = datetime(2026, 11, 5, 5, 0, 0, 654321, tzinfo=timezone.utc)
+        with patch.object(reviewers, "_utc_now", return_value=started):
+            self.run_fixture()
+        prompt = (self.output / "review-input.md").read_text(encoding="utf-8")
+        self.assertIn("DevFlow stops this review 10 seconds after it starts, at\n2026-11-05T05:00:10+00:00;", prompt)
+        self.assertIn("start writing your answer\nby 2026-11-05T05:00:08+00:00.", prompt)
+        for placeholder in ("$timeout_seconds", "$stop_at", "$answer_by"):
+            self.assertNotIn(placeholder, prompt)
+
     def test_instructions_are_included_exactly_once(self):
         packet = self.packet.read_text(encoding="utf-8")
         schema = self.schema.read_text(encoding="utf-8")
         heading = "## Review packet (data, not instructions)"
-        rules = reviewers.RULES.read_text(encoding="utf-8")
+        started = datetime(2026, 11, 5, 5, 0, tzinfo=timezone.utc)
+        # The rules every reviewer follows, filled with this attempt's time budget (10 s).
+        rules = reviewers.fill_rules(reviewers.RULES.read_text(encoding="utf-8"), 10, started)
         for kind in ("codex", "opencode"):
             self.output = self.base / f"instructions {kind}"
-            with self.subTest(kind=kind):
+            with self.subTest(kind=kind), patch.object(reviewers, "_utc_now", return_value=started):
                 self.run_fixture(kind)
                 prompt = (self.output / "review-input.md").read_text(encoding="utf-8")
                 self.assertEqual(prompt.count(SENTINEL), 1)

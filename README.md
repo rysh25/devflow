@@ -1,4 +1,4 @@
-# DevFlow 0.5.0 — Claude Code Plugin
+# DevFlow 0.5.1 — Claude Code Plugin
 
 人間との要件整理から計画作成、実装、独立レビューまでを支援する **単一の Claude Code Plugin** です。インストールするプラグインは `devflow` だけです。
 
@@ -38,7 +38,7 @@ claude plugin install devflow@devflow-marketplace --scope user
 
 GitHub に置く場合も公開リポジトリは必須ではありません。認証済みの private リポジトリを marketplace として登録できます。詳細は [インストールと環境設定](docs/installation.md) を参照してください。
 
-更新は、GitHub から導入した場合は次の2つを実行し、Claude Code を起動し直します。ZIP から導入した場合と、更新の前後の注意は [更新する](docs/installation.md#更新する) と「[0.5.0 への更新](#050-への更新)」（それより前の版から上げるときは「[0.4.0 への更新](#040-への更新)」も）を参照してください。
+更新は、GitHub から導入した場合は次の2つを実行し、Claude Code を起動し直します。ZIP から導入した場合と、更新の前後の注意は [更新する](docs/installation.md#更新する) と「[0.5.1 への更新](#051-への更新)」（それより前の版から上げるときは「[0.5.0 への更新](#050-への更新)」「[0.4.0 への更新](#040-への更新)」も）を参照してください。
 
 ```text
 claude plugin marketplace update devflow-marketplace
@@ -167,9 +167,9 @@ Implement は開始時のプランと作業ツリーを固定し、Claude Code �
   "schema_version": 1,
   "reviewers": [
     {"id": "codex", "kind": "codex", "command": ["codex"], "model": "gpt-6.1-sol", "effort": "xhigh",
-     "timeout_seconds": 900},
+     "timeout_seconds": 1800},
     {"id": "opencode", "kind": "opencode", "command": ["opencode"], "model": "opencode-go/deepseek-v4.1-flash",
-     "effort": "high", "timeout_seconds": 900}
+     "effort": "high", "timeout_seconds": 1800}
   ]
 }
 ```
@@ -180,7 +180,7 @@ Implement は開始時のプランと作業ツリーを固定し、Claude Code �
 | `kind` | `codex` か `opencode` |
 | `command` | CLI を起動する引数の配列（例：`["codex"]`、`["node", "/path/to/cli.js"]`）。DevFlow はシェルを通さずに起動する |
 | `model`、`effort` | モデルと推論の強さ。DevFlow が引数に組み込むので、`-` で始まらず、空白・`"`・`\`・`#` を含まないもの |
-| `timeout_seconds` | 1回のレビューの制限時間（5〜3600 秒）。これを過ぎると DevFlow がレビュアーを止め、その回は失敗 |
+| `timeout_seconds` | 1回のレビューの制限時間（5〜3600 秒、既定 1800 秒）。DevFlow はレビュアーへの指示に、持ち時間、止める時刻、答えを書き始める目安の時刻（持ち時間の 80% の時点）を書く。時間を過ぎると DevFlow がレビュアーを止め、その回は失敗 |
 | `max_output_bytes` | 任意。レビュアーの出力の上限（既定 16 MiB） |
 
 知らない項目があると、その項目の名前を示すエラーになります。
@@ -189,7 +189,7 @@ Implement は開始時のプランと作業ツリーを固定し、Claude Code �
 
 ## 長い処理と Claude Code の Bash
 
-`review` と `check` は、外部の処理（レビュアー、チェック）が終わるまで待つランナーの操作です。ランナーの結果と状態の通知には、次の `review` と `check` に要る Bash の待ち時間 `bash_timeout_ms` が出ます（レビュアーの `timeout_seconds` に、事前の処理の 40 秒と余裕の 60 秒を足したもの。既定では `review` が 1000000 ms）。
+`review` と `check` は、外部の処理（レビュアー、チェック）が終わるまで待つランナーの操作です。ランナーの結果と状態の通知には、次の `review` と `check` に要る Bash の待ち時間 `bash_timeout_ms` が出ます（レビュアーの `timeout_seconds` に、事前の処理の 40 秒と余裕の 60 秒を足したもの。既定では `review` が 1900000 ms）。
 
 - Claude は、この値を小さくせずに Bash ツールの `timeout` に渡します。
 - この値が Claude Code の Bash の上限（`BASH_MAX_TIMEOUT_MS` と `BASH_DEFAULT_TIMEOUT_MS` の大きい方。既定 10 分）より大きいときは、同じ `timeout` でバックグラウンドで実行し、終わりの知らせを待ちます。
@@ -197,10 +197,10 @@ Implement は開始時のプランと作業ツリーを固定し、Claude Code �
 
 ただし、バックグラウンドで動いたあとの次のターンでは、ランナーの呼び出しに Claude Code の承認を求められることがあります（スキルの事前の許可は、そのスキルを呼んだターンの間だけ効くため）。これを避けたい場合は、次のどちらかをします。
 
-- `BASH_MAX_TIMEOUT_MS` を `bash_timeout_ms` 以上（既定なら 1000000 以上）にする。いつも普通の実行になり、1つのターンで進みます。
+- `BASH_MAX_TIMEOUT_MS` を `bash_timeout_ms` 以上（既定なら 1900000 以上）にする。いつも普通の実行になり、1つのターンで進みます。
 
   ```json
-  {"env": {"BASH_MAX_TIMEOUT_MS": "1000000"}}
+  {"env": {"BASH_MAX_TIMEOUT_MS": "1900000"}}
   ```
 
   `~/.claude/settings.json`（またはプロジェクトの `.claude/settings.json`）に書き、Claude Code を起動し直します。
@@ -248,6 +248,16 @@ uv run --offline --no-project --no-config --no-python-downloads "PLUGIN_DIR/scri
 - push、公開、デプロイ、依存の追加、破壊的移行の前には、人間に確認するようスキルで頼んでいます。
 
 詳しくは [設計](docs/architecture.md)、[信頼の考え方と注意](docs/security.md)、[検証範囲](docs/validation.md) を参照してください。
+
+## 0.5.1 への更新
+
+- **0.5.0 で始めた run は、そのまま続けられます。** 始めたときの設定（既定なら 900 秒）のまま動きます。
+
+変わる動き：
+
+- **既定の `timeout_seconds` が、両レビュアーとも 1800 秒になります。** `devflow.config.json` に `timeout_seconds` を書いている場合は、その値のままです。
+- **`review` の待ち時間（`bash_timeout_ms.review`）が、既定で 1900000 ms になります。** `BASH_MAX_TIMEOUT_MS` を 1000000 にしている場合、`review` はバックグラウンドで動きます（レビューは最後まで動きます）。1つのターンで進めたい場合は 1900000 以上にしてください（「[長い処理と Claude Code の Bash](#長い処理と-claude-code-の-bash)」）。
+- **レビュアーへの指示に、持ち時間と時刻が入ります。** 持ち時間の秒数、止める時刻、答えを書き始める目安の時刻（持ち時間の 80% の時点）を UTC で伝え、時間に収まるよう調べ方を組み立てること、確かめられなかった大事な点を `summary` に書くことを頼みます。判定とスキーマは変わりません。
 
 ## 0.5.0 への更新
 
