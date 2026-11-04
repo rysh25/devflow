@@ -8,7 +8,8 @@ import re
 from uuid import uuid4
 
 from ..common.errors import CaptureError, DevFlowError
-from ..common.review import after_failed_review, all_approved, next_reviewer
+from ..common.review import (REVIEW_BUDGET, after_failed_review, all_approved, ask_at_limit, decide_at_limit,
+                             next_reviewer)
 from ..common.reviewers import preflight, run_review
 from ..common.engine import RunEngine
 from ..common.runs import RUNNER_WAIT, TERMINAL, open_escalation
@@ -146,17 +147,22 @@ class Engine(RunEngine):
         state = self._state(run_id)
         if state["status"] != "ready":
             raise DevFlowError(f"Review requires status ready, not {state['status']}.")
-        provider = next_reviewer(state["config"]["reviewers"], state["review_count"], state["config"]["max_reviews"])
+        # At the review limit no reviewer starts; the request asks the human instead.
+        provider = (next_reviewer(state["config"]["reviewers"], state["review_count"], state["review_limit"])
+                    if state["review_count"] < state["review_limit"] else None)
         # A missing or unsupported reviewer CLI must not consume an attempt.
-        probe = preflight(provider)
+        probe = preflight(provider) if provider else None
 
         def prepare(state: dict):
             self._verify(state)
             if state["status"] != "ready":
                 raise DevFlowError(f"Review requires status ready, not {state['status']}.")
-            if state["review_count"] >= state["config"]["max_reviews"]:
-                raise DevFlowError("Review budget exhausted. A resume never resets this counter.")
-            if next_reviewer(state["config"]["reviewers"], state["review_count"], state["config"]["max_reviews"]) != provider:
+            approved = {item["provider"] for item in state["passes"] if item["plan_hash"] == state["plan_hash"]}
+            if ask_at_limit(state, state["review_count"], approved,
+                            lambda reason, questions: self._escalate(
+                                state, {"reason": reason, "questions": questions}, "ready", kind=REVIEW_BUDGET)):
+                return None
+            if next_reviewer(state["config"]["reviewers"], state["review_count"], state["review_limit"]) != provider:
                 raise DevFlowError("The run changed during the reviewer check; inspect status and retry.")
             number = state["review_count"] + 1
             relative_dir = f"reviews/{number:02d}"
@@ -189,7 +195,7 @@ class Engine(RunEngine):
                                    "retry_consumes_another_attempt": True,
                                    # What the reviewer did, when it ran to the end.
                                    **({"activity": result["activity"]} if result is not None else {})}
-            state["status"] = after_failed_review(number, state["config"])
+            state["status"] = after_failed_review(number, state, "ready")
             self._artifact(state, f"{relative_dir}/error.json", json_bytes(state["last_error"]))
             return
         providers = state["config"]["reviewers"]
@@ -203,10 +209,8 @@ class Engine(RunEngine):
         if review["verdict"] == "pass":
             state["passes"].append({"provider": provider["id"], "plan_hash": state["plan_hash"], "number": number})
             approved = {item["provider"]: item["plan_hash"] for item in state["passes"] if item["plan_hash"] == state["plan_hash"]}
-            if all_approved(providers, approved, state["plan_hash"]):
-                state["status"] = "completed"
-            else:
-                state["status"] = "ready" if number < state["config"]["max_reviews"] else "exhausted"
+            # At the review limit, the next review request asks the human.
+            state["status"] = "completed" if all_approved(providers, approved, state["plan_hash"]) else "ready"
             self._artifact(state, f"{relative_dir}/reflection.json", json_bytes({"review_number": number, "summary": "No findings; plan unchanged.", "decisions": [], "plan_hash": state["plan_hash"]}))
         elif review["verdict"] == "human_required":
             self._escalate(state, {"reason": review["summary"], "questions": [q["question"] for q in review["questions"]]}, "awaiting_revision")
@@ -252,14 +256,14 @@ class Engine(RunEngine):
             changed = self._commit_plan(state, text)
             reflection.update({"plan_hash": state["plan_hash"], "previous_plan_hash": expected_hash, "changed": changed})
             self._artifact(state, f"reviews/{review['number']:02d}/reflection.json", json_bytes(reflection))
-            state["status"] = "ready" if state["review_count"] < state["config"]["max_reviews"] else "exhausted"
+            state["status"] = "ready"  # At the review limit, the next review request asks the human.
             self._save(state)
         return self.status(run_id)
 
-    def _escalate(self, state: dict, reason: dict, return_status: str) -> None:
+    def _escalate(self, state: dict, reason: dict, return_status: str, kind: str | None = None) -> None:
         escalation_id = uuid4().hex
         value = open_escalation(state, escalation_id, reason["reason"], reason["questions"], return_status,
-                                {"review_number": state["review_count"]})
+                                {"review_number": state["review_count"], **({"kind": kind} if kind else {})})
         self._artifact(state, f"escalations/{escalation_id}.json", json_bytes(value))
         state["status"] = "awaiting_human"
 
@@ -286,8 +290,14 @@ class Engine(RunEngine):
             if session != state["owner_session"]:
                 raise DevFlowError("Only the session that owns the run may resolve its human question.")
             value = read_json(self._draft(run_id, answer_file))
-            if set(value) != {"answer", "event_ids"} or not isinstance(value["answer"], str) or not isinstance(value["event_ids"], list) or not value["event_ids"]:
-                raise DevFlowError("Human answer requires answer and actual recorded event_ids.")
+            # Only the review limit question also takes the human's decision.
+            budget = escalation["detail"].get("kind") == REVIEW_BUDGET
+            fields = {"answer", "event_ids", "decision"} if budget else {"answer", "event_ids"}
+            if (not isinstance(value, dict) or set(value) != fields or not isinstance(value["answer"], str)
+                    or not isinstance(value["event_ids"], list) or not value["event_ids"]
+                    or (budget and value["decision"] not in ("continue", "stop"))):
+                raise DevFlowError("Human answer requires answer and actual recorded event_ids, and decision "
+                                   "continue or stop for the review limit question.")
             available = {item["event_id"]: item["answer_text"] for item in approval_candidates(state, self._events(state))}
             if len(set(value["event_ids"])) != len(value["event_ids"]) or any(not isinstance(i, str) or i not in available for i in value["event_ids"]):
                 raise DevFlowError("Resolution must cite new successful AskUserQuestion responses after the pause; ordinary prompts are not approval.")
@@ -298,7 +308,10 @@ class Engine(RunEngine):
             value.update({"escalation_id": escalation["id"], "review_number": review_number, "questions": escalation["questions"]})
             self._artifact(state, f"escalations/{escalation['id']}-answer.json", json_bytes(value))
             state["resolved_escalations"].append({"id": escalation["id"], "review_number": review_number})
-            state["status"] = escalation["return_status"]
+            if budget:
+                decide_at_limit(state, value["decision"], escalation["return_status"])
+            else:
+                state["status"] = escalation["return_status"]
             state["escalation"] = None
             self._save(state)
         return self.status(run_id)

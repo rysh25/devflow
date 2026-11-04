@@ -1,6 +1,6 @@
 ---
 name: implement
-description: Implement an explicitly selected Markdown plan, run approved project checks, and alternate independent Codex and OpenCode reviews with a hard limit of six review attempts. Use only when the user invokes /devflow:implement with a plan file.
+description: Implement an explicitly selected Markdown plan, run approved project checks, and alternate independent Codex and OpenCode reviews up to max_reviews attempts, which only the human can raise at the limit. Use only when the user invokes /devflow:implement with a plan file.
 argument-hint: "<plan-file>"
 disable-model-invocation: true
 allowed-tools: Bash(uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *) PowerShell(uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *)
@@ -36,7 +36,7 @@ DevFlow records and verifies; it does not limit tools. It assumes you follow the
 - Preserve all pre-existing changes. Write runner input files in the run's draft directory. Do not edit the input plan, `devflow.config.json`, or DevFlow's run records and counters; the runner manages them and stops the run when they do not match.
 - You may run tests, builds and other commands while implementing. Only the runner's `check` results count as validation evidence; never invent results. If no checks are configured, human validation is required; recommend configuring checks before a fresh run.
 - Ask the human before pushing, publishing, deploying, adding dependencies or running irreversible migrations, unless the human explicitly asked for it or the project's rules (`CLAUDE.md`, `AGENTS.md` and the like) say how to handle it. Committing is not limited.
-- Source code changes invalidate prior approvals; the runner owns that decision. Never reset a run to obtain additional reviews.
+- Source code changes invalidate prior approvals; the runner owns that decision. Never reset or replace a run to obtain additional reviews; at the review limit the runner asks the human.
 - `recover` is for a human who has confirmed that no reviewer or check process remains. Do not run it yourself.
 - A plugin is not a background daemon. If the session or permissions stop progress, explain the blocker and the exact resume command.
 

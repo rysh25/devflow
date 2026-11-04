@@ -387,6 +387,22 @@ class HookCliEngineTests(FlowFixture):
         saved = read_json(Path(resolved["run_dir"]) / resolved["resolutions"][-1])
         self.assertEqual(json.loads(saved["human_event"]["answer_text"])["answers"]["Keep compatibility?"], actual)
 
+    def test_the_runner_accepts_stop_only_for_the_review_limit_question(self):
+        self.start()
+        questions = self.draft / "questions.json"
+        self.edit(questions, json.dumps({"reason": "Need a decision.", "questions": ["May the API change?"]}))
+        self.invoke("escalate", "--questions-file", questions)
+        question = {"questions": [{"question": "May the API change?"}]}
+        hook(self.event("PreToolUse", tool_name="AskUserQuestion", tool_use_id="stop-1", tool_input=question), PLUGIN)
+        hook(self.event("PostToolUse", tool_name="AskUserQuestion", tool_use_id="stop-1", tool_input=question,
+                        tool_response={"answers": {"May the API change?": "No."}}), PLUGIN)
+        event = self.invoke("status")["human_events"][-1]
+        # The parser takes stop; the runner keeps it for the review limit question.
+        message = self.invoke("resolve", "--event-id", event["event_id"], "--decision", "stop",
+                              "--reason", "Stop is not this question's answer", expect=2)
+        self.assertIn("continue/stop for the review limit question (continue/cancel otherwise)", message)
+        self.assertEqual(self.engine.status(self.run_id)["status"], "awaiting_human")
+
     def test_resume_command_cannot_be_reused_as_human_answer(self):
         self.start()
         questions = self.draft / "questions.json"

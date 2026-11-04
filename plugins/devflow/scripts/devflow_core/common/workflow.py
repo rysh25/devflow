@@ -24,7 +24,7 @@ class Option:
     """One ``--flag VALUE`` of a runner action.
 
     Kinds: draft (a file in the run's draft directory), hash, event, decision
-    (continue/cancel), text, int and confirm (a required yes-flag for humans).
+    (continue/cancel/stop), text, int and confirm (a required yes-flag for humans).
     """
     flag: str
     kind: str
@@ -159,7 +159,7 @@ class Workflow:
                 if option.kind == "confirm":
                     parser.add_argument(option.flag, action="store_true", required=option.required)
                 elif option.kind == "decision":
-                    parser.add_argument(option.flag, choices=["continue", "cancel"], required=option.required)
+                    parser.add_argument(option.flag, choices=["continue", "cancel", "stop"], required=option.required)
                 else:
                     kind = {"draft": Path, "int": int}.get(option.kind, str)
                     parser.add_argument(option.flag, type=kind, required=option.required)

@@ -545,7 +545,7 @@ class RunFormatTests(RuntimeFixture):
     def test_session_bound_to_an_old_run_is_released_by_the_next_prompt(self):
         for flow in ("plan", "implement"):
             for version, release in ((2, "0.2.x"), (3, "0.3.x"), (4, "an older version (run format 4)"),
-                                     (5, "an older version (run format 5)")):
+                                     (5, "an older version (run format 5)"), (6, "0.4.x")):
                 with self.subTest(flow=flow, version=version):
                     identifier = self.bind_to_old_run(identifier=self.old_id(flow, version), flow=flow,
                                                       version=version)
@@ -559,10 +559,10 @@ class RunFormatTests(RuntimeFixture):
                     self.assertTrue(self.run_dir(flow, identifier).exists())  # Never touched.
 
     def test_unreleased_and_last_released_formats_are_unsupported(self):
-        # Formats 4 and 5 were never released (0.4.0 development) and format 3 is 0.3.x:
-        # none is continued.
+        # Formats 4 and 5 were never released (0.4.0 development), format 3 is 0.3.x and
+        # format 6 is 0.4.x: none is continued.
         for version, release in ((3, "0.3.x"), (4, "an older version (run format 4)"),
-                                 (5, "an older version (run format 5)")):
+                                 (5, "an older version (run format 5)"), (6, "0.4.x")):
             for flow in ("plan", "implement"):
                 with self.subTest(version=version, flow=flow):
                     identifier = self.bind_to_old_run(identifier=self.old_id(flow, version), flow=flow,

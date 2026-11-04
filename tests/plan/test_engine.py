@@ -14,11 +14,13 @@ from devflow_core import cli, router
 from devflow_core.common import paths, sessions
 from devflow_core.common import runs as runs_module
 from devflow_core.common.errors import DevFlowError, ReviewerError
-from devflow_core.common.storage import file_lock, read_json
+from devflow_core.common.review import REVIEW_LIMIT_REASON
+from devflow_core.common.storage import atomic_write_json, file_lock, read_json
 from devflow_core.plan import engine as engine_module
 from devflow_core.plan.engine import Engine
 from devflow_core.plan.review import validate_review
 from devflow_core.workflows import WORKFLOWS
+from tests.common.test_common import LIMIT_QUESTION
 
 PLUGIN_ROOT = paths.PLUGIN_ROOT
 RESOURCES = WORKFLOWS["plan"].resource_dir
@@ -138,6 +140,27 @@ class EngineTests(unittest.TestCase):
 
     def resolve(self, answer_file, session=None):
         return self.engine.resolve(self.run_id, answer_file, session or self.session)
+
+    def limit_answer(self, text):
+        """The human's answer to the pending question on the question screen: its recorded event."""
+        tool_use_id = f"limit-{len(self.engine.status(self.run_id)['resolved_escalations'])}"
+        event_id = self.record(self.question(text, tool_use_id=tool_use_id))
+        return next(e for e in self.engine.status(self.run_id)["human_events"] if e["event_id"] == event_id)
+
+    def at_limit(self, decision):
+        """Answer the pending review limit question and resolve it with ``decision``."""
+        actual = self.limit_answer("Continue with two more reviews." if decision == "continue" else "Stop here.")
+        return self.resolve(self.draft("limit-answer.json", {"answer": actual["answer_text"],
+                                                            "event_ids": [actual["event_id"]], "decision": decision}))
+
+    def ask_at_limit(self):
+        """A review request at the limit: no reviewer CLI is probed or started."""
+        self.preflight.reset_mock()
+        with patch(RUN_REVIEW) as call:
+            asked = self.engine.review(self.run_id)
+            call.assert_not_called()
+        self.preflight.assert_not_called()
+        return asked
 
     # -- workflow steps -------------------------------------------------------------------
     def append(self, role, content):
@@ -308,11 +331,15 @@ class EngineTests(unittest.TestCase):
                 self.assertEqual(reviewed["review_count"], index)
                 self.assertEqual(reviewed["status"], "awaiting_revision")
                 result = self.reflect(reviewed)
-                self.assertEqual(result["status"], "exhausted" if index == 6 else "ready")
-            with self.assertRaises(DevFlowError):
-                self.engine.review(self.run_id)
+                self.assertEqual(result["status"], "ready")
+            # At the limit the request asks the human instead of starting a seventh reviewer.
+            asked = self.engine.review(self.run_id)
             self.assertEqual(call.call_count, 6)
         self.assertEqual(seen, ["codex", "opencode"] * 3)
+        self.assertEqual(asked["status"], "awaiting_human")
+        self.assertEqual(asked["escalation"]["detail"], {"review_number": 6, "kind": "review_budget"})
+        result = self.at_limit("stop")
+        self.assertEqual(result["status"], "exhausted")
         self.assertFalse(result["final_plan_reviewed"])
         self.assertEqual(result["plan_version"], 6)
         resumed = self.resume("new-human-session")
@@ -430,23 +457,22 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(result["review_count"], 1)
         self.assertTrue((self.run / "reviews" / "01" / "error.json").exists())
 
-    def test_sixth_failed_attempt_is_exhausted_not_retryable(self):
+    def test_sixth_failed_attempt_is_not_retried_and_asks_the_human(self):
         self.ready()
         with patch(RUN_REVIEW, return_value=adapter_result(review_value("changes_required"))):
             for _ in range(5):
                 self.reflect(self.engine.review(self.run_id))
         with patch(RUN_REVIEW, side_effect=RuntimeError("sixth call failed")):
             final = self.engine.review(self.run_id)
-        self.assertEqual(final["status"], "exhausted")
+        self.assertEqual(final["status"], "ready")
         self.assertEqual(final["review_count"], 6)
         self.assertFalse(final["final_plan_reviewed"])
         resumed = self.resume("recovery-session")
         self.assertEqual(resumed["review_count"], 6)
-        self.assertEqual(resumed["status"], "exhausted")
-        with patch(RUN_REVIEW) as call:
-            with self.assertRaises(DevFlowError):
-                self.engine.review(self.run_id)
-            call.assert_not_called()
+        self.assertEqual(resumed["status"], "ready")
+        asked = self.ask_at_limit()
+        self.assertEqual((asked["status"], asked["review_count"]), ("awaiting_human", 6))
+        self.assertIn("sixth call failed", asked["last_error"]["message"])
 
     def test_config_is_frozen_for_run_even_if_project_default_changes(self):
         self.ready()
@@ -483,7 +509,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(resumed["next_reviewer"], "opencode")
         self.assertEqual(resumed["status"], "ready")
 
-    def test_recover_clears_inflight_and_exhausts_a_used_budget(self):
+    def test_recover_at_the_limit_leads_to_the_question(self):
         (self.project / "devflow.config.json").write_text('{"max_reviews":2}', encoding="utf-8")
         self.ready()
         self.reflect(self.submit(review_value("changes_required")))
@@ -494,16 +520,124 @@ class EngineTests(unittest.TestCase):
         self.assertEqual((interrupted["status"], interrupted["review_count"]), ("reviewing", 2))
         self.assertEqual(interrupted["inflight"]["number"], 2)
         recovered = self.engine.recover(self.run_id, confirmed=True, expected_review=2)
-        self.assertEqual(recovered["status"], "exhausted")
+        self.assertEqual(recovered["status"], "ready")
         self.assertIsNone(recovered["inflight"])
         self.assertEqual(recovered["review_count"], 2)  # The interrupted attempt stays consumed.
         self.assertIsNone(recovered["next_reviewer"])
         self.assertTrue((self.run / "reviews" / "02" / "recovery.json").is_file())
-        with patch(RUN_REVIEW) as call:
-            with self.assertRaises(DevFlowError):
-                self.engine.review(self.run_id)
-            call.assert_not_called()
+        asked = self.ask_at_limit()
+        self.assertEqual(asked["escalation"]["questions"], [
+            "Review limit reached: 2 of 2 reviews used. Reviewers approving the current version: none. Continue with "
+            "2 more reviews (new limit 4; next reviewers in order: codex, opencode), or stop and end the run as exhausted?"])
         self.assertFalse(self.engine.report(self.run_id)["converged"])
+
+    def reach_limit_with_opencode_approving(self):
+        """Six reviews: five with findings, then opencode approves the current plan."""
+        self.ready()
+        for _ in range(5):
+            self.reflect(self.submit(review_value("changes_required")))
+        self.assertEqual(self.submit(review_value())["status"], "ready")
+        return self.ask_at_limit()
+
+    def test_the_limit_question_and_continue_completes_with_the_earlier_pass(self):
+        asked = self.reach_limit_with_opencode_approving()
+        self.assertEqual(asked["status"], "awaiting_human")
+        self.assertEqual((asked["escalation"]["reason"], asked["escalation"]["questions"]),
+                         (REVIEW_LIMIT_REASON, [LIMIT_QUESTION]))
+        record = read_json(self.run / f"escalations/{asked['escalation']['id']}.json")
+        self.assertEqual(record["detail"], {"review_number": 6, "kind": "review_budget"})
+        # The resume command is never the answer.
+        self.resume(self.session)
+        self.assertEqual(self.engine.status(self.run_id)["human_events"], [])
+        actual = self.limit_answer("Continue with two more reviews.")
+        for value in ({"answer": actual["answer_text"], "event_ids": [actual["event_id"]]},
+                      {"answer": actual["answer_text"], "event_ids": [actual["event_id"]], "decision": "cancel"}):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(DevFlowError, "continue or stop"):
+                    self.resolve(self.draft("limit-answer.json", value))
+        continued = self.resolve(self.draft("limit-answer.json", {
+            "answer": actual["answer_text"], "event_ids": [actual["event_id"]], "decision": "continue"}))
+        self.assertEqual((continued["status"], continued["review_limit"], continued["remaining_reviews"],
+                          continued["next_reviewer"]), ("ready", 8, 2, "codex"))
+        self.assertEqual(continued["config"]["max_reviews"], 6)
+        answer = read_json(self.run / f"escalations/{asked['escalation']['id']}-answer.json")
+        self.assertEqual(answer["decision"], "continue")
+        seen = []
+        def reviewer(provider, *args, **kwargs):
+            seen.append(provider["id"])
+            return adapter_result(review_value())
+        with patch(RUN_REVIEW, side_effect=reviewer):
+            final = self.engine.review(self.run_id)
+        # Codex's seventh review joins opencode's sixth pass of the same plan.
+        self.assertEqual(seen, ["codex"])
+        self.assertEqual((final["status"], final["review_count"]), ("completed", 7))
+
+    def test_continuing_dispatches_reviews_seven_and_eight_in_order(self):
+        self.reach_limit_with_opencode_approving()
+        self.at_limit("continue")
+        seen = []
+        def reviewer(provider, *args, **kwargs):
+            seen.append(provider["id"])
+            return adapter_result(review_value("changes_required" if len(seen) == 1 else "pass"))
+        with patch(RUN_REVIEW, side_effect=reviewer):
+            self.reflect(self.engine.review(self.run_id))  # codex finds an issue; the plan changes
+            eighth = self.engine.review(self.run_id)       # opencode approves the new plan alone
+        self.assertEqual(seen, ["codex", "opencode"])
+        self.assertEqual((eighth["status"], eighth["review_count"]), ("ready", 8))
+        asked = self.ask_at_limit()
+        self.assertEqual(asked["escalation"]["questions"], [
+            "Review limit reached: 8 of 8 reviews used. Reviewers approving the current version: opencode. Continue "
+            "with 2 more reviews (new limit 10; next reviewers in order: codex, opencode), or stop and end the run "
+            "as exhausted?"])
+
+    def test_a_limit_answer_grants_no_authority_over_later_findings(self):
+        (self.project / "devflow.config.json").write_text('{"max_reviews":2}', encoding="utf-8")
+        self.ready()
+        self.reflect(self.submit(review_value("changes_required")))
+        self.reflect(self.submit(review_value("changes_required")))
+        self.ask_at_limit()
+        self.at_limit("continue")
+        state = self.submit(review_value("changes_required", severity="critical"))
+        with self.assertRaisesRegex(DevFlowError, "recorded human resolution"):
+            self.reflect(state, action="reject", change=False)
+
+    def test_decision_belongs_only_to_the_limit_question(self):
+        self.ready()
+        self.submit(review_value("human_required", human=True))
+        actual = self.limit_answer("Keep scope")
+        with self.assertRaisesRegex(DevFlowError, "continue or stop"):
+            self.resolve(self.draft("answer.json", {"answer": actual["answer_text"], "event_ids": [actual["event_id"]],
+                                                    "decision": "continue"}))
+        resolved = self.resolve(self.draft("answer.json", {"answer": actual["answer_text"],
+                                                          "event_ids": [actual["event_id"]]}))
+        self.assertEqual(resolved["status"], "awaiting_revision")
+
+    def test_cancel_while_the_limit_question_waits(self):
+        (self.project / "devflow.config.json").write_text('{"max_reviews":2}', encoding="utf-8")
+        self.ready()
+        self.reflect(self.submit(review_value("changes_required")))
+        self.reflect(self.submit(review_value("changes_required")))
+        self.assertEqual(self.ask_at_limit()["status"], "awaiting_human")
+        self.assertEqual(self.engine.cancel(self.run_id)["status"], "cancelled")
+
+    def test_a_round_past_the_ceiling_ends_without_a_question(self):
+        self.ready()
+        stored = read_json(self.run / "state.json")
+        atomic_write_json(self.run / "state.json", dict(stored, review_count=98, review_limit=98))
+        ended = self.ask_at_limit()
+        self.assertEqual((ended["status"], ended["escalation"]), ("exhausted", None))
+
+    def test_a_review_limit_outside_whole_rounds_is_corrupt(self):
+        self.ready()
+        stored = read_json(self.run / "state.json")
+        for limit in (7, 5, 100):
+            with self.subTest(limit=limit):
+                atomic_write_json(self.run / "state.json", dict(stored, review_limit=limit))
+                with self.assertRaisesRegex(DevFlowError, "never reset"):
+                    self.engine.status(self.run_id)
+        # A state without the field is not this format: listed as invalid, never continued.
+        atomic_write_json(self.run / "state.json", {key: value for key, value in stored.items() if key != "review_limit"})
+        self.assertEqual(self.engine.store.inspect(self.run_id).format, "invalid")
 
     def test_stale_hash_and_missing_dispositions_do_not_commit(self):
         self.ready()
@@ -944,6 +1078,8 @@ class EngineTests(unittest.TestCase):
         self.ready()
         self.reflect(self.submit(review_value("changes_required")))
         self.reflect(self.submit(review_value("changes_required")))
+        self.ask_at_limit()
+        self.assertEqual(self.at_limit("stop")["status"], "exhausted")
         with self.assertRaisesRegex(DevFlowError, "both reviewers"):
             self.engine.publish(self.run_id)
         self.assertFalse((self.project / "docs").exists())
