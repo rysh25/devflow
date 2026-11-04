@@ -29,11 +29,15 @@ REMOVED_NAMES = ("guard", "allowlist", "ShellPolicy", "ShellPolicyError", "shell
                  "external_directory", "repository_context", "context_files", "file_manifest", "context_file",
                  "new_session", "kill_group", "extra_env", "project_doc_max_bytes", "OPENCODE_PROJECT_OFF",
                  "OPENCODE_DISABLE_PROJECT_CONFIG", "OPENCODE_CONFIG_PROJECT_DISABLE", "OPENCODE_DISABLE_CLAUDE_CODE",
+                 # The read server (removed in stage 0) and the plan's other names of the limits.
+                 "READ_SERVER", "OPENCODE_READ_ONLY_TOOLS", "CODEX_RESOURCE_TOOLS", "OTHER_CALLS", "reviewer_read",
+                 "reviewer_tools", "READ_TOOLS", "NON_WRITING", "PROTECTED",
                  # Checks of Claude Code's Bash limit, which DevFlow no longer depends on.
                  "bash_limit", "limit_warnings", "timeout_warnings", "bash_needs", "LIMIT_WARNING",
                  "BASH_MAX_DEFAULT_MS", "BASH_DEFAULT_DEFAULT_MS")
 REMOVED_WORDING = ("deny(", "onFailure", "--strict-config", "--ignore-user-config", "--ignore-rules", "--ephemeral",
-                   "--sandbox", "--yolo", "--dangerously", "--context-file", "context.md", "read-only")
+                   "--sandbox", "--yolo", "--dangerously", "--context-file", "context.md", "read-only",
+                   "review-read", "reads.jsonl", "2.2.3", '"web":')
 #: Wording of the removed limits in the Japanese documents.
 JAPANESE_WORDING = ("ガード", "許可されたコマンド", "書き込まないツール", "読み取り専用", "ランナーだけを通", "拒否")
 

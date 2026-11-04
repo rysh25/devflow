@@ -7,8 +7,10 @@ project. It reads what it needs with its own tools. DevFlow adds only what it
 needs to start the CLI and read its answer: the model and effort, no waiting for
 approvals (Codex gets ``approval_policy="never"``; ``opencode run`` itself
 declines what the user's settings would ask about), JSON events, the output
-schema (Codex), the working directory and a closed standard input. The reviewer instructions ask it to treat every file as
-data, so a file cannot change its verdict or this contract.
+schema (Codex), the working directory, and the standard input: Codex reads the
+prompt from it, then it is closed; OpenCode's is closed from the start. The
+reviewer instructions ask it to treat every file as data, so a file cannot
+change its verdict or this contract.
 
 The answer is checked strictly. The event stream is not: a review fails only
 when the output shows that the run did not finish or gave no answer. Tool
@@ -195,8 +197,10 @@ def parse_opencode_events(output: str) -> tuple[Any, dict]:
         elif kind == "text":
             content = part.get("text")
             if isinstance(content, str):
-                # A part can be sent again as it grows; its last version counts.
-                current[part.get("id", len(current))] = content
+                # A part can be sent again as it grows; its last version counts. A part
+                # whose ID is not a string is a part of its own.
+                key = part.get("id")
+                current[key if isinstance(key, str) else len(current)] = content
         elif kind == "step_finish":
             reason, last, current = part.get("reason"), current, {}
         else:
@@ -262,7 +266,7 @@ def preflight(config: dict) -> dict:
     version = raw.decode("utf-8", errors="replace").strip()
     if code or not version:
         raise ReviewerError(f"{kind} --version failed (exit {code})")
-    subcommand, flags = CLIS[kind].subcommand, CLIS[kind].flags
+    subcommand, flags = CLIS[kind].subcommand, CLIS[kind].flags()
     code, raw, _ = _capture(resolved + [subcommand, "--help"], limit=262144)
     if code:
         raise ReviewerError(f"{kind} {subcommand} --help failed with exit {code}")
@@ -276,10 +280,11 @@ def preflight(config: dict) -> dict:
 
 
 def build_command(config: dict, work_dir: Path, cwd: Path, schema_path: Path) -> tuple[list[str], dict[str, str]]:
-    """Return argv and environment additions. Never compose a shell command."""
+    """The argv (the user's command with its executable resolved, then DevFlow's
+    arguments) and the environment additions. Never a shell command."""
     kind, prefix, model, effort, _ = _config(config)
     work_dir, cwd = work_dir.resolve(), cwd.resolve()
-    return prefix + CLIS[kind].arguments(model, effort, work_dir, cwd, schema_path.resolve()), {"PWD": str(cwd)}
+    return _resolve(prefix) + CLIS[kind].arguments(model, effort, work_dir, cwd, schema_path.resolve()), {"PWD": str(cwd)}
 
 
 def _write_new(path: Path, value: str | bytes) -> None:
@@ -308,17 +313,20 @@ class CLI:
     """What DevFlow needs to know about one reviewer CLI.
 
     Adding a CLI means adding one subclass to ``CLIS`` (and its kind to
-    ``settings.REVIEWER_KINDS``): the subcommand and flags DevFlow passes,
-    which ``preflight`` checks, the arguments, the standard input, and how
-    to read the answer and the activity from the output.
+    ``settings.REVIEWER_KINDS``): the subcommand, the arguments, the standard
+    input, and how to read the answer and the activity from the output.
     """
 
     subcommand = ""
-    flags: tuple[str, ...] = ()
 
     def arguments(self, model: str, effort: str, work_dir: Path, cwd: Path, schema_path: Path) -> list[str]:
         """The arguments after the user's command prefix; ``review-input.md`` in ``work_dir`` holds the prompt."""
         raise NotImplementedError
+
+    def flags(self) -> list[str]:
+        """The options the arguments pass, which ``preflight`` looks for in the subcommand's help."""
+        passed = self.arguments("model", "effort", Path("work"), Path("cwd"), Path("schema.json"))
+        return list(dict.fromkeys(argument for argument in passed if argument.startswith("--")))
 
     def stdin(self, prompt: str) -> bytes | None:
         """The standard input; None closes it."""
@@ -333,8 +341,6 @@ class Codex(CLI):
     """``codex exec``: the prompt on standard input (then closed); the answer is its final message file."""
 
     subcommand = "exec"
-    flags = ("--json", "--output-schema", "--output-last-message", "--skip-git-repo-check", "--cd", "--model",
-             "--config")
 
     def arguments(self, model, effort, work_dir, cwd, schema_path):
         return [self.subcommand, "--json", "--skip-git-repo-check", "--cd", str(cwd), "--model", model,
@@ -357,7 +363,6 @@ class OpenCode(CLI):
     """``opencode run``: the prompt as an attached file and a closed standard input (it would wait for input)."""
 
     subcommand = "run"
-    flags = ("--format", "--model", "--file", "--standalone")
     message = "Review as instructed in the attached file. Return only the required JSON object."
 
     def arguments(self, model, effort, work_dir, cwd, schema_path):
@@ -406,7 +411,6 @@ def run_review(config: dict, packet_path: Path, work_dir: Path, schema_path: Pat
         raise ReviewerError("Combined review prompt exceeds byte limit; never truncate silently")
     _write_new(work_dir / "review-input.md", prompt)
     argv, additions = build_command(config, work_dir, cwd, schema_path)
-    argv = _resolve(prefix) + argv[len(prefix):]
     env = {**os.environ, **additions}
     # Never log credentials or the inherited environment; prefix arguments may
     # hold secrets, so only their count is recorded.

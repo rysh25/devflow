@@ -331,6 +331,21 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(fourth["status"], "completed")
         self.assertEqual(fourth["review_count"], 4)
 
+    def test_a_round_that_fails_after_the_reviewer_finished_keeps_what_it_did(self):
+        self.ready()
+        provider = self.engine.status(self.run_id)["config"]["reviewers"][0]
+        with self.engine._lock(self.run_id):
+            state = self.engine._state(self.run_id)
+            state["review_count"] = 1
+            # The reviewed plan hash no longer matches: the round fails.
+            reservation = {"number": 1, "target": "0" * 64}
+            self.engine._finish_review(state, reservation, "reviews/01", provider, adapter_result(review_value()), None)
+            self.engine._save(state)
+        status = self.engine.status(self.run_id)
+        self.assertEqual(status["last_error"]["activity"], ACTIVITY)
+        self.assertEqual([(r["status"], r["plan_hash"], r["tool_calls"]) for r in status["reviews"]],
+                         [("failed", "0" * 64, ACTIVITY["tool_calls"])])
+
     def test_failed_attempt_consumed_resume_explicit_and_alternating(self):
         self.ready()
         with patch(RUN_REVIEW, side_effect=RuntimeError("mock provider unavailable")):

@@ -190,6 +190,15 @@ class OpenCodeEventTests(unittest.TestCase):
                        oc("text", id="p", text=json.dumps(REVIEW)), oc("step_finish", reason="stop"))
         self.assertEqual(reviewers.parse_opencode_events(output)[0], REVIEW)
 
+    def test_text_parts_whose_id_is_not_a_string_are_kept_in_order(self):
+        # Each is a part of its own: none is lost, and nothing fails.
+        half = json.dumps(REVIEW)[:20], json.dumps(REVIEW)[20:]
+        for first, second in (({}, []), (None, None), (7, 7)):
+            with self.subTest(ids=(first, second)):
+                output = lines(oc("step_start"), oc("text", id=first, text=half[0]), oc("text", id=second, text=half[1]),
+                               oc("step_finish", reason="stop"))
+                self.assertEqual(reviewers.parse_opencode_events(output)[0], REVIEW)
+
     def test_only_an_unfinished_answer_or_a_main_session_error_fails(self):
         cases = {
             "error in the main session": (opencode({"type": "error", "sessionID": "main", "error": {"name": "X"}}),
@@ -220,6 +229,10 @@ class CommandTests(unittest.TestCase):
         self.work = Path("run", "review-processes", "01").resolve()
         self.cwd = Path("project").resolve()
         self.schema = Path("schema.json").resolve()
+        # The executable as configured (the real lookup is tested with the fake CLIs).
+        resolve = patch.object(reviewers, "_resolve", lambda prefix: prefix)
+        resolve.start()
+        self.addCleanup(resolve.stop)
 
     def test_codex_runs_with_the_users_settings_in_the_directory_under_review(self):
         argv, env = reviewers.build_command(reviewer(), self.work, self.cwd, self.schema)
@@ -238,14 +251,14 @@ class CommandTests(unittest.TestCase):
         # Only the working directory: the project's own settings and instructions load as usual.
         self.assertEqual(env, {"PWD": str(self.cwd)})
 
-    def test_each_cli_is_one_class_whose_checked_flags_are_the_ones_it_passes(self):
+    def test_each_cli_is_one_class_and_preflight_checks_the_options_it_passes(self):
         self.assertEqual(set(reviewers.CLIS), set(settings.REVIEWER_KINDS))
+        self.assertEqual(reviewers.CLIS["codex"].flags(), ["--json", "--skip-git-repo-check", "--cd", "--model",
+                                                           "--config", "--output-schema", "--output-last-message"])
+        self.assertEqual(reviewers.CLIS["opencode"].flags(), ["--format", "--standalone", "--model", "--file"])
         for kind, cli in reviewers.CLIS.items():
             with self.subTest(kind=kind):
-                arguments = cli.arguments("m", "high", self.work, self.cwd, self.schema)
-                self.assertEqual(arguments[0], cli.subcommand)
-                passed = {argument for argument in arguments if argument.startswith("--")}
-                self.assertEqual(set(cli.flags), passed - {"--"}, "preflight checks exactly the flags passed")
+                self.assertEqual(cli.arguments("m", "high", self.work, self.cwd, self.schema)[0], cli.subcommand)
 
     def test_the_users_command_prefix_is_kept(self):
         for kind in ("codex", "opencode"):

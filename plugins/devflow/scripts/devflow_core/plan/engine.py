@@ -37,8 +37,8 @@ class Engine(RunEngine):
 
     def _reviews(self, state: dict, with_reviews: bool = False) -> list[dict]:
         """Each review round, from its records: the reviewer, the plan hash it reviewed, the
-        outcome and, when it succeeded, the verdict and tool calls (and with ``with_reviews``
-        the review)."""
+        outcome, the tool calls when the reviewer ran to the end, and the verdict when the
+        round succeeded (and with ``with_reviews`` the review)."""
         run, entries = self._run(state["run_id"]), []
         for number in range(1, state["review_count"] + 1):
             base = f"reviews/{number:02d}"
@@ -56,7 +56,7 @@ class Engine(RunEngine):
                          "reviewer_id": ended["provider"] if ended else inflight.get("reviewer_id"),
                          "status": "failed" if ended else "dispatched",
                          "plan_hash": ended["plan_hash"] if ended else inflight.get("target"),
-                         **({"review": None} if with_reviews else {})}
+                         **((ended or {}).get("activity") or {}), **({"review": None} if with_reviews else {})}
             entries.append(entry)
         return entries
 
@@ -186,7 +186,9 @@ class Engine(RunEngine):
         if error is not None:
             state["last_error"] = {"review_number": number, "provider": provider["id"],
                                    "plan_hash": reservation["target"], "message": str(error),
-                                   "retry_consumes_another_attempt": True}
+                                   "retry_consumes_another_attempt": True,
+                                   # What the reviewer did, when it ran to the end.
+                                   **({"activity": result["activity"]} if result is not None else {})}
             state["status"] = after_failed_review(number, state["config"])
             self._artifact(state, f"{relative_dir}/error.json", json_bytes(state["last_error"]))
             return

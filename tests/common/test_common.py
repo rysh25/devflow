@@ -323,7 +323,7 @@ class EnvironmentTests(unittest.TestCase):
 
         def bounded(argv, **options):
             waited.append(options["timeout"])
-            text = " ".join(reviewers.CLIS["codex"].flags)
+            text = " ".join(reviewers.CLIS["codex"].flags())
             return Completed(0, f"codex 1.0.0 {text}".encode(), b"", False, False, False, None, 0.0)
         with patch.object(reviewers, "run_bounded", bounded), patch.object(reviewers, "_resolve", lambda prefix: prefix):
             reviewers.preflight({"id": "codex", "kind": "codex", "command": ["codex"], "model": "m", "effort": "e",

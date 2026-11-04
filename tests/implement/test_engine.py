@@ -1082,6 +1082,9 @@ class RecoveryAndIntegrityTests(EngineFixture):
         self.assertIn("changed since checkpoint", result["last_error"])
         self.assertEqual(result["review_count"], 1)
         self.assertEqual(result["attempts"][-1]["status"], "failed")
+        # The reviewer ran to the end: what it did stays on the failed round.
+        self.assertEqual([(r["status"], r["tool_calls"]) for r in result["reviews"]],
+                         [("failed", ACTIVITY["tool_calls"])])
 
     def run_checks_with(self, during):
         original = checks_module.run_checks

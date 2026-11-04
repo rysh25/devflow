@@ -246,7 +246,9 @@ class Engine(RunEngine):
             except DevFlowError as exc:
                 error = exc
         if error is not None:
-            state["attempts"][-1].update(status="failed",error=str(error),finished_at=now())
+            # What the reviewer did is kept when it ran to the end.
+            state["attempts"][-1].update(status="failed",error=str(error),finished_at=now(),
+                                         **({"activity":result["activity"]} if result is not None else {}))
             # A reviewer failure says nothing about the code: approvals for this
             # snapshot stay (as in plan); this attempt never adds one.
             state.update(status=after_failed_review(number,state["config"]),resume_status="ready_review",last_error=str(error))
@@ -373,7 +375,8 @@ class Engine(RunEngine):
             result["report"] = read_json(report_path)
 
 def review_rounds(state):
-    """Each review attempt: its reviewer, snapshot, outcome and, when it succeeded, its verdict and tool calls."""
+    """Each review attempt: its reviewer, snapshot, outcome, its tool calls when the reviewer ran to
+    the end, and its verdict when it succeeded."""
     return [{"number":a["number"],"reviewer_id":a["reviewer_id"],"snapshot_id":a["snapshot_id"],"status":a["status"],
              **({"verdict":a["verdict"]} if "verdict" in a else {}),**(a.get("activity") or {})} for a in state["attempts"]]
 
