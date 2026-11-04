@@ -31,7 +31,7 @@ Claude Code のセッション内からは、実際の解凍先パスを使い�
 
 `review` と `check` は、外部の処理が終わるまで待つランナーの操作です。Claude は、ランナーが返す `bash_timeout_ms`（既定では `review` が 1000000 ms）を Bash ツールの `timeout` に渡し、Claude Code の Bash の上限より大きいときはバックグラウンドで実行して、終わりの知らせを待ちます。そのため、何も設定しなくてもレビューは最後まで動きます。
 
-バックグラウンドで動いたあとの次のターンでは、ランナーの呼び出しに承認を求められることがあります（スキルの事前の許可は、そのスキルを呼んだターンの間だけ効くため）。避けたい場合は、Bash の上限（`BASH_MAX_TIMEOUT_MS` と `BASH_DEFAULT_TIMEOUT_MS` の大きい方）を `bash_timeout_ms` 以上にします。
+バックグラウンドで動いたあとの次のターンでは、ランナーの呼び出しに承認を求められることがあります（スキルの事前の許可は、そのスキルを呼んだターンの間だけ効くため）。権限のモードが `auto` のときなど、Claude Code が自動で許可する場合は求められません。避けたい場合は、Bash の上限（`BASH_MAX_TIMEOUT_MS` と `BASH_DEFAULT_TIMEOUT_MS` の大きい方）を `bash_timeout_ms` 以上にします。
 
 ```json
 {"env": {"BASH_MAX_TIMEOUT_MS": "1000000"}}

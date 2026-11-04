@@ -700,6 +700,21 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(out["coverage"]["user_texts_without_hook_record"], 1)
         self.assertEqual(out["coverage"]["human_response_count"], 2)  # The extra hooked prompt, and this one.
 
+    def test_a_subagent_report_worded_differently_in_the_transcript_is_matched_by_its_prompt_id(self):
+        # As Claude Code 2.1.317 records it: the transcript's text has a lead-in the
+        # hook prompt lacks; the prompt ID is the same.
+        marker = transcript_marker(str(self.path))
+        report = '<agent-message from="a1">\n[Subagent hand-back] REPORT</agent-message>'
+        self.write(entry("user", "request"),
+                   entry("user", "Another Claude session sent a message:\n" + report, isMeta=True,
+                         origin={"kind": "peer", "from": "a1", "name": "Explore"}, promptId="p-report"),
+                   entry("assistant", "Question?"), entry("user", "Answer", origin={"kind": "human"}))
+        out = capture_interview(marker, [self.prompt("request"), dict(self.prompt(report), prompt_id="p-report"),
+                                         self.prompt("Answer")])
+        self.assertEqual(out["coverage"]["mode"], "bounded-transcript-with-hook-provenance")
+        self.assertEqual([m["content"] for m in out["messages"]], ["request", "Question?", "Answer"])
+        self.assertEqual(out["coverage"]["human_response_count"], 1)
+
     def test_a_notice_whose_hook_prompt_has_no_or_another_prompt_id_is_still_not_human(self):
         for hook_id in (None, "p-other"):
             with self.subTest(hook_prompt_id=hook_id):

@@ -552,14 +552,16 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
         if any(tool_id == seen for _, _, seen in linked):
             raise CaptureError("Duplicate AskUserQuestion answer hooks are ambiguous")
         linked.append((event_index, event, tool_id))
-    # Notices take, from the hook prompts left, the one with their prompt ID,
-    # or else the only one with the same text (several: none, a human's may be among them).
+    # Notices take, from the hook prompts left, the one with their prompt ID (the
+    # transcript may word a notice differently from its hook prompt), or else the
+    # only one with the same text (several: none, a human's may be among them).
     automated_events: set[int] = set()
     for text, prompt_id in notices:
-        left = [p for p in prompts if not p["used"] and p["text"] == text]
+        left = [p for p in prompts if not p["used"]]
         matching = next((p for p in left if prompt_id and p["prompt_id"] == prompt_id), None)
-        if matching is None and len(left) == 1:
-            matching = left[0]
+        same_text = [p for p in left if p["text"] == text]
+        if matching is None and len(same_text) == 1:
+            matching = same_text[0]
         if matching:
             matching["used"] = True
             automated_events.add(matching["event_index"])
