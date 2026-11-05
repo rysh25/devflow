@@ -107,6 +107,9 @@ class Fixture(unittest.TestCase):
         with self.store.lock(self.run_id):
             state = self.store.load(self.run_id)
             state["status"] = status
+            # A real run never leaves a terminal status; the fixture does, so its end time goes too.
+            if status not in TERMINAL:
+                state["finished_at"] = None
             state["inflight"] = ({"kind": "check", "number": 1, "reviewer_id": None, "target": "fixture",
                                   "started_at": "2026-11-01T12:34:56+00:00"}
                                  if status in WORKFLOW.inflight_statuses else None)

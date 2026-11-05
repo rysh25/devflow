@@ -22,6 +22,6 @@ uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN
 3. For `plan`, read `${CLAUDE_PLUGIN_ROOT}/references/plan-workflow.md` in full. For `implement`, read `${CLAUDE_PLUGIN_ROOT}/references/implement-workflow.md` in full. The runner uses `plan ACTION` or `implement ACTION`, with every global option before that selector.
 4. Continue from the saved state. For `awaiting_human`, ask the pending questions: invoking resume is not an answer or approval. An interview not yet sealed must resume in its original Claude conversation.
 5. For an in-flight/recovery error, stop and ask the human to inspect associated processes. Do not remove locks or run the operator-only recovery action yourself.
-6. For completed Plan reviews with pending/error publication, follow the Plan publication/report instructions; no reviewer is called again. For any terminal Implement state, report the stored outcome and stop without edits.
+6. For completed or accepted Plan reviews with pending/error publication, follow the Plan publication/report instructions; for any other terminal Plan state, run `report`; no reviewer is called again. For any terminal Implement state, report the stored outcome and stop without edits. In every terminal state, show `review_summary_markdown` unchanged.
 
 The same review count, review limit (`review_limit`) and frozen plan/settings remain in effect across sessions. Technical failure is not permission to switch model, skip checks, or silently repeat a consumed attempt.

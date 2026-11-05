@@ -2,13 +2,13 @@
 
 ## 一つの配布と独立したワークフロー
 
-DevFlow 0.6.0 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
+DevFlow 0.7.0 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
 
 ```mermaid
 flowchart TD
     D[DevFlow Plugin] --> P[Plan]
     D --> B[Implement]
-    P -->|双方承認後に保存| F[Markdown計画ファイル]
+    P -->|双方承認か人間の受け入れの後に保存（横に承認の記録）| F[Markdown計画ファイル]
     F -->|人間がパスを明示指定| B
 ```
 
@@ -49,7 +49,8 @@ Python コードは `plugins/devflow/scripts/devflow_core/` の1つのパッケ�
 | `git.py` | DevFlow 自身の git の呼び出し。利用者の git の設定のまま、`GIT_DIR` などのリポジトリを差し替える環境変数だけを外す |
 | `sessions.py` | セッション記録、人間の判断に使える回答の規則、事前に埋めた質問の判定、回答文の取り出し |
 | `notices.py` | フックが Claude に渡す状態の通知（run の状態、ランナーの場所、`bash_timeout_ms`） |
-| `reviewers.py` | Codex / OpenCode の事前確認・起動・出力の検査。CLI ごとの違いは `CLI` のサブクラス（`Codex`、`OpenCode`）に集める |
+| `reviewers.py` | Codex / OpenCode の事前確認・起動・出力の検査。CLI ごとの違いは `CLI` のサブクラス（`Codex`、`OpenCode`）に集める。トークン数の読み取り（`CLI.tokens`、`review_tokens`）と、回の CLI の版（`recorded_cli_version`）もここ |
+| `summary.py` | レビューの要約：各フローが自分の記録を直した共通の形（`source`）から、データを作る `build` と、決まった英語の Markdown を作る `render`。上限の確認で待っている間と run が終わったあとに、`status` と最終レポートに入る |
 | `counts.py` | 前もって知らない名前（出来事の種類、ツールの名前）の、上限付きの数え方 |
 | `settings.py` | `devflow.config.json` の重ね合わせと、レビュアー設定の共通規則 |
 | `workflow.py` | 各フローが実装する契約（`Workflow` クラス）と、動作の表（`Command` / `Option`）。CLI の登録、所有者が要る操作（`needs_owner`）、振り分けはこの表から導く。共通層はフロー固有の state の項目を直接読まず、`summary` や `frozen_config` などの契約を通す |
@@ -66,11 +67,13 @@ import の向きは一方向です。`common` はフローや router を import 
 
 面接の記録は、Claude Code の会話の記録（transcript）とフックの記録から作ります。人間の発言は `UserPromptSubmit` の記録と照合し、`AskUserQuestion` の回答は `PostToolUse` の記録から取ります。会話の記録の知らない行・添付・ブロックの種類は読み飛ばして数え、`coverage.unknown_types` に種類ごとに出します。質問の回答が読めない形のときも、読み飛ばして数えます。会話の記録とフックの記録のどちらかで読めればその回答を使い、どちらでも読めなければ、その質問は回答なしとして残します。知っていて面接に入れない行（サブエージェントの記録、圧縮の境界と要約、自動の知らせなど）は、`coverage.ignored_records` に合わせて数えます。自動の知らせ（タスクの知らせ、サブエージェントの報告）は `UserPromptSubmit` にも届くので、同じプロンプトの ID の、なければ同じ文のものが1件だけのときのフックの発言と結び付け、人間の発言から除きます。どれか決められないときは、その文の発言を出どころ不明として残し、人間の回答に数えません。人間の発言を会話の記録の中に置けないとき、また会話の記録がないとき（Claude Code がパスを渡さない、ファイルが書かれていない）は、フックの記録だけで順番どおりの面接を作り、そのことを `coverage.mode` と `reason` に示します。このとき、フックの記録にない人間の文と質問は捨てず、最後に会話の記録の順で残します。会話の記録がないときは、自動の知らせと見分けられないので、元の依頼より後の発言を人間の回答に数えません（数えるのは質問の回答だけです）。止まるのは、記録が壊れているとわかるとき（JSONL の破損、同じ UUID で違う中身、質問のフックと会話の記録の食い違い）だけです。
 
-`interview` → `planning` → `ready` → `reviewing` と進みます。通常の指摘は `awaiting_revision`、人間の判断は `awaiting_human`、技術的な停止は `paused_error` です。両レビュアーが同一ハッシュを承認したときだけ `completed` となります。レビューの上限に達して承認が揃っていないと、次の `review` はレビュアーを起動せずに人間に確認します（`awaiting_human`、確認の種類は `review_budget`）。続ければ `ready` に戻り、やめれば `exhausted` です。計画中のソースの変化は追いません。
+`interview` → `planning` → `ready` → `reviewing` と進みます。通常の指摘は `awaiting_revision`、人間の判断は `awaiting_human`、技術的な停止は `paused_error` です。両レビュアーが同一ハッシュを承認したときだけ `completed` となります。レビューの上限に達して承認が揃っていないと、次の `review` はレビュアーを起動せずに人間に確認します（`awaiting_human`、確認の種類は `review_budget`）。続ければ `ready` に戻り、やめれば `exhausted`、受け入れれば `accepted` です。`accepted` は、人間がその時点のプラン（最後のレビューのあとに直した、まだレビューしていない版でもよい）を受け入れたことで、`completed` とは別の終わり方です。答えの記録（`escalations/<id>-answer.json`）に、受け入れた版のハッシュが残ります。計画中のソースの変化は追いません。
 
-レビュー完了後、スキルが `plan publish` と `plan report` を呼びます。出版状態 `publication.status` は `pending` / `publishing` / `published` / `error` / `disabled` を区別します。`completed` だけでは正式ファイルの保存成功を意味しません。
+`completed` と `accepted` では、スキルが `plan publish` と `plan report` を呼びます。ほかの終わり方（`exhausted`、`cancelled`）でも `plan report` を呼び、レビューの要約を見せます。出版状態 `publication.status` は `pending` / `publishing` / `published` / `error` / `disabled` を区別します。`completed` や `accepted` だけでは正式ファイルの保存成功を意味しません。
 
-既定保存先は `docs/plans/`、ファイル名は依頼中の最初の `REVIEW-10` のようなチケット識別子、なければ `plan-<run-id>.md` です。既存の一次候補があれば `<識別子>-<run-id>.md` に分離し、そちらも存在する場合は上書きせず止まります。正式ファイルはレビュー済みのバイト列と同じです。公開時に見出しやメタデータを付加して未レビューの変更を混ぜません。
+既定保存先は `docs/plans/`、ファイル名は依頼中の最初の `REVIEW-10` のようなチケット識別子、なければ `plan-<run-id>.md` です。公開するプランの横に、人が読める承認の記録 `<名前>.approval.md` を置きます。プランと承認の記録の両方の名前が空いている候補を、`<名前>`、`<名前>-<run-id>` の順に選び、どちらも使えなければ上書きせず止まります。正式ファイルはレビュー済み（`accepted` では人間が受け入れた）のバイト列と同じです。公開時に見出しやメタデータを付加して未レビューの変更を混ぜません。承認の情報は、横の承認の記録と `publication.json` にだけ書きます。
+
+承認の記録の中身は、決まった英語の言葉で、プランのファイル名、承認の種類（`reviewers` か `human`）、承認した者（レビュアーの id、または人間と `AskUserQuestion` の答えの event ID）、承認した版のハッシュ、run ID、承認した時刻（run の `finished_at`）、公開した時刻、レビューの回数と上限、残っている指摘の数、最後の版がレビュー済みかです。中身は公開の予定と一緒に run の記録 `approval.md` として一度だけ作り、それを外へ写すので、途中で止まった公開を再開しても同じバイト列になります。受領 `publication.json`（`schema_version` 2）は、`approval`（`reviewers` か `human`）、`approval_path`、公開の予定の時刻と同じ `published_at` を持ちます。`plan report` は、公開したプランと承認の記録の両方が今もそのバイト列か（`published_plan_matches_at_report`、`published_approval_matches_at_report`）を確かめます。
 
 `exhausted` / `awaiting_human` / `paused_error` のプランを自動的に正式採用しません。
 
@@ -92,9 +95,10 @@ flowchart TD
     R -->|上限到達| H
     H -->|続ける| R
     H -->|やめる| E[exhausted]
+    H -->|受け入れて終える| A[accepted]
 ```
 
-図は主要経路だけを示しています。人への問い合わせから戻る先は問い合わせ時の状態に依存します。例えば手動検証の承認後はレビュー待ちへ戻ります。技術的な失敗は `paused_error`、人間の中止は `cancelled` です。
+図は主要経路だけを示しています。人への問い合わせから戻る先は問い合わせ時の状態に依存します。例えば手動検証の承認後はレビュー待ちへ戻ります。技術的な失敗は `paused_error`、人間の中止は `cancelled` です。終わった run（`completed`・`exhausted`・`cancelled`・`accepted`）は、取り消しても変わりません。
 
 計画の実装・修正は現在の Claude Code のメインセッションが担当し、サブエージェントに分けることもできます。Python ランナーが新しい Claude セッションを起動することはありません。ランナーは明示的なアクション単位で進み、Claude は返された状態を読んで次のアクションを選びます。
 
@@ -128,9 +132,9 @@ checkpoint では、開始時からの変更の一覧（`snapshots/NNN.json`）�
 6. ロックを取り直し、予約が今も有効か、対象が変わっていないかを確かめてから、答えのスキーマとスナップショット ID を確かめます。cancel や recover の後に返った結果は `late/` に残すだけで、run は変えません。
 7. 各指摘の採否を記録し、必要なら Claude Code が修正します。
 
-最初のレビューの上限は `max_reviews`（既定 6、最大 6）、既定の順序は Codex/OpenCode の交互です。送信後の失敗も数えます。上限に達して承認が揃っていないと、次の `review` はレビュアーを起動せずに人間に確認します。続ければ、レビュアーの人数分だけ上限（state の `review_limit`）を上げ、同じ順序で数え続けます。この確認と回答では、同じスナップショットへの承認を消しません。合計は 99 回までです（記録の番号が 2 桁のため）。レビュアーの失敗は、同じスナップショットに対する他のレビュアーの承認を取り消しません。返答が得られなかったからといって枠を戻さず、再開時にもリセットしません。
+最初のレビューの上限は `max_reviews`（既定 6、最大 6）、既定の順序は Codex/OpenCode の交互です。送信後の失敗も数えます。上限に達して承認が揃っていないと、次の `review` はレビュアーを起動せずに人間に確認します（続ける・やめる・受け入れて終える）。続ければ、レビュアーの人数分だけ上限（state の `review_limit`）を上げ、同じ順序で数え続けます。この確認と回答では、同じスナップショットへの承認を消しません。合計は 99 回までです（記録の番号が 2 桁のため）。レビュアーの失敗は、同じスナップショットに対する他のレビュアーの承認を取り消しません。返答が得られなかったからといって枠を戻さず、再開時にもリセットしません。
 
-両者の合格が **同じスナップショット ID** に揃ったときだけ早期完了します。上限の確認では、実装場所のコードが候補と一致することを確かめてから、今の版を承認しているレビュアーを示します。最後に許されたレビューの後に修正し、上限で「やめる」を選んだ場合は、最終修正がレビューされていないことを報告します。チェックの再試行上限はレビュー上限と別管理です。
+両者の合格が **同じスナップショット ID** に揃ったときだけ早期完了します。上限の確認では、実装場所のコードが候補と一致することを確かめてから、今の版を承認しているレビュアーを示します。最後に許されたレビューの後に修正し、上限で「やめる」を選んだ場合は、最終修正がレビューされていないことを報告します。上限で「受け入れて終える」を選ぶと `accepted` で終わります。答えを記録する前に、実装場所のコードが最新の checkpoint のままで、そのチェックが通っている（または人間が検証を認めた）ことを確かめます。受け入れた版は resolutions の記録の `snapshot_id` です。チェックの再試行上限はレビュー上限と別管理です。
 
 ## レビューのパケットとレビュアーの CLI
 
@@ -141,7 +145,7 @@ checkpoint では、開始時からの変更の一覧（`snapshots/NNN.json`）�
 
 差分のファイルは、開始時から今までのスナップショットの範囲の変更を、Git の unified diff と同じ形で書きます。空のファイルの追加・削除、モードだけの変更、バイナリの変更にも、必ず見出し（`diff --git`、`new file mode`、`old mode` / `new mode`、`Binary files … differ`）を付けます。
 
-レビュアーの CLI ごとの違いは、`reviewers.py` の `CLI` のサブクラス（`Codex`、`OpenCode`）に集めます。サブクラスは、使うサブコマンド、引数、標準入力、答えと動きの読み方を持ちます。事前確認は、引数に含まれるオプション（`--` で始まるもの）が、サブコマンドの `--help` にあることを確かめます。DevFlow が加えるのは、モデルと effort、承認を待たないこと（Codex には `approval_policy="never"` を渡す。OpenCode の `opencode run` は、利用者の設定で確認が要る操作を、自分で断って続ける）、JSON での出力、結果のスキーマ（Codex）、作業ディレクトリと `PWD`、標準入力（Codex にはプロンプトを渡してから閉じ、OpenCode は初めから閉じる）だけです。新しい CLI は、サブクラスを1つ書いて `CLIS` と `settings.REVIEWER_KINDS` に名前を足せば加えられます。確かめた版を `environment.CHECKED_VERSIONS` に足すと、それより新しい版で `doctor` が警告します（足さなければ警告しません）。
+レビュアーの CLI ごとの違いは、`reviewers.py` の `CLI` のサブクラス（`Codex`、`OpenCode`）に集めます。サブクラスは、使うサブコマンド、引数、標準入力、答えと動きの読み方を持ちます。事前確認は、引数に含まれるオプション（`--` で始まるもの）が、サブコマンドの `--help` にあることを確かめます。DevFlow が加えるのは、モデルと effort、承認を待たないこと（Codex には `approval_policy="never"` を渡す。OpenCode の `opencode run` は、利用者の設定で確認が要る操作を、自分で断って続ける）、JSON での出力、結果のスキーマ（Codex）、作業ディレクトリと `PWD`、標準入力（Codex にはプロンプトを渡してから閉じ、OpenCode は初めから閉じる）だけです。新しい CLI は、サブクラスを1つ書いて `CLIS` と `settings.REVIEWER_KINDS` に名前を足せば加えられます。トークン数は、サブクラスの `tokens` が CLI の名前のまま、平らな「名前 → 数」で返します（書かなければ unknown）。Codex は `turn.completed` の `usage` がスレッドの累計なので、スレッドごとの最後の値を足します。OpenCode は `step_finish` の `tokens` が1段階分なので、全部を足し、入れ子は `cache.read` のようにつなぎます。トークン数は答えの成否と関係なく、回の出力（`review-processes/NN/stdout.jsonl`）から読み、成功・失敗・回復のどの回の記録にも残します。確かめた版を `environment.CHECKED_VERSIONS` に足すと、それより新しい版で `doctor` が警告します（足さなければ警告しません）。
 
 出力の検査は、壊れているとわかるときだけ失敗にします。
 
@@ -157,9 +161,9 @@ checkpoint では、開始時からの変更の一覧（`snapshots/NNN.json`）�
 
 ## 状態保存と復旧
 
-対象プロジェクトの `.devflow/runs/plan/RUN_ID/` と `.devflow/runs/implement/RUN_ID/` に、計画、設定、ベースライン、スナップショット、チェック、レビュー、採否、人間の発言を保存します。確定記録は上書きしません。レビュアーへの入力、ログ、生の出力は、両フローとも `review-processes/NN/` に置きます。受け付けたレビューの `reviews/NN/review.json` は、フローで形が違います。Implement はレビューの答えそのもの（レビュアーと動きの数は state の `attempts` に記録）、Plan は答え（`result`）を、レビュアー（`provider`）、プランのハッシュ、動きの数（`activity`）と一緒に包んだものです。
+対象プロジェクトの `.devflow/runs/plan/RUN_ID/` と `.devflow/runs/implement/RUN_ID/` に、計画、設定、ベースライン、スナップショット、チェック、レビュー、採否、人間の発言を保存します。確定記録は上書きしません。レビュアーへの入力、ログ、生の出力は、両フローとも `review-processes/NN/` に置きます。受け付けたレビューの `reviews/NN/review.json` は、フローで形が違います。Implement はレビューの答えそのもの（レビュアーと動きの数は state の `attempts` に記録）、Plan は答え（`result`）を、レビュアー（`provider`）、プランのハッシュとレビューした版の番号（`plan_version`）、動きの数（`activity`）、トークン数（`tokens`）、時刻（`started_at`・`finished_at`）と一緒に包んだもの（`schema_version` 2）です。Plan の失敗した回の `error.json` と回復した回の `recovery.json` にも、時刻、トークン数、版の番号が入ります。直しの記録 `reflection.json` は、前後の版の番号と、足した行と消した行の数（直したときに1回だけ数える）を持ちます。
 
-- **run の state**（`schema_version` 8）は、全フロー共通の枠（`owner_session`、`event_ids`、`inflight`、`escalation` など）と、各フローが宣言した項目だけを持ちます。処理中の状態（チェック中・レビュー中）と `inflight` は必ず一致します。それより古い形式（0.1.x の 1、0.2.x の 2、0.3.x の 3、0.4.0 の開発中の 4 と 5、0.4.x の 6、0.5.x の 7）の run は `unsupported`、読めない run は `invalid` として扱い、`unsupported` だけは新しい開始を止めません。
+- **run の state**（`schema_version` 9）は、全フロー共通の枠（`owner_session`、`event_ids`、`inflight`、`escalation`、run が初めて終わった時刻 `finished_at` など）と、各フローが宣言した項目だけを持ちます。処理中の状態（チェック中・レビュー中）と `inflight` は必ず一致します。それより古い形式（0.1.x の 1、0.2.x の 2、0.3.x の 3、0.4.0 の開発中の 4 と 5、0.4.x の 6、0.5.x の 7、0.6.x の 8）の run は `unsupported`、読めない run は `invalid` として扱い、`unsupported` だけは新しい開始を止めません。
 - **所有者**は run の `owner_session` だけで決まります。セッション記録（`.devflow/sessions/<ハッシュ>.json`）は、そのセッションが見ている run か、開始待ちのどちらか一方だけを持ちます。終わった run と `unsupported` の run への紐付けは、次の入力（バックグラウンドの処理の終わりの知らせを含む）で外します。そのため Claude は、run ができたあとの操作に `--run RUN_ID` を付けます。
 - **run を変える操作**は、`--session` に所有者のセッションを渡したときだけ受け付けます（`Command.needs_owner`）。`status`、`doctor`、人間専用の `recover` は所有者を問いません。
 - **開始**は「開始待ちの記録 → run の作成 → 紐付け」の3段階です。run は一時ディレクトリに全部作ってから rename で置くので、途中の状態の run は現れません。途中で止まった場合、次の入力で、作成済みなら紐付けを完了し、未作成なら開始待ちを取り消します。

@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from ..common import summary
 from ..common.errors import DevFlowError, UsageError
 from ..common.environment import bash_timeout_ms
 from ..common.review import after_failed_review, check_review_budget, check_review_config, review_budget
@@ -38,7 +39,7 @@ class ImplementWorkflow(Workflow):
     commands = COMMANDS
     name = "implement"
     statuses = frozenset({"implementing", "needs_revision", "ready_check", "checking", "ready_review",
-                          "reviewing", "awaiting_human", "paused_error", "completed", "exhausted", "cancelled"})
+                          "reviewing", "awaiting_human", "paused_error"}) | TERMINAL
     inflight_statuses = frozenset({"checking", "reviewing"})
     state_fields = frozenset({"config", "plan_source", "source_digest", "attempts", "review_limit", "approvals",
                               "revision", "checkpoint_count", "check_attempts", "check_dispatch_count", "check_history",
@@ -127,8 +128,14 @@ class ImplementWorkflow(Workflow):
             state.update(status="paused_error", resume_status="implementing", approvals={})
         else:
             # An interrupted review is a reviewer failure: other approvals stay.
-            state["attempts"][-1].update(status="failed", error="Human-confirmed interrupted dispatch; outcome unknown",
-                                         finished_at=now())
+            from ..common.reviewers import review_tokens
+            attempt = state["attempts"][-1]
+            reviewer = next(r for r in state["config"]["reviewers"] if r["id"] == attempt["reviewer_id"])
+            # The human confirmed the process stopped: its output no longer grows.
+            tokens = review_tokens(reviewer, store.run_dir(state["run_id"]) / "review-processes"
+                                   / f"{attempt['number']:02}")
+            attempt.update(status="failed", error="Human-confirmed interrupted dispatch; outcome unknown",
+                           finished_at=now(), tokens=tokens)
             state.update(status=after_failed_review(len(state["attempts"]), state, "ready_review"),
                          resume_status="ready_review")
         state.update(last_error="Recovered interrupted operation after human process confirmation")
@@ -140,7 +147,7 @@ class ImplementWorkflow(Workflow):
             state["resume_status"] = None
 
     def before_save(self, store, state: dict) -> None:
-        if state["status"] in {"completed", "exhausted", "cancelled"}:
+        if state["status"] in TERMINAL:
             from .engine import terminal_report
             relative = f"reports/final-{state['state_revision'] + 1:06}.json"
             # Ending a run must not depend on every event file being readable;
@@ -150,8 +157,21 @@ class ImplementWorkflow(Workflow):
                 observed_error = None
             except (DevFlowError, OSError, ValueError) as exc:
                 observed, observed_error = None, str(exc)
-            store.stage(state, relative, json_bytes(terminal_report(store.project, state, observed, observed_error)))
+            report = terminal_report(store, state, observed, observed_error)
+            data = json_bytes(report)
+            try:
+                check_json_size(relative, data)
+            except DevFlowError:
+                # The run's end and its acceptance are saved; the summary is never cut,
+                # and status still shows it, rebuilt from the records.
+                report.update(review_summary=None, review_summary_error=summary.TOO_LARGE)
+                data = json_bytes(report)
+            store.stage(state, relative, data)
             state["report_path"] = relative
+
+    def review_summary_source(self, store, state: dict) -> dict:
+        from .engine import summary_source
+        return summary_source(store, state)
 
     def context_fields(self, state: dict, run_dir: Path) -> dict:
         budget = self.summary(state)

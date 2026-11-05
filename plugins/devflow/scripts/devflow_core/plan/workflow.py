@@ -7,7 +7,7 @@ import re
 from ..common.errors import UsageError
 from ..common.review import after_failed_review, check_review_budget, check_review_config, review_budget
 from ..common.runs import TERMINAL
-from ..common.storage import json_bytes
+from ..common.storage import json_bytes, now
 from ..common.workflow import Workflow
 from .commands import COMMANDS
 
@@ -18,7 +18,7 @@ class PlanWorkflow(Workflow):
     commands = COMMANDS
     name = "plan"
     statuses = frozenset({"interview", "planning", "ready", "reviewing", "awaiting_revision",
-                          "awaiting_human", "paused_error", "completed", "exhausted", "cancelled"})
+                          "awaiting_human", "paused_error"}) | TERMINAL
     inflight_statuses = frozenset({"reviewing"})
     state_fields = frozenset({"config", "review_count", "review_limit", "plan_version", "plan_hash", "current_plan",
                               "passes", "transcript_marker", "resolved_escalations", "last_error", "last_review",
@@ -77,12 +77,19 @@ class PlanWorkflow(Workflow):
             state["status"] = "ready"
 
     def on_recover(self, store, state: dict) -> None:
+        from ..common.reviewers import review_tokens
         number = state["review_count"]
         state["status"] = after_failed_review(number, state, "ready")
         inflight = state["inflight"]
+        reviewer = next(r for r in state["config"]["reviewers"] if r["id"] == inflight["reviewer_id"])
         state["last_error"] = {"review_number": number, "provider": inflight["reviewer_id"],
                                "plan_hash": inflight["target"], "message": "Operator confirmed the interrupted "
-                               "reviewer process is stopped; attempt remains consumed."}
+                               "reviewer process is stopped; attempt remains consumed.",
+                               # The human confirmed the process stopped: its output no longer grows.
+                               "started_at": inflight["started_at"], "finished_at": now(),
+                               "tokens": review_tokens(reviewer, store.run_dir(state["run_id"]) / "review-processes"
+                                                       / f"{number:02d}"),
+                               "plan_version": state["plan_version"]}
         store.stage(state, f"reviews/{number:02d}/recovery.json", json_bytes(state["last_error"]))
 
     def context_fields(self, state: dict, run_dir: Path) -> dict:
@@ -95,6 +102,10 @@ class PlanWorkflow(Workflow):
     def summary(self, state: dict) -> dict:
         return {**review_budget(state, state["review_count"]),
                 "publication": state["publication"]}
+
+    def review_summary_source(self, store, state: dict) -> dict:
+        from .engine import summary_source
+        return summary_source(store, state)
 
     def frozen_config(self, state: dict) -> dict:
         return state["config"]

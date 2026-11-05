@@ -13,8 +13,12 @@ REVIEW_BUDGET = "review_budget"
 REVIEW_LIMIT_REASON = "The review limit is reached without approval from every reviewer"
 REVIEW_LIMIT_QUESTION = ("Review limit reached: {used} of {limit} reviews used. "
                          "Reviewers approving the current version: {approved}. "
-                         "Continue with {grant} more reviews (new limit {new_limit}; "
-                         "next reviewers in order: {order}), or stop and end the run as exhausted?")
+                         "Choose one: (1) continue with {grant} more reviews (new limit {new_limit}; "
+                         "next reviewers in order: {order}); (2) stop and end the run as exhausted; "
+                         "(3) accept the current version ({version}) and end the run as accepted "
+                         "(accepted by the human, not approved by every reviewer).")
+#: The answers to the review limit question, in the order it lists them.
+LIMIT_DECISIONS = ("continue", "stop", "accept")
 # Field names in a rejected response come from the model: show a bounded,
 # escaped, deterministic selection.
 SHOWN_FIELD_NAMES = 8
@@ -46,14 +50,16 @@ def after_failed_review(used: int, state: dict, ready_status: str) -> str:
     return "paused_error" if used < state["review_limit"] else ready_status
 
 
-def ask_at_limit(state: dict, used: int, approved: Collection[str],
+def ask_at_limit(state: dict, used: int, approved: Collection[str], version: str,
                  escalate: Callable[[str, list[str]], None]) -> bool:
-    """At the review limit, ask the human whether to add one round of reviewers.
+    """At the review limit, ask the human whether to add one round of reviewers,
+    stop, or accept the current version.
 
     Returns False while reviews remain. At the limit it calls ``escalate(reason,
     questions)`` with the review_budget question, or ends the run as exhausted
     when one more round would pass TOTAL_REVIEW_CEILING, and returns True.
-    ``approved`` holds the reviewers approving the current version.
+    ``approved`` holds the reviewers approving the current version, and
+    ``version`` names that version (a plan hash or snapshot ID).
     """
     limit = state["review_limit"]
     if used < limit:
@@ -67,20 +73,23 @@ def ask_at_limit(state: dict, used: int, approved: Collection[str],
     order = [reviewers[(used + index) % grant]["id"] for index in range(grant)]
     escalate(REVIEW_LIMIT_REASON, [REVIEW_LIMIT_QUESTION.format(
         used=used, limit=limit, approved=", ".join(approving) or "none", grant=grant,
-        new_limit=limit + grant, order=", ".join(order))])
+        new_limit=limit + grant, order=", ".join(order), version=version)])
     return True
 
 
 def decide_at_limit(state: dict, decision: str, return_status: str) -> None:
     """Apply the human's answer to the review_budget question: continue adds one
-    round of reviewers and returns to ``return_status``; stop ends as exhausted."""
+    round of reviewers and returns to ``return_status``; stop ends as exhausted;
+    accept ends as accepted. Stop and accept change neither the limit nor approvals."""
     if decision == "continue":
         state["review_limit"] += len(state["config"]["reviewers"])
         state["status"] = return_status
     elif decision == "stop":
         state["status"] = "exhausted"
+    elif decision == "accept":
+        state["status"] = "accepted"
     else:
-        raise DevFlowError("The review limit question takes continue or stop")
+        raise DevFlowError("The review limit question takes continue, stop or accept")
 
 
 VERDICTS = ("pass", "changes_required", "human_required")

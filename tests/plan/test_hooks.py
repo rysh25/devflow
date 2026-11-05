@@ -253,7 +253,7 @@ class DispatchTests(PlanHookFixture):
         self.assertEqual(self.bound_run(), self.run_id)  # The binding is kept.
 
     def test_terminal_releases_only_after_next_human_prompt(self):
-        for status in ("completed", "exhausted", "cancelled"):
+        for status in ("completed", "exhausted", "cancelled", "accepted"):
             with self.subTest(status=status):
                 self.start()
                 self.set_status(status)
@@ -266,7 +266,7 @@ class DispatchTests(PlanHookFixture):
                 self.assertIsNone(result)
                 # Only the start prompt: neither tool calls nor the releasing prompt are recorded.
                 self.assertEqual(len(self.events()), 1)
-        self.assertEqual(len(self.store.scan()[0]), 3)
+        self.assertEqual(len(self.store.scan()[0]), 4)  # One run per terminal status.
 
     def test_new_workflow_can_start_after_terminal_handoff(self):
         self.start()

@@ -9,10 +9,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
+from . import summary
 from .errors import DevFlowError
-from .runs import RUNNER_WAIT, RunStore
+from .review import REVIEW_BUDGET
+from .runs import RUNNER_WAIT, TERMINAL, RunStore
 from .sessions import approval_candidates, prefilled_question_events
-from .storage import read_json
+from .storage import now, read_json
 
 
 class RunEngine:
@@ -137,8 +139,26 @@ class RunEngine:
         except (DevFlowError, OSError, ValueError) as exc:
             result.update(human_events=[], prefilled_questions=None,
                           events_error=f"Human event records cannot be read: {exc}")
+        self._review_summary(state, result)
         self._status_details(state, result)
         return result
+
+    def _review_summary(self, state: dict, result: dict) -> None:
+        """The review summary, while the review limit question waits and after the run ends.
+        Status only displays: a summary that cannot be built is reported, not raised."""
+        escalation = state["escalation"] or {}
+        if state["status"] not in TERMINAL and not (
+                state["status"] == "awaiting_human" and escalation.get("detail", {}).get("kind") == REVIEW_BUDGET):
+            return
+        try:
+            source = self.workflow.review_summary_source(self.store, state)
+            if source is None:
+                return
+            data = summary.build(source, now())
+            result.update(review_summary=data, review_summary_markdown=summary.render(data), review_summary_error=None)
+        except (DevFlowError, OSError, ValueError, KeyError, TypeError) as exc:
+            result.update(review_summary=None, review_summary_markdown=None,
+                          review_summary_error=f"The review summary cannot be built: {exc}")
 
     def _status_details(self, state: dict, result: dict) -> None:
         """Workflow-specific additions to ``status`` (optional)."""

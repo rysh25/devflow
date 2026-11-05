@@ -774,5 +774,91 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(self.attempts(), [])
 
 
+class TokenTests(unittest.TestCase):
+    """Token counts under each CLI's own names, read whether or not the answer was valid."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="devflow tokens ")
+        self.addCleanup(temporary.cleanup)
+        # Resolved, as run directories are: macOS keeps temporary files under a symlink
+        # (/var -> /private/var), and records are never read through one.
+        self.work = Path(temporary.name).resolve()
+
+    def tokens(self, kind, output):
+        (self.work / "stdout.jsonl").write_text(output, encoding="utf-8")
+        return reviewers.review_tokens(reviewer(kind), self.work)
+
+    def test_codex_counts_the_last_running_total_of_each_thread(self):
+        output = lines({"type": "thread.started", "thread_id": "main"},
+                       {"type": "turn.completed", "thread_id": "main", "usage": {"input_tokens": 10, "output_tokens": 1}},
+                       # The same thread's running total again: it replaces the earlier one.
+                       {"type": "turn.completed", "thread_id": "main", "usage": {"input_tokens": 25, "output_tokens": 4}},
+                       {"type": "turn.completed", "thread_id": "sub", "usage": {"input_tokens": 3}},
+                       "not json", {"type": "turn.completed", "usage": "not an object"})
+        self.assertEqual(self.tokens("codex", output), {"input_tokens": 28, "output_tokens": 4})
+        # An event without a thread belongs to the main thread.
+        output = lines({"type": "thread.started", "thread_id": "main"},
+                       {"type": "turn.completed", "thread_id": "main", "usage": {"input_tokens": 10}},
+                       {"type": "turn.completed", "usage": {"input_tokens": 12}})
+        self.assertEqual(self.tokens("codex", output), {"input_tokens": 12})
+
+    def test_opencode_adds_every_step_of_every_session_with_joined_names(self):
+        output = lines(oc("step_finish", tokens={"input": 5, "output": 1, "cache": {"read": 100, "write": 0}}),
+                       oc("step_finish", session="sub", tokens={"input": 2, "reasoning": 7}),
+                       oc("step_finish", reason="stop"), oc("text", text="x"))
+        self.assertEqual(self.tokens("opencode", output),
+                         {"cache.read": 100, "cache.write": 0, "input": 7, "output": 1, "reasoning": 7})
+
+    def test_only_non_negative_integers_count_and_none_means_unknown(self):
+        output = lines(oc("step_finish", tokens={"input": True, "output": -1, "reasoning": 1.5, "total": "9"}))
+        self.assertIsNone(self.tokens("opencode", output))
+        self.assertIsNone(self.tokens("codex", lines({"type": "turn.started"})))
+        (self.work / "stdout.jsonl").unlink()
+        self.assertIsNone(reviewers.review_tokens(reviewer("codex"), self.work))
+        self.assertIsNone(reviewers.CLI().tokens(self.work / "stdout.jsonl"))
+
+    def test_counts_survive_an_invalid_answer_or_a_timeout_and_never_fail_a_review(self):
+        # The turn completed with its usage, then the output stopped (a timeout) or held no valid answer.
+        output = codex(end=({"type": "turn.completed", "usage": {"input_tokens": 4}},)) + "\n{\"type\": \"item.started\""
+        self.assertEqual(self.tokens("codex", output), {"input_tokens": 4})
+        (self.work / "stdout.jsonl").write_bytes(b"\xff\xfe" + json.dumps(
+            {"type": "turn.completed", "usage": {"input_tokens": 1}}).encode())
+        self.assertIsNone(reviewers.review_tokens(reviewer("codex"), self.work))  # one undecodable line
+        with patch.object(reviewers.Codex, "tokens", side_effect=ReviewerError("unreadable")):
+            self.assertIsNone(self.tokens("codex", "x"))
+        self.assertIsNone(reviewers.review_tokens({"kind": "unknown"}, self.work))
+
+    def test_the_recorded_cli_version(self):
+        self.assertIsNone(reviewers.recorded_cli_version(self.work))
+        (self.work / "invocation.json").write_text(json.dumps({"cli_version": "codex-cli 0.166.0"}), encoding="utf-8")
+        self.assertEqual(reviewers.recorded_cli_version(self.work), "codex-cli 0.166.0")
+
+    def test_deeply_nested_lines_are_unreadable_lines_not_errors(self):
+        deep = "[" * 100000 + "]" * 100000
+        output = lines(oc("step_finish", tokens={"input": 2}), deep)
+        self.assertEqual(self.tokens("opencode", output), {"input": 2})
+        self.assertEqual(reviewers.parse_codex_events(codex(deep).split("\n"))["other_events"], {"(unreadable line)": 1})
+        # Token counts nested too deeply to read are unknown, not an error. Written as text:
+        # building such a value in Python and encoding it would itself fail (Python 3.11).
+        nested = '{"type": "step_finish", "part": {"tokens": ' + '{"x": ' * 5000 + "{}" + "}" * 5000 + "}}"
+        (self.work / "stdout.jsonl").write_text(nested, encoding="utf-8")
+        self.assertIsNone(reviewers.review_tokens(reviewer("opencode"), self.work))
+        (self.work / "invocation.json").write_text(deep, encoding="utf-8")
+        self.assertIsNone(reviewers.recorded_cli_version(self.work))
+
+    def test_counts_whose_sum_cannot_be_written_are_unknown(self):
+        # Each total parses, but their sum passes Python's integer-to-text limit (4,300 digits).
+        output = lines(*('{"type": "turn.completed", "thread_id": "%s", "usage": {"input_tokens": %s}}' % (thread, "9" * 4300)
+                         for thread in ("main", "sub")))
+        self.assertIsNone(self.tokens("codex", output))
+
+    def test_metadata_a_record_cannot_hold_is_unknown(self):
+        # JSON accepts an escaped lone surrogate; UTF-8 records cannot hold it.
+        output = lines({"type": "turn.completed", "usage": {"\ud800": 5, "input_tokens": 1}})
+        self.assertEqual(self.tokens("codex", output), {"input_tokens": 1})
+        (self.work / "invocation.json").write_text(json.dumps({"cli_version": "codex \ud800"}), encoding="utf-8")
+        self.assertIsNone(reviewers.recorded_cli_version(self.work))
+
+
 if __name__ == "__main__":
     unittest.main()
