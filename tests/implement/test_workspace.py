@@ -87,7 +87,7 @@ class WorkspaceStartTests(WorkspaceFixture):
         checked = self.engine.check(self.run_id, self.session)
         self.assertEqual(checked["status"], "ready_review")
         results = read_json(Path(checked["run_dir"]) / checked["validation"]["path"])["results"]
-        self.assertTrue(same_path(results[0]["stdout"].strip(), self.worktree))
+        self.assertTrue(same_path(Path(results[0]["stdout_path"]).read_text().strip(), self.worktree))
 
     def test_a_relative_workspace_is_resolved_against_the_project(self):
         status = self.start("../feature worktree")

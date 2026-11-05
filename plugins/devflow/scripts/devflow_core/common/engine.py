@@ -74,10 +74,7 @@ class RunEngine:
         self._check_frozen_config(state)
 
     def read_frozen_config(self, run_id: str) -> dict | None:
-        """The run's frozen configuration (None if its workflow has none); repairs nothing."""
-        if (self._run(run_id) / "transaction.json").exists():
-            raise DevFlowError("Diagnosis changes nothing; complete the pending run transaction with /devflow:resume "
-                               "or cancel first.")
+        """The run's frozen configuration (None if its workflow has none); changes nothing."""
         return self._check_frozen_config(self.store.read(run_id))
 
     # -- external processes -----------------------------------------------------------------

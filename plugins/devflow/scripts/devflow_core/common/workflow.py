@@ -90,11 +90,15 @@ class Workflow:
         """Canonical start argument; the start hook and the runner compare these."""
         raise NotImplementedError
 
-    def build_start(self, project: Path, pending: dict, options: dict) -> tuple[dict, dict[str, bytes]]:
+    def build_start(self, project: Path, pending: dict, options: dict,
+                    scratch: Path) -> tuple[dict, dict[str, bytes | Path]]:
         """Return the workflow fields (including ``status``) and initial artifacts.
 
         ``options`` holds the values of ``extra_start_options`` (by
         ``option_name``); it is empty when the run starts inside the hook.
+        An artifact is bytes, or a file written with ``write_new`` in
+        ``scratch`` (a private directory next to the runs), which is moved
+        into the run, so large start records never pass through memory.
         """
         raise NotImplementedError
 

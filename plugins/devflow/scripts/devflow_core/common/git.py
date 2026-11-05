@@ -19,7 +19,11 @@ from .process import run_bounded
 
 #: Arguments every call gets: no pager, no index refresh, no fsmonitor hook.
 BASE_ARGS = ("--no-pager", "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false")
-DEFAULT_LIMIT = 8 * 1024 * 1024
+#: The default wait for a Git call; it finds a Git that hangs.
+TIMEOUT_SECONDS = 30
+#: A conservative read rate for Git calls that read file contents, so their wait
+#: grows with what they read instead of acting as a size limit.
+CONTENT_BYTES_PER_SECOND = 10 * 1024 * 1024
 
 
 #: The variables that choose the user's configuration files; they are kept.
@@ -42,19 +46,25 @@ def git_executable() -> str:
     return executable
 
 
-def run_git(root: Path, *args: str, ok_codes: tuple[int, ...] = (0,), timeout: float = 30,
-            limit: int = DEFAULT_LIMIT) -> bytes:
-    """Run ``git -C root ARGS`` and return stdout; any failure raises DevFlowError."""
+def content_timeout(size: int) -> float:
+    """The wait for a Git call that reads ``size`` bytes of file contents."""
+    return TIMEOUT_SECONDS + -(-max(0, size) // CONTENT_BYTES_PER_SECOND)
+
+
+def run_git(root: Path, *args: str, ok_codes: tuple[int, ...] = (0,), timeout: float = TIMEOUT_SECONDS,
+            data: bytes | None = None) -> bytes:
+    """Run ``git -C root ARGS`` (``data`` on its standard input) and return stdout.
+
+    Any failure raises DevFlowError; the output is never limited by size.
+    """
     command = [git_executable(), *BASE_ARGS, "-C", str(root), *args]
-    result = run_bounded(command, cwd=Path(root), timeout=timeout, limit=limit, env=git_environment())
+    result = run_bounded(command, cwd=Path(root), timeout=timeout, env=git_environment(), data=data)
     if result.timed_out:
         raise DevFlowError(f"Cannot inspect Git repository: git exceeded {timeout:g} seconds")
-    if result.output_limit_exceeded:
-        raise DevFlowError(f"Cannot inspect Git repository: output exceeded {limit} bytes")
     if result.retained_pipes:
         raise DevFlowError("Cannot inspect Git repository: a descendant retained output pipes")
-    if result.read_error:
-        raise DevFlowError("Cannot inspect Git repository: " + result.read_error)
+    if result.output_error:
+        raise DevFlowError("Cannot inspect Git repository: " + result.output_error)
     if result.exit_code not in ok_codes:
         message = result.stderr.decode("utf-8", "replace").strip()[:1000]
         raise DevFlowError(f"Git inspection failed ({result.exit_code}): {message}")

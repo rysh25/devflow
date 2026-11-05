@@ -1,4 +1,4 @@
-# DevFlow 0.5.1 — Claude Code Plugin
+# DevFlow 0.6.0 — Claude Code Plugin
 
 人間との要件整理から計画作成、実装、独立レビューまでを支援する **単一の Claude Code Plugin** です。インストールするプラグインは `devflow` だけです。
 
@@ -38,7 +38,7 @@ claude plugin install devflow@devflow-marketplace --scope user
 
 GitHub に置く場合も公開リポジトリは必須ではありません。認証済みの private リポジトリを marketplace として登録できます。詳細は [インストールと環境設定](docs/installation.md) を参照してください。
 
-更新は、GitHub から導入した場合は次の2つを実行し、Claude Code を起動し直します。ZIP から導入した場合と、更新の前後の注意は [更新する](docs/installation.md#更新する) と「[0.5.1 への更新](#051-への更新)」（それより前の版から上げるときは「[0.5.0 への更新](#050-への更新)」「[0.4.0 への更新](#040-への更新)」も）を参照してください。
+更新は、GitHub から導入した場合は次の2つを実行し、Claude Code を起動し直します。ZIP から導入した場合と、更新の前後の注意は [更新する](docs/installation.md#更新する) と「[0.6.0 への更新](#060-への更新)」（それより前の版から上げるときは「[0.5.1 への更新](#051-への更新)」「[0.5.0 への更新](#050-への更新)」「[0.4.0 への更新](#040-への更新)」も）を参照してください。
 
 ```text
 claude plugin marketplace update devflow-marketplace
@@ -181,7 +181,6 @@ Implement は開始時のプランと作業ツリーを固定し、Claude Code �
 | `command` | CLI を起動する引数の配列（例：`["codex"]`、`["node", "/path/to/cli.js"]`）。DevFlow はシェルを通さずに起動する |
 | `model`、`effort` | モデルと推論の強さ。DevFlow が引数に組み込むので、`-` で始まらず、空白・`"`・`\`・`#` を含まないもの |
 | `timeout_seconds` | 1回のレビューの制限時間（5〜3600 秒、既定 1800 秒）。DevFlow はレビュアーへの指示に、持ち時間、止める時刻、答えを書き始める目安の時刻（持ち時間の 80% の時点）を書く。時間を過ぎると DevFlow がレビュアーを止め、その回は失敗 |
-| `max_output_bytes` | 任意。レビュアーの出力の上限（既定 16 MiB） |
 
 知らない項目があると、その項目の名前を示すエラーになります。
 
@@ -249,6 +248,27 @@ uv run --offline --no-project --no-config --no-python-downloads "PLUGIN_DIR/scri
 
 詳しくは [設計](docs/architecture.md)、[信頼の考え方と注意](docs/security.md)、[検証範囲](docs/validation.md) を参照してください。
 
+## 0.6.0 への更新
+
+更新の前に、次を確認してください。
+
+- **0.5.x の run は続けられません。** 続ける場合は、更新の前に 0.5.x のまま終えるか、取り消してください。更新後は `status` に `unsupported` と表示され、新しい run の開始は止めません。
+- **`devflow.config.json` から次の項目を消してください。** 0.6.0 にはなく、残っていると、その名前を示すエラーになります。
+  - `implement.snapshot.max_files`、`implement.snapshot.max_file_bytes`、`implement.snapshot.max_total_bytes`
+  - `reviewers[].max_output_bytes`
+  - `implement.checks[].max_output_bytes`
+
+変わる動き：
+
+- **プロジェクトの中身や出力の大きさでは止めません。** ファイルの大きさと数、レビュアーとチェックの出力、Plan の面接の transcript に、上限はありません。外部の処理を止めるのは時間切れだけです。
+- **Implement の記録は、ファイルの中身を写しません。**
+  - 開始時は、ファイルごとのパス・ハッシュ・サイズ・実行属性の一覧を記録します。中身を保存するのは、Git が同じバイト列を持っていない本文ファイル（開始前の変更、未追跡のファイル、`files` モードの本文ファイル）だけで、開始時に1回だけです。
+  - checkpoint では、変更の一覧と、差分のファイル `snapshots/NNN.diff` を1回だけ書きます。レビュアーに渡す差分も、このファイルです。
+- **チェックの出力は、ログのファイルにだけあります。** チェックの記録には、ログの場所を書きます。
+- **Stop の hook はなくなりました。** フックは `UserPromptSubmit`、`PreToolUse`、`PostToolUse` の3つです。
+- **途中で止まった保存は、なかったことになります。** run の記録は、新しい記録を書いてから `state.json` を置き換えて確定します。「途中の保存が残っている」という状態はなくなりました。止まった操作は、もう一度実行します（チェックやレビュアーが終わった後の保存なら、これまでどおり `recover` で終えます）。
+- **対象範囲がおよそ 25 万ファイル（パスの長さによる）を超えると、開始時にエラーになります。** 記録の JSON が読み込みの上限（64 MiB）を超えるためです。`snapshot.include` / `snapshot.exclude` で範囲を絞ってください。
+
 ## 0.5.1 への更新
 
 - **0.5.0 で始めた run は、そのまま続けられます。** 始めたときの設定（既定なら 900 秒）のまま動きます。
@@ -282,7 +302,7 @@ uv run --offline --no-project --no-config --no-python-downloads "PLUGIN_DIR/scri
 変わる動き：
 
 - **DevFlow は、どのツールも制限しません。** Plan と Implement の中で、Claude Code の設定とモードが許すツール（Bash、PowerShell、サブエージェント、MCP、Web など）をそのまま使えます。フックは失敗しても止めません。Plan で「ソースとドキュメントを書き換えない」「人間への質問はこの会話でする」は、スキルの指示で頼みます。
-- **レビュアーは、自分のツールでファイルを読みます。** 利用者の各 CLI の設定のまま、実装場所（Plan ではプロジェクト）で起動します。パケットにはファイルの中身を入れず、場所と差分のファイル（`reviews/NN/changes.diff`）を渡します。プロジェクトの設定と `AGENTS.md` などは、各 CLI がふだんどおり読み込みます。ツールの呼び出しは止めず、件数を `status` と最終レポートに出します。
+- **レビュアーは、自分のツールでファイルを読みます。** 利用者の各 CLI の設定のまま、実装場所（Plan ではプロジェクト）で起動します。パケットにはファイルの中身を入れず、場所と差分のファイルを渡します。プロジェクトの設定と `AGENTS.md` などは、各 CLI がふだんどおり読み込みます。ツールの呼び出しは止めず、件数を `status` と最終レポートに出します。
 - **レビュアーの `command` の制限をなくしました。** シェルを通す起動や、各 CLI の確認を省くフラグも、利用者の選択として受け付けます。
 - **CLI の版の制限をなくしました。** DevFlow が渡すフラグがあれば、どの版でも動きます。確かめた版より新しいときは、`doctor` が警告します。
 - **`BASH_MAX_TIMEOUT_MS` の設定は任意になりました。** 足りないときは、Claude がレビューをバックグラウンドで実行します（「[長い処理と Claude Code の Bash](#長い処理と-claude-code-の-bash)」）。

@@ -1,4 +1,4 @@
-"""Extraction of a *bounded* Claude Code interview.
+"""Extraction of the marked part of a Claude Code interview (from its start marker to the seal).
 
 Only user-visible text and AskUserQuestion inputs/results leave this adapter.
 Thinking blocks, unrelated tool results, and earlier session history never do.
@@ -21,7 +21,6 @@ from ..common.counts import tally
 from ..common.errors import CaptureError
 from ..common.sessions import SCREEN_FILLED_QUESTION_FIELDS, answer_content as _answer_content, prefilled_question
 
-MAX_CAPTURE_BYTES = 16 * 1024 * 1024
 _TAIL_BYTES = 4096
 _IGNORED_RECORDS = {
     "progress", "file-history-snapshot", "queue-operation", "pr-link",
@@ -133,36 +132,47 @@ def transcript_marker(path: str | None) -> dict:
             "tail_size": tail_size, "tail_sha256": _digest(tail)}
 
 
-def _read_segment(marker: dict) -> str:
-    try:
-        path = Path(marker["path"])
-        offset = marker["offset"]
-        tail_size = marker["tail_size"]
-        if (not isinstance(offset, int) or isinstance(offset, bool) or offset < 0
-                or not isinstance(tail_size, int) or not 0 <= tail_size <= min(offset, _TAIL_BYTES)):
-            raise ValueError("invalid offsets")
-        stat = path.stat()
-        if not path.is_file():
-            raise CaptureError("Transcript is no longer a regular file")
-        if stat.st_size < offset:
-            raise CaptureError("Transcript was truncated; restart the interview rather than guess its history")
-        if marker.get("existed") and (stat.st_dev, stat.st_ino) != (
-                marker.get("device"), marker.get("inode")):
-            raise CaptureError("Transcript was replaced or rotated during the interview")
-        if stat.st_size - offset > MAX_CAPTURE_BYTES:
-            raise CaptureError("Interview transcript exceeds the 16 MiB capture limit")
-        with path.open("rb") as stream:
-            stream.seek(offset - tail_size)
-            if _digest(stream.read(tail_size)) != marker["tail_sha256"]:
-                raise CaptureError("Transcript prefix changed during the interview")
-            data = stream.read(MAX_CAPTURE_BYTES + 1)
-        if len(data) > MAX_CAPTURE_BYTES:
-            raise CaptureError("Interview transcript exceeds the 16 MiB capture limit")
-        return data.decode("utf-8")
-    except CaptureError:
-        raise
-    except (KeyError, ValueError, TypeError, OSError, UnicodeError) as exc:
-        raise CaptureError(f"Cannot read the marked interview transcript: {exc}") from exc
+class _Segment:
+    """The marked part of a transcript, read lazily one line at a time.
+
+    Lines are split only at newline (``\\n``): JSON strings may hold U+2028,
+    U+2029 or U+0085 unescaped, which ``str.splitlines`` would split. Each line
+    is strict UTF-8. The size is never limited; ``bytes_read`` is known once the
+    lines have been read.
+    """
+
+    def __init__(self, marker: dict):
+        self.marker = marker
+        self.bytes_read = 0
+
+    def __iter__(self):
+        marker = self.marker
+        try:
+            path = Path(marker["path"])
+            offset = marker["offset"]
+            tail_size = marker["tail_size"]
+            if (not isinstance(offset, int) or isinstance(offset, bool) or offset < 0
+                    or not isinstance(tail_size, int) or not 0 <= tail_size <= min(offset, _TAIL_BYTES)):
+                raise ValueError("invalid offsets")
+            stat = path.stat()
+            if not path.is_file():
+                raise CaptureError("Transcript is no longer a regular file")
+            if stat.st_size < offset:
+                raise CaptureError("Transcript was truncated; restart the interview rather than guess its history")
+            if marker.get("existed") and (stat.st_dev, stat.st_ino) != (
+                    marker.get("device"), marker.get("inode")):
+                raise CaptureError("Transcript was replaced or rotated during the interview")
+            with path.open("rb") as stream:
+                stream.seek(offset - tail_size)
+                if _digest(stream.read(tail_size)) != marker["tail_sha256"]:
+                    raise CaptureError("Transcript prefix changed during the interview")
+                for raw in stream:
+                    self.bytes_read += len(raw)
+                    yield raw.decode("utf-8")
+        except CaptureError:
+            raise
+        except (KeyError, ValueError, TypeError, OSError, UnicodeError) as exc:
+            raise CaptureError(f"Cannot read the marked interview transcript: {exc}") from exc
 
 
 def _scaffolding(text: str, record: dict) -> bool:
@@ -236,11 +246,12 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
     """
     if not isinstance(events, list) or any(not isinstance(e, dict) for e in events):
         raise CaptureError("Hook events must be a list of objects")
-    try:
-        if len(_json(events).encode("utf-8")) > MAX_CAPTURE_BYTES:
-            raise CaptureError("Interview hook log exceeds the 16 MiB capture limit")
-    except (TypeError, ValueError) as exc:
-        raise CaptureError(f"Invalid hook event data: {exc}") from exc
+    # Each record is checked on its own; the records are never joined into one string.
+    for index, event in enumerate(events):
+        try:
+            _json(event)
+        except (TypeError, ValueError) as exc:
+            raise CaptureError(f"Invalid hook event data at index {index}: {exc}") from exc
     prompts: list[dict] = []
     post_questions: list[tuple[int, dict]] = []
     unknown: dict[str, dict[str, int]] = {"records": {}, "attachments": {}, "blocks": {}, "hooks": {}}
@@ -261,7 +272,7 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
             post_questions.append((index, event))
     # No transcript (no path, or a file Claude Code never wrote): the hook records alone.
     missing = marker["path"] is None or not (marker.get("existed") or Path(marker["path"]).exists())
-    segment = "" if missing else _read_segment(marker)
+    segment = _Segment(marker)
 
     messages: list[dict] = []
     questions: dict[str, dict] = {}
@@ -331,7 +342,7 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
         seen_uuids[uuid] = fingerprint
         return False
 
-    for number, line in enumerate(segment.splitlines(), 1):
+    for number, line in enumerate(() if missing else segment, 1):
         if not line.strip():
             continue
         try:
@@ -582,7 +593,7 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
             for prompt in prompts[1:]:
                 prompt["origin_unknown"] = True
         return _hooks_only(marker, events, [p for p in prompts if p["event_index"] not in automated_events],
-                           post_questions, questions, len(segment.encode("utf-8")), scan, unhooked,
+                           post_questions, questions, segment.bytes_read, scan, unhooked,
                            _NO_TRANSCRIPT if missing else _UNPLACED)
     if unused:
         first = unused[0]
@@ -624,7 +635,7 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
     # (``assistant_messages``) instead of stopping.
     shown = any(m["role"] == "assistant" for m in messages)
     return {"schema_version": 1, "messages": messages, "coverage": _coverage(
-        "bounded-transcript-with-hook-provenance", marker, len(segment.encode("utf-8")), scan, messages,
+        "bounded-transcript-with-hook-provenance", marker, segment.bytes_read, scan, messages,
         reason=None if shown else ("No message of Claude's was in a form this version reads; the human's words "
                                    "are complete, Claude's are not included."),
         answered=sum(1 for item in questions.values()

@@ -9,6 +9,10 @@ from ..common.settings import validate_reviewers, workflow_overlay
 from .checks import validate_checks
 
 
+#: The snapshot settings; the scope's size is never limited.
+SNAPSHOT_FIELDS = frozenset({"mode", "include", "exclude", "context_paths", "max_packet_bytes"})
+
+
 def _integer(value, low, high, name):
     if type(value) is not int or not low <= value <= high:
         raise DevFlowError(f"{name} must be an integer between {low} and {high}")
@@ -24,16 +28,22 @@ def validate_config(value: dict) -> dict:
     if type(value["allow_dirty"]) is not bool:
         raise DevFlowError("allow_dirty must be a boolean")
     snapshot = value["snapshot"]
-    sf = {"mode", "include", "exclude", "context_paths", "max_files", "max_file_bytes", "max_total_bytes", "max_packet_bytes"}
-    if not isinstance(snapshot, dict) or set(snapshot) != sf or snapshot["mode"] not in {"git", "files"}:
-        raise DevFlowError("Invalid snapshot config; mode must explicitly be git or files")
+    if not isinstance(snapshot, dict):
+        raise DevFlowError("snapshot must be an object")
+    unknown, missing = set(snapshot) - SNAPSHOT_FIELDS, SNAPSHOT_FIELDS - set(snapshot)
+    if unknown or missing:
+        raise DevFlowError("Invalid snapshot fields"
+                           + (" (unknown: " + ", ".join(sorted(unknown)) + ")" if unknown else "")
+                           + (" (missing: " + ", ".join(sorted(missing)) + ")" if missing else "")
+                           + "; see the project settings in the DevFlow README")
+    if snapshot["mode"] not in {"git", "files"}:
+        raise DevFlowError("snapshot.mode must explicitly be git or files")
     for field in ("include", "exclude", "context_paths"):
         if not isinstance(snapshot[field], list) or any(not isinstance(x, str) or not x or "\x00" in x for x in snapshot[field]):
             raise DevFlowError(f"snapshot.{field} must be a string array")
     if not snapshot["include"]:
         raise DevFlowError("At least one snapshot include pattern is required")
-    for field, low, high in (("max_files", 1, 100000), ("max_file_bytes", 1024, 32*1024*1024), ("max_total_bytes", 1024, 64*1024*1024), ("max_packet_bytes", 1024, 16*1024*1024)):
-        _integer(snapshot[field], low, high, "snapshot." + field)
+    _integer(snapshot["max_packet_bytes"], 1024, 16 * 1024 * 1024, "snapshot.max_packet_bytes")
     validate_reviewers(value["reviewers"], value["max_reviews"])
     validate_checks(value["checks"])
     if value["checks"] and not any(check.get("required", True) for check in value["checks"]):

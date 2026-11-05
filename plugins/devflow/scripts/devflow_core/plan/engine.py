@@ -391,9 +391,10 @@ class Engine(RunEngine):
                 no_symlinks(target)
                 if target.read_bytes() != data:
                     raise DevFlowError("The exported plan changed during publication.")
-                receipt_path = run / "publication.json"
-                if receipt_path.exists():
-                    receipt = read_json(receipt_path)
+                # Whether a receipt exists is decided by the committed records, never by a
+                # file a stopped save may have left.
+                if "publication.json" in state["artifacts"]:
+                    receipt = read_json(run / "publication.json")
                     if receipt.get("path") != publication["path"] or receipt.get("plan_hash") != state["plan_hash"]:
                         raise DevFlowError("The existing publication receipt does not match this target.")
                 else:
@@ -405,7 +406,10 @@ class Engine(RunEngine):
                 state["publication"] = publication
                 self._save(state)
             except (DevFlowError, OSError, ValueError) as exc:
-                publication.update(status="error", error=str(exc))
+                # A state whose save may have failed is never saved again: the
+                # error is recorded on the committed state.
+                state = self._state(run_id)
+                publication = dict(state.get("publication", {}), status="error", error=str(exc))
                 state["publication"] = publication
                 self._save(state)
                 raise DevFlowError(f"Plan reviews completed, but publication failed: {exc}") from exc

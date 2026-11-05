@@ -112,9 +112,9 @@ class CliTests(unittest.TestCase):
         self.assertEqual(out, "")
         self.assertIn("DevFlow hook failed", err)
 
-    def test_stop_hook_error_cannot_cause_infinite_retry_loop(self):
-        code, out, err = self.cli("hook", stdin=json.dumps({"hook_event_name": "Stop"}))
-        self.assertEqual(code, 0)
+    def test_a_hook_input_missing_its_required_fields_exits_1_never_2(self):
+        code, out, err = self.cli("hook", stdin=json.dumps({"hook_event_name": "UserPromptSubmit"}))
+        self.assertEqual(code, 1)
         self.assertEqual(out, "")
         self.assertIn("DevFlow hook failed", err)
 

@@ -360,6 +360,39 @@ class GitEnvironmentTests(unittest.TestCase):
         self.assertEqual((env["GIT_TERMINAL_PROMPT"], env["GIT_OPTIONAL_LOCKS"]), ("0", "0"))
 
 
+class RunGitTests(unittest.TestCase):
+    """Each way a Git process can fail is its own error; the output is never limited."""
+
+    def run_with(self, completed, **options):
+        from devflow_core.common import git
+        with patch.object(git, "run_bounded", return_value=completed) as bounded, \
+                patch.object(git, "git_executable", return_value="git"):
+            return git.run_git(Path("."), "status", **options), bounded
+
+    def test_failures_are_named(self):
+        from devflow_core.common.process import Completed
+        for completed, message in ((Completed(None, b"", b"", True, False, None, 1.0), "git exceeded 7 seconds"),
+                                   (Completed(0, b"", b"", False, True, None, 1.0), "descendant retained output pipes"),
+                                   (Completed(0, b"", b"", False, False, "cannot read stdout: EIO", 1.0),
+                                    "Cannot inspect Git repository: cannot read stdout: EIO"),
+                                   (Completed(128, b"", b"fatal: bad", False, False, None, 1.0), r"failed \(128\): fatal: bad")):
+            with self.subTest(message=message), self.assertRaisesRegex(DevFlowError, message):
+                self.run_with(completed, timeout=7)
+
+    def test_standard_input_and_a_large_output_pass_through(self):
+        from devflow_core.common.process import Completed
+        output = b"x" * (9 * 1024 * 1024)  # Larger than the 8 MiB limit of 0.5.x.
+        result, bounded = self.run_with(Completed(0, output, b"", False, False, None, 1.0), data=b"./a.txt\n")
+        self.assertEqual(result, output)
+        self.assertEqual(bounded.call_args.kwargs["data"], b"./a.txt\n")
+
+    def test_content_reads_wait_by_their_size(self):
+        from devflow_core.common.git import TIMEOUT_SECONDS, content_timeout
+        self.assertEqual(content_timeout(0), TIMEOUT_SECONDS)
+        self.assertEqual(content_timeout(1), TIMEOUT_SECONDS + 1)
+        self.assertEqual(content_timeout(10 * 1024 * 1024 * 3), TIMEOUT_SECONDS + 3)
+
+
 class EnvironmentTests(unittest.TestCase):
     def test_bash_timeout_is_the_process_limit_plus_the_runners_margin(self):
         self.assertEqual(bash_timeout_ms(900), 960000)
@@ -399,7 +432,7 @@ class EnvironmentTests(unittest.TestCase):
         def bounded(argv, **options):
             waited.append(options["timeout"])
             text = " ".join(reviewers.CLIS["codex"].flags())
-            return Completed(0, f"codex 1.0.0 {text}".encode(), b"", False, False, False, None, 0.0)
+            return Completed(0, f"codex 1.0.0 {text}".encode(), b"", False, False, None, 0.0)
         with patch.object(reviewers, "run_bounded", bounded), patch.object(reviewers, "_resolve", lambda prefix: prefix):
             reviewers.preflight({"id": "codex", "kind": "codex", "command": ["codex"], "model": "m", "effort": "e",
                                  "timeout_seconds": 10})
@@ -409,12 +442,12 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(git.call_args.kwargs["timeout"], GIT_FACT_SECONDS)
 
     def test_released_run_formats_have_names_and_unreleased_ones_are_generic(self):
-        self.assertEqual(runs.RELEASES, {1: "0.1.x", 2: "0.2.x", 3: "0.3.x", 6: "0.4.x"})
+        self.assertEqual(runs.RELEASES, {1: "0.1.x", 2: "0.2.x", 3: "0.3.x", 6: "0.4.x", 7: "0.5.x"})
         for version, release in runs.RELEASES.items():
             with self.subTest(version=version):
                 self.assertEqual(runs.release_name(version), release)
         # Formats 4 and 5 were never released (0.4.0 development); they are named generically.
-        self.assertGreater(runs.SCHEMA_VERSION, 6)
+        self.assertGreater(runs.SCHEMA_VERSION, 7)
         self.assertEqual(runs.release_name(4), "an older version (run format 4)")
         self.assertEqual(runs.release_name(5), "an older version (run format 5)")
         self.assertEqual(runs.release_name(9), "an older version (run format 9)")

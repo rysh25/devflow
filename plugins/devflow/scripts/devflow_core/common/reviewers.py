@@ -36,7 +36,7 @@ from .counts import tally
 from .environment import PROBE_SECONDS, version_warnings
 from .errors import DevFlowError, ReviewerError
 from .process import run_bounded
-from .settings import MAX_OUTPUT_BYTES, validate_reviewer
+from .settings import validate_reviewer
 
 MAX_PACKET_BYTES = 32 * 1024 * 1024
 #: Share of a reviewer's time limit after which it is asked to start writing its answer.
@@ -86,9 +86,23 @@ class Activity:
                 "other_events": dict(sorted(self.other_events.items()))}
 
 
-def _events(output: str, activity: Activity):
+def _lines(path: Path):
+    """Each line of a reviewer's output file, split only at newline.
+
+    The file is read lazily, one line at a time; undecodable bytes are
+    replaced, as the output is only counted and its answer is checked.
+    """
+    try:
+        with path.open("rb") as stream:
+            for raw in stream:
+                yield raw.decode("utf-8", errors="replace")
+    except OSError as exc:
+        raise ReviewerError(f"Cannot read reviewer output {path.name}: {exc}") from exc
+
+
+def _events(lines, activity: Activity):
     """Each JSON object line; other lines are counted and skipped."""
-    for line in output.splitlines():
+    for line in lines:
         if not line.strip():
             continue
         try:
@@ -107,7 +121,7 @@ def _message(value: object) -> str:
     return str(value)[:500]
 
 
-def parse_codex_events(output: str) -> dict:
+def parse_codex_events(lines) -> dict:
     """Check that the main thread's turn completed, and count what the run did.
 
     The main thread is the first one started. An event that names another
@@ -120,7 +134,7 @@ def parse_codex_events(output: str) -> dict:
     """
     activity, seen = Activity(), set()
     main, completed, failures = None, False, []
-    for event in _events(output, activity):
+    for event in _events(lines, activity):
         kind, thread = event.get("type"), event.get("thread_id")
         if kind == "thread.started":
             if main is None and isinstance(thread, str):
@@ -164,7 +178,7 @@ def parse_codex_events(output: str) -> dict:
     return activity.value()
 
 
-def parse_opencode_events(output: str) -> tuple[Any, dict]:
+def parse_opencode_events(lines) -> tuple[Any, dict]:
     """The main session's answer, and a count of what the run did.
 
     The main session is the first one in the output; the events of any other
@@ -175,7 +189,7 @@ def parse_opencode_events(output: str) -> tuple[Any, dict]:
     """
     activity, seen = Activity(), set()
     main, current, last, reason = None, {}, {}, None
-    for event in _events(output, activity):
+    for event in _events(lines, activity):
         kind, session = event.get("type"), event.get("sessionID")
         part = event.get("part") if isinstance(event.get("part"), dict) else {}
         if main is None and isinstance(session, str):
@@ -238,24 +252,34 @@ def _resolve(prefix: list[str]) -> list[str]:
 
 
 def _capture(argv: list[str], *, cwd: Path | None = None, env: dict | None = None,
-             data: bytes | None = None, timeout: float = PROBE_SECONDS, limit: int = MAX_OUTPUT_BYTES,
-             log_dir: Path | None = None) -> tuple[int, bytes, bytes]:
-    """Run one reviewer process; any timeout, overflow or stuck descendant is a failure."""
-    try:
-        # Each stream has its own limit: stderr diagnostics do not use up stdout's room.
-        result = run_bounded(argv, cwd=cwd, env=env, data=data, timeout=timeout, limit=limit, per_stream=True)
-    except DevFlowError as exc:
-        raise ReviewerError(f"Cannot run reviewer: {exc}") from exc
-    if log_dir is not None:
-        _write_new(log_dir / "stdout.jsonl", result.stdout)
-        _write_new(log_dir / "stderr.log", result.stderr)
+             data: bytes | None = None, timeout: float = PROBE_SECONDS,
+             log_dir: Path | None = None) -> tuple[int, bytes]:
+    """Run one reviewer process; a timeout, a stuck descendant or lost output is a failure.
+
+    With ``log_dir`` the output goes straight to ``stdout.jsonl`` and
+    ``stderr.log`` there, created before the launch, and the returned stdout
+    is empty; otherwise (the CLI probes) it is returned. Output is never
+    limited by size.
+    """
+    if log_dir is None:
+        result = _run(argv, cwd, env, data, timeout, None, None)
+    else:
+        with _open_new(log_dir / "stdout.jsonl") as stdout, _open_new(log_dir / "stderr.log") as stderr:
+            result = _run(argv, cwd, env, data, timeout, stdout, stderr)
     if result.timed_out:
         raise ReviewerError(f"Reviewer timed out after {timeout:g} seconds; no automatic retry")
-    if result.output_limit_exceeded or result.read_error:
-        raise ReviewerError("Reviewer output exceeded the size limit or could not be read")
+    if result.output_error:
+        raise ReviewerError("Reviewer output could not be captured: " + result.output_error)
     if result.retained_pipes:
         raise ReviewerError("Reviewer descendants kept pipes open; cleanup is incomplete")
-    return result.exit_code, result.stdout, result.stderr
+    return result.exit_code, result.stdout
+
+
+def _run(argv, cwd, env, data, timeout, stdout, stderr):
+    try:
+        return run_bounded(argv, cwd=cwd, env=env, data=data, timeout=timeout, stdout=stdout, stderr=stderr)
+    except DevFlowError as exc:
+        raise ReviewerError(f"Cannot run reviewer: {exc}") from exc
 
 
 def preflight(config: dict) -> dict:
@@ -266,12 +290,12 @@ def preflight(config: dict) -> dict:
     """
     kind, prefix, model, effort, _ = _config(config)
     resolved = _resolve(prefix)
-    code, raw, _ = _capture(resolved + ["--version"], limit=65536)
+    code, raw = _capture(resolved + ["--version"])
     version = raw.decode("utf-8", errors="replace").strip()
     if code or not version:
         raise ReviewerError(f"{kind} --version failed (exit {code})")
     subcommand, flags = CLIS[kind].subcommand, CLIS[kind].flags()
-    code, raw, _ = _capture(resolved + [subcommand, "--help"], limit=262144)
+    code, raw = _capture(resolved + [subcommand, "--help"])
     if code:
         raise ReviewerError(f"{kind} {subcommand} --help failed with exit {code}")
     help_text = raw.decode("utf-8", errors="replace")
@@ -291,22 +315,31 @@ def build_command(config: dict, work_dir: Path, cwd: Path, schema_path: Path) ->
     return _resolve(prefix) + CLIS[kind].arguments(model, effort, work_dir, cwd, schema_path.resolve()), {"PWD": str(cwd)}
 
 
-def _write_new(path: Path, value: str | bytes) -> None:
-    data = value.encode("utf-8") if isinstance(value, str) else value
+def _open_new(path: Path):
+    """A new file for the adapter's records; an existing one is never replaced."""
     try:
-        with path.open("xb") as handle:
-            handle.write(data)
+        return path.open("xb")
     except OSError as exc:
         raise ReviewerError(f"Cannot create adapter output {path.name}: {exc}") from exc
 
 
-def _read_text(path: Path, limit: int) -> str:
+def _write_new(path: Path, value: str | bytes) -> None:
+    data = value.encode("utf-8") if isinstance(value, str) else value
+    with _open_new(path) as handle:
+        try:
+            handle.write(data)
+        except OSError as exc:
+            raise ReviewerError(f"Cannot create adapter output {path.name}: {exc}") from exc
+
+
+def _read_text(path: Path, limit: int | None) -> str:
+    """A reviewer input or output file; ``None`` reads it whole (output files are never limited)."""
     if path.is_symlink() or not path.is_file():
         raise ReviewerError(f"Missing or unsafe reviewer input/output: {path.name}")
     try:
         with path.open("rb") as handle:
-            data = handle.read(limit + 1)
-        if len(data) > limit:
+            data = handle.read() if limit is None else handle.read(limit + 1)
+        if limit is not None and len(data) > limit:
             raise ReviewerError(f"Reviewer file exceeds byte limit: {path.name}; never truncate silently")
         return data.decode("utf-8")
     except (OSError, UnicodeError) as exc:
@@ -336,8 +369,8 @@ class CLI:
         """The standard input; None closes it."""
         return None
 
-    def answer(self, output: str, work_dir: Path, limit: int) -> tuple[Any, dict]:
-        """The answer as strict JSON, and what the run did."""
+    def answer(self, output: Path, work_dir: Path) -> tuple[Any, dict]:
+        """The answer as strict JSON, and what the run did; ``output`` is the stdout log."""
         raise NotImplementedError
 
 
@@ -355,9 +388,9 @@ class Codex(CLI):
     def stdin(self, prompt):
         return prompt.encode("utf-8")
 
-    def answer(self, output, work_dir, limit):
-        activity = parse_codex_events(output)
-        final = _read_text(work_dir / "final-response.json", limit)
+    def answer(self, output, work_dir):
+        activity = parse_codex_events(_lines(output))
+        final = _read_text(work_dir / "final-response.json", None)
         if not final.strip():
             raise ReviewerError("Codex finished without an answer")
         return json_value(final), activity
@@ -373,8 +406,8 @@ class OpenCode(CLI):
         return [self.subcommand, "--format", "json", "--standalone", "--model", f"{model}#{effort}",
                 "--file", str(work_dir / "review-input.md"), self.message]
 
-    def answer(self, output, work_dir, limit):
-        return parse_opencode_events(output)
+    def answer(self, output, work_dir):
+        return parse_opencode_events(_lines(output))
 
 
 #: The reviewer CLIs by kind.
@@ -414,7 +447,6 @@ def run_review(config: dict, packet_path: Path, work_dir: Path, schema_path: Pat
     """
     kind, prefix, _, _, timeout = _config(config)
     cli = CLIS[kind]
-    output_limit = config.get("max_output_bytes", MAX_OUTPUT_BYTES)
     probe = probe if probe is not None else preflight(config)
     if work_dir.is_symlink():
         raise ReviewerError("Adapter directory must not be a symlink")
@@ -441,13 +473,11 @@ def run_review(config: dict, packet_path: Path, work_dir: Path, schema_path: Pat
     # hold secrets, so only their count is recorded.
     _write_new(work_dir / "invocation.json", json.dumps({**probe, "cwd": str(cwd.resolve()),
                "prefix_arg_count": len(prefix) - 1, "timeout_seconds": timeout,
-               "max_output_bytes": output_limit,
                "packet_sha256": hashlib.sha256(packet.encode("utf-8")).hexdigest(),
                "shell": False, "settings": "the user's own CLI settings"},
               ensure_ascii=False, indent=2) + "\n")
-    code, stdout, _ = _capture(argv, cwd=cwd, env=env, timeout=timeout, data=cli.stdin(prompt),
-                              limit=output_limit, log_dir=work_dir)
+    code, _ = _capture(argv, cwd=cwd, env=env, timeout=timeout, data=cli.stdin(prompt), log_dir=work_dir)
     if code:
         raise ReviewerError(f"{kind} exited with {code}; inspect stderr.log (no automatic retry)")
-    value, activity = cli.answer(stdout.decode("utf-8", errors="replace"), work_dir, output_limit)
+    value, activity = cli.answer(work_dir / "stdout.jsonl", work_dir)
     return {"review": validate(value), "activity": activity}

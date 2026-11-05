@@ -61,18 +61,15 @@ def resolve_run(project: Path, run_id: str, all_stores: dict[str, RunStore]):
 
 
 def assert_available(project: Path, session: str, all_stores: dict[str, RunStore], selected=None) -> None:
-    """One unfinished run per project; damaged or interrupted records stop starts."""
+    """One unfinished run per project; damaged records stop starts."""
     for flow, store in all_stores.items():
         runs, _ = store.scan()
         for info in runs:
             if selected == (flow, info.run_id) or info.format == "unsupported":
-                continue  # A run from an older format is never continued, so it never blocks (even mid-transaction).
+                continue  # A run from an older format is never continued, so it never blocks.
             if info.format == "invalid":
                 raise DevFlowError(f"Run {flow}/{info.run_id} cannot be read ({info.error}); "
                                    "preserve it for human recovery before starting another")
-            if info.recovery_required:
-                raise DevFlowError(f"Run {flow}/{info.run_id} has an interrupted transaction; complete it with "
-                                   f"/devflow:resume {info.run_id} or cancel before starting another")
             if info.format == "current" and info.state["status"] not in TERMINAL:
                 raise DevFlowError(f"Another unfinished {flow} run exists ({info.run_id}); resume or cancel it first")
     for name, record, error in sessions.scan_records(project, WORKFLOWS):
@@ -90,9 +87,12 @@ def assert_available(project: Path, session: str, all_stores: dict[str, RunStore
 def _create(project: Path, session: str, pending: dict, all_stores: dict[str, RunStore],
             options: dict | None = None) -> dict:
     workflow = WORKFLOWS[pending["flow"]]
-    fields, artifacts = workflow.build_start(project, pending, dict(options or {}))
-    return all_stores[pending["flow"]].create(fields, artifacts, run_id=pending["run_id"], owner=session,
-                                              first_event=pending["event"])
+    store = all_stores[pending["flow"]]
+    # Large start records are written into the scratch directory and moved into the run.
+    with store.scratch(pending["run_id"]) as scratch:
+        fields, artifacts = workflow.build_start(project, pending, dict(options or {}), scratch)
+        return store.create(fields, artifacts, run_id=pending["run_id"], owner=session,
+                            first_event=pending["event"])
 
 
 def _bound(record: dict, flow: str, run_id: str) -> dict:
@@ -166,7 +166,7 @@ def _resume(project: Path, session: str, argument: str, payload: dict, record: d
         raise DevFlowError("Finish or cancel this session's active workflow before resuming another")
     store = all_stores[flow]
     with store.lock(run_id):
-        state = store.load(run_id)  # Completes an interrupted transaction first.
+        state = store.load(run_id)
         reason = store.transfer_refusal(state, session)
         if reason:
             raise DevFlowError(reason)
@@ -229,9 +229,9 @@ def handle_hook(payload: dict, plugin_root: Path, environ=None) -> dict | None:
     if not isinstance(payload, dict):
         raise DevFlowError("Hook input must be a JSON object")
     event = payload.get("hook_event_name")
-    # hooks.json registers these four events only (tools/package.py checks it):
+    # hooks.json registers these three events only (tools/package.py checks it):
     # Claude Code sends no other event to this hook.
-    if event not in {"UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"}:
+    if event not in {"UserPromptSubmit", "PreToolUse", "PostToolUse"}:
         return None
     cwd, session = payload.get("cwd"), payload.get("session_id")
     if not isinstance(cwd, str) or not cwd or not isinstance(session, str) or not sessions.SESSION_ID.fullmatch(session):
@@ -268,8 +268,6 @@ def handle_hook(payload: dict, plugin_root: Path, environ=None) -> dict | None:
     try:
         return _tool_event(project, event, payload, record, all_stores, plugin_root)
     except (DevFlowError, OSError, ValueError) as exc:
-        if event == "Stop":
-            return None
         return notices.context(event, _unrecorded(
             record, exc, "this answer was not recorded and cannot resolve a DevFlow escalation."))
 
@@ -309,7 +307,7 @@ def _submit(project: Path, session: str, command: str | None, argument: str, pay
 
 def _tool_event(project: Path, event: str, payload: dict, record: dict, all_stores: dict[str, RunStore],
                 plugin_root: Path) -> dict | None:
-    """AskUserQuestion (PreToolUse and PostToolUse) and Stop for the session that owns its run."""
+    """AskUserQuestion (PreToolUse and PostToolUse) for the session that owns its run."""
     current = sessions.binding(project, record, all_stores)
     if current is None or not current.owner or not current.supported:
         return None  # Never recorded: this session does not own a current run.
@@ -318,16 +316,13 @@ def _tool_event(project: Path, event: str, payload: dict, record: dict, all_stor
         # The question as Claude sent it, before the screen adds the human's answers.
         store.append_event(current.run_id, payload, "observation")
         return None
-    if event == "PostToolUse":
-        if payload.get("tool_name") != "AskUserQuestion":
-            return None
-        event_id = store.append_event(current.run_id, payload, "question")
-        if event_id is None:
-            return None
-        return notices.context(event, f"DevFlow recorded this human question/answer as event {event_id}. "
-                                      "Use its exact response and event ID if resolving a human escalation.")
-    store.append_event(current.run_id, payload, "stop")
-    return None
+    if payload.get("tool_name") != "AskUserQuestion":
+        return None
+    event_id = store.append_event(current.run_id, payload, "question")
+    if event_id is None:
+        return None
+    return notices.context(event, f"DevFlow recorded this human question/answer as event {event_id}. "
+                                  "Use its exact response and event ID if resolving a human escalation.")
 
 
 def _overview(project: Path, all_stores: dict[str, RunStore], session: str | None = None) -> dict:
@@ -373,11 +368,7 @@ def status(project: Path, session: str | None, run_id: str | None) -> dict:
             return {"plugin": "devflow", **info.public()}
         if info.format == "invalid":
             raise DevFlowError(f"Run {run_id} cannot be read: {info.error}")
-        value = {"plugin": "devflow", "flow": flow, **WORKFLOWS[flow].engine(project).status(run_id)}
-        if info.recovery_required:
-            value.update(recovery_required=True,
-                         recovery="An interrupted transaction is pending; /devflow:resume or cancel completes it")
-        return value
+        return {"plugin": "devflow", "flow": flow, **WORKFLOWS[flow].engine(project).status(run_id)}
     record, record_error, current = None, None, None
     if session:
         try:
@@ -405,8 +396,6 @@ def blocking_warnings(project: Path) -> list[str]:
                 for item in overview["sessions"]["pending_starts"]]
     warnings += [f"Invalid session record {item['record']}: {item['error']}" for item in overview["sessions"]["invalid_records"]]
     warnings += [f"Incomplete run creation {name}; a human may move it away" for name in overview["incomplete_creations"]]
-    warnings += [f"Run {item['flow']}/{item['run_id']} needs recovery (interrupted transaction)"
-                 for item in overview["runs"] if item.get("recovery_required") and item["format"] == "current"]
     warnings += [f"Run {item['flow']}/{item['run_id']} cannot be read and blocks new starts: {item.get('error')}"
                  for item in overview["runs"] if item["format"] == "invalid"]
     return warnings

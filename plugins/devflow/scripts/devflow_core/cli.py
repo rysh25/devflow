@@ -3,7 +3,7 @@
 Every runner error, including a malformed invocation, is one JSON object on
 stdout with exit status 2. ``--help`` and ``--version`` print text. Hook
 failures go to stderr with exit status 1, which Claude Code shows without
-blocking the tool or the prompt; a failed Stop hook exits 0 so it never loops.
+blocking the tool or the prompt.
 """
 from __future__ import annotations
 
@@ -158,8 +158,7 @@ def main(argv=None) -> int:
     except Exception as exc:  # noqa: BLE001 - every failure is reported, never retried
         if command == "hook":
             print("DevFlow hook failed: " + str(exc), file=sys.stderr)
-            # Exit status 2 would make Claude Code block the tool or the prompt. A failed
-            # Stop hook exits 0: a non-zero Stop exit can keep Claude from stopping.
-            return 0 if isinstance(payload, dict) and payload.get("hook_event_name") == "Stop" else 1
+            # Exit status 2 would make Claude Code block the tool or the prompt.
+            return 1
         emit({"error": type(exc).__name__, "message": str(exc), "automatic_retry": False})
         return 2

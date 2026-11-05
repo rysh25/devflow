@@ -35,7 +35,8 @@ class PlanWorkflow(Workflow):
             raise UsageError("Start one workflow with one explicit command, not stacked skills.")
         return request
 
-    def build_start(self, project: Path, pending: dict, options: dict) -> tuple[dict, dict[str, bytes]]:
+    def build_start(self, project: Path, pending: dict, options: dict,
+                    scratch: Path) -> tuple[dict, dict[str, bytes]]:
         # Plan starts inside the prompt hook and has no extra start options; ``options`` is unused.
         from .config import load_config
         from .transcript import transcript_marker

@@ -89,21 +89,25 @@ class Engine(RunEngine):
             self._require(state,{"implementing","ready_check","ready_review"})
             self._verify(state)
             summary = checked_text(self._draft(state, summary_file), 256*1024)
-            current = snapshot.capture(self._workspace(state),state["config"])
-            delta = snapshot.compare(read_json(self._run(run_id)/"baseline.json"),current)
+            workspace = self._workspace(state)
+            current = snapshot.capture(workspace,state["config"])
+            baseline = read_json(self._run(run_id)/"baseline.json")
+            # The changes and their diff are written once; no listing or contents are copied.
+            record = snapshot.changes(baseline,current)
+            diff = snapshot.diff(workspace,self._run(run_id),baseline,current,record)
             number = state["checkpoint_count"] + 1
             base = f"snapshots/{number:03}"
-            self._artifact(state,base+".json",json_bytes(current))
-            self._artifact(state,base+"-diff.json",json_bytes(delta))
+            self._artifact(state,base+".json",json_bytes(record))
+            self._artifact(state,base+".diff",diff.encode("utf-8"))
             self._artifact(state,base+"-summary.md",summary.encode("utf-8"))
             prior = (state.get("candidate") or {}).get("snapshot_id")
             if prior != current["snapshot_id"]:
                 state["approvals"] = {}
                 state["binary_attestation"] = None
             state.update(status="ready_check",checkpoint_count=number,validation=None,
-                candidate={"snapshot_id":current["snapshot_id"],"path":base+".json","diff":base+"-diff.json","summary":base+"-summary.md"})
-            if delta["binary_changes"] and not state.get("binary_attestation"):
-                self._escalate(state,"binary_changes",["Review these binary changes independently and confirm whether their contents are acceptable: " + ", ".join(delta["binary_changes"])],"ready_check","Text-only reviewers cannot inspect binary content")
+                candidate={"snapshot_id":current["snapshot_id"],"path":base+".json","diff":base+".diff","summary":base+"-summary.md"})
+            if record["binary_changes"] and not state.get("binary_attestation"):
+                self._escalate(state,"binary_changes",["Review these binary changes independently and confirm whether their contents are acceptable: " + ", ".join(record["binary_changes"])],"ready_check","Text-only reviewers cannot inspect binary content")
             self._save(state)
         return self.status(run_id)
 
@@ -164,7 +168,7 @@ class Engine(RunEngine):
     def _packet(self,state,current,workspace,diff_path):
         """Review data only: the reviewer reads the code itself, from the workspace and the diff file."""
         run = self._run(state["run_id"])
-        delta = read_json(run/state["candidate"]["diff"])
+        record = read_json(run/state["candidate"]["path"])
         for path in state["config"]["snapshot"]["context_paths"]:
             if path not in current["files"] or current["files"][path].get("binary"):
                 raise DevFlowError(f"Context path must name an included text file: {path}")
@@ -174,11 +178,8 @@ class Engine(RunEngine):
             if item.get("review_path"):
                 entry["review"] = read_json(run/item["review_path"])
             history.append(entry)
+        # The check record names its log files; the output is only in the logs.
         check_results = read_json(run/state["validation"]["path"]) if state["validation"].get("path") else None
-        if check_results is not None:
-            # The logs stay in their files; the packet gives their paths.
-            check_results = {**check_results, "results":[{k:v for k,v in result.items() if k not in ("stdout","stderr")}
-                                                         for result in check_results["results"]]}
         mode = state["config"]["snapshot"]["mode"]
         value = {"schema_version":2,"kind":"code_review","snapshot_id":current["snapshot_id"],
             "workspace":{"path":str(workspace),"mode":mode,"branch":branch(workspace,mode),
@@ -186,7 +187,7 @@ class Engine(RunEngine):
             "plan":(run/"plan.md").read_bytes().decode("utf-8"),"plan_path":str(run/"plan.md"),
             "plan_sha256":state["artifacts"]["plan.md"],"baseline_id":state["baseline_id"],
             "implementation_summary":checked_text(run/state["candidate"]["summary"]),
-            "changes":snapshot.change_list(delta),"diff_path":str(diff_path),
+            "changes":snapshot.packet_changes(record),"diff_path":str(diff_path),
             "context_paths":list(state["config"]["snapshot"]["context_paths"]),
             "scope":{"mode":current["mode"],"excluded":current.get("excluded",[]),"limitations":current.get("scope_note")},
             "validation":state["validation"],"check_results":check_results,
@@ -225,8 +226,8 @@ class Engine(RunEngine):
             if next_reviewer(state["config"]["reviewers"],len(state["attempts"]),state["review_limit"]) != provider:
                 raise DevFlowError("The run changed during the reviewer check; inspect status and retry")
             number = len(state["attempts"]) + 1
-            delta = read_json(self._run(run_id)/state["candidate"]["diff"])
-            diff_path = self._artifact(state,f"reviews/{number:02}/changes.diff",snapshot.diff_text(delta).encode("utf-8"))
+            # The diff was written once, at the checkpoint.
+            diff_path = self._run(run_id)/state["candidate"]["diff"]
             # _current has just verified the workspace.
             workspace = Path(state["workspace"]["path"])
             packet = self._packet(state,current,workspace,diff_path)
@@ -344,8 +345,8 @@ class Engine(RunEngine):
             if decision not in allowed or not isinstance(reason,str) or not reason.strip():
                 raise DevFlowError("Supply continue/stop for the review limit question (continue/cancel otherwise) "
                                    "and a faithful explanation of the human's decision")
-            # Verify before queueing new immutable artifacts: _current checks
-            # every committed artifact, not the next transaction's draft writes.
+            # Verify before holding new immutable artifacts: _current checks every
+            # listed artifact, and a held one is not on disk until the save.
             if decision == "continue" and kind in {"manual_validation", "binary_changes"}:
                 self._current(state)
             else:
