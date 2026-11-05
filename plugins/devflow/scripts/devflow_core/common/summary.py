@@ -1,10 +1,13 @@
-"""The review summary every workflow shows: one data shape, one Markdown form.
+"""The review summary every workflow shows: one data shape, one short Markdown form.
 
 Each workflow converts its own records into a ``source`` (one entry per review
 attempt and the run's approval facts); ``build`` adds what follows from those
 facts, and ``render`` turns the data into fixed English Markdown that Claude shows
-unchanged. Nothing is shortened. The models and efforts are the requested ones,
-never a claim about what the provider ran.
+unchanged. The data holds everything; the Markdown shows what a decision needs (one
+table row per review, one line per reviewer, and the failures, remaining findings
+and human decisions), and the rest is read from the data and the run's records.
+Text is never cut. The models and efforts are the requested ones, never a claim
+about what the provider ran.
 
 ``source``::
 
@@ -18,19 +21,25 @@ never a claim about what the provider ran.
                   "findings": [{"id", "severity", "category", "location", "recommendation",
                                 "action", "reason"}],
                   "fix": {"summary", "version_change", "file_changes"} | None,
-                  "tokens", "record"}],
-     "human_decisions": [{"at", "review_number", "questions", "answer", "decision",
-                          "interpretation", "event_ids"}],
+                  "tokens", "tool_call_count", "record"}],
+     "human_decisions": [{"at", "review_number", "question_kind", "questions", "answer",
+                          "decision", "interpretation", "event_ids"}],
      "human_acceptance": {"event_ids", "answer", "version", "accepted_at", "record"} | None}
 
 A review's ``status`` is ``succeeded``, ``failed`` or ``in_progress``; a missing
 disposition (``action``/``reason``) is None, shown as undecided. ``cli_version`` comes
 from the attempt's process record named by ``cli_version_source``, which is not a
-hashed run record.
+hashed run record. ``tool_call_count`` is None when the reviewer did not run to the
+end. A human decision's ``review_number`` is the number of reviews when the question
+was asked and ``question_kind`` the kind the question was recorded with (None when
+an older record has neither).
 """
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+
+from .review import REVIEW_BUDGET
+from .storage import json_bytes
 
 SCHEMA_VERSION = 1
 #: Why a saved report holds no summary although one was built: the summary is never cut.
@@ -55,9 +64,35 @@ def _seconds(start: object, end: object) -> int | None:
         return None
 
 
+def _reviewer_totals(reviewer: dict, own: list[dict]) -> dict:
+    """One reviewer over the run: its requested model and effort, the CLI versions its
+    reviews recorded (in order, once each) and its token counts summed by the names its
+    CLI printed. Counts are never added across CLIs. A total a record cannot hold (past
+    Python's integer-to-text limit) is unknown, as a single review's counts are."""
+    versions = []
+    for entry in own:
+        if entry["cli_version"] is not None and entry["cli_version"] not in versions:
+            versions.append(entry["cli_version"])
+    tokens, without = {}, 0
+    for entry in own:
+        if not entry["tokens"]:
+            without += 1
+            continue
+        for name, value in entry["tokens"].items():
+            tokens[name] = tokens.get(name, 0) + value
+    try:
+        json_bytes(tokens)
+    except ValueError:
+        tokens = {}
+    return {"id": reviewer["id"], "requested_model": reviewer["requested_model"],
+            "requested_effort": reviewer["requested_effort"], "cli_versions": versions,
+            "tokens": dict(sorted(tokens.items())) or None, "reviews_without_tokens": without}
+
+
 def build(source: dict, now: str) -> dict:
     """The summary data: the source's reviews with times, limits and counts, the
-    approval state, the remaining findings, the trend and the time totals."""
+    approval state, the remaining findings, the trend, each reviewer's totals and
+    the time totals."""
     limits = {item["id"]: item for item in source["reviewers"]}
     reviews = []
     for entry in source["reviews"]:
@@ -72,10 +107,11 @@ def build(source: dict, now: str) -> dict:
                         "duration_seconds": _seconds(entry["started_at"], entry["finished_at"]),
                         "finding_counts": counts})
     approving = set(source["approving_current"])
-    approval_reviewers = []
+    approval_reviewers, totals = [], []
     remaining, count = [], 0
     for reviewer in source["reviewers"]:
         own = [entry for entry in reviews if entry["reviewer_id"] == reviewer["id"]]
+        totals.append(_reviewer_totals(reviewer, own))
         approval_reviewers.append({
             "id": reviewer["id"], "approves_current": reviewer["id"] in approving,
             "approved": [{"review_number": entry["number"], "version": entry["version"]}
@@ -103,6 +139,7 @@ def build(source: dict, now: str) -> dict:
             "reviewers": approval_reviewers,
             "human_acceptance": source["human_acceptance"]},
         "remaining_findings": {"count": count, "items": remaining},
+        "reviewer_totals": totals,
         "human_decisions": source["human_decisions"],
         "time": {"run_elapsed_seconds": _seconds(source["created_at"], source["finished_at"] or now),
                  "review_seconds_total": sum(value for value in durations if value is not None),
@@ -119,131 +156,102 @@ def _duration(seconds: object) -> str:
     return "unknown" if seconds is None else str(timedelta(seconds=int(seconds)))
 
 
-def _yes(value: bool) -> str:
-    return "yes" if value else "no"
-
-
-def _version(version: dict) -> str:
-    return version["label"] + (f" ({version['id']})" if version.get("id") else "")
+def _count(number: int, noun: str) -> str:
+    return f"{number} {noun}" + ("" if number == 1 else "s")
 
 
 def _status(summary: dict) -> str:
     status = summary["status"]
-    if status == "awaiting_human" and summary["pending_question"] == "review_budget":
+    if status == "awaiting_human" and summary["pending_question"] == REVIEW_BUDGET:
         return "awaiting_human (review limit question)"
     return STATUS_TEXT.get(status, status)
 
 
-def _finding(finding: dict, indent: str) -> list[str]:
-    decision = ("undecided" if finding["action"] is None
-                else f"{finding['action']} — {finding['reason']}")
-    return [f"{indent}- {finding['id']} [{finding['severity']}] {finding['category']} — {finding['location']}",
-            f"{indent}  - Recommendation: {finding['recommendation']}",
-            f"{indent}  - Decision: {decision}"]
-
-
-def _changes(fix: dict) -> str | None:
-    change = fix.get("version_change")
-    if change is not None:
-        return (f"{change['from']} → {change['to']} "
-                f"(+{_known(change['lines_added'])} −{_known(change['lines_removed'])} lines)")
-    files = fix.get("file_changes")
-    if files is not None:
-        return "; ".join(f"{item['change']} {item['path']}" for item in files) or "no file changes"
-    return None
+def _findings(entry: dict) -> str:
+    """A succeeded review's findings: the count per severity, then per disposition."""
+    if entry["status"] != "succeeded":
+        return "—"
+    if not entry["findings"]:
+        return "none"
+    counts = entry["finding_counts"]
+    dispositions = {}
+    for finding in entry["findings"]:
+        action = finding["action"] or "undecided"
+        dispositions[action] = dispositions.get(action, 0) + 1
+    order = sorted(action for action in dispositions if action != "undecided")
+    order += ["undecided"] if "undecided" in dispositions else []
+    return (", ".join(f"{severity} {counts[severity]}" for severity in SEVERITIES if counts[severity])
+            + "; " + ", ".join(f"{action} {dispositions[action]}" for action in order))
 
 
 def render(summary: dict) -> str:
-    """The fixed Markdown form of ``build``'s data."""
-    approval, time = summary["approval"], summary["time"]
+    """The fixed Markdown form of ``build``'s data. Table cells hold only fixed values
+    (numbers, IDs, labels, counts, times); free text goes to the lists below the table."""
+    approval, time, reviews = summary["approval"], summary["time"], summary["reviews"]
     lines = [f"## DevFlow review summary — {summary['flow']} run {summary['run_id']}", ""]
     lines.append(f"- Status: {_status(summary)}")
-    lines.append(f"- Reviews: {summary['review_count']} of limit {summary['review_limit']}")
     missing = time["reviews_without_time"]
-    lines.append(f"- Time: run {_duration(time['run_elapsed_seconds'])}, reviews {_duration(time['review_seconds_total'])}"
-                 + (f" ({missing} review{'s' if missing != 1 else ''} without recorded time)" if missing else ""))
-    lines.append(f"- Current version: {_version(approval['current_version'])}; "
-                 f"reviewed: {_yes(approval['latest_version_reviewed'])}")
-    lines.append("- Approvals of the current version: "
-                 + (", ".join(f"{item['id']} {_yes(item['approves_current'])}" for item in approval["reviewers"])
-                    or "none"))
-    lines.append("- Approved versions: " + ("; ".join(
-        f"{item['id']} " + (", ".join(f"{entry['version']['label']} (review {entry['review_number']})"
-                                      for entry in item["approved"]) or "none")
-        for item in approval["reviewers"]) or "none"))
-    acceptance = approval["human_acceptance"]
-    lines.append("- Human acceptance: " + (
-        "none" if acceptance is None else
-        f"event {', '.join(acceptance['event_ids'])}, version {_known(acceptance['version'])}, "
-        f"at {_known(acceptance['accepted_at'])} ({acceptance['record']})"))
+    lines.append(f"- Reviews: {summary['review_count']} of limit {summary['review_limit']}; "
+                 f"time: run {_duration(time['run_elapsed_seconds'])}, reviews {_duration(time['review_seconds_total'])}"
+                 + (f" ({_count(missing, 'review')} without recorded time)" if missing else ""))
+    approvals = ", ".join(f"{item['id']} {'yes' if item['approves_current'] else 'no'}"
+                          for item in approval["reviewers"]) or "none"
+    lines.append(f"- Current version: {approval['current_version']['label']}, "
+                 f"{'reviewed' if approval['latest_version_reviewed'] else 'not reviewed'}; approvals: {approvals}")
 
-    lines += ["", "### Finding counts", ""]
-    if summary["reviews"]:
-        lines += ["| Review | Reviewer | Result | " + " | ".join(s.capitalize() for s in SEVERITIES) + " |",
-                  "|---|---|---|" + "---|" * len(SEVERITIES)]
-        for entry in summary["reviews"]:
+    lines.append("")
+    if reviews:
+        lines += ["| # | Reviewer | Version | Result | Findings | Tool calls | Time |",
+                  "|---|---|---|---|---|---|---|"]
+        for entry in reviews:
             result = entry["verdict"] if entry["status"] == "succeeded" else entry["status"]
-            counts = entry["finding_counts"]
-            cells = [str(counts[s]) for s in SEVERITIES] if counts else [""] * len(SEVERITIES)
-            lines.append(f"| {entry['number']} | {entry['reviewer_id']} | {result} | " + " | ".join(cells) + " |")
+            lines.append(f"| {entry['number']} | {_known(entry['reviewer_id'])} | {entry['version']['label']} | "
+                         f"{_known(result)} | {_findings(entry)} | {_known(entry['tool_call_count'])} | "
+                         f"{_duration(entry['duration_seconds'])} of {_duration(entry['timeout_seconds'])} |")
     else:
         lines.append("No reviews yet.")
 
-    findings_by_review = {}
-    for entry in summary["reviews"]:
-        findings_by_review[entry["number"]] = {finding["id"]: finding for finding in entry["findings"]}
-        lines += ["", f"### Review {entry['number']} — {entry['reviewer_id']}", ""]
-        lines.append(f"- Model: {_known(entry['requested_model'])} (requested), "
-                     f"effort: {_known(entry['requested_effort'])} (requested), CLI: {_known(entry['cli_version'])} "
-                     f"(process record {entry['cli_version_source']}, not hashed)")
-        lines.append(f"- Started: {_known(entry['started_at'])}, finished: {_known(entry['finished_at'])}, "
-                     f"time: {_duration(entry['duration_seconds'])} of {_duration(entry['timeout_seconds'])}")
-        counts = entry["finding_counts"]
-        lines.append(f"- Version: {entry['version']['label']}; status: {entry['status']}; "
-                     f"verdict: {_known(entry['verdict'])}"
-                     + ("; findings: " + ", ".join(f"{s} {counts[s]}" for s in SEVERITIES) if counts else ""))
-        tokens = entry["tokens"]
-        lines.append("- Tokens: " + ("unknown" if not tokens else
-                                     ", ".join(f"{name} {value:,}" for name, value in tokens.items())))
-        lines.append(f"- Record: {_known(entry['record'])}")
-        if entry["error"]:
-            lines.append(f"- Failure: {entry['error']}")
-        if entry["status"] == "succeeded":
-            if entry["findings"]:
-                lines.append("- Findings:")
-                for finding in entry["findings"]:
-                    lines += _finding(finding, "  ")
-            else:
-                lines.append("- Findings: none")
-        fix = entry["fix"]
-        if fix is not None:
-            lines.append(f"- Fix: {fix['summary']}")
-            changed = _changes(fix)
-            if changed is not None:
-                lines.append(f"- Changed: {changed}")
+    lines.append("")
+    for item in summary["reviewer_totals"]:
+        tokens = ("unknown" if item["tokens"] is None
+                  else ", ".join(f"{name} {value:,}" for name, value in item["tokens"].items()))
+        without = item["reviews_without_tokens"]
+        lines.append(f"- {item['id']}: {_known(item['requested_model'])}, {_known(item['requested_effort'])} "
+                     f"(requested), {', '.join(item['cli_versions']) or 'CLI unknown'}; tokens: {tokens}"
+                     + (f" ({_count(without, 'review')} without token counts)" if without else ""))
+
+    failures = [entry for entry in reviews if entry["status"] != "succeeded" and entry["error"]]
+    if failures:
+        lines.append("- Failures:")
+        lines += [f"  - Review {entry['number']} ({_known(entry['reviewer_id'])}): {entry['error']}"
+                  for entry in failures]
+    else:
+        lines.append("- Failures: none")
 
     remaining = summary["remaining_findings"]
-    lines += ["", f"### Remaining findings ({remaining['count']})", ""]
     if remaining["items"]:
-        records = {entry["number"]: entry["record"] for entry in summary["reviews"]}
+        findings = {entry["number"]: {finding["id"]: finding for finding in entry["findings"]} for entry in reviews}
+        lines.append(f"- Remaining findings ({remaining['count']}):")
         for item in remaining["items"]:
-            lines.append(f"- {item['reviewer_id']}, review {item['review_number']} "
-                         f"({_known(records.get(item['review_number']))})"
-                         + ("" if item["finding_ids"] else ": no findings (human questions only)"))
+            where = f"  - {item['reviewer_id']}, review {item['review_number']}"
+            if not item["finding_ids"]:
+                lines.append(f"{where}: no findings (human questions only)")
             for identifier in item["finding_ids"]:
-                lines += _finding(findings_by_review[item["review_number"]][identifier], "  ")
+                finding = findings[item["review_number"]][identifier]
+                lines.append(f"{where}: {finding['id']} [{finding['severity']}] {finding['category']} — "
+                             f"{finding['location']}: {finding['recommendation']}")
     else:
-        lines.append("none")
+        lines.append("- Remaining findings: none")
 
-    lines += ["", "### Human decisions", ""]
     if summary["human_decisions"]:
+        lines.append("- Human decisions:")
         for decision in summary["human_decisions"]:
-            where = f", review {decision['review_number']}" if decision["review_number"] is not None else ""
-            text = (f"- {_known(decision['at'])}{where}: question: {' / '.join(decision['questions'])} — "
-                    f"answer: {decision['answer']} — decision: {_known(decision['decision'])}")
-            if decision["interpretation"]:
-                text += f" — interpretation: {decision['interpretation']}"
-            lines.append(text + f" (event {', '.join(decision['event_ids'])})")
+            number = decision["review_number"]
+            after = ("After an unknown number of reviews" if number is None
+                     else f"After {_count(number, 'review')}")
+            kind = decision["question_kind"] or "question"
+            choice = _known(decision["decision"]) if kind == REVIEW_BUDGET else "answered"
+            lines.append(f"  - {after}, {kind}: {choice} ({_known(decision['at'])})")
     else:
-        lines.append("none")
+        lines.append("- Human decisions: none")
     return "\n".join(lines) + "\n"

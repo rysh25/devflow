@@ -2,7 +2,7 @@
 
 ## 一つの配布と独立したワークフロー
 
-DevFlow 0.7.1 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
+DevFlow 0.7.2 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
 
 ```mermaid
 flowchart TD
@@ -50,7 +50,7 @@ Python コードは `plugins/devflow/scripts/devflow_core/` の1つのパッケ�
 | `sessions.py` | セッション記録、人間の判断に使える回答の規則、事前に埋めた質問の判定、回答文の取り出し |
 | `notices.py` | フックが Claude に渡す状態の通知（run の状態、ランナーの場所、`bash_timeout_ms`） |
 | `reviewers.py` | Codex / OpenCode の事前確認・起動・出力の検査。CLI ごとの違いは `CLI` のサブクラス（`Codex`、`OpenCode`）に集める。トークン数の読み取り（`CLI.tokens`、`review_tokens`）と、回の CLI の版（`recorded_cli_version`）もここ |
-| `summary.py` | レビューの要約：各フローが自分の記録を直した共通の形（`source`）から、データを作る `build` と、決まった英語の Markdown を作る `render`。上限の確認で待っている間と run が終わったあとに、`status` と最終レポートに入る |
+| `summary.py` | レビューの要約：各フローが自分の記録を直した共通の形（`source`）から、データを作る `build` と、決まった英語の短い Markdown を作る `render`。データはすべてを持ち（レビュアーごとの合計 `reviewer_totals` を含む）、Markdown は判断に要るもの（1 回 1 行の表、レビュアーごとの 1 行、失敗、残っている指摘、人間の決定）だけを出す。表のセルには決まった値だけを入れ、自由な文は表の下の一覧に置く。上限の確認で待っている間と run が終わったあとに、`status` と最終レポートに入る |
 | `counts.py` | 前もって知らない名前（出来事の種類、ツールの名前）の、上限付きの数え方 |
 | `settings.py` | `devflow.config.json` の重ね合わせと、レビュアー設定の共通規則 |
 | `workflow.py` | 各フローが実装する契約（`Workflow` クラス）と、動作の表（`Command` / `Option`）。CLI の登録、所有者が要る操作（`needs_owner`）、振り分けはこの表から導く。共通層はフロー固有の state の項目を直接読まず、`summary` や `frozen_config` などの契約を通す |
