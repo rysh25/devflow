@@ -780,7 +780,9 @@ class TokenTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="devflow tokens ")
         self.addCleanup(temporary.cleanup)
-        self.work = Path(temporary.name)
+        # Resolved, as run directories are: macOS keeps temporary files under a symlink
+        # (/var -> /private/var), and records are never read through one.
+        self.work = Path(temporary.name).resolve()
 
     def tokens(self, kind, output):
         (self.work / "stdout.jsonl").write_text(output, encoding="utf-8")

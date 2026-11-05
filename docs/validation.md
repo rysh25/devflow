@@ -183,6 +183,8 @@ DevFlow のレビューの後、Windows の CI で、子孫がパイプを開い
   - Implement：resolutions の記録に `decision: accept` と最新の checkpoint の ID が入り、終わりのレポートに `human_acceptance` と警告が入りました。要約は、失敗した回（時間切れ、`time: 0:00:07 of 0:00:05`）と、その回の出力にあったトークン数を示しました。
   - どちらも、終わったときに Claude が要約をそのまま見せました。
 
+DevFlow のレビューの後、PR の CI の macOS で、`tests/common/test_reviewers.py` の CLI の版を読むテストだけが失敗しました。macOS は一時ディレクトリを symlink（`/var` → `/private/var`）の下に置き、DevFlow の記録の読み取りは symlink を通るパスを読まないためです。run のディレクトリは、解決したプロジェクトのパスの下にあるので、実際の run には当てはまりません。テストの一時ディレクトリを、ほかのテストと同じく解決するよう、テストだけを 1 行直しました（DevFlow のレビューを通していない変更です）。
+
 ## この環境では確認していないもの
 
 - 認証済み Codex / OpenCode の、モデルの利用権限、課金・レート制限。
