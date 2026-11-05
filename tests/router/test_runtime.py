@@ -517,11 +517,13 @@ class RunFormatTests(RuntimeFixture):
         self.assertIn("Cannot summarize run", listed[0]["error"])
 
     def test_old_run_with_a_leftover_transaction_does_not_block(self):
+        # Runs of 0.5.x and earlier could leave a transaction.json; it is never read or touched.
         identifier = self.raw_run("plan", status="reviewing")
         atomic_json(self.run_dir("plan", identifier) / "transaction.json",
                     {"schema_version": 1, "base_revision": 0, "state": {}, "writes": {}})
         listed = runtime.status(self.project, self.session, None)["runs"][0]
-        self.assertEqual((listed["format"], listed["recovery_required"]), ("unsupported", True))
+        self.assertEqual(listed["format"], "unsupported")
+        self.assertNotIn("recovery_required", listed)
         self.assertNotIn(identifier, " ".join(runtime.blocking_warnings(self.project)))
         self.plan_start()
         self.assertTrue((self.run_dir("plan", identifier) / "transaction.json").exists())  # Never touched.
@@ -559,10 +561,10 @@ class RunFormatTests(RuntimeFixture):
                     self.assertTrue(self.run_dir(flow, identifier).exists())  # Never touched.
 
     def test_unreleased_and_last_released_formats_are_unsupported(self):
-        # Formats 4 and 5 were never released (0.4.0 development), format 3 is 0.3.x and
-        # format 6 is 0.4.x: none is continued.
+        # Formats 4 and 5 were never released (0.4.0 development), format 3 is 0.3.x,
+        # format 6 is 0.4.x and format 7 is 0.5.x: none is continued.
         for version, release in ((3, "0.3.x"), (4, "an older version (run format 4)"),
-                                 (5, "an older version (run format 5)"), (6, "0.4.x")):
+                                 (5, "an older version (run format 5)"), (6, "0.4.x"), (7, "0.5.x")):
             for flow in ("plan", "implement"):
                 with self.subTest(version=version, flow=flow):
                     identifier = self.bind_to_old_run(identifier=self.old_id(flow, version), flow=flow,
@@ -628,44 +630,6 @@ class RunFormatTests(RuntimeFixture):
                 self.assertIsNone(self.record("new-session"))
                 path.unlink()
                 path.parent.rmdir()
-
-    def test_pending_transaction_is_reported_blocks_starts_and_resume_completes_it(self):
-        identifier = self.plan_start()
-        store = RunStore(self.project, WORKFLOWS["plan"])
-        with store.lock(identifier):
-            state = store.load(identifier)
-            state["last_error"] = {"message": "interrupted"}
-            desired = dict(state, state_revision=state["state_revision"] + 1)
-            atomic_json(self.run_dir("plan", identifier) / "transaction.json",
-                        {"schema_version": SCHEMA_VERSION, "base_revision": state["state_revision"], "state": desired, "writes": {}})
-        before = sorted(p.name for p in self.run_dir("plan", identifier).iterdir())
-        overview = runtime.status(self.project, "other-session", None)
-        self.assertTrue(overview["runs"][0]["recovery_required"])
-        self.assertTrue(runtime.status(self.project, None, identifier)["recovery_required"])
-        self.assertEqual(sorted(p.name for p in self.run_dir("plan", identifier).iterdir()), before)
-        self.assert_not_accepted(self.prompt("/devflow:implement feature.md", session="other-session"),
-                                 "interrupted transaction")
-        self.prompt("/devflow:resume " + identifier)
-        self.assertFalse((self.run_dir("plan", identifier) / "transaction.json").exists())
-        self.assertEqual(self.engine("plan").status(identifier)["last_error"], {"message": "interrupted"})
-
-    def test_cancel_also_completes_a_pending_transaction(self):
-        identifier = self.plan_start()
-        store = RunStore(self.project, WORKFLOWS["plan"])
-        with store.lock(identifier):
-            state = store.load(identifier)
-            desired = dict(state, state_revision=state["state_revision"] + 1, last_error={"message": "x"})
-            atomic_json(self.run_dir("plan", identifier) / "transaction.json",
-                        {"schema_version": SCHEMA_VERSION, "base_revision": state["state_revision"], "state": desired, "writes": {}})
-        self.assertEqual(self.engine("plan").cancel(identifier)["status"], "cancelled")
-        self.assertFalse((self.run_dir("plan", identifier) / "transaction.json").exists())
-
-    def test_corrupt_journal_is_not_resumed(self):
-        identifier = self.plan_start()
-        (self.run_dir("plan", identifier) / "transaction.json").write_text(
-            json.dumps({"schema_version": SCHEMA_VERSION}), encoding="utf-8")
-        self.assert_not_accepted(self.prompt("/devflow:resume " + identifier), "pending transaction")
-        self.assertTrue((self.run_dir("plan", identifier) / "transaction.json").exists())
 
     def test_old_per_workflow_session_directories_do_not_block_starts(self):
         old = self.project / ".devflow" / "sessions"
@@ -1005,7 +969,7 @@ class UnifiedCliTests(RuntimeFixture):
         self.assertEqual(json.loads(output)["status"], "idle")
         self.assertFalse((self.project / ".devflow").exists())
 
-    def test_real_hook_failure_exits_1_and_a_failed_stop_exits_0(self):
+    def test_real_hook_failure_exits_1_never_2(self):
         # Exit status 2 would make Claude Code block the tool or the prompt.
         for payload in ("not json", "[]", json.dumps({"hook_event_name": "PreToolUse"}),
                         json.dumps(self.payload(prompt=None)),
@@ -1014,19 +978,24 @@ class UnifiedCliTests(RuntimeFixture):
                 failed = self.process("hook", payload=payload)
                 self.assertEqual((failed.returncode, failed.stdout), (1, ""))
                 self.assertIn("DevFlow hook failed", failed.stderr)
-        stopped = self.process("hook", payload=json.dumps({"hook_event_name": "Stop"}))
-        self.assertEqual((stopped.returncode, stopped.stdout), (0, ""))
-        self.assertIn("DevFlow hook failed", stopped.stderr)
 
     def test_in_process_hook_failure_exits_1_never_2(self):
-        for payload, expected in (("{", 1), (json.dumps({"hook_event_name": "PostToolUse"}), 1),
-                                  (json.dumps({"hook_event_name": "Stop", "cwd": 3}), 0)):
+        for payload in ("{", json.dumps({"hook_event_name": "PostToolUse"}),
+                        json.dumps({"hook_event_name": "UserPromptSubmit", "cwd": 3})):
             with self.subTest(payload=payload):
                 out, err = io.StringIO(), io.StringIO()
                 with patch.object(sys, "stdin", io.StringIO(payload)), redirect_stdout(out), redirect_stderr(err):
                     code = cli.main(["hook"])
-                self.assertEqual((code, out.getvalue()), (expected, ""))
+                self.assertEqual((code, out.getvalue()), (1, ""))
                 self.assertIn("DevFlow hook failed", err.getvalue())
+
+    def test_an_event_the_hook_does_not_handle_is_silent(self):
+        for payload in ({"hook_event_name": "Stop"}, {"hook_event_name": "Stop", "cwd": 3},
+                        {"hook_event_name": "SessionStart"}):
+            with self.subTest(payload=payload):
+                result = self.process("hook", payload=json.dumps(payload))
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertFalse((self.project / ".devflow").exists())
 
     def test_real_hook_reports_a_command_error_as_context_with_exit_0(self):
         result = self.process("hook", payload=json.dumps(self.payload(prompt="/devflow:implement")))

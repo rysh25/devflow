@@ -12,6 +12,8 @@ import re
 import shutil
 import stat
 
+from typing import BinaryIO
+
 from ..common.errors import DevFlowError
 from ..common.process import run_bounded
 
@@ -30,24 +32,23 @@ def _resolve_executable(argv: list[str]) -> list[str]:
     return [resolved, *argv[1:]]
 
 
-def bounded_run(argv: list[str], cwd: Path, timeout_seconds: float, max_output_bytes: int = 1_048_576, env: dict | None = None) -> dict:
-    """Capture bounded stdout/stderr; a timeout or overflow is a recorded result, not a pass.
+def bounded_run(argv: list[str], cwd: Path, timeout_seconds: float, stdout: BinaryIO, stderr: BinaryIO,
+                env: dict | None = None) -> dict:
+    """Run one check, writing its output to the log files the caller opened.
 
-    Return bytes internally so callers such as Git inventory can decode strictly.
-    A child retaining pipes after its parent exits is an error, not a pass.
+    A timeout, a descendant retaining the pipes, or an output that could not
+    be captured is a recorded result, not a pass.
     """
-    result = run_bounded(_resolve_executable(argv), cwd=cwd, timeout=timeout_seconds, limit=max_output_bytes, env=env)
+    result = run_bounded(_resolve_executable(argv), cwd=cwd, timeout=timeout_seconds, env=env,
+                         stdout=stdout, stderr=stderr)
     error = None
     if result.timed_out:
         error = f"Check exceeded {timeout_seconds} seconds; process-tree termination was requested."
-    elif result.output_limit_exceeded:
-        error = f"Combined stdout/stderr exceeded {max_output_bytes} bytes; output is incomplete."
     elif result.retained_pipes:
         error = "A descendant retained output pipes after the command exited; process-tree termination was requested."
-    elif result.read_error:
-        error = "Could not capture all command output: " + result.read_error
-    return {"stdout_bytes": result.stdout, "stderr_bytes": result.stderr, "exit_code": result.exit_code,
-            "error": error, "timed_out": result.timed_out, "output_limit_exceeded": result.output_limit_exceeded,
+    elif result.output_error:
+        error = "Could not capture all command output: " + result.output_error
+    return {"exit_code": result.exit_code, "error": error, "timed_out": result.timed_out,
             "duration_seconds": result.duration_seconds}
 
 
@@ -67,16 +68,23 @@ def _safe_directory(path: Path, root: Path | None = None) -> Path:
     return absolute
 
 
+#: The fields a check may have.
+CHECK_FIELDS = frozenset({"id", "argv", "timeout_seconds", "required", "cwd"})
+
+
 def validate_checks(checks: list[dict], timeout_default: int = 600) -> list[dict]:
     if not isinstance(checks, list) or len(checks) > 32:
         raise DevFlowError("checks must be an array of at most 32 approved commands.")
     ids = set()
     validated = []
     for value in checks:
-        fields = {"id", "argv", "timeout_seconds", "required", "cwd", "max_output_bytes"}
-        if not isinstance(value, dict) or set(value) - fields:
-            raise DevFlowError("A check contains unknown fields.")
-        check = {"timeout_seconds": timeout_default, "required": True, "cwd": ".", "max_output_bytes": 1_048_576, **value}
+        if not isinstance(value, dict):
+            raise DevFlowError("Each check must be an object.")
+        unknown = set(value) - CHECK_FIELDS
+        if unknown:
+            raise DevFlowError("Invalid check fields (unknown: " + ", ".join(sorted(unknown))
+                               + "); see the project settings in the DevFlow README")
+        check = {"timeout_seconds": timeout_default, "required": True, "cwd": ".", **value}
         identifier = check.get("id")
         if not isinstance(identifier, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", identifier) or identifier in ids:
             raise DevFlowError("Each check needs a unique lowercase id.")
@@ -90,8 +98,6 @@ def validate_checks(checks: list[dict], timeout_default: int = 600) -> list[dict
             raise DevFlowError("Check required must be a boolean.")
         if type(check["timeout_seconds"]) is not int or not 1 <= check["timeout_seconds"] <= 3600:
             raise DevFlowError("Check timeout_seconds must be an integer from 1 to 3600.")
-        if type(check["max_output_bytes"]) is not int or not 1024 <= check["max_output_bytes"] <= 16 * 1024 * 1024:
-            raise DevFlowError("Check max_output_bytes must be from 1 KiB to 16 MiB.")
         cwd = check["cwd"]
         if not isinstance(cwd, str) or not cwd or "\\" in cwd or ":" in cwd or cwd.startswith("/") or ".." in cwd.split("/") or any(ord(char) < 32 for char in cwd):
             raise DevFlowError("Check cwd must be a project-relative directory without traversal.")
@@ -100,7 +106,7 @@ def validate_checks(checks: list[dict], timeout_default: int = 600) -> list[dict
 
 
 def run_checks(project: Path, checks: list[dict], work_dir: Path, timeout_default: int = 600) -> dict:
-    """Execute only configured argv, saving immutable bounded stdout/stderr logs."""
+    """Execute only configured argv; each check's output goes to its own new log files."""
     configured = validate_checks(checks, timeout_default)
     if not configured:
         return {"status": "not_configured", "results": []}
@@ -118,23 +124,19 @@ def run_checks(project: Path, checks: list[dict], work_dir: Path, timeout_defaul
         prepared.append((check, cwd, paths))
     results = []
     for check, cwd, paths in prepared:
-        try:
-            execution = bounded_run(check["argv"], cwd, check["timeout_seconds"], check["max_output_bytes"])
-        except DevFlowError as exc:
-            execution = {"exit_code": None, "stdout_bytes": b"", "stderr_bytes": b"", "error": str(exc), "duration_seconds": 0.0, "timed_out": False, "output_limit_exceeded": False}
-        for path, stream in zip(paths, ("stdout", "stderr")):
-            with path.open("xb") as output:
-                output.write(execution[stream + "_bytes"])
+        # The logs exist before the launch, so a check that cannot start still leaves two empty logs.
+        with paths[0].open("xb") as stdout, paths[1].open("xb") as stderr:
+            try:
+                execution = bounded_run(check["argv"], cwd, check["timeout_seconds"], stdout, stderr)
+            except DevFlowError as exc:
+                execution = {"exit_code": None, "error": str(exc), "duration_seconds": 0.0, "timed_out": False}
         status = "error" if execution["error"] else "passed" if execution["exit_code"] == 0 else "failed"
         results.append({
             "id": check["id"], "required": check["required"], "status": status,
             "argv": check["argv"], "cwd": check["cwd"],
             "exit_code": execution["exit_code"], "error": execution["error"],
-            "stdout": execution["stdout_bytes"].decode("utf-8", "replace"),
-            "stderr": execution["stderr_bytes"].decode("utf-8", "replace"),
             "stdout_path": str(paths[0]), "stderr_path": str(paths[1]),
-            "duration_seconds": execution["duration_seconds"],
-            "timed_out": execution["timed_out"], "output_limit_exceeded": execution["output_limit_exceeded"],
+            "duration_seconds": execution["duration_seconds"], "timed_out": execution["timed_out"],
         })
     required_statuses = {result["status"] for result in results if result["required"]}
     overall = "error" if "error" in required_statuses else "failed" if "failed" in required_statuses else "passed"

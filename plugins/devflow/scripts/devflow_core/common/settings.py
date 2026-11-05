@@ -10,10 +10,8 @@ from .storage import no_symlinks, read_json
 
 
 REVIEWER_KINDS = frozenset({"codex", "opencode"})
-REVIEWER_FIELDS = frozenset({"id", "kind", "command", "model", "effort", "timeout_seconds", "max_output_bytes"})
-REVIEWER_REQUIRED = frozenset({"id", "kind", "command", "model", "effort", "timeout_seconds"})
-#: The largest reviewer output DevFlow reads, and the default.
-MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+REVIEWER_FIELDS = frozenset({"id", "kind", "command", "model", "effort", "timeout_seconds"})
+REVIEWER_REQUIRED = REVIEWER_FIELDS
 
 
 def _document(project: Path) -> dict:
@@ -93,8 +91,4 @@ def validate_reviewer(reviewer: object) -> dict:
     timeout = reviewer["timeout_seconds"]
     if type(timeout) is not int or not 5 <= timeout <= 3600:
         raise DevFlowError("timeout_seconds must be an integer between 5 and 3600")
-    if "max_output_bytes" in reviewer:
-        limit = reviewer["max_output_bytes"]
-        if type(limit) is not int or not 1024 <= limit <= MAX_OUTPUT_BYTES:
-            raise DevFlowError("max_output_bytes must be an integer between 1024 and 16 MiB")
     return reviewer

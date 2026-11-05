@@ -8,7 +8,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from devflow_core.common import runs
+from devflow_core.common import runs, storage
 from devflow_core.common.errors import DevFlowError
 from devflow_core.common.runs import RunStore, make_event, open_escalation
 from devflow_core.common.storage import atomic_json, read_json
@@ -81,19 +81,133 @@ class RunStoreTests(unittest.TestCase):
             self.store.save(state)
         self.assertEqual(self.store.read(self.run_id)["state_revision"], 1)
 
-    def test_read_never_replays_a_pending_transaction_but_load_does(self):
+    def interrupted(self, change, *, records=None):
+        """A save that stops before ``state.json`` is replaced, after writing its records."""
+        original = runs.atomic_json
+
+        def stop(path, value):
+            if Path(path).name == "state.json":
+                raise OSError("stopped before the commit")
+            return original(path, value)
         with self.store.lock(self.run_id):
             state = self.store.load(self.run_id)
-        desired = dict(state, note="journaled", state_revision=1)
-        journal = self.store.run_dir(self.run_id) / "transaction.json"
-        atomic_json(journal, {"schema_version": runs.SCHEMA_VERSION, "base_revision": 0, "state": desired, "writes": {}})
-        info = self.store.inspect(self.run_id)
-        self.assertTrue(info.recovery_required)
-        self.assertEqual(self.store.read(self.run_id)["note"], "n")
-        self.assertTrue(journal.exists())
+            change(state)
+            for relative, data in (records or {}).items():
+                self.store.stage(state, relative, data)
+            with patch.object(runs, "atomic_json", side_effect=stop), self.assertRaises(OSError):
+                self.store.save(state)
+
+    def test_display_reads_never_write_and_a_stopped_save_is_not_committed(self):
+        run = self.store.run_dir(self.run_id)
+        before = sorted(path.relative_to(run) for path in run.rglob("*"))
+        self.store.read(self.run_id)
+        self.store.inspect(self.run_id)
+        self.assertEqual(sorted(path.relative_to(run) for path in run.rglob("*")), before)
+        self.interrupted(lambda state: state.update(note="never"), records={"left.json": b'{"a": 1}\n'})
+        committed = self.store.read(self.run_id)
+        self.assertEqual((committed["note"], committed["state_revision"]), ("n", 0))
+        self.assertNotIn("left.json", committed["artifacts"])
+        # The leftover is listed by nothing, so verification and reads ignore it.
+        self.assertTrue((run / "left.json").is_file())
+        self.store.verify_artifacts(committed)
+        self.assertEqual(self.store.inspect(self.run_id).format, "current")
+        self.assertFalse((run / "transaction.json").exists())
+
+    def test_a_save_writes_new_records_replaces_leftovers_and_never_changes_committed_ones(self):
+        run = self.store.run_dir(self.run_id)
+        self.interrupted(lambda state: None, records={"rounds/01.json": b'{"old": true}\n'})
         with self.store.lock(self.run_id):
-            self.assertEqual(self.store.load(self.run_id)["note"], "journaled")
-        self.assertFalse(journal.exists())
+            state = self.store.load(self.run_id)
+            self.store.stage(state, "rounds/01.json", b'{"new": true}\n')  # Replaces the leftover.
+            self.store.stage(state, "rounds/02.json", b'{"fresh": true}\n')  # Nothing there yet.
+            self.store.stage(state, "input.txt", b"data\n")  # Committed and identical: nothing to do.
+            self.store.save(state)
+        self.assertEqual((run / "rounds" / "01.json").read_bytes(), b'{"new": true}\n')
+        self.assertEqual((run / "rounds" / "02.json").read_bytes(), b'{"fresh": true}\n')
+        self.store.verify_artifacts(self.store.read(self.run_id))
+        with self.store.lock(self.run_id):
+            state = self.store.load(self.run_id)
+            self.store.stage(state, "input.txt", b"different\n")
+            with self.assertRaisesRegex(DevFlowError, "Refusing to overwrite a different immutable artifact: input.txt"):
+                self.store.save(state)
+        self.assertEqual((run / "input.txt").read_bytes(), b"data\n")
+        self.assertEqual(self.store.read(self.run_id)["state_revision"], 1)
+
+    def test_a_save_after_the_state_changed_on_disk_is_refused(self):
+        with self.store.lock(self.run_id):
+            state = self.store.load(self.run_id)
+            stale = dict(state, note="stale")
+            state["note"] = "first"
+            self.store.save(state)
+            with self.assertRaisesRegex(DevFlowError, "changed since it was loaded"):
+                self.store.save(stale)
+        self.assertEqual(self.store.read(self.run_id)["note"], "first")
+
+    def test_verification_reads_files_in_chunks_and_finds_changes(self):
+        run = self.store.run_dir(self.run_id)
+        with patch.object(Path, "read_bytes", side_effect=AssertionError("read whole")):
+            self.store.verify_artifacts(self.state)
+        (run / "input.txt").write_bytes(b"changed\n")
+        with self.assertRaisesRegex(DevFlowError, "Immutable artifact changed or is missing: input.txt"):
+            self.store.verify_artifacts(self.state)
+
+    def test_json_records_that_could_not_be_read_back_are_never_written(self):
+        with patch.object(storage, "JSON_LIMIT", 64):
+            with self.store.lock(self.run_id):
+                state = self.store.load(self.run_id)
+                with self.assertRaisesRegex(DevFlowError, "Record big.json would be .* over the 64 MiB JSON limit"):
+                    self.store.stage(state, "big.json", b"x" * 65)
+                state["note"] = "x" * 100
+                with self.assertRaisesRegex(DevFlowError, "Record state.json would be"):
+                    self.store.save(state)
+            identifier = runs.new_run_id()
+            with self.assertRaisesRegex(DevFlowError, "Record start.json would be"):
+                self.store.create({"status": "working", "note": "n", "escalation": None}, {"start.json": b"x" * 65},
+                                  run_id=identifier, owner="owner", first_event=make_event(prompt(), "prompt"))
+        self.assertEqual(self.store.read(self.run_id)["note"], "n")
+        self.assertFalse((self.store.root / identifier).exists())
+        # A JSON record given as a file is refused the same way, by its size.
+        identifier = runs.new_run_id()
+        with self.store.scratch(identifier) as scratch:
+            source = scratch / "start.json"
+            storage.write_new(source, b"x" * 65)
+            with patch.object(storage, "JSON_LIMIT", 64), \
+                    self.assertRaisesRegex(DevFlowError, "Record start.json would be 65 bytes, over the 64 MiB JSON limit"):
+                self.store.create({"status": "working", "note": "n", "escalation": None}, {"start.json": source},
+                                  run_id=identifier, owner="owner", first_event=make_event(prompt(), "prompt"))
+        self.assertFalse((self.store.root / identifier).exists())
+        self.assertFalse(any(path.name.startswith(runs.CREATING) for path in self.store.root.iterdir()))
+
+    def test_a_file_record_is_moved_into_the_new_run(self):
+        identifier = runs.new_run_id()
+        with self.store.scratch(identifier) as scratch:
+            self.assertTrue(scratch.name.startswith(runs.CREATING))
+            source = scratch / "copy"
+            storage.write_new(source, [b"large ", b"record\n"])
+            state = self.store.create({"status": "working", "note": "n", "escalation": None},
+                                      {"baseline/copy": source}, run_id=identifier, owner="owner",
+                                      first_event=make_event(prompt(), "prompt"))
+            self.assertFalse(source.exists())
+        run = self.store.run_dir(identifier)
+        self.assertEqual((run / "baseline" / "copy").read_bytes(), b"large record\n")
+        self.assertEqual(state["artifacts"]["baseline/copy"], storage.digest(b"large record\n"))
+        self.assertFalse(scratch.exists())
+
+    def test_the_scratch_directory_is_removed_after_a_failed_start(self):
+        identifier = runs.new_run_id()
+        with self.assertRaises(OSError):
+            with self.store.scratch(identifier) as scratch:
+                (scratch / "copy").write_bytes(b"x")
+                raise OSError("start failed")
+        self.assertFalse(scratch.exists())
+
+    def test_scratch_creates_the_record_directories_of_a_new_project(self):
+        project = self.project / "fresh project"
+        project.mkdir()
+        store = RunStore(project, Toy())
+        with store.scratch(runs.new_run_id()) as scratch:
+            self.assertTrue(scratch.is_dir())
+        self.assertTrue((project / ".devflow" / ".gitignore").is_file())
 
     def test_question_retries_are_deduplicated_per_session(self):
         first = self.store.append_event(self.run_id, question(), "question")

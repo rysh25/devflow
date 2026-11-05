@@ -137,8 +137,8 @@ def _validate_files(files: dict[str, bytes]) -> dict:
     _require(isinstance(hooks, dict), "Missing unified hook map")
     # Hooks only record and add context: they never block, and the tool hooks
     # run only for AskUserQuestion (so other tool calls start no process).
-    _require(set(hooks) == {"UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"},
-             "Hooks must be exactly UserPromptSubmit, PreToolUse, PostToolUse and Stop")
+    _require(set(hooks) == {"UserPromptSubmit", "PreToolUse", "PostToolUse"},
+             "Hooks must be exactly UserPromptSubmit, PreToolUse and PostToolUse")
     for event, matchers in hooks.items():
         _require(isinstance(matchers, list) and matchers, f"Invalid hook event {event}")
         for matcher in matchers:

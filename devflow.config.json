@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "implement": {
+    "checks": [
+      {"id": "tests", "argv": ["python", "tools/test_all.py", "--quiet"], "timeout_seconds": 600},
+      {"id": "package", "argv": ["python", "tools/package.py", "--validate-only"], "timeout_seconds": 120}
+    ]
+  }
+}

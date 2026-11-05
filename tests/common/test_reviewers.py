@@ -50,6 +50,16 @@ def lines(*events):
     return "\n".join(event if isinstance(event, str) else json.dumps(event) for event in events)
 
 
+def parse_codex(output):
+    """The Codex parser reads the output file line by line."""
+    return reviewers.parse_codex_events(output.split("\n"))
+
+
+def parse_opencode(output):
+    """The OpenCode parser reads the output file line by line."""
+    return reviewers.parse_opencode_events(output.split("\n"))
+
+
 def codex(*items, end=({"type": "turn.completed", "usage": {}},)):
     return lines({"type": "thread.started", "thread_id": "thread-1"}, {"type": "turn.started"}, *items, *end)
 
@@ -87,7 +97,7 @@ class JsonTests(unittest.TestCase):
 
 class CodexEventTests(unittest.TestCase):
     def test_a_completed_turn_with_no_tools(self):
-        self.assertEqual(reviewers.parse_codex_events(codex(answer_item())), NO_TOOLS)
+        self.assertEqual(parse_codex(codex(answer_item())), NO_TOOLS)
 
     def test_every_tool_and_subagent_is_counted_once_by_its_type(self):
         output = codex(
@@ -102,7 +112,7 @@ class CodexEventTests(unittest.TestCase):
             item("item.completed", "a_tool_added_in_a_later_version", "n1"),
             item("item.completed", "reasoning", "r1", text="thinking"),
             answer_item())
-        self.assertEqual(reviewers.parse_codex_events(output), {
+        self.assertEqual(parse_codex(output), {
             "tool_call_count": 6, "other_events": {},
             "tool_calls": {"a_tool_added_in_a_later_version": 1, "collab_tool_call": 1, "command_execution": 2,
                            "mcp_tool_call": 1, "web_search": 1}})
@@ -116,7 +126,7 @@ class CodexEventTests(unittest.TestCase):
             '{"type": "item.completed", "item": {"id": "x", "id": "y", "type": "web_search"}}',
             "not a json line",
             answer_item())
-        activity = reviewers.parse_codex_events(output)
+        activity = parse_codex(output)
         self.assertEqual(activity["tool_calls"], {"todo_list": 1, "web_search": 1})
         self.assertEqual(activity["other_events"], {"(unreadable line)": 1, "an.event.added.later": 1,
                                                     "error": 1, "error item": 1})
@@ -128,22 +138,22 @@ class CodexEventTests(unittest.TestCase):
             {"type": "thread.started", "thread_id": other},
             item("item.completed", "command_execution", "c9", thread_id=other),
             {"type": "turn.failed", "thread_id": other, "error": {"message": "child failed"}}))
-        activity = reviewers.parse_codex_events(child_failed)
+        activity = parse_codex(child_failed)
         self.assertEqual(activity["other_events"], {"turn.failed in another thread": 1})
         main_failed = codex(answer_item(), end=(
             {"type": "turn.failed", "error": {"message": "main failed"}},
             {"type": "turn.completed", "thread_id": other, "usage": {}}))
         with self.assertRaisesRegex(ReviewerError, "main failed"):
-            reviewers.parse_codex_events(main_failed)
+            parse_codex(main_failed)
         # A failed main turn stays a failure even if a later turn completes.
         failed_then_completed = codex(answer_item(), end=(
             {"type": "turn.failed", "error": {"message": "main failed first"}},
             {"type": "turn.completed", "usage": {}}))
         with self.assertRaisesRegex(ReviewerError, "main failed first"):
-            reviewers.parse_codex_events(failed_then_completed)
+            parse_codex(failed_then_completed)
         named_main = lines({"type": "thread.started", "thread_id": "thread-1"},
                            {"type": "turn.completed", "thread_id": "thread-1", "usage": {}})
-        self.assertEqual(reviewers.parse_codex_events(named_main), NO_TOOLS)
+        self.assertEqual(parse_codex(named_main), NO_TOOLS)
 
     def test_only_an_unfinished_or_failed_turn_fails(self):
         cases = {
@@ -153,12 +163,12 @@ class CodexEventTests(unittest.TestCase):
         }
         for name, output in cases.items():
             with self.subTest(case=name), self.assertRaisesRegex(ReviewerError, "turn"):
-                reviewers.parse_codex_events(output)
+                parse_codex(output)
 
 
 class OpenCodeEventTests(unittest.TestCase):
     def test_the_answer_is_the_main_sessions_last_step(self):
-        value, activity = reviewers.parse_opencode_events(opencode())
+        value, activity = parse_opencode(opencode())
         self.assertEqual((value, activity), (REVIEW, NO_TOOLS))
 
     def test_tools_steps_and_subagent_sessions_are_counted(self):
@@ -175,7 +185,7 @@ class OpenCodeEventTests(unittest.TestCase):
             oc("step_finish", session="sub", reason="stop"),
             oc("reasoning", text="thinking"), oc("step_finish", reason="tool-calls"),
             {"type": "an_event_added_later", "sessionID": "main"}, "not a json line")
-        value, activity = reviewers.parse_opencode_events(output)
+        value, activity = parse_opencode(output)
         self.assertEqual(value, REVIEW)
         self.assertEqual(activity, {
             "tool_call_count": 5, "tool_calls": {"grep": 1, "mcp_docs_search": 1, "read": 1, "shell": 1, "task": 1},
@@ -184,12 +194,12 @@ class OpenCodeEventTests(unittest.TestCase):
     def test_a_later_step_that_finishes_gives_the_answer(self):
         output = lines(oc("step_start"), oc("text", id="a", text='{"draft": true}'), oc("step_finish", reason="stop"),
                        oc("step_start"), oc("text", id="b", text=json.dumps(REVIEW)), oc("step_finish", reason="stop"))
-        self.assertEqual(reviewers.parse_opencode_events(output)[0], REVIEW)
+        self.assertEqual(parse_opencode(output)[0], REVIEW)
 
     def test_a_text_part_sent_again_counts_once_with_its_last_version(self):
         output = lines(oc("step_start"), oc("text", id="p", text='{"schema_version": 1, '),
                        oc("text", id="p", text=json.dumps(REVIEW)), oc("step_finish", reason="stop"))
-        self.assertEqual(reviewers.parse_opencode_events(output)[0], REVIEW)
+        self.assertEqual(parse_opencode(output)[0], REVIEW)
 
     def test_text_parts_whose_id_is_not_a_string_are_kept_in_order(self):
         # Each is a part of its own: none is lost, and nothing fails.
@@ -198,7 +208,7 @@ class OpenCodeEventTests(unittest.TestCase):
             with self.subTest(ids=(first, second)):
                 output = lines(oc("step_start"), oc("text", id=first, text=half[0]), oc("text", id=second, text=half[1]),
                                oc("step_finish", reason="stop"))
-                self.assertEqual(reviewers.parse_opencode_events(output)[0], REVIEW)
+                self.assertEqual(parse_opencode(output)[0], REVIEW)
 
     def test_only_an_unfinished_answer_or_a_main_session_error_fails(self):
         cases = {
@@ -216,13 +226,13 @@ class OpenCodeEventTests(unittest.TestCase):
         }
         for name, (output, message) in cases.items():
             with self.subTest(case=name), self.assertRaisesRegex(ReviewerError, message):
-                reviewers.parse_opencode_events(output)
+                parse_opencode(output)
 
     def test_the_answer_itself_is_strict_json(self):
         for text in ('{"verdict":"pass","verdict":"pass"}', "```json\n{}\n```"):
             output = lines(oc("step_start"), oc("text", id="a", text=text), oc("step_finish", reason="stop"))
             with self.subTest(text=text), self.assertRaises(ReviewerError):
-                reviewers.parse_opencode_events(output)
+                parse_opencode(output)
 
 
 class CommandTests(unittest.TestCase):
@@ -288,7 +298,7 @@ class ReviewerSettingsTests(unittest.TestCase):
         return [reviewer(kinds[index % len(kinds)], id=f"r{index}") for index in range(count)]
 
     def test_complete_entries_accepted(self):
-        for entry in (reviewer(), reviewer("opencode"), reviewer(max_output_bytes=4096),
+        for entry in (reviewer(), reviewer("opencode"),
                       reviewer(command=["/opt/bash/codex"]), reviewer(command=["node", "C:\\tools\\codex.js"]),
                       reviewer(command=[sys.executable, "/tmp/fake reviewer.py", "pass"])):
             with self.subTest(entry=entry):
@@ -309,7 +319,7 @@ class ReviewerSettingsTests(unittest.TestCase):
             del entry[field]
             with self.subTest(missing=field):
                 self.assertRejected(entry, f"missing: {field}")
-        for field in ("api_key", "web", "protocol_version"):
+        for field in ("api_key", "web", "protocol_version", "max_output_bytes"):
             with self.subTest(unknown=field):
                 self.assertRejected({**reviewer("opencode"), field: 2}, rf"unknown: {field}\).*README")
         self.assertRejected(["codex"], "object")
@@ -347,16 +357,6 @@ class ReviewerSettingsTests(unittest.TestCase):
             with self.subTest(timeout=timeout):
                 self.assertRejected(reviewer(timeout_seconds=timeout), "timeout_seconds")
 
-    def test_max_output_bytes_boundaries(self):
-        self.assertEqual(settings.MAX_OUTPUT_BYTES, 16 * MIB)
-        self.assertEqual(reviewers.MAX_OUTPUT_BYTES, 16 * MIB)
-        for limit in (1024, 16 * MIB):
-            with self.subTest(limit=limit):
-                settings.validate_reviewer(reviewer(max_output_bytes=limit))
-        for limit in (1023, 16 * MIB + 1, 0, True, 1024.0, "4096"):
-            with self.subTest(limit=limit):
-                self.assertRejected(reviewer(max_output_bytes=limit), "max_output_bytes")
-
     def test_reviewer_count_against_max_reviews(self):
         for count, accepted in ((1, False), (2, True), (3, True), (6, True), (7, False)):
             with self.subTest(count=count):
@@ -392,15 +392,43 @@ class ReviewerSettingsTests(unittest.TestCase):
             settings.validate_reviewers(entries, 6)
 
 
-class OutputLimitTests(unittest.TestCase):
-    def test_each_stream_has_its_own_limit_so_stderr_logs_do_not_use_up_stdout(self):
-        code = "import sys; sys.stdout.write('o' * 3000); sys.stdout.flush(); sys.stderr.write('e' * 3000)"
-        exit_code, stdout, stderr = reviewers._capture([sys.executable, "-c", code], limit=4096)
-        self.assertEqual((exit_code, len(stdout), len(stderr)), (0, 3000, 3000))
+class CaptureTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="devflow capture ")
+        self.addCleanup(temporary.cleanup)
+        self.work = Path(temporary.name)
 
-    def test_a_single_stream_over_its_limit_is_a_failure(self):
-        with self.assertRaisesRegex(ReviewerError, "exceeded the size limit"):
-            reviewers._capture([sys.executable, "-c", "import sys; sys.stderr.write('e' * 9000)"], limit=4096)
+    def test_a_probe_returns_its_whole_output(self):
+        code = "import sys; sys.stdout.write('o' * (17 * 1024 * 1024)); sys.stderr.write('e' * 9000)"
+        exit_code, stdout = reviewers._capture([sys.executable, "-c", code], timeout=60)
+        self.assertEqual((exit_code, len(stdout)), (0, 17 * MIB))
+
+    def test_a_review_writes_its_output_files_before_and_while_it_runs(self):
+        code = "import sys; sys.stdout.write('o' * (17 * 1024 * 1024)); sys.stderr.write('e' * 9000)"
+        exit_code, stdout = reviewers._capture([sys.executable, "-c", code], timeout=60, log_dir=self.work)
+        self.assertEqual((exit_code, stdout), (0, b""))
+        self.assertEqual((self.work / "stdout.jsonl").stat().st_size, 17 * MIB)
+        self.assertEqual((self.work / "stderr.log").stat().st_size, 9000)
+
+    def test_existing_output_files_stop_the_launch(self):
+        marker = self.work / "launched"
+        (self.work / "stdout.jsonl").write_text("earlier", encoding="utf-8")
+        code = f"import pathlib; pathlib.Path({str(marker)!r}).write_text('x')"
+        with self.assertRaisesRegex(ReviewerError, "Cannot create adapter output stdout.jsonl"):
+            reviewers._capture([sys.executable, "-c", code], log_dir=self.work)
+        self.assertFalse(marker.exists())
+        self.assertEqual((self.work / "stdout.jsonl").read_text(encoding="utf-8"), "earlier")
+
+    def test_a_failed_launch_still_leaves_both_output_files(self):
+        with self.assertRaisesRegex(ReviewerError, "Cannot run reviewer"):
+            reviewers._capture([str(self.work / "missing-cli")], log_dir=self.work)
+        self.assertEqual([(self.work / name).read_bytes() for name in ("stdout.jsonl", "stderr.log")], [b"", b""])
+
+    def test_lines_split_only_at_newline(self):
+        path = self.work / "stdout.jsonl"
+        event = {"type": "text", "part": {"text": "a\u2028b\u2029c\x85d"}}
+        path.write_bytes(json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n" + b"{}\n")
+        self.assertEqual([json.loads(line) for line in reviewers._lines(path)], [event, {}])
 
 
 FAKE = r'''
@@ -428,9 +456,10 @@ with open(records / "attempts.txt", "a", encoding="utf-8") as handle:
     handle.write(mode + "\n")
 if mode == "timeout":
     time.sleep(30)
-if mode == "too-large":
-    print("x" * 65536)
-    raise SystemExit(0)
+def emit(event):
+    sys.stdout.flush()
+    sys.stdout.buffer.write(json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n")
+    sys.stdout.buffer.flush()
 if mode == "exit-error":
     print("fixture failure", file=sys.stderr)
     raise SystemExit(7)
@@ -447,6 +476,9 @@ if codex:
     Path(args[args.index("--output-last-message") + 1]).write_text(text, encoding="utf-8")
     print(json.dumps({"type": "thread.started", "thread_id": "thread-1"}))
     print(json.dumps({"type": "turn.started"}))
+    if mode == "large":
+        emit({"type": "item.completed", "item": {"id": "big", "type": "command_execution",
+              "aggregated_output": "x" * (17 * 1024 * 1024) + "\u2028end"}})
     if mode == "tools":
         print(json.dumps({"type": "item.completed", "item": {"id": "c1", "type": "command_execution"}}))
         print(json.dumps({"type": "item.completed", "item": {"id": "c2", "type": "command_execution"}}))
@@ -456,6 +488,9 @@ if codex:
     print(json.dumps({"type": "item.completed", "item": {"id": "a", "type": "agent_message", "text": stream_text}}))
     print(json.dumps({"type": "turn.completed", "usage": {}}))
 else:
+    if mode == "large":
+        emit({"type": "tool_use", "sessionID": "s1",
+              "part": {"id": "big", "tool": "read", "output": "x" * (17 * 1024 * 1024) + "\u2028end"}})
     if mode == "tools":
         print(json.dumps({"type": "step_start", "sessionID": "s1", "part": {}}))
         print(json.dumps({"type": "tool_use", "sessionID": "s1", "part": {"id": "t1", "tool": "read"}}))
@@ -590,14 +625,13 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(set(meta), {"kind", "executable", "cli_version", "version_warnings", "requested_model",
                                      "requested_effort",
                                      "effective_model_attested", "cwd", "prefix_arg_count", "timeout_seconds",
-                                     "max_output_bytes", "packet_sha256", "shell", "settings"})
+                                     "packet_sha256", "shell", "settings"})
         self.assertFalse(meta["effective_model_attested"])
         self.assertEqual(Path(meta["cwd"]), self.project)
         self.assertFalse(meta["shell"])
         self.assertEqual(meta["settings"], "the user's own CLI settings")
         self.assertEqual(meta["prefix_arg_count"], 2)
         self.assertEqual(meta["timeout_seconds"], 10)
-        self.assertEqual(meta["max_output_bytes"], 16 * MIB)
         self.assertEqual(meta["packet_sha256"], hashlib.sha256(self.packet.read_bytes()).hexdigest())
         self.assertEqual(list(self.project.iterdir()), [])
 
@@ -705,21 +739,14 @@ class ProcessTests(unittest.TestCase):
         self.assertTrue((self.output / "stdout.jsonl").is_file())
         self.assertEqual(self.attempts(), ["timeout"])
 
-    def test_output_size_is_bounded_by_default_limit(self):
-        # The default is the 16 MiB ceiling; patch it down to exercise the bound.
-        with patch.object(reviewers, "MAX_OUTPUT_BYTES", 1024):
-            with self.assertRaisesRegex(ReviewerError, "size limit"):
-                self.run_fixture("codex", "too-large")
-        self.assertLessEqual((self.output / "stdout.jsonl").stat().st_size, 1024)
-
-    def test_per_reviewer_output_limit(self):
-        with self.assertRaisesRegex(ReviewerError, "size limit"):
-            self.run_fixture("codex", "too-large", max_output_bytes=1024)
-        self.assertLessEqual((self.output / "stdout.jsonl").stat().st_size, 1024)
-        self.assertEqual(self.meta()["max_output_bytes"], 1024)
-        self.output = self.base / "large limit"
-        self.assertEqual(self.run_fixture(max_output_bytes=16 * MIB)["review"], FIXTURE_REVIEW)
-        self.assertEqual(self.meta()["max_output_bytes"], 16 * MIB)
+    def test_output_is_never_limited_by_size(self):
+        for kind in ("codex", "opencode"):
+            self.output = self.base / f"large {kind}"
+            with self.subTest(kind=kind):
+                result = self.run_fixture(kind, "large")
+                self.assertEqual(result["review"], FIXTURE_REVIEW)
+                self.assertEqual(result["activity"]["tool_call_count"], 1)
+                self.assertGreater((self.output / "stdout.jsonl").stat().st_size, 17 * MIB)
 
     def test_no_replay_or_overwrite(self):
         self.run_fixture()

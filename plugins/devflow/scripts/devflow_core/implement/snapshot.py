@@ -1,11 +1,17 @@
-"""Deterministic, bounded snapshots of an explicitly scoped local worktree.
+"""Deterministic snapshots of an explicitly scoped local worktree.
 
 No checkout, reset, add, commit, Git filters, or external diff driver is used.
-Snapshots contain local file bytes, including changes present before a run.
+A snapshot lists each file's path, sha256, size, mode and whether it is
+binary; it never holds file contents. Files are hashed while they are read,
+so their size never stops a snapshot. The start-time snapshot keeps a copy of
+only the text files whose exact bytes Git does not already hold (changes
+present before the run, untracked files, every text file in files mode), so a
+checkpoint's diff starts from the worktree as it was, not from HEAD.
 """
 
 from __future__ import annotations
 
+import codecs
 import difflib
 import fnmatch
 import hashlib
@@ -15,8 +21,12 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 
-from ..common.git import run_git
+from ..common.git import content_timeout, run_git
 from ..common.errors import DevFlowError
+from ..common.storage import write_new
+
+#: How much of a file is read at a time.
+CHUNK = 64 * 1024
 
 
 DEFAULT_EXCLUDES = [
@@ -46,12 +56,7 @@ def _settings(config: dict) -> dict:
     value = config.get("snapshot", config)
     if not isinstance(value, dict):
         raise DevFlowError("snapshot must be an object.")
-    result = {
-        "mode": "git", "include": ["**"], "exclude": [],
-        "max_files": 5000, "max_file_bytes": 1_000_000,
-        "max_total_bytes": 20_000_000, "max_packet_bytes": 2_000_000,
-        "context_paths": [],
-    }
+    result = {"mode": "git", "include": ["**"], "exclude": [], "max_packet_bytes": 2_000_000, "context_paths": []}
     result.update(value)
     if result["mode"] not in {"git", "files"}:
         raise DevFlowError("snapshot.mode must explicitly be git or files.")
@@ -65,9 +70,8 @@ def _settings(config: dict) -> dict:
             raise DevFlowError(f"Unsafe snapshot glob: {pattern!r}")
     for context in result["context_paths"]:
         validate_relative(context)
-    for name in ("max_files", "max_file_bytes", "max_total_bytes", "max_packet_bytes"):
-        if type(result[name]) is not int or result[name] < 1:
-            raise DevFlowError(f"snapshot.{name} must be a positive integer.")
+    if type(result["max_packet_bytes"]) is not int or result["max_packet_bytes"] < 1:
+        raise DevFlowError("snapshot.max_packet_bytes must be a positive integer.")
     return result
 
 
@@ -162,7 +166,8 @@ def _scoped_status(raw: bytes, settings: dict) -> list[dict]:
     return result
 
 
-def _git_inventory(root: Path, settings: dict) -> tuple[list[tuple[str, str | None]], dict]:
+def _git_inventory(root: Path, settings: dict) -> tuple[list[tuple[str, str | None]], dict, dict[str, str]]:
+    """Candidate paths with their Git modes, the Git facts, and each tracked path's index ID."""
     try:
         top = run_git(root, "rev-parse", "--show-toplevel").decode("utf-8", "strict").strip()
         if Path(top).resolve() != root:
@@ -170,14 +175,17 @@ def _git_inventory(root: Path, settings: dict) -> tuple[list[tuple[str, str | No
         head_raw = run_git(root, "rev-parse", "--verify", "HEAD", ok_codes=(0, 128))
         head = head_raw.decode("ascii", "strict").strip() or None
         candidates: dict[str, str | None] = {}
+        index: dict[str, str] = {}
         for entry in run_git(root, "ls-files", "--stage", "-z").split(b"\0"):
             if not entry:
                 continue
             prefix, raw_path = entry.split(b"\t", 1)
-            mode, _oid, stage = prefix.decode("ascii").split(" ")
+            mode, oid, stage = prefix.decode("ascii").split(" ")
             if stage != "0":
                 raise DevFlowError("Unmerged Git index entries require human resolution before an implementation run starts.")
-            candidates[raw_path.decode("utf-8", "strict")] = mode
+            path = raw_path.decode("utf-8", "strict")
+            candidates[path] = mode
+            index[path] = oid
         for raw_path in run_git(root, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0"):
             if raw_path:
                 candidates[raw_path.decode("utf-8", "strict")] = None
@@ -187,29 +195,20 @@ def _git_inventory(root: Path, settings: dict) -> tuple[list[tuple[str, str | No
     return sorted(candidates.items()), {
         "head": head, "dirty": bool(status), "status": status,
         "scope": "Dirty status and file contents cover included tracked and non-ignored untracked paths only; ignored untracked paths are not scanned.",
-    }
+    }, index
 
 
 def _file_inventory(root: Path, settings: dict, excluded: list[dict]) -> list[tuple[str, str | None]]:
     candidates: list[tuple[str, str | None]] = []
     todo = [root]
-    visited = 0
     while todo:
         directory = todo.pop()
         try:
             with os.scandir(directory) as scanned:
-                entries = []
-                for entry in scanned:
-                    if visited + len(entries) >= max(settings["max_files"] * 20, 1000):
-                        raise DevFlowError("Project traversal exceeds its bounded entry budget; narrow include/exclude scope.")
-                    entries.append(entry)
-                entries.sort(key=lambda entry: entry.name)
+                entries = sorted(scanned, key=lambda entry: entry.name)
         except OSError as exc:
             raise DevFlowError(f"Cannot enumerate project directory: {directory}") from exc
         for entry in entries:
-            visited += 1
-            if visited > max(settings["max_files"] * 20, 1000):
-                raise DevFlowError("Project traversal exceeds its bounded entry budget; narrow include/exclude scope.")
             relative = Path(entry.path).relative_to(root).as_posix()
             validate_relative(relative)
             reason = _excluded_reason(relative, settings)
@@ -244,37 +243,110 @@ def _content(info: os.stat_result) -> tuple:
     return (info.st_size, info.st_mtime_ns)
 
 
-def _read_file(path: Path, limit: int, git_mode: str | None) -> dict:
+def _read_file(path: Path, git_mode: str | None) -> dict:
+    """Hash one file while reading it in chunks, and decide whether it is binary.
+
+    A file is binary when it contains NUL or is not valid UTF-8, the same rule
+    as before; its contents are never kept.
+    """
     before = path.lstat()
     if _is_link(before) or not stat.S_ISREG(before.st_mode):
         raise DevFlowError(f"Snapshot requires a regular non-link file: {path}")
-    if before.st_size > limit:
-        raise DevFlowError(f"Snapshot file exceeds {limit} bytes: {path}")
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
+    hasher = hashlib.sha256()
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    size, text = 0, True
     with os.fdopen(descriptor, "rb") as stream:
         opened = os.fstat(stream.fileno())
         if _content(opened) != _content(before):
             raise DevFlowError(f"File changed while snapshot opened it: {path}")
-        data = stream.read(limit + 1)
+        while chunk := stream.read(CHUNK):
+            hasher.update(chunk)
+            size += len(chunk)
+            if text:
+                try:
+                    text = b"\0" not in chunk and decoder.decode(chunk) is not None
+                except UnicodeDecodeError:
+                    text = False
         after_read = os.fstat(stream.fileno())
+    if text:
+        try:
+            decoder.decode(b"", final=True)
+        except UnicodeDecodeError:
+            text = False
     after = path.lstat()
     # Each call is compared with itself in full, and across the two calls by content only.
-    if (len(data) > limit or _fingerprint(opened) != _fingerprint(after_read)
+    if (size != after_read.st_size or _fingerprint(opened) != _fingerprint(after_read)
             or _fingerprint(before) != _fingerprint(after) or _content(after_read) != _content(after)):
         raise DevFlowError(f"File changed while snapshot read it: {path}")
-    try:
-        text = data.decode("utf-8") if b"\0" not in data else None
-    except UnicodeDecodeError:
-        text = None
     mode = "100755" if before.st_mode & 0o111 else "100644"
     if os.name == "nt" and git_mode in {"100644", "100755"}:
         mode = git_mode
-    return {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data), "mode": mode, "text": text, "binary": text is None, "_stat": _fingerprint(after)}
+    return {"sha256": hasher.hexdigest(), "size": size, "mode": mode, "binary": not text, "_stat": _fingerprint(after)}
 
 
-def capture(project: Path, config: dict) -> dict:
-    """Capture included bytes, failing instead of silently truncating coverage."""
+def _chunks(path: Path, hasher):
+    """A file's bytes in chunks, hashed as they are read."""
+    with path.open("rb") as stream:
+        while chunk := stream.read(CHUNK):
+            hasher.update(chunk)
+            yield chunk
+
+
+def _git_held(root: Path, paths: list[str], files: dict[str, dict], index: dict[str, str]) -> dict[str, str]:
+    """The tracked paths whose exact bytes are the blob in Git's index, with that blob's ID.
+
+    Git computes the IDs itself (``hash-object --no-filters``, so no filter or
+    line-ending conversion runs). Each path is passed as ``./path`` so a name
+    that starts with a double quote is taken literally.
+    """
+    if not paths:
+        return {}
+    data = "".join(f"./{path}\n" for path in paths).encode("utf-8")
+    try:
+        output = run_git(root, "hash-object", "--no-filters", "--stdin-paths", data=data,
+                         timeout=content_timeout(sum(files[path]["size"] for path in paths)))
+        ids = output.decode("ascii", "strict").split()
+    except UnicodeError as exc:
+        raise DevFlowError("Cannot read the object IDs Git computed") from exc
+    if len(ids) != len(paths):
+        raise DevFlowError("Git computed a different number of object IDs than files")
+    return {path: oid for path, oid in zip(paths, ids) if index.get(path) == oid}
+
+
+def _keep_copies(root: Path, settings: dict, files: dict[str, dict], candidates: dict[str, str | None],
+                 index: dict[str, str], copies: Path) -> None:
+    """Record where each text file's start-time bytes can be read back (``source``).
+
+    Git holds the bytes: ``{"git": ID}``. Otherwise a copy is written once to
+    ``copies/<sha256>`` and recorded as ``{"copy": "<copies name>/<sha256>"}``.
+    Binary files need no source: their diff never shows contents.
+    """
+    text = [path for path, record in files.items() if not record["binary"]]
+    tracked = [path for path in text if settings["mode"] == "git" and candidates.get(path) is not None]
+    held = _git_held(root, tracked, files, index)
+    for path in text:
+        record = files[path]
+        if path in held:
+            record["source"] = {"git": held[path]}
+            continue
+        target = copies / record["sha256"]
+        if not target.exists():
+            hasher = hashlib.sha256()
+            write_new(target, _chunks(_safe_path(root, path), hasher))
+            if hasher.hexdigest() != record["sha256"]:
+                raise DevFlowError(f"File changed during snapshot: {path}")
+        record["source"] = {"copy": f"{copies.name}/{record['sha256']}"}
+
+
+def capture(project: Path, config: dict, copies: Path | None = None) -> dict:
+    """List every included file without its contents; the size of the scope never stops it.
+
+    ``copies`` (the start of a run only) is a directory for the start-time
+    copies of text files Git does not hold; each file then names its
+    ``source``.
+    """
     settings = _settings(config)
     try:
         if _is_link(Path(project).lstat()):
@@ -286,8 +358,9 @@ def capture(project: Path, config: dict) -> dict:
         raise DevFlowError(f"Project is not a directory: {root}")
     excluded: list[dict] = []
     git = None
+    index: dict[str, str] = {}
     if settings["mode"] == "git":
-        candidates, git = _git_inventory(root, settings)
+        candidates, git, index = _git_inventory(root, settings)
     else:
         candidates = _file_inventory(root, settings, excluded)
     files: dict[str, dict] = {}
@@ -315,7 +388,7 @@ def capture(project: Path, config: dict) -> dict:
             raise DevFlowError(f"Git symlinks and submodules require an explicit separate scope: {relative}")
         path = _safe_path(root, relative)
         try:
-            value = _read_file(path, settings["max_file_bytes"], git_mode)
+            value = _read_file(path, git_mode)
         except FileNotFoundError:
             if git_mode is not None and not path.exists():
                 continue  # Tracked file deleted from local worktree.
@@ -325,18 +398,20 @@ def capture(project: Path, config: dict) -> dict:
         fingerprints[relative] = value.pop("_stat")
         files[relative] = value
         total_bytes += value["size"]
-        if len(files) > settings["max_files"]:
-            raise DevFlowError(f"Snapshot exceeds {settings['max_files']} included files.")
-        if total_bytes > settings["max_total_bytes"]:
-            raise DevFlowError(f"Snapshot exceeds {settings['max_total_bytes']} included bytes.")
     for relative in settings["context_paths"]:
         if relative not in files:
             raise DevFlowError(f"Requested context file is not in the captured scope: {relative}")
-    # Detect files added, removed, renamed, or touched while this bounded capture
-    # was being assembled. This is optimistic consistency, not a filesystem lock.
+    if copies is not None:
+        try:
+            _keep_copies(root, settings, files, dict(candidates), index, copies)
+        except OSError as exc:
+            raise DevFlowError(f"Cannot keep the start-time copies: {exc}") from exc
+    # Detect files added, removed, renamed, or touched while this capture was
+    # being assembled (copies included). This is optimistic consistency, not a
+    # filesystem lock.
     if settings["mode"] == "git":
-        final_candidates, final_git = _git_inventory(root, settings)
-        if final_git != git:
+        final_candidates, final_git, final_index = _git_inventory(root, settings)
+        if final_git != git or final_index != index:
             raise DevFlowError("Git state changed during snapshot; stop concurrent edits and retry.")
     else:
         final_candidates = _file_inventory(root, settings, [])
@@ -353,10 +428,8 @@ def capture(project: Path, config: dict) -> dict:
                 raise DevFlowError(f"Deleted file reappeared during snapshot: {relative}")
     except OSError as exc:
         raise DevFlowError("File tree changed during snapshot; stop concurrent edits and retry.") from exc
-    signature = {path: {key: value[key] for key in ("sha256", "size", "mode")} for path, value in sorted(files.items())}
-    snapshot_id = hashlib.sha256(json.dumps(signature, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
     return {
-        "schema_version": 1, "snapshot_id": snapshot_id, "mode": settings["mode"],
+        "schema_version": 2, "snapshot_id": snapshot_id(files), "mode": settings["mode"],
         "git": git, "files": files, "excluded": sorted(excluded, key=lambda item: item["path"]),
         "file_count": len(files), "total_bytes": total_bytes,
         "context_paths": list(settings["context_paths"]),
@@ -364,8 +437,20 @@ def capture(project: Path, config: dict) -> dict:
     }
 
 
-def _file_diff(path: str, before: dict | None, after: dict | None, binary: bool) -> str:
-    """One file's change in Git's unified diff form, with its header even when the body is empty."""
+def snapshot_id(files: dict[str, dict]) -> str:
+    """The snapshot ID: the sha256 of every path's sha256, size and mode (nothing else)."""
+    signature = {path: {key: value[key] for key in ("sha256", "size", "mode")} for path, value in sorted(files.items())}
+    return hashlib.sha256(json.dumps(signature, ensure_ascii=False, sort_keys=True,
+                                     separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _file_diff(path: str, before: dict | None, after: dict | None, binary: bool,
+               before_text: str | None, after_text: str | None) -> str:
+    """One file's change in Git's unified diff form, with its header even when the body is empty.
+
+    The records carry no contents: the texts are passed in (``None`` for a
+    side that does not exist and for a binary change).
+    """
     lines = [f"diff --git a/{path} b/{path}\n"]
     if before is None:
         lines.append(f"new file mode {after['mode']}\n")
@@ -379,41 +464,98 @@ def _file_diff(path: str, before: dict | None, after: dict | None, binary: bool)
         if (before or {}).get("sha256") != (after or {}).get("sha256"):
             lines.append(f"Binary files {old_name} and {new_name} differ\n")
         return "".join(lines)
-    body = difflib.unified_diff((before or {}).get("text", "").splitlines(keepends=True),
-                                (after or {}).get("text", "").splitlines(keepends=True),
+    body = difflib.unified_diff((before_text or "").splitlines(keepends=True),
+                                (after_text or "").splitlines(keepends=True),
                                 fromfile=old_name, tofile=new_name)
     lines += [line if line.endswith("\n") else line + "\n\\ No newline at end of file\n" for line in body]
     return "".join(lines)
 
 
-def compare(baseline: dict, current: dict) -> dict:
-    """Changed file records, each with its exact Git-style unified diff."""
+def _brief(record: dict | None, keys=("mode", "size", "sha256", "binary")) -> dict | None:
+    return None if record is None else {key: record[key] for key in keys}
+
+
+def changes(baseline: dict, current: dict) -> dict:
+    """The record of a checkpoint: every change since the start, without contents.
+
+    Applying these changes to the start-time listing gives the current
+    listing, whose ID is ``snapshot_id``.
+    """
     old, new = baseline["files"], current["files"]
-    changes = []
-    binary_changes = []
-    unchanged = 0
+    result, binary_changes, unchanged = [], [], 0
     for path in sorted(set(old) | set(new)):
         before, after = old.get(path), new.get(path)
         if before is not None and after is not None and (before["sha256"], before["mode"]) == (after["sha256"], after["mode"]):
             unchanged += 1
             continue
-        kind = "added" if before is None else "deleted" if after is None else "modified"
-        is_binary = any(item is not None and item.get("binary") for item in (before, after))
-        if is_binary:
+        if any(item is not None and item["binary"] for item in (before, after)):
             binary_changes.append(path)
-        changes.append({"path": path, "change": kind, "before": before, "after": after,
-                        "diff": _file_diff(path, before, after, is_binary)})
-    return {"baseline_id": baseline["snapshot_id"], "snapshot_id": current["snapshot_id"], "changed_files": changes, "binary_changes": binary_changes, "unchanged_count": unchanged}
+        result.append({"path": path, "change": "added" if before is None else "deleted" if after is None else "modified",
+                       "before": _brief(before), "after": _brief(after)})
+    return {"schema_version": 1, "baseline_id": baseline["snapshot_id"], "snapshot_id": current["snapshot_id"],
+            "changes": result, "binary_changes": binary_changes, "unchanged_count": unchanged,
+            "file_count": current["file_count"], "total_bytes": current["total_bytes"]}
 
 
-def diff_text(delta: dict) -> str:
-    """All changes of a ``compare`` result as one unified diff."""
-    return "".join(change["diff"] for change in delta["changed_files"])
+def packet_changes(record: dict) -> list[dict]:
+    """The review packet's change list (format 2): mode, size and hash before and after, never contents."""
+    binary = set(record["binary_changes"])
+    return [{"path": change["path"], "change": change["change"], "binary": change["path"] in binary,
+             "before": _brief(change["before"], ("mode", "size", "sha256")),
+             "after": _brief(change["after"], ("mode", "size", "sha256"))} for change in record["changes"]]
 
 
-def change_list(delta: dict) -> list[dict]:
-    """Each changed path with its mode, size and hash before and after; never the contents."""
-    def brief(record: dict | None) -> dict | None:
-        return None if record is None else {key: record[key] for key in ("mode", "size", "sha256")}
-    return [{"path": change["path"], "change": change["change"], "binary": change["path"] in delta["binary_changes"],
-             "before": brief(change["before"]), "after": brief(change["after"])} for change in delta["changed_files"]]
+def _from_git(root: Path, path: str, record: dict) -> bytes:
+    """A start-time blob, read with replace refs ignored (they apply to cat-file, not hash-object)."""
+    oid = record["source"]["git"]
+    output = run_git(root, "--no-replace-objects", "cat-file", "--batch", data=f"{oid}\n".encode("ascii"),
+                     timeout=content_timeout(record["size"]))
+    header, _, rest = output.partition(b"\n")
+    fields = header.decode("ascii", "replace").split()
+    if fields[1:] == ["missing"]:
+        raise DevFlowError(f"The start-time version of {path} is no longer in Git (it was staged again and removed "
+                           "by git gc); cancel this run and start a new one")
+    if len(fields) != 3 or fields[1] != "blob" or not fields[2].isdigit():
+        raise DevFlowError(f"Cannot read the start-time version of {path} from Git")
+    return rest[:int(fields[2])]
+
+
+def _start_text(root: Path, run_dir: Path, path: str, record: dict) -> str:
+    source = record.get("source") or {}
+    if "copy" in source:
+        data = (run_dir / source["copy"]).read_bytes()
+    elif "git" in source:
+        data = _from_git(root, path, record)
+    else:
+        raise DevFlowError(f"The start-time version of {path} was not kept; cancel this run and start a new one")
+    if hashlib.sha256(data).hexdigest() != record["sha256"]:
+        raise DevFlowError(f"The start-time version of {path} does not match the baseline record; "
+                           "cancel this run and start a new one")
+    return data.decode("utf-8")
+
+
+def _current_text(root: Path, path: str, record: dict) -> str:
+    data = _safe_path(root, path).read_bytes()
+    if hashlib.sha256(data).hexdigest() != record["sha256"]:
+        raise DevFlowError(f"File changed during checkpoint: {path}")
+    return data.decode("utf-8")
+
+
+def diff(root: Path, run_dir: Path, baseline: dict, current: dict, record: dict) -> str:
+    """Every change of ``record`` as one Git-style unified diff, one file at a time.
+
+    Only one file's start-time and current texts are held at once.
+    """
+    root = Path(root).resolve(strict=True)
+    binary = set(record["binary_changes"])
+    parts = []
+    for change in record["changes"]:
+        path, before, after = change["path"], change["before"], change["after"]
+        before_text = after_text = None
+        if path not in binary:
+            if before is not None:
+                before_text = _start_text(root, run_dir, path, baseline["files"][path])
+            if after is not None:
+                after_text = _current_text(root, path, current["files"][path])
+        parts.append(_file_diff(path, before, after, path in binary, before_text, after_text))
+    return "".join(parts)

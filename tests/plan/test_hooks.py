@@ -209,12 +209,11 @@ class DispatchTests(PlanHookFixture):
         self.assertIsNone(result)
         self.assertEqual(len(self.events()), 1)
 
-    def test_stop_records_but_never_blocks(self):
+    def test_a_stop_event_is_not_handled_and_records_nothing(self):
         self.start()
-        result = self.hook(self.payload("Stop", last_assistant_message="What scope?"))
-        self.assertIsNone(result)
-        event = self.events()[-1]
-        self.assertEqual((event["kind"], event["payload"]["last_assistant_message"]), ("stop", "What scope?"))
+        before = len(self.events())
+        self.assertIsNone(self.hook(self.payload("Stop")))
+        self.assertEqual(len(self.events()), before)
 
     def test_tool_calls_other_than_questions_are_not_stopped_or_recorded(self):
         self.start()

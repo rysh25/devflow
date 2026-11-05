@@ -2,7 +2,6 @@
   "hooks": {
     "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "uv", "args": ["run", "--offline", "--no-project", "--no-config", "--no-python-downloads", "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py", "hook"], "timeout": 30}]}],
     "PreToolUse": [{"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": "uv", "args": ["run", "--offline", "--no-project", "--no-config", "--no-python-downloads", "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py", "hook"], "timeout": 30}]}],
-    "PostToolUse": [{"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": "uv", "args": ["run", "--offline", "--no-project", "--no-config", "--no-python-downloads", "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py", "hook"], "timeout": 30}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": "uv", "args": ["run", "--offline", "--no-project", "--no-config", "--no-python-downloads", "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py", "hook"], "timeout": 15}]}]
+    "PostToolUse": [{"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": "uv", "args": ["run", "--offline", "--no-project", "--no-config", "--no-python-downloads", "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py", "hook"], "timeout": 30}]}]
   }
 }

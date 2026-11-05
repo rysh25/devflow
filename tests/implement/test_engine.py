@@ -7,7 +7,6 @@ pending start, then the runner's ``implement start`` creates the run.
 """
 from __future__ import annotations
 
-import base64
 import copy
 import json
 import os
@@ -35,6 +34,10 @@ from tests.common.test_common import LIMIT_QUESTION
 
 ACTIVITY = {"tool_call_count": 2, "tool_calls": {"command_execution": 2}, "other_events": {}}
 EVENT_ID = r"\A[a-f0-9]{32}\Z"
+
+
+class InjectedStop(Exception):
+    """A process stopped at a chosen moment (power loss, a killed command)."""
 
 
 def in_thread(function):
@@ -238,8 +241,8 @@ class EngineFlowTests(EngineFixture):
         from devflow_core.implement import snapshot
         original_capture = snapshot.capture
         original = self.plan.read_bytes()
-        def change_after_capture(project, config):
-            result = original_capture(project, config)
+        def change_after_capture(project, config, copies=None):
+            result = original_capture(project, config, copies)
             self.plan.write_bytes(original + b"Changed during baseline capture.\n")
             return result
         self.prompt(f'/devflow:implement "{self.plan}"')
@@ -247,6 +250,17 @@ class EngineFlowTests(EngineFixture):
             with self.assertRaisesRegex(DevFlowError, "plan changed during startup"):
                 router.runner_start(self.project, self.session, "implement", str(self.plan))
         self.assertEqual(self.runs(), [])
+        self.reviewer.assert_not_called()
+
+    def test_a_baseline_too_large_to_read_back_creates_no_run(self):
+        from devflow_core.common import storage
+        self.prompt(f'/devflow:implement "{self.plan}"')
+        with patch.object(storage, "JSON_LIMIT", 64):
+            with self.assertRaisesRegex(DevFlowError, r"Record baseline.json would be .* over the 64 MiB JSON limit; "
+                                                      r"it was not saved\. The snapshot scope has 1 files; narrow "
+                                                      r"snapshot.include or snapshot.exclude and start again"):
+                router.runner_start(self.project, self.session, "implement", str(self.plan))
+        self.assertEqual(self.runs(), [])  # No run, no creation or scratch directory left.
         self.reviewer.assert_not_called()
 
     def test_start_retains_exact_bom_crlf_plan_bytes_and_review_hash(self):
@@ -367,7 +381,8 @@ class EngineFlowTests(EngineFixture):
         self.assertEqual(changed["after"]["size"], len(self.source.read_bytes()))
         self.assertNotIn("VALUE = 1", json.dumps(first["changes"]))
         diff = Path(first["diff_path"]).read_text(encoding="utf-8")
-        self.assertEqual(Path(first["diff_path"]), self.run / "reviews" / "01" / "changes.diff")
+        self.assertEqual(Path(first["diff_path"]), self.run / "snapshots" / "001.diff")
+        self.assertFalse((self.run / "reviews" / "01" / "changes.diff").exists())
         self.assertIn("diff --git a/module.py b/module.py\n", diff)
         self.assertIn("+VALUE = 1", diff)
         self.assertEqual(first["context_paths"], ["unchanged.txt"])
@@ -441,7 +456,6 @@ class EngineFlowTests(EngineFixture):
             packet = self.run / attempt["packet_path"]
             self.assertTrue(packet.is_file())
             self.assertEqual(digest(packet.read_bytes()), attempt["packet_sha256"])
-            self.assertFalse((self.run / "transaction.json").exists())
             # No lock is held while the external reviewer runs.
             self.assertFalse((self.run / "state.lock").exists())
             return self.respond(*args, **kwargs)
@@ -1095,64 +1109,96 @@ class RecoveryAndIntegrityTests(EngineFixture):
             self.engine.status(self.run_id)
         self.assertEqual(len(read_json(self.run / "state.json")["attempts"]), 7)
 
-    def pending_transaction(self):
-        current = self.state()
-        desired = copy.deepcopy(current)
-        payload = json_bytes({"evidence": "A durable, recoverable artifact."})
-        relative = "recovery-test/evidence.json"
-        desired["state_revision"] += 1
-        desired["last_error"] = "Recovered pending transaction fixture."
-        desired["artifacts"][relative] = digest(payload)
-        journal = {"schema_version": runs.SCHEMA_VERSION, "base_revision": current["state_revision"], "state": desired,
-                   "writes": {relative: base64.b64encode(payload).decode("ascii")}}
-        atomic_write_json(self.run / "transaction.json", journal)
-        return current, desired, relative, payload
+    def stopped_commit(self):
+        """Stop every save just before ``state.json`` is replaced (its records are already written)."""
+        original = runs.atomic_json
 
-    def test_pending_transaction_recovers_complete_artifact_and_state_atomically(self):
-        self.start()
-        current, desired, relative, payload = self.pending_transaction()
-        before = (self.run / "state.json").read_bytes()
-        # Reading for display never replays a transaction; it reports it.
-        self.assertEqual(self.engine.status(self.run_id)["state_revision"], current["state_revision"])
-        shown = router.status(self.project, None, self.run_id)
-        self.assertTrue(shown["recovery_required"])
-        self.assertEqual((self.run / "state.json").read_bytes(), before)
-        self.assertTrue((self.run / "transaction.json").exists())
-        self.assertFalse((self.run / relative).exists())
-        # A changing load (here the explicit resume) completes it first.
-        resumed = self.resume()
-        self.assertEqual(resumed["last_error"], desired["last_error"])
-        self.assertEqual(resumed["state_revision"], desired["state_revision"] + 1)
-        self.assertEqual(self.state()["artifacts"][relative], digest(payload))
-        self.assertEqual((self.run / relative).read_bytes(), payload)
-        self.assertFalse((self.run / "transaction.json").exists())
-        self.assertNotIn("recovery_required", router.status(self.project, None, self.run_id))
+        def stop(path, value):
+            if Path(path).name == "state.json" and Path(path).parent == self.run:
+                raise InjectedStop("stopped before the commit")
+            return original(path, value)
+        return patch.object(runs, "atomic_json", side_effect=stop)
 
-    def test_already_committed_pending_transaction_is_idempotent(self):
+    def test_a_checkpoint_stopped_before_the_commit_is_simply_run_again(self):
         self.start()
-        _, desired, relative, payload = self.pending_transaction()
-        path = self.run / relative
-        path.parent.mkdir()
-        path.write_bytes(payload)
-        atomic_write_json(self.run / "state.json", desired)
-        with self.engine.store.lock(self.run_id):
-            self.assertEqual(self.engine.store.load(self.run_id), desired)
-        self.assertEqual(self.state(), desired)
-        self.assertFalse((self.run / "transaction.json").exists())
+        self.source.write_text("VALUE = 1\n", encoding="utf-8")
+        with self.stopped_commit(), self.assertRaises(InjectedStop):
+            self.checkpoint()
+        stopped = self.state()
+        self.assertEqual((stopped["status"], stopped["checkpoint_count"]), ("implementing", 0))
+        leftovers = sorted(path.name for path in (self.run / "snapshots").iterdir())
+        self.assertTrue(leftovers)
+        self.assertFalse(any(name.startswith("snapshots/") for name in stopped["artifacts"]))
+        # The command is run again; the leftovers are replaced and committed once.
+        result = self.checkpoint("Implemented VALUE after the stopped save.")
+        self.assertEqual((result["status"], result["checkpoint_count"]), ("ready_check", 1))
+        self.assertEqual(sorted(path.name for path in (self.run / "snapshots").iterdir()), leftovers)
+        self.assertIn("after the stopped save", (self.run / result["candidate"]["summary"]).read_text(encoding="utf-8"))
+        self.engine.store.verify_artifacts(self.state())
 
-    def test_divergent_pending_artifact_is_not_overwritten_or_silently_recovered(self):
+    def test_a_changed_committed_record_stops_the_run_and_is_never_rewritten(self):
         self.start()
-        current, _, relative, _ = self.pending_transaction()
-        path = self.run / relative
-        path.parent.mkdir()
-        path.write_bytes(b"Conflicting bytes must be retained.")
-        self.assertEqual(self.engine.status(self.run_id)["state_revision"], current["state_revision"])
-        self.assertNotAccepted(f"/devflow:resume {self.run_id}", "Divergent artifact")
-        with self.assertRaisesRegex(DevFlowError, "Divergent artifact"):
-            self.engine.cancel(self.run_id, self.session, "Cancel cannot hide the conflict.")
-        self.assertEqual(self.state(), current)
-        self.assertTrue((self.run / "transaction.json").is_file())
-        self.assertEqual(path.read_bytes(), b"Conflicting bytes must be retained.")
+        plan = self.run / "plan.md"
+        plan.write_bytes(b"A different plan.\n")
+        with self.assertRaisesRegex(DevFlowError, "Immutable artifact changed or is missing: plan.md"):
+            self.checkpoint()
+        self.assertEqual(plan.read_bytes(), b"A different plan.\n")
+        self.assertEqual(self.state()["checkpoint_count"], 0)
+
+    def test_an_answer_whose_save_stopped_is_never_an_answer(self):
+        self.start()
+        self.ready()
+        self.escalate()
+        question = {"questions": [{"question": "Which VALUE should be implemented?"}]}
+        self.hook("PreToolUse", tool_name="AskUserQuestion", tool_use_id="stopped", tool_input=question)
+        with self.stopped_commit(), self.assertRaises(InjectedStop):
+            self.hook("PostToolUse", tool_name="AskUserQuestion", tool_use_id="stopped", tool_input=question,
+                      tool_response={"answers": {"Which VALUE should be implemented?": "1"}})
+        self.assertEqual(self.engine.status(self.run_id)["human_events"], [])
+
+    def test_a_check_whose_last_save_stopped_waits_for_human_recovery(self):
+        self.start()
+        self.source.write_text("VALUE = 1\n", encoding="utf-8")
+        self.assertEqual(self.checkpoint()["status"], "ready_check")
+        original = runs.atomic_json
+        saves = []
+
+        def stop_the_last(path, value):
+            if Path(path).name == "state.json" and Path(path).parent == self.run:
+                saves.append(value["status"])
+                if value["status"] != "checking":
+                    raise InjectedStop("stopped before the commit")
+            return original(path, value)
+        with patch.object(runs, "atomic_json", side_effect=stop_the_last), self.assertRaises(InjectedStop):
+            self.engine.check(self.run_id, self.session)
+        stopped = self.state()
+        self.assertEqual((stopped["status"], stopped["inflight"]["kind"]), ("checking", "check"))
+        logs = list((self.run / "check-processes").glob("*/verify.stdout.log"))
+        self.assertTrue(logs)
+        with self.assertRaisesRegex(DevFlowError, "Cannot perform this action in checking"):
+            self.engine.check(self.run_id, self.session)
+        recovered = self.engine.recover(self.run_id, confirmed=True)
+        self.assertEqual((recovered["status"], recovered["inflight"]), ("paused_error", None))
+        self.assertIsNone(recovered["validation"])
+        self.assertTrue(all(path.exists() for path in logs))
+
+    def test_a_review_whose_last_save_stopped_waits_for_human_recovery(self):
+        self.start()
+        self.ready()
+        original = runs.atomic_json
+
+        def stop_the_last(path, value):
+            if Path(path).name == "state.json" and Path(path).parent == self.run and value["status"] != "reviewing":
+                raise InjectedStop("stopped before the commit")
+            return original(path, value)
+        with patch.object(runs, "atomic_json", side_effect=stop_the_last), self.assertRaises(InjectedStop):
+            self.review()
+        stopped = self.state()
+        self.assertEqual((stopped["status"], stopped["inflight"]["kind"]), ("reviewing", "review"))
+        with self.assertRaisesRegex(DevFlowError, "Cannot perform this action in reviewing"):
+            self.review()
+        recovered = self.engine.recover(self.run_id, confirmed=True)
+        self.assertEqual((recovered["review_count"], recovered["attempts"][0]["status"]), (1, "failed"))
 
     def test_stale_lock_requires_human_recovery_and_is_not_auto_deleted(self):
         self.start()
@@ -1164,21 +1210,6 @@ class RecoveryAndIntegrityTests(EngineFixture):
             impatient.checkpoint(self.run_id, self.session, self.draft_text("summary.md", "Blocked by a stale lock."))
         self.assertEqual(lock.read_bytes(), content)
         self.assertEqual(self.state()["checkpoint_count"], 0)
-
-    def test_pending_transaction_does_not_bypass_existing_lock(self):
-        self.start()
-        current, _, _, _ = self.pending_transaction()
-        lock = self.run / "state.lock"
-        lock.write_bytes(json_bytes({"token": "still-owned"}))
-        # Display reads take no lock and change nothing.
-        self.assertEqual(self.engine.status(self.run_id)["state_revision"], current["state_revision"])
-        with self.assertRaisesRegex(DevFlowError, "locked"):
-            Engine(self.project, lock_wait=0.2).cancel(self.run_id, self.session, "Blocked by the lock.")
-        with patch("devflow_core.router.HOOK_WAIT", 0.2):
-            self.assertNotAccepted(f"/devflow:resume {self.run_id}", "locked")
-        self.assertEqual(self.state(), current)
-        self.assertTrue((self.run / "transaction.json").exists())
-        self.assertTrue(lock.exists())
 
     def test_source_edits_are_never_stopped_but_invalidate_stale_results(self):
         # Decision D1: DevFlow does not stop any tool. Changed code is detected
@@ -1227,7 +1258,8 @@ class RecoveryAndIntegrityTests(EngineFixture):
         def dispatch(*args, **kwargs):
             recorded.append(in_thread(lambda: self.prompt("A note typed while the reviewer runs.")))
             recorded.append(in_thread(lambda: self.engine.store.append_event(
-                self.run_id, {"session_id": self.session, "hook_event_name": "Stop"}, "stop")))
+                self.run_id, {"session_id": self.session, "hook_event_name": "UserPromptSubmit",
+                              "prompt": "A second note."}, "prompt")))
             self.assertEqual(self.state()["status"], "reviewing")
             return self.respond(*args, **kwargs)
 
@@ -1451,7 +1483,11 @@ class DirtyGitProjectTests(EngineFixture):
         self.assertEqual(result["escalation"]["session_id"], self.session)
         baseline = read_json(self.run / "baseline.json")
         self.assertTrue(baseline["git"]["dirty"])
-        self.assertEqual(baseline["files"]["module.py"]["text"].encode(), original)
+        # The edit made before the run is kept once, as a copy; the record holds no contents.
+        copy = baseline["files"]["module.py"]["source"]["copy"]
+        self.assertEqual(copy, "baseline/" + digest(original))
+        self.assertEqual((self.run / copy).read_bytes(), original)
+        self.assertNotIn(original.decode("utf-8").strip(), (self.run / "baseline.json").read_text(encoding="utf-8"))
         self.assertEqual(self.source.read_bytes(), original)
         event = self.answer("Preserve the existing edits and use them as the implementation baseline.")
         result = self.engine.resolve(self.run_id, self.session, event, "continue", "The user acknowledged the dirty baseline.")
@@ -1460,6 +1496,41 @@ class DirtyGitProjectTests(EngineFixture):
         self.assertEqual((self.project / "user-notes.txt").read_text(encoding="utf-8"), "Do not discard my work.\n")
         self.assertEqual(self.git("rev-parse", "HEAD").strip(), previous_head)
         self.assertEqual(self.git("diff", "--cached", "--name-only"), "")
+
+    def clean_git(self, **files):
+        """A clean committed repository holding module.py and ``files``."""
+        self.config["snapshot"]["mode"] = "git"
+        self.write_config()
+        for name, text in files.items():
+            (self.project / name).write_text(text, encoding="utf-8")
+        self.git("init", "--quiet")
+        self.git("add", "--all")
+        self.git("-c", "user.name=DevFlow offline tests", "-c", "user.email=tests@example.invalid", "commit", "--quiet", "-m", "Fixture baseline")
+
+    def test_no_record_holds_the_contents_of_an_unchanged_file(self):
+        sentinel = "UNCHANGED-FILE-CONTENTS-5d2c41"
+        self.clean_git(**{"stable.py": f"# {sentinel}\n"})
+        self.start()
+        self.ready()
+        self.review()
+        self.assertEqual(sorted(path.name for path in (self.run / "reviews" / "01").iterdir()), ["packet.json", "review.json"])
+        self.assertFalse((self.run / "baseline").exists())  # Git holds every start-time byte.
+        for path in self.run.rglob("*"):
+            if path.is_file():
+                with self.subTest(path=path.relative_to(self.run)):
+                    self.assertNotIn(sentinel.encode(), path.read_bytes())
+
+    def test_a_large_diff_is_written_once(self):
+        self.clean_git()
+        self.start()
+        self.source.write_text("".join(f"VALUE_{index} = {index}\n" for index in range(300_000)), encoding="utf-8")
+        result = self.checkpoint()
+        diff = self.run / result["candidate"]["diff"]
+        self.assertEqual(result["candidate"]["diff"], "snapshots/001.diff")
+        self.assertGreater(diff.stat().st_size, 3_000_000)
+        large = [path.relative_to(self.run).as_posix() for path in self.run.rglob("*")
+                 if path.is_file() and path.stat().st_size > 1_000_000]
+        self.assertEqual(large, ["snapshots/001.diff"])
 
     def test_explicit_allow_dirty_keeps_same_baseline_without_question(self):
         self.config["allow_dirty"] = True

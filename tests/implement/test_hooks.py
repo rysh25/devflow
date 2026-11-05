@@ -103,7 +103,7 @@ class Fixture(unittest.TestCase):
         return self.store.events(self.stored())
 
     def set_status(self, status):
-        """Fixture-only state change through the run store's own transaction."""
+        """Fixture-only state change through the run store's own save."""
         with self.store.lock(self.run_id):
             state = self.store.load(self.run_id)
             state["status"] = status
@@ -560,13 +560,12 @@ class SessionCaptureTests(Fixture):
         self.assertIsNone(self.hook(self.payload(event="SessionStart")))
         self.bind()
         self.assertIsNone(self.hook(self.payload(event="PostToolUse", tool="Write")))
-        self.assertEqual(len(self.stored()["event_ids"]), 1)
         self.assertIsNone(self.hook(self.payload(event="Stop")))
-        self.assertEqual(self.events()[-1]["kind"], "stop")
+        self.assertEqual(len(self.stored()["event_ids"]), 1)
 
     def test_hook_configuration_uses_exec_form_and_never_blocks(self):
         config = json.loads((PACKAGE.parents[2] / "hooks" / "hooks.json").read_text(encoding="utf-8"))
-        self.assertEqual(set(config["hooks"]), {"UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"})
+        self.assertEqual(set(config["hooks"]), {"UserPromptSubmit", "PreToolUse", "PostToolUse"})
         for event, matchers in config["hooks"].items():
             for matcher in matchers:
                 # Tool hooks run only for AskUserQuestion; other tool calls start no process.
@@ -578,7 +577,7 @@ class SessionCaptureTests(Fixture):
                     self.assertEqual(hook["command"], "uv")
                     self.assertIsInstance(hook["args"], list)
                     self.assertNotIn("onFailure", hook)
-                    self.assertEqual(hook["timeout"], 15 if event == "Stop" else 30)
+                    self.assertEqual(hook["timeout"], 30)
                     self.assertEqual(hook["args"][-1], "hook")
                     self.assertIn("${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py", hook["args"])
                     self.assertIn("--no-python-downloads", hook["args"])

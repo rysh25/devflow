@@ -1207,171 +1207,122 @@ class EngineTests(unittest.TestCase):
                                        "publish.directory")
                 self.assertIsNone(self.bound_run())
 
-    # -- interrupted transactions: display reads never repair; resume completes them ------
-    def test_seal_partial_commit_recovers_frozen_capture_without_recapturing(self):
-        self.start_interview()
+    # -- stopped saves: a save that stops before state.json is replaced is not committed --
+    def stop_commit(self, when=lambda value: True):
+        """Stop the saves (chosen by the new state) just before ``state.json`` is replaced."""
         original_atomic = runs_module.atomic_json
+
         def crash_state_commit(path, value):
-            if path == self.run / "state.json":
-                raise InjectedCrash("after interview artifacts, before state commit")
+            if path == self.run / "state.json" and when(value):
+                raise InjectedCrash("after the records, before the state commit")
             return original_atomic(path, value)
-        with patch("devflow_core.common.runs.atomic_json", side_effect=crash_state_commit):
-            with self.assertRaises(InjectedCrash):
-                self.seal()
-        self.assertTrue((self.run / "transaction.json").is_file())
-        frozen = (self.run / "interview.json").read_bytes()
+        return patch("devflow_core.common.runs.atomic_json", side_effect=crash_state_commit)
+
+    def test_a_stopped_seal_is_not_committed_and_sealing_again_captures_anew(self):
+        self.start_interview()
+        with self.stop_commit(), self.assertRaises(InjectedCrash):
+            self.seal()
         self.assertEqual(read_json(self.run / "state.json")["status"], "interview")
-        # A display read reports the pending transaction without replaying it.
-        self.assertEqual(self.engine.status(self.run_id)["status"], "interview")
-        self.assertTrue(router.status(self.project, None, self.run_id)["recovery_required"])
-        self.assertTrue((self.run / "transaction.json").is_file())
-        # Recovery must replay the captured bytes, not recapture a newer or
-        # now-incompatible conversation or changed draft decision file.
-        with self.transcript.open("a", encoding="utf-8") as stream:
-            stream.write('{"type":"unsupported-new-event"}\n')
-        self.draft("decisions.json", {"summary": "changed after crash", "decisions": [], "constraints": [], "open_questions": ["new"]})
-        with patch("devflow_core.plan.engine.capture_interview", side_effect=AssertionError("must not recapture")) as capture, patch(RUN_REVIEW) as provider:
-            self.resume(self.session)
-            recovered = Engine(self.project).status(self.run_id)
-        self.assertEqual(recovered["status"], "planning")
-        self.assertEqual((self.run / "interview.json").read_bytes(), frozen)
-        self.assertEqual(read_json(self.run / "decisions.json")["summary"], "Human confirmed the downtime limit.")
-        self.assertFalse((self.run / "transaction.json").exists())
-        capture.assert_not_called()
+        self.assertNotIn("interview.json", read_json(self.run / "state.json")["artifacts"])
+        self.assertTrue((self.run / "interview.json").is_file())  # A leftover nothing reads.
+        decisions = self.draft("decisions.json", {"summary": "Sealed again after the stop.", "decisions": [],
+                                                  "constraints": [], "open_questions": []})
+        with patch(RUN_REVIEW) as provider:
+            sealed = self.engine.seal(self.run_id, decisions)
+        self.assertEqual(sealed["status"], "planning")
+        self.assertEqual(read_json(self.run / "decisions.json")["summary"], "Sealed again after the stop.")
+        self.engine.report(self.run_id)  # Every committed hash matches.
         provider.assert_not_called()
 
-    def test_apply_artifacts_before_state_commit_recover_exactly_once(self):
+    def test_a_stopped_apply_keeps_the_committed_plan_and_applies_once_when_run_again(self):
         self.ready()
         state = self.submit(review_value("changes_required"))
         base_revision = state["state_revision"]
-        original_atomic = runs_module.atomic_json
-        def crash_state_commit(path, value):
-            if path == self.run / "state.json":
-                raise InjectedCrash("after plan and ledger files")
-            return original_atomic(path, value)
-        with patch("devflow_core.common.runs.atomic_json", side_effect=crash_state_commit):
-            with self.assertRaises(InjectedCrash):
-                self.reflect(state)
-        plan = self.run / "plans" / "plan-v001.md"
-        ledger = self.run / "reviews" / "01" / "reflection.json"
-        plan_bytes, ledger_bytes = plan.read_bytes(), ledger.read_bytes()
-        self.assertEqual(read_json(self.run / "state.json")["state_revision"], base_revision)
-        self.draft("revised.md", "Do not substitute this changed draft during recovery.")
+        with self.stop_commit(), self.assertRaises(InjectedCrash):
+            self.reflect(state)
+        stopped = read_json(self.run / "state.json")
+        self.assertEqual((stopped["state_revision"], stopped["plan_version"]), (base_revision, 0))
+        self.assertTrue((self.run / "plans" / "plan-v001.md").is_file())  # Leftover.
         with patch(RUN_REVIEW) as provider:
-            self.resume(self.session)
-            recovered = Engine(self.project).status(self.run_id)
-            repeated = self.engine.status(self.run_id)
-        self.assertEqual(recovered["status"], "ready")
-        self.assertEqual(recovered["review_count"], 1)
-        self.assertEqual(recovered["plan_version"], 1)
-        # One revision for the replayed commit, one for recording the resume request.
-        self.assertEqual(recovered["state_revision"], base_revision + 2)
-        self.assertEqual(repeated["state_revision"], recovered["state_revision"])
-        self.assertEqual(plan.read_bytes(), plan_bytes)
-        self.assertEqual(ledger.read_bytes(), ledger_bytes)
+            applied = self.reflect(self.engine.status(self.run_id))
+        self.assertEqual((applied["status"], applied["plan_version"]), ("ready", 1))
+        self.assertEqual(applied["state_revision"], base_revision + 1)
         self.assertEqual(len(list((self.run / "plans").glob("*.md"))), 2)
-        self.assertFalse((self.run / "transaction.json").exists())
-        self.engine.report(self.run_id)  # All immutable hashes remain consistent.
+        self.engine.report(self.run_id)  # The replaced leftover matches its committed hash.
         provider.assert_not_called()
 
-    def test_partial_artifact_materialization_reuses_identical_existing_plan(self):
+    def test_a_stopped_reservation_never_dispatches_and_the_review_can_run(self):
         self.ready()
-        state = self.submit(review_value("changes_required"))
-        ledger = self.run / "reviews" / "01" / "reflection.json"
-        original_write = runs_module.write_new
-        def crash_on_ledger(path, data):
-            if path == ledger:
-                raise InjectedCrash("first artifact written; second not written")
-            return original_write(path, data)
-        with patch("devflow_core.common.runs.write_new", side_effect=crash_on_ledger):
-            with self.assertRaises(InjectedCrash):
-                self.reflect(state)
-        plan = self.run / "plans" / "plan-v001.md"
-        self.assertTrue(plan.is_file())
-        self.assertFalse(ledger.exists())
-        original_plan = plan.read_bytes()
-        with patch("devflow_core.common.runs.write_new", wraps=original_write) as writes:
-            self.resume(self.session)
-        recovered = self.engine.status(self.run_id)
-        self.assertEqual(recovered["status"], "ready")
-        self.assertEqual(plan.read_bytes(), original_plan)
-        self.assertTrue(ledger.is_file())
-        # Only the missing ledger is materialized (plus the resume request's own event record).
-        written = [c.args[0] for c in writes.call_args_list]
-        self.assertEqual([path for path in written if path.parent.name != "events"], [ledger])
-
-    def test_committed_state_with_unremoved_journal_is_idempotent(self):
-        self.start_interview()
-        self.seal()
-        journal = self.run / "transaction.json"
-        original_unlink = Path.unlink
-        def crash_unlink(path, *args, **kwargs):
-            if path == journal:
-                raise InjectedCrash("state committed; journal cleanup interrupted")
-            return original_unlink(path, *args, **kwargs)
-        with patch.object(Path, "unlink", new=crash_unlink):
-            with self.assertRaises(InjectedCrash):
-                self.engine.plan(self.run_id, self.draft("plan.md", "# Frozen original plan\n"))
-        committed = read_json(self.run / "state.json")
-        self.assertEqual(committed["status"], "ready")
-        self.assertTrue(journal.exists())
-        self.engine.status(self.run_id)
-        self.assertTrue(journal.exists())  # Display reads never repair.
-        self.resume(self.session)
-        recovered = self.engine.status(self.run_id)
-        # Replaying the committed journal adds nothing; only the resume request is a new revision.
-        self.assertEqual(recovered["state_revision"], committed["state_revision"] + 1)
-        self.assertEqual(recovered["plan_hash"], committed["plan_hash"])
-        self.assertEqual(recovered["plan_version"], 0)
-        self.assertFalse(journal.exists())
-        self.assertEqual(len(list((self.run / "plans").glob("*.md"))), 1)
-
-    def test_reserved_attempt_wal_recovery_never_redispatches_provider(self):
-        self.ready()
-        original_finish = self.engine.store._finish_transaction
-        def crash_after_journal(run_id):
-            if (self.run / "transaction.json").exists():
-                raise InjectedCrash("journal durable, no files committed")
-            return original_finish(run_id)
-        with patch.object(self.engine.store, "_finish_transaction", side_effect=crash_after_journal), patch(RUN_REVIEW) as provider:
+        with self.stop_commit(lambda value: value["status"] == "reviewing"), patch(RUN_REVIEW) as provider:
             with self.assertRaises(InjectedCrash):
                 self.engine.review(self.run_id)
             provider.assert_not_called()
-        self.assertEqual(read_json(self.run / "state.json")["review_count"], 0)
-        self.assertEqual(read_json(self.run / "transaction.json")["state"]["review_count"], 1)
-        self.assertTrue(router.status(self.project, None, self.run_id)["recovery_required"])
-        with patch(RUN_REVIEW) as provider:
-            # The locked load inside review completes the reservation, so the
-            # attempt stays consumed and is never dispatched a second time.
-            with self.assertRaises(DevFlowError):
-                Engine(self.project).review(self.run_id)
-            recovered = self.engine.status(self.run_id)
-            self.assertEqual(recovered["review_count"], 1)
-            self.assertEqual(recovered["status"], "reviewing")
-            self.assertFalse((self.run / "transaction.json").exists())
-            with self.assertRaises(DevFlowError):
-                self.engine.review(self.run_id)
-            self.assertNotAccepted(self.resume_prompt(self.session), "resume", "recover")
-            provider.assert_not_called()
-        self.engine.recover(self.run_id, confirmed=True, expected_review=1)
-        self.resume(self.session)
-        with patch(RUN_REVIEW, return_value=adapter_result(review_value())) as provider:
-            next_review = self.engine.review(self.run_id)
-        self.assertEqual(next_review["review_count"], 2)
-        self.assertEqual(provider.call_args.args[0]["id"], "opencode")
+        unchanged = self.engine.status(self.run_id)
+        self.assertEqual((unchanged["status"], unchanged["review_count"]), ("ready", 0))
+        self.assertTrue((self.run / "reviews" / "01" / "packet.md").exists())  # Leftover.
+        self.assertEqual(self.submit(review_value())["review_count"], 1)
+        self.engine.report(self.run_id)
 
-    def test_prejournal_failure_reserves_nothing_and_can_retry_safe_empty_round_directory(self):
+    def test_a_review_whose_last_save_stopped_waits_for_human_recovery(self):
         self.ready()
-        original_atomic = runs_module.atomic_json
-        def crash_before_journal(path, value):
-            if path == self.run / "transaction.json":
-                raise InjectedCrash("journal never committed")
-            return original_atomic(path, value)
-        with patch("devflow_core.common.runs.atomic_json", side_effect=crash_before_journal), patch(RUN_REVIEW) as provider:
+        with self.stop_commit(lambda value: value["status"] != "reviewing"), \
+                patch(RUN_REVIEW, return_value=adapter_result(review_value())):
+            with self.assertRaises(InjectedCrash):
+                self.engine.review(self.run_id)
+        stopped = self.engine.status(self.run_id)
+        self.assertEqual((stopped["status"], stopped["review_count"]), ("reviewing", 1))
+        with patch(RUN_REVIEW) as provider, self.assertRaises(DevFlowError):
+            self.engine.review(self.run_id)
+        provider.assert_not_called()
+        recovered = self.engine.recover(self.run_id, confirmed=True, expected_review=1)
+        self.assertEqual(recovered["review_count"], 1)
+        self.assertEqual(recovered["reviews"][0]["status"], "failed")
+
+    def test_a_stopped_publication_is_recorded_on_the_committed_state(self):
+        self.completed("/devflow:plan REVIEW-10")
+        original = runs_module.write_new
+        failures = []
+
+        def fail_receipt_once(path, data):
+            if path == self.run / "publication.json" and not failures:
+                failures.append(path)
+                raise OSError("Synthetic receipt failure")
+            return original(path, data)
+        with patch("devflow_core.common.runs.write_new", side_effect=fail_receipt_once):
+            with self.assertRaisesRegex(DevFlowError, "publication failed"):
+                self.engine.publish(self.run_id)
+        failed = self.engine.status(self.run_id)
+        self.assertEqual(failed["publication"]["status"], "error")
+        self.assertNotIn("publication.json", read_json(self.run / "state.json")["artifacts"])
+        self.engine.report(self.run_id)  # Every listed record exists and matches.
+        published = self.engine.publish(self.run_id)
+        self.assertEqual(published["publication"]["path"], "docs/plans/REVIEW-10.md")
+        self.assertIn("publication.json", read_json(self.run / "state.json")["artifacts"])
+
+    def test_a_leftover_receipt_is_never_taken_as_the_publication(self):
+        self.completed("/devflow:plan REVIEW-10")
+        with self.stop_commit(lambda value: value["publication"].get("status") == "published"):
+            with self.assertRaises(InjectedCrash):
+                self.engine.publish(self.run_id)
+        self.assertTrue((self.run / "publication.json").is_file())
+        self.assertNotIn("publication.json", read_json(self.run / "state.json")["artifacts"])
+        published = self.engine.publish(self.run_id)
+        self.assertEqual(published["publication"]["status"], "published")
+        self.assertIn("publication.json", read_json(self.run / "state.json")["artifacts"])
+        self.engine.report(self.run_id)
+        target = self.project / "docs" / "plans" / "REVIEW-10.md"
+        target.unlink()
+        with self.assertRaisesRegex(DevFlowError, "not silently recreated"):
+            self.engine.publish(self.run_id)
+        self.assertFalse(target.exists())
+
+    def test_a_failure_before_the_save_commits_nothing_and_can_be_run_again(self):
+        self.ready()
+        with patch("devflow_core.common.runs.write_new", side_effect=InjectedCrash("before any record")), \
+                patch(RUN_REVIEW) as provider:
             with self.assertRaises(InjectedCrash):
                 self.engine.review(self.run_id)
             provider.assert_not_called()
-        self.assertFalse((self.run / "transaction.json").exists())
         self.assertFalse((self.run / "reviews" / "01" / "packet.md").exists())
         unchanged = self.engine.status(self.run_id)
         self.assertEqual(unchanged["review_count"], 0)

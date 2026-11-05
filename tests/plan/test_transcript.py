@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "plugins" / "devflow" / "scripts"
-from devflow_core.plan.transcript import CaptureError, capture_interview, transcript_marker
+from devflow_core.plan.transcript import CaptureError, _Segment, capture_interview, transcript_marker
 
 
 def entry(role, content, **extra):
@@ -25,6 +25,46 @@ class TranscriptTests(unittest.TestCase):
 
     def prompt(self, text):
         return {"hook_event_name": "UserPromptSubmit", "prompt": text}
+
+    def test_a_segment_larger_than_16_mib_is_captured(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "req"), {"type": "progress", "data": "x" * (17 * 1024 * 1024)},
+                   entry("assistant", [{"type": "text", "text": "Scope?"}]), entry("user", "All of it."))
+        out = capture_interview(marker, [self.prompt("req"), self.prompt("All of it.")])
+        self.assertEqual([m["content"] for m in out["messages"]], ["req", "Scope?", "All of it."])
+        self.assertEqual(out["coverage"]["captured_bytes"], self.path.stat().st_size)
+
+    def test_line_separators_inside_strings_keep_the_record_whole(self):
+        marker = transcript_marker(str(self.path))
+        text = "one\u2028two\u2029three\x85four"
+        self.write(entry("user", "req"), entry("assistant", [{"type": "text", "text": text}]))
+        self.assertIn("\u2028".encode(), self.path.read_bytes())  # Written unescaped, as Claude Code does.
+        out = capture_interview(marker, [self.prompt("req")])
+        self.assertEqual([m["content"] for m in out["messages"]], ["req", text])
+
+    def test_an_incomplete_last_line_is_a_broken_record(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry("user", "req"))
+        with self.path.open("a", encoding="utf-8") as stream:
+            stream.write('{"type": "assistant", "message": {"role": "assi')
+        with self.assertRaisesRegex(CaptureError, "Malformed or incomplete transcript JSONL at segment line 2"):
+            capture_interview(marker, [self.prompt("req")])
+
+    def test_the_segment_is_read_one_line_at_a_time(self):
+        marker = transcript_marker(str(self.path))
+        first = json.dumps(entry("user", "req"), ensure_ascii=False) + "\n"
+        self.write(entry("user", "req"), *[entry("assistant", "x" * 1000) for _ in range(50)])
+        segment = _Segment(marker)
+        lines = iter(segment)
+        self.assertEqual(next(lines), first)
+        self.assertEqual(segment.bytes_read, len(first.encode("utf-8")))
+        self.assertEqual(sum(1 for _ in lines), 50)
+        self.assertEqual(segment.bytes_read, self.path.stat().st_size)
+
+    def test_a_broken_hook_record_is_named_by_its_index(self):
+        marker = transcript_marker(str(self.path))
+        with self.assertRaisesRegex(CaptureError, r"^Invalid hook event data at index 1: "):
+            capture_interview(marker, [self.prompt("req"), {"hook_event_name": "X", "value": float("nan")}])
 
     def test_missing_at_start_and_raw_text_is_preserved(self):
         marker = transcript_marker(str(self.path))
@@ -914,10 +954,9 @@ class TranscriptTests(unittest.TestCase):
 
     def test_a_transcript_never_written_uses_the_hook_records(self):
         marker = transcript_marker(str(self.path))
-        out = capture_interview(marker, [self.prompt("req"), {"hook_event_name": "Stop", "last_assistant_message": "Q?"}])
+        out = capture_interview(marker, [self.prompt("req")])
         self.assertEqual(out["coverage"]["mode"], "hook-records-only")
         self.assertTrue(out["coverage"]["reason"].startswith("There was no Claude Code transcript"))
-        # Claude's words are not taken from the Stop hook.
         self.assertEqual([m["content"] for m in out["messages"]], ["req"])
         # A transcript that existed and then vanished is a broken record.
         self.write(entry("user", "req"))

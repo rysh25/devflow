@@ -9,9 +9,6 @@
     "include": ["**"],
     "exclude": [],
     "context_paths": [],
-    "max_files": 5000,
-    "max_file_bytes": 1000000,
-    "max_total_bytes": 20000000,
     "max_packet_bytes": 2000000
   },
   "reviewers": [

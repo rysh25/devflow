@@ -23,8 +23,7 @@ FIELDS = frozenset({"path", "git_common_dir", "git_dir", "identity"})
 
 
 def git_version() -> tuple[int, ...]:
-    result = run_bounded([git_executable(), "--version"], cwd=None, timeout=30, limit=65536,
-                         env=git_environment())
+    result = run_bounded([git_executable(), "--version"], cwd=None, timeout=30, env=git_environment())
     match = re.search(r"(\d+)\.(\d+)", result.stdout.decode("utf-8", "replace"))
     if result.exit_code != 0 or not match:
         raise DevFlowError("Cannot establish the Git version")

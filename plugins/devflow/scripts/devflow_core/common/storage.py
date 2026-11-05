@@ -16,12 +16,41 @@ from uuid import uuid4
 from .errors import DevFlowError
 
 
+#: The largest JSON record DevFlow reads, and so the largest it writes.
+JSON_LIMIT = 64 * 1024 * 1024
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def digest_file(path: Path) -> str:
+    """The sha256 of a file, read 1 MiB at a time (never whole into memory)."""
+    hasher = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _refuse_large_json(name: str, size: int) -> None:
+    if size > JSON_LIMIT:
+        raise DevFlowError(f"Record {name} would be {size} bytes, over the 64 MiB JSON limit; it was not saved")
+
+
+def check_json_size(name: str, data: bytes) -> bytes:
+    """Refuse to write a JSON record that ``read_json`` could not read back."""
+    _refuse_large_json(name, len(data))
+    return data
+
+
+def check_json_file(name: str, path: Path) -> None:
+    """The same refusal for a record given as a file (its size, without reading it)."""
+    _refuse_large_json(name, Path(path).stat().st_size)
 
 
 def json_bytes(value: object) -> bytes:
@@ -37,7 +66,7 @@ def _unique(pairs):
     return result
 
 
-def read_json(path: Path, limit: int = 64 * 1024 * 1024) -> dict:
+def read_json(path: Path, limit: int = JSON_LIMIT) -> dict:
     no_symlinks(path)
     try:
         if path.stat().st_size > limit:
@@ -72,17 +101,35 @@ def within(path: Path, base: Path) -> Path:
     return resolved
 
 
-def write_new(path: Path, data: bytes) -> None:
-    """Publish a complete immutable artifact exclusively, using a hard link."""
+def _temporary(path: Path, data, prefix: str) -> Path:
+    """A complete temporary file next to ``path``, on disk (fsync) before it is used.
+
+    ``data`` is bytes or a sequence of byte chunks, so a large file is never
+    held whole in memory.
+    """
     no_symlinks(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(prefix=".flow-new-", dir=str(path.parent))
+    fd, name = tempfile.mkstemp(prefix=prefix, dir=str(path.parent))
     temporary = Path(name)
     try:
         with os.fdopen(fd, "wb") as stream:
-            stream.write(data)
+            for chunk in ((data,) if isinstance(data, (bytes, bytearray)) else data):
+                stream.write(chunk)
             stream.flush()
             os.fsync(stream.fileno())
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return temporary
+
+
+def write_new(path: Path, data) -> None:
+    """Publish a complete immutable artifact exclusively, using a hard link.
+
+    ``data`` is bytes or a sequence of byte chunks.
+    """
+    temporary = _temporary(path, data, ".flow-new-")
+    try:
         os.link(temporary, path)
     except FileExistsError as exc:
         raise DevFlowError(f"Refusing to replace immutable artifact: {path}") from exc
@@ -92,19 +139,18 @@ def write_new(path: Path, data: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def atomic_write_json(path: Path, value: object) -> None:
-    no_symlinks(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(prefix=".flow-", dir=str(path.parent))
-    temporary = Path(name)
+def replace_file(path: Path, data: bytes) -> None:
+    """Replace a file atomically (temporary file, fsync, rename)."""
+    temporary = _temporary(path, data, ".flow-")
     try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(json_bytes(value))
-            stream.flush()
-            os.fsync(stream.fileno())
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def atomic_write_json(path: Path, value: object) -> None:
+    """Replace a JSON file atomically; never one that ``read_json`` could not read back."""
+    replace_file(path, check_json_size(Path(path).name, json_bytes(value)))
 
 
 atomic_json = atomic_write_json

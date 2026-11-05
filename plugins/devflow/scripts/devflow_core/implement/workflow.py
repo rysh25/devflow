@@ -9,7 +9,7 @@ from ..common.environment import bash_timeout_ms
 from ..common.review import after_failed_review, check_review_budget, check_review_config, review_budget
 from ..common.runs import TERMINAL
 from ..common.sessions import prefilled_question_events
-from ..common.storage import digest, json_bytes, no_symlinks, now
+from ..common.storage import check_json_size, digest, json_bytes, no_symlinks, now
 from ..common.workflow import Option, Workflow
 from .commands import COMMANDS
 
@@ -60,7 +60,8 @@ class ImplementWorkflow(Workflow):
             path = Path(project) / path
         return os.path.normpath(str(path))
 
-    def build_start(self, project: Path, pending: dict, options: dict) -> tuple[dict, dict[str, bytes]]:
+    def build_start(self, project: Path, pending: dict, options: dict,
+                    scratch: Path) -> tuple[dict, dict[str, bytes | Path]]:
         from . import snapshot
         from .config import load_config
         from .engine import _plan_bytes
@@ -73,7 +74,15 @@ class ImplementWorkflow(Workflow):
         # The workspace is decided once, before anything is created, and frozen.
         workspace = resolve_workspace(project, options.get("workspace"), config["snapshot"]["mode"])
         data = _plan_bytes(plan, config["max_plan_bytes"])
-        baseline = snapshot.capture(Path(workspace["path"]), config)
+        # Only the text files Git does not hold are copied, once, into scratch/baseline.
+        copies = scratch / "baseline"
+        baseline = snapshot.capture(Path(workspace["path"]), config, copies=copies)
+        baseline_bytes = json_bytes(baseline)
+        try:
+            check_json_size("baseline.json", baseline_bytes)
+        except DevFlowError as exc:
+            raise DevFlowError(f"{exc}. The snapshot scope has {baseline['file_count']} files; narrow "
+                               "snapshot.include or snapshot.exclude and start again") from exc
         if _plan_bytes(plan, config["max_plan_bytes"]) != data:
             raise DevFlowError("Input plan changed during startup; no run was created. Confirm the plan and invoke implement again")
         fields = {
@@ -86,11 +95,15 @@ class ImplementWorkflow(Workflow):
             "report_path": None, "resume_status": None, "escalation": None, "workspace": workspace,
         }
         artifacts = {
-            "plan.md": data, "config.json": json_bytes(config), "baseline.json": json_bytes(baseline),
+            "plan.md": data, "config.json": json_bytes(config), "baseline.json": baseline_bytes,
             "request.json": json_bytes({"intent": {"action": "start", "args": pending["args"],
                                                    "workspace": options.get("workspace")},
                                         "event": pending["event"]}),
         }
+        for record in baseline["files"].values():
+            copy = (record.get("source") or {}).get("copy")
+            if copy:
+                artifacts[copy] = copies / Path(copy).name
         if baseline.get("git", {}) and baseline["git"].get("dirty") and not config["allow_dirty"]:
             escalation = {"id": "E001", "reason": "Existing changes require explicit acknowledgement",
                           "questions": ["The worktree has existing changes. Preserve them and continue from this captured baseline?"],

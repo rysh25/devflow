@@ -1,13 +1,14 @@
-"""Run records for every workflow: one envelope and one transaction model.
+"""Run records for every workflow: one envelope and one way to save.
 
 The run state's ``owner_session`` is the only authority on which Claude session
 owns a run. Runs appear by an atomic directory rename, so a run directory is
-never half-created. Locked loads roll forward a committed transaction; reads
-for display never change a file.
+never half-created. A save writes its new records first and then replaces
+``state.json``, which is the moment it is committed: a save that stops earlier
+is simply not committed, and ``state.json`` only ever names records that are
+on disk. Reads for display never change a file.
 """
 from __future__ import annotations
 
-import base64
 import json
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -19,13 +20,13 @@ import shutil
 from uuid import uuid4
 
 from .errors import DevFlowError
-from .storage import (atomic_json, digest, file_lock, json_bytes, no_symlinks, now,
-                      read_json, within, write_new)
+from .storage import (atomic_json, check_json_file, check_json_size, digest, digest_file, file_lock, json_bytes,
+                      no_symlinks, now, read_json, replace_file, within, write_new)
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 # Older run formats and the releases that wrote them; they are never continued.
 # A format that was never released has no name and is shown generically.
-RELEASES = {1: "0.1.x", 2: "0.2.x", 3: "0.3.x", 6: "0.4.x"}
+RELEASES = {1: "0.1.x", 2: "0.2.x", 3: "0.3.x", 6: "0.4.x", 7: "0.5.x"}
 
 
 def release_name(version: int) -> str:
@@ -36,7 +37,7 @@ SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}\Z")
 EVENT_ID = re.compile(r"[a-f0-9]{32}\Z")
 #: ``observation``: the AskUserQuestion input as Claude sent it, recorded at
 #: PreToolUse (before the question screen adds answers); never an answer itself.
-EVENT_KINDS = frozenset({"prompt", "question", "observation", "stop"})
+EVENT_KINDS = frozenset({"prompt", "question", "observation"})
 MAX_EVENT_BYTES = 4 * 1024 * 1024
 MAX_EVENTS = 5000
 CREATING = ".creating-"
@@ -120,12 +121,10 @@ class RunInfo:
     format: str  # current | unsupported | invalid
     state: dict | None
     error: str | None
-    recovery_required: bool
     schema_version: int | None = None
 
     def public(self) -> dict:
-        value = {"flow": self.flow, "run_id": self.run_id, "format": self.format,
-                 "recovery_required": self.recovery_required}
+        value = {"flow": self.flow, "run_id": self.run_id, "format": self.format}
         if self.error:
             value["error"] = self.error
         if self.format == "unsupported":
@@ -217,89 +216,42 @@ class RunStore:
         return state
 
     # -- reading ----------------------------------------------------------------------------
-    def _transaction(self, run_id: str) -> dict:
-        journal = read_json(self.run_dir(run_id) / "transaction.json", limit=256 * 1024 * 1024)
-        desired = journal.get("state")
-        if (journal.get("schema_version") != SCHEMA_VERSION or not isinstance(desired, dict)
-                or type(journal.get("base_revision")) is not int
-                or desired.get("state_revision") != journal["base_revision"] + 1
-                or not isinstance(journal.get("writes"), dict)):
-            raise DevFlowError("Invalid pending transaction; preserve it for human recovery")
-        self.validate(desired, run_id)
-        return journal
-
-    def _finish_transaction(self, run_id: str) -> None:
-        """Replay a committed journal: only file and state writes, never a dispatch."""
-        run = self.run_dir(run_id)
-        path = run / "transaction.json"
+    def _committed(self, run_id: str) -> dict:
+        path = self.run_dir(run_id) / "state.json"
         if not path.exists():
-            return
-        journal = self._transaction(run_id)
-        desired = journal["state"]
-        current = read_json(run / "state.json") if (run / "state.json").exists() else None
-        if current is not None:
-            revision = current.get("state_revision")
-            if revision not in {journal["base_revision"], desired["state_revision"]}:
-                raise DevFlowError("Pending transaction is stale; refusing to replace newer state")
-            if revision == desired["state_revision"] and current != desired:
-                raise DevFlowError("Conflicting committed transaction state")
-        for relative, encoded in journal["writes"].items():
-            target = within(run / relative, run)
-            try:
-                data = base64.b64decode(encoded, validate=True)
-            except (ValueError, TypeError) as exc:
-                raise DevFlowError("Corrupt pending artifact bytes") from exc
-            if digest(data) != desired["artifacts"].get(relative):
-                raise DevFlowError("Pending artifact does not match its committed hash")
-            if target.exists():
-                if not target.is_file() or target.read_bytes() != data:
-                    raise DevFlowError(f"Divergent artifact blocks recovery: {relative}; never overwrite it")
-            else:
-                write_new(target, data)
-        atomic_json(run / "state.json", desired)
-        path.unlink()
+            raise DevFlowError("Run has no committed state; preserve it for human recovery: " + run_id)
+        return self.validate(read_json(path), run_id)
 
     def load(self, run_id: str) -> dict:
-        """Locked read for a change: completes a leftover transaction first."""
+        """Locked read for a change."""
         self._require_lock(run_id)
-        self._finish_transaction(run_id)
-        return self.validate(read_json(self.run_dir(run_id) / "state.json"), run_id)
+        return self._committed(run_id)
 
     def read(self, run_id: str) -> dict:
-        """Display read: never writes; a pending transaction is reported, not replayed."""
-        run = self.run_dir(run_id)
-        if (run / "state.json").exists():
-            return self.validate(read_json(run / "state.json"), run_id)
-        if (run / "transaction.json").exists():
-            return self._transaction(run_id)["state"]
-        raise DevFlowError("Run has no committed state; preserve it for human recovery: " + run_id)
+        """Display read of the committed state; never writes."""
+        return self._committed(run_id)
 
     def inspect(self, run_id: str) -> RunInfo:
         """Classify a run without raising or changing anything."""
-        recovery = False
         try:
             run = self.run_dir(run_id)
             if not run.is_dir():
                 raise DevFlowError("Run path is not a directory")
-            recovery = (run / "transaction.json").exists()
-            if (run / "state.json").exists():
-                raw = read_json(run / "state.json")
-            elif recovery:
-                raw = read_json(run / "transaction.json", limit=256 * 1024 * 1024).get("state")
-            else:
+            if not (run / "state.json").exists():
                 raise DevFlowError("Run has no committed state")
+            raw = read_json(run / "state.json")
             if not isinstance(raw, dict):
                 raise DevFlowError("Run state must be an object")
             version = raw.get("schema_version")
             if type(version) is int and 1 <= version < SCHEMA_VERSION:
                 if (raw.get("run_id") == run_id and raw.get("flow") == self.flow
                         and raw.get("project") == str(self.project) and isinstance(raw.get("status"), str)):
-                    return RunInfo(self.flow, run_id, "unsupported", raw, None, recovery, version)
+                    return RunInfo(self.flow, run_id, "unsupported", raw, None, version)
                 raise DevFlowError("Run state from an older DevFlow format has mismatched basic information")
             state = self.read(run_id)
-            return RunInfo(self.flow, run_id, "current", state, None, recovery, SCHEMA_VERSION)
+            return RunInfo(self.flow, run_id, "current", state, None, SCHEMA_VERSION)
         except (DevFlowError, OSError, TypeError, KeyError, ValueError, AttributeError) as exc:
-            return RunInfo(self.flow, run_id, "invalid", None, str(exc), recovery)
+            return RunInfo(self.flow, run_id, "invalid", None, str(exc))
 
     def scan(self) -> tuple[list[RunInfo], list[str]]:
         """Every run directory (bounded) plus leftover ``.creating-*`` directories."""
@@ -317,21 +269,28 @@ class RunStore:
             elif RUN_ID.fullmatch(path.name):
                 runs.append(self.inspect(path.name))
             else:
-                runs.append(RunInfo(self.flow, path.name, "invalid", None, "Not a run directory name", False))
+                runs.append(RunInfo(self.flow, path.name, "invalid", None, "Not a run directory name"))
         return runs, creating
 
     # -- writing ----------------------------------------------------------------------------
     def stage(self, state: dict, relative: str, data: bytes) -> Path:
-        """Stage an immutable artifact for the next save; never overwrite one."""
+        """Hold a new immutable artifact for the next save, which writes it."""
         run = self.run_dir(state["run_id"])
         target = within(run / relative, run)
-        if target.exists() and (not target.is_file() or target.read_bytes() != data):
-            raise DevFlowError(f"Refusing to overwrite a different immutable artifact: {relative}")
-        state.setdefault("_pending_writes", {})[relative] = base64.b64encode(data).decode("ascii")
+        if relative.endswith(".json"):
+            check_json_size(relative, data)
+        state.setdefault("_pending_writes", {})[relative] = data
         state["artifacts"][relative] = digest(data)
         return target
 
     def save(self, state: dict) -> None:
+        """Write the held artifacts, then replace ``state.json``: the commit.
+
+        A save that stops before the replacement is not committed. Files it
+        left are listed by no committed state, so nothing reads them, and the
+        next save at the same place replaces them. A state whose save failed
+        must not be saved again; reload the committed state instead.
+        """
         run_id = state["run_id"]
         self._require_lock(run_id)
         self.workflow.before_save(self, state)
@@ -339,25 +298,61 @@ class RunStore:
         base_revision = state["state_revision"]
         desired = dict(state, updated_at=now(), state_revision=base_revision + 1)
         self.validate(desired, run_id)
-        path = self.run_dir(run_id) / "transaction.json"
-        if path.exists():
-            raise DevFlowError("A prior transaction must recover before another change")
-        atomic_json(path, {"schema_version": SCHEMA_VERSION, "base_revision": base_revision,
-                           "state": desired, "writes": writes})
-        self._finish_transaction(run_id)
+        run = self.run_dir(run_id)
+        committed = self._committed(run_id)
+        if committed["state_revision"] != base_revision:
+            raise DevFlowError("Run state changed since it was loaded; reload and retry")
+        for relative, data in writes.items():
+            self._publish(run, relative, data, committed["artifacts"])
+        atomic_json(run / "state.json", desired)
         state.clear()
         state.update(desired)
+
+    @staticmethod
+    def _publish(run: Path, relative: str, data: bytes, committed: dict) -> None:
+        """Write one artifact at its place; a committed artifact is never changed."""
+        target = within(run / relative, run)
+        if not (target.exists() or target.is_symlink()):
+            write_new(target, data)
+        elif relative in committed:
+            if not target.is_file() or target.is_symlink() or digest_file(target) != digest(data):
+                raise DevFlowError(f"Refusing to overwrite a different immutable artifact: {relative}")
+        else:
+            # Left by a save that was never committed.
+            if not target.is_file() or target.is_symlink():
+                raise DevFlowError(f"Refusing to replace a non-file at an artifact place: {relative}")
+            replace_file(target, data)
 
     def verify_artifacts(self, state: dict) -> None:
         run = self.run_dir(state["run_id"])
         for relative, expected in state["artifacts"].items():
             path = within(run / relative, run)
-            if not path.is_file() or digest(path.read_bytes()) != expected:
+            if not path.is_file() or digest_file(path) != expected:
                 raise DevFlowError(f"Immutable artifact changed or is missing: {relative}; stop and investigate")
 
-    def create(self, fields: dict, artifacts: dict[str, bytes], *, run_id: str, owner: str, first_event: dict,
-               directories: tuple[str, ...] = ()) -> dict:
-        """Build a complete run in a private directory, then publish it by rename."""
+    @contextmanager
+    def scratch(self, run_id: str):
+        """A private directory for large start records, removed afterwards.
+
+        Its ``.creating-`` name makes a leftover show like any interrupted creation.
+        """
+        ensure_data_root(self.project)
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = self.root / f"{CREATING}{validate_run_id(run_id)}.start"
+        no_symlinks(path)
+        path.mkdir(mode=0o700)
+        try:
+            yield path
+        finally:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def create(self, fields: dict, artifacts: dict[str, bytes | Path], *, run_id: str, owner: str,
+               first_event: dict, directories: tuple[str, ...] = ()) -> dict:
+        """Build a complete run in a private directory, then publish it by rename.
+
+        An artifact is bytes, or a ``Path`` to a file written with ``write_new``
+        (on disk already) in the same file system, which is moved in.
+        """
         ensure_data_root(self.project)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         final = self.run_dir(run_id)
@@ -377,8 +372,19 @@ class RunStore:
             for relative, data in files.items():
                 target = within(staging / relative, staging)
                 target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                write_new(target, data)
-                hashes[relative] = digest(data)
+                if isinstance(data, Path):
+                    no_symlinks(data)
+                    if not data.is_file():
+                        raise DevFlowError(f"A start record must be a regular file: {relative}")
+                    if relative.endswith(".json"):
+                        check_json_file(relative, data)
+                    hashes[relative] = digest_file(data)
+                    os.replace(data, target)
+                else:
+                    if relative.endswith(".json"):
+                        check_json_size(relative, data)
+                    write_new(target, data)
+                    hashes[relative] = digest(data)
             created = now()
             state = {**fields, "schema_version": SCHEMA_VERSION, "flow": self.flow, "run_id": run_id,
                      "project": str(self.project), "owner_session": owner, "created_at": created,
@@ -445,14 +451,14 @@ class RunStore:
 
     # -- human events -----------------------------------------------------------------------
     def events(self, state: dict) -> list[dict]:
-        """Every event of the run, including ones staged in the current transaction."""
+        """Every event of the run, including ones held for the next save."""
         run = self.run_dir(state["run_id"])
         pending = state.get("_pending_writes", {})
         result = []
         for identifier in state["event_ids"]:
             relative = f"events/{identifier}.json"
             if relative in pending:
-                value = validate_event(json.loads(base64.b64decode(pending[relative])))
+                value = validate_event(json.loads(pending[relative]))
             else:
                 value = validate_event(read_json(run / relative, limit=MAX_EVENT_BYTES + 4096))
             if value["event_id"] != identifier:

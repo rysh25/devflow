@@ -98,9 +98,29 @@ class ConfigCliTests(unittest.TestCase):
             config = load_config(self.project, WORKFLOW)
         processes.assert_not_called()
         self.assertEqual(config["snapshot"]["mode"], "files")
-        self.assertEqual(config["snapshot"]["max_files"], self.config["snapshot"]["max_files"])
+        self.assertEqual(config["snapshot"]["max_packet_bytes"], self.config["snapshot"]["max_packet_bytes"])
         self.assertEqual(config["checks"], overlay["checks"])
         self.assertFalse((self.project / ".devflow").exists())
+
+    def test_settings_removed_in_0_6_0_are_errors_that_name_them(self):
+        cases = (
+            ({"implement": {"snapshot": {"max_files": 9, "max_file_bytes": 9, "max_total_bytes": 9}}},
+             r"^Invalid snapshot fields \(unknown: max_file_bytes, max_files, max_total_bytes\); "
+             r"see the project settings in the DevFlow README$"),
+            ({"implement": {"checks": [{"id": "tests", "argv": [sys.executable], "max_output_bytes": 1024}]}},
+             r"^Invalid check fields \(unknown: max_output_bytes\); see the project settings in the DevFlow README$"),
+            ({"reviewers": [{**reviewer, "max_output_bytes": 1024} for reviewer in self.config["reviewers"]]},
+             r"unknown: max_output_bytes\).*README"),
+        )
+        for document, message in cases:
+            with self.subTest(document=document):
+                atomic_write_json(self.project / "devflow.config.json", {"schema_version": 1, **document})
+                with self.assertRaisesRegex(DevFlowError, message):
+                    load_config(self.project, WORKFLOW)
+
+    def test_a_snapshot_mode_other_than_git_or_files_is_named(self):
+        with self.assertRaisesRegex(DevFlowError, r"^snapshot.mode must explicitly be git or files$"):
+            validate_config({**self.config, "snapshot": {**self.config["snapshot"], "mode": "auto"}})
 
     def test_doctor_reports_offline_limits_and_missing_checks(self):
         with patch("devflow_core.implement.commands.preflight", return_value={"offline": True}) as probe:

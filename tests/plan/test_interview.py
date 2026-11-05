@@ -260,16 +260,6 @@ class FrozenDoctorTests(InterviewFixture):
         self.assertEqual(code, 0)
         self.assertEqual(report["configuration_source"], "frozen_run")
 
-    def test_doctor_does_not_repair_pending_transaction(self):
-        engine, run_id = self.start_frozen_wrapper()
-        transaction = engine._run(run_id) / "transaction.json"
-        transaction.write_text('{"fixture":"must remain untouched"}', encoding="utf-8")
-        before = transaction.read_bytes()
-        code, report = self.doctor("--session", "interview-session")
-        self.assertEqual(code, 2)
-        self.assertIn("Diagnosis changes nothing", report["message"])
-        self.assertEqual(transaction.read_bytes(), before)
-
     def test_doctor_refuses_changed_frozen_config(self):
         engine, run_id = self.start_frozen_wrapper()
         path = engine._run(run_id) / "config.json"
