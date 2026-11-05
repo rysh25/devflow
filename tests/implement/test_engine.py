@@ -31,6 +31,7 @@ from devflow_core.implement.review import validate_review
 from devflow_core.workflows import WORKFLOWS
 from devflow_core.common.review import REVIEW_LIMIT_REASON
 from tests.common.test_common import limit_question
+from tests.plan.test_engine import UNWRITABLE, raise_unwritable, unwritable_activity
 
 ACTIVITY = {"tool_call_count": 2, "tool_calls": {"command_execution": 2}, "other_events": {}}
 EVENT_ID = r"\A[a-f0-9]{32}\Z"
@@ -1756,6 +1757,43 @@ class SummaryAndAcceptanceTests(EngineFixture):
         cancelled = self.engine.cancel(self.run_id, self.session, "Stopping.")
         self.assertEqual(cancelled["status"], "cancelled")
         self.assertIsNone(cancelled["report"]["review_summary"]["reviews"][0]["cli_version"])
+
+
+class UnwritableReviewerTextTests(EngineFixture):
+    """0.7.1: reviewer output holding text a record cannot hold never stops a save."""
+
+    def test_reviewer_text_a_record_cannot_hold_never_stops_a_save(self):
+        self.start()
+        self.ready()
+        for number, kind in enumerate(UNWRITABLE, start=1):
+            with self.subTest(kind=kind):
+                self.reviewer.side_effect = lambda *args, kind=kind, **kwargs: raise_unwritable(kind)
+                failed = self.review()
+                self.assertEqual(failed["status"], "paused_error")
+                self.assertEqual(failed["attempts"][number - 1]["error"], UNWRITABLE[kind])
+                self.assertEqual(failed["last_error"], UNWRITABLE[kind])
+                json.dumps(self.engine.status(self.run_id), ensure_ascii=False).encode("utf-8")  # runner output
+                self.resume()
+        # A successful review whose activity names cannot be held counts them as unnamed.
+        def with_unwritable_names(config, packet_path, *args, **kwargs):
+            return {**self.respond(config, packet_path, *args, **kwargs), "activity": unwritable_activity()}
+        self.reviewer.side_effect = with_unwritable_names
+        reviewed = self.review()
+        self.assertEqual(reviewed["attempts"][4]["activity"]["tool_calls"], {"(unnamed)": 1})
+        # A late failure (after recovery) is kept with its text escaped.
+        def recovered_then_failed(*args, **kwargs):
+            self.engine.recover(self.run_id, confirmed=True)
+            raise_unwritable("opencode error")
+        self.reviewer.side_effect = recovered_then_failed
+        with self.assertRaisesRegex(DevFlowError, "stale review"):
+            self.review()
+        late = list((self.run / "late").glob("review-006-*.json"))
+        self.assertEqual(len(late), 1)
+        self.assertEqual(read_json(late[0])["error"], UNWRITABLE["opencode error"])
+        cancelled = self.engine.cancel(self.run_id, self.session, "Stopping.")
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertFinalReportSaved(cancelled)
+        json.dumps(self.engine.status(self.run_id), ensure_ascii=False).encode("utf-8")
 
 
 if __name__ == "__main__":

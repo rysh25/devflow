@@ -18,7 +18,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from devflow_core.common import reviewers, settings
+from devflow_core.common import reviewers, settings, storage
 from devflow_core.common.errors import DevFlowError, ReviewerError
 
 MIB = 1024 * 1024
@@ -858,6 +858,41 @@ class TokenTests(unittest.TestCase):
         self.assertEqual(self.tokens("codex", output), {"input_tokens": 1})
         (self.work / "invocation.json").write_text(json.dumps({"cli_version": "codex \ud800"}), encoding="utf-8")
         self.assertIsNone(reviewers.recorded_cli_version(self.work))
+
+
+class UnwritableTextTests(unittest.TestCase):
+    """Text a record cannot hold (an unpaired surrogate, from a JSON escape) in a CLI's output."""
+
+    def test_an_answer_holding_such_text_is_refused_never_rewritten(self):
+        for text in ('{"summary": "bad \\ud800"}', '{"\\udfff": 1}', '{"items": ["ok", {"x": "\\ud800"}]}'):
+            with self.subTest(text=text), self.assertRaisesRegex(
+                    ReviewerError, r"Reviewer answer contains text that cannot be saved \(an unpaired surrogate\)"):
+                reviewers.json_value(text)
+        self.assertEqual(reviewers.json_value('{"summary": "日本語 😀 \\ud83d\\ude00"}'), {"summary": "日本語 😀 😀"})
+
+    def test_both_cli_readers_refuse_such_an_answer(self):
+        bad = {**REVIEW, "summary": "bad \ud800"}
+        with self.assertRaisesRegex(ReviewerError, "cannot be saved"):
+            parse_opencode(opencode(value=bad))
+        with tempfile.TemporaryDirectory(prefix="devflow unwritable ") as temporary:
+            work = Path(temporary).resolve()
+            (work / "stdout.jsonl").write_text(codex(answer_item()), encoding="utf-8")
+            (work / "final-response.json").write_text(json.dumps(bad), encoding="utf-8")
+            with self.assertRaisesRegex(ReviewerError, "cannot be saved"):
+                reviewers.CLIS["codex"].answer(work / "stdout.jsonl", work)
+
+    def test_a_duplicate_key_message_holding_such_text_is_an_error_a_record_can_hold_once_escaped(self):
+        with self.assertRaisesRegex(ReviewerError, "Duplicate JSON key") as caught:
+            reviewers.json_value('{"\\ud800": 1, "\\ud800": 2}')
+        self.assertFalse(storage.writable(str(caught.exception)))
+        self.assertTrue(storage.writable(storage.writable_text(str(caught.exception))))
+
+    def test_names_a_record_cannot_hold_are_counted_as_unnamed(self):
+        activity = parse_codex(codex(item("item.completed", "\ud800tool", "t1"), {"type": "\udfffkind"}, answer_item()))
+        self.assertEqual((activity["tool_calls"], activity["other_events"]), ({"(unnamed)": 1}, {"(unnamed)": 1}))
+        _, activity = parse_opencode(opencode(oc("tool_use", callID="c1", tool="\ud800"), oc("\udfffkind")))
+        self.assertEqual((activity["tool_calls"], activity["other_events"]), ({"(unnamed)": 1}, {"(unnamed)": 1}))
+        storage.json_bytes(activity)
 
 
 if __name__ == "__main__":

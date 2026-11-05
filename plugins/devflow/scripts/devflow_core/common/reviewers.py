@@ -12,10 +12,12 @@ prompt from it, then it is closed; OpenCode's is closed from the start. The
 reviewer instructions ask it to treat every file as data, so a file cannot
 change its verdict or this contract.
 
-The answer is checked strictly. The event stream is not: a review fails only
-when the output shows that the run did not finish or gave no answer. Tool
-calls, subagents, errors the CLI recovered from and event types DevFlow does
-not know are counted and recorded, never refused.
+The answer is checked strictly: it is refused, never rewritten, when it is not
+strict JSON or holds text a record cannot hold (an unpaired surrogate). The
+event stream is not: a review fails only when the output shows that the run did
+not finish or gave no answer. Tool calls, subagents, errors the CLI recovered
+from and event types DevFlow does not know are counted and recorded, never
+refused; a name a record cannot hold is counted as unnamed.
 
 Each workflow supplies its packet, instructions, output schema and a validator
 for its review fields; this module owns everything about the external CLIs.
@@ -37,7 +39,7 @@ from .environment import PROBE_SECONDS, version_warnings
 from .errors import DevFlowError, ReviewerError
 from .process import run_bounded
 from .settings import validate_reviewer
-from .storage import json_bytes, read_json
+from .storage import json_bytes, read_json, writable
 
 MAX_PACKET_BYTES = 32 * 1024 * 1024
 #: Share of a reviewer's time limit after which it is asked to start writing its answer.
@@ -45,7 +47,8 @@ ANSWER_SHARE = 0.8
 
 
 def json_value(text: str) -> Any:
-    """Strict JSON for a review: duplicate keys and NaN fail."""
+    """Strict JSON for a review: duplicate keys, NaN and text a record cannot hold fail.
+    The answer is never rewritten."""
     def pairs(items: list[tuple[str, Any]]) -> dict:
         result = {}
         for key, value in items:
@@ -58,9 +61,17 @@ def json_value(text: str) -> Any:
         raise ReviewerError(f"Invalid JSON constant: {value}")
 
     try:
-        return json.loads(text, object_pairs_hook=pairs, parse_constant=invalid)
+        value = json.loads(text, object_pairs_hook=pairs, parse_constant=invalid)
     except (ValueError, TypeError) as exc:
         raise ReviewerError(f"Invalid reviewer JSON: {exc}") from exc
+    # The answer goes into a record as it is: one a record cannot hold is refused.
+    try:
+        json_bytes(value)
+    except UnicodeEncodeError as exc:
+        raise ReviewerError("Reviewer answer contains text that cannot be saved (an unpaired surrogate)") from exc
+    except (ValueError, RecursionError) as exc:
+        raise ReviewerError("Reviewer answer cannot be saved as a record") from exc
+    return value
 
 
 def text(value: Any, label: str, limit: int = 32768) -> str:
@@ -347,22 +358,12 @@ def _read_text(path: Path, limit: int | None) -> str:
         raise ReviewerError(f"Cannot read reviewer file {path.name}: {exc}") from exc
 
 
-def _writable(text: str) -> bool:
-    """Whether a string from a CLI's output can be saved: JSON accepts escaped lone
-    surrogates, which records (UTF-8) cannot hold."""
-    try:
-        text.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return True
-
-
 def _add_tokens(totals: dict[str, int], values: dict, prefix: str = "") -> None:
     """Add a CLI's token counts under its own names; nested names are joined with ".".
     Only non-negative integers (not booleans) under names a record can hold count."""
     for name, value in values.items():
         key = f"{prefix}{name}"
-        if not _writable(key):
+        if not writable(key):
             continue
         if isinstance(value, dict):
             _add_tokens(totals, value, key + ".")
@@ -498,7 +499,7 @@ def recorded_cli_version(work_dir: Path) -> str | None:
         value = read_json(Path(work_dir) / "invocation.json").get("cli_version")
     except DevFlowError:
         return None
-    return value if isinstance(value, str) and _writable(value) else None
+    return value if isinstance(value, str) and writable(value) else None
 
 
 def _utc_now() -> datetime:

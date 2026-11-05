@@ -6,7 +6,8 @@ import unittest
 from unittest.mock import patch
 
 from devflow_core.common.storage import (DevFlowError, atomic_json, checked_text, digest,
-    file_lock, json_bytes, no_symlinks, read_json, within, write_new)
+    file_lock, json_bytes, no_symlinks, read_json, within, writable, writable_text, write_new)
+from devflow_core.common.counts import MAX_NAMES, tally
 from devflow_core.common.errors import ReviewerError
 from devflow_core.common.review import (REVIEW_LIMIT_REASON, all_approved, ask_at_limit, check_fields,
                                         check_review_budget, decide_at_limit, next_reviewer, review_budget,
@@ -117,6 +118,44 @@ class SharedStorageTests(unittest.TestCase):
             with file_lock(path):
                 self.fail("Existing lock unexpectedly removed")
         self.assertEqual(read_json(path), stale)
+
+
+class WritableTextTests(unittest.TestCase):
+    """Text a record (UTF-8) cannot hold: JSON accepts escaped unpaired surrogates."""
+
+    def test_writable(self):
+        for text in ("", "plain", "日本語と絵文字 😀", "\U0001F600"):
+            with self.subTest(text=text):
+                self.assertTrue(writable(text))
+        for text in ("\ud800", "ok \udfff", "\udc80 end"):
+            with self.subTest(text=text):
+                self.assertFalse(writable(text))
+
+    def test_writable_text_escapes_only_what_a_record_cannot_hold(self):
+        self.assertEqual(writable_text("日本語 😀"), "日本語 😀")
+        self.assertEqual(writable_text("bad \ud800 here"), "bad \\ud800 here")
+        self.assertTrue(writable(writable_text("\ud800\udfff")))
+        json_bytes({"message": writable_text("a \ud800")})
+
+
+class CountTests(unittest.TestCase):
+    def test_names_are_cut_and_missing_or_unwritable_ones_are_unnamed(self):
+        counts = {}
+        for name in ("read", "read", "x" * 100, "", None, 7, "\ud800tool", "a" * 63 + "\ud800"):
+            tally(counts, name, "(unnamed)")
+        self.assertEqual(counts, {"read": 2, "x" * 64: 1, "(unnamed)": 5})
+        json_bytes(counts)
+        # A name cut at 64 characters is checked after the cut.
+        counts = {}
+        tally(counts, "a" * 64 + "\ud800", "(untyped)")
+        self.assertEqual(counts, {"a" * 64: 1})
+
+    def test_distinct_names_are_bounded(self):
+        counts = {}
+        for index in range(MAX_NAMES + 3):
+            tally(counts, f"name-{index}", "(unnamed)")
+        self.assertEqual(len(counts), MAX_NAMES + 1)
+        self.assertEqual(counts["(other)"], 3)
 
 
 class FieldCheckTests(unittest.TestCase):

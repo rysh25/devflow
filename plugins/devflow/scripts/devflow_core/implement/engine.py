@@ -14,7 +14,7 @@ from ..common.reviewers import preflight, recorded_cli_version, review_tokens, r
 from ..common.engine import RunEngine
 from ..common.runs import RUNNER_WAIT, TERMINAL, open_escalation
 from ..common.sessions import approval_candidates
-from ..common.storage import checked_text, digest, json_bytes, no_symlinks, now, read_json, within
+from ..common.storage import checked_text, digest, json_bytes, no_symlinks, now, read_json, within, writable_text
 
 
 def _plan_bytes(path: Path, limit: int) -> bytes:
@@ -280,11 +280,13 @@ class Engine(RunEngine):
                 error = exc
         if error is not None:
             # What the reviewer did is kept when it ran to the end.
-            state["attempts"][-1].update(status="failed",error=str(error),finished_at=now(),tokens=tokens,
+            # The error text may carry a CLI's output: a record holds it escaped.
+            message = writable_text(str(error))
+            state["attempts"][-1].update(status="failed",error=message,finished_at=now(),tokens=tokens,
                                          **({"activity":result["activity"]} if result is not None else {}))
             # A reviewer failure says nothing about the code: approvals for this
             # snapshot stay (as in plan); this attempt never adds one.
-            state.update(status=after_failed_review(number,state,"ready_review"),resume_status="ready_review",last_error=str(error))
+            state.update(status=after_failed_review(number,state,"ready_review"),resume_status="ready_review",last_error=message)
             return
         review_path = f"reviews/{number:02}/review.json"
         self._artifact(state,review_path,json_bytes(review))

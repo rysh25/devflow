@@ -32,6 +32,37 @@ PROBE = {"kind": "fixture", "executable": "/fixture/reviewer", "cli_version": "f
 LEGACY = "plan" + "flow"  # A pre-DevFlow name, assembled so no tracked file spells it.
 
 
+
+def raise_unwritable(kind):
+    """The real reader's error for CLI output holding text a record cannot hold (an unpaired surrogate)."""
+    from devflow_core.common import reviewers
+    if kind == "answer":
+        reviewers.json_value('{"summary": "bad \\ud800"}')
+    elif kind == "codex turn failure":
+        reviewers.parse_codex_events([json.dumps({"type": "thread.started", "thread_id": "t"}),
+                                      json.dumps({"type": "turn.failed", "error": {"message": "boom \ud800"}})])
+    elif kind == "opencode error":
+        reviewers.parse_opencode_events([json.dumps({"type": "error", "sessionID": "s", "error": {"message": "boom \ud800"}})])
+    elif kind == "duplicate key":
+        reviewers.json_value('{"\\ud800": 1, "\\ud800": 2}')
+    raise AssertionError(f"{kind} did not raise")
+
+
+#: Each kind, and what its recorded error text holds once escaped.
+UNWRITABLE = {"answer": "Reviewer answer contains text that cannot be saved (an unpaired surrogate)",
+              "codex turn failure": "Codex reported that the review turn failed: boom \\ud800",
+              "opencode error": "OpenCode reported an error: boom \\ud800",
+              "duplicate key": "Duplicate JSON key: \\ud800"}
+
+
+def unwritable_activity():
+    """What the real Codex reader counts for a tool and an event whose names a record cannot hold."""
+    from devflow_core.common import reviewers
+    return reviewers.parse_codex_events([
+        json.dumps({"type": "thread.started", "thread_id": "t"}),
+        json.dumps({"type": "item.completed", "item": {"id": "1", "type": "\ud800tool"}}),
+        json.dumps({"type": "\udfffkind"}), json.dumps({"type": "turn.completed", "usage": {}})])
+
 class InjectedCrash(RuntimeError):
     """A deterministic crash boundary, not an actual killed process."""
 
@@ -1784,6 +1815,38 @@ class EngineTests(unittest.TestCase):
                 self.engine.review(self.run_id)
         recovered = self.engine.recover(self.run_id, confirmed=True, expected_review=2)
         self.assertIsNone(recovered["inflight"])
+
+    def test_reviewer_text_a_record_cannot_hold_never_stops_a_save(self):
+        self.ready()
+        for number, kind in enumerate(UNWRITABLE, start=1):
+            with self.subTest(kind=kind):
+                with patch(RUN_REVIEW, side_effect=lambda *args, kind=kind, **kwargs: raise_unwritable(kind)):
+                    failed = self.engine.review(self.run_id)
+                self.assertEqual(failed["status"], "paused_error")
+                record = read_json(self.run / "reviews" / f"{number:02d}" / "error.json")
+                self.assertEqual(record["message"], UNWRITABLE[kind])
+                self.assertEqual(failed["last_error"]["message"], UNWRITABLE[kind])
+                json.dumps(self.engine.status(self.run_id), ensure_ascii=False).encode("utf-8")  # runner output
+                self.resume(self.session)
+        # A successful review whose activity names cannot be held counts them as unnamed.
+        with patch(RUN_REVIEW, return_value={"review": validate_review(review_value("changes_required")),
+                                             "activity": unwritable_activity()}):
+            reviewed = self.engine.review(self.run_id)
+        self.assertEqual(read_json(self.run / "reviews" / "05" / "review.json")["activity"]["tool_calls"], {"(unnamed)": 1})
+        self.reflect(reviewed)
+        # A late failure (after recovery) is kept with its text escaped.
+        def recovered_then_failed(*args, **kwargs):
+            self.engine.recover(self.run_id, confirmed=True, expected_review=6)
+            raise_unwritable("codex turn failure")
+        with patch(RUN_REVIEW, side_effect=recovered_then_failed):
+            with self.assertRaisesRegex(DevFlowError, "stale review"):
+                self.engine.review(self.run_id)
+        late = list((self.run / "late").glob("review-006-*.json"))
+        self.assertEqual(len(late), 1)
+        self.assertEqual(read_json(late[0])["error"], UNWRITABLE["codex turn failure"])
+        cancelled = self.engine.cancel(self.run_id)
+        self.assertEqual(cancelled["status"], "cancelled")
+        json.dumps(self.engine.report(self.run_id), ensure_ascii=False).encode("utf-8")
 
 
 if __name__ == "__main__":
