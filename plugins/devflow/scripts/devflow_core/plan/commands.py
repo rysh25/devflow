@@ -32,7 +32,7 @@ COMMANDS = (
     Command("pause", "Escalate: JSON {reason:string,questions:string[]}",
             lambda e, a, run, s: e.pause(run, a.reason_file), (Option("--reason-file", "draft"),)),
     Command("resolve", "Resolve with exact status.human_events answer_text and event_id values "
-            "(and decision continue/stop for the review limit question)",
+            "(and decision continue/stop/accept for the review limit question)",
             lambda e, a, run, s: e.resolve(run, a.answer_file, s), (Option("--answer-file", "draft"),)),
     Command("cancel", "Keep all audit data and stop the run", lambda e, a, run, s: e.cancel(run)),
     Command("report", "Verify artifacts and produce a JSON handoff report", lambda e, a, run, s: e.report(run)),

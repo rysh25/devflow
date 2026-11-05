@@ -19,11 +19,13 @@ from devflow_core.common import runs
 
 # The one canonical field error; the plan and implement validator tests share it.
 FIELD_ERROR = 'findings[0] has missing or unknown fields (missing: none; unknown: "consequence")'
-# The one canonical review limit question (default settings, 6 used, opencode approving);
-# the plan and implement engine tests share it.
-LIMIT_QUESTION = ("Review limit reached: 6 of 6 reviews used. Reviewers approving the current version: opencode. "
-                  "Continue with 2 more reviews (new limit 8; next reviewers in order: codex, opencode), "
-                  "or stop and end the run as exhausted?")
+def limit_question(version, used=6, limit=6, approved="opencode", grant=2, new_limit=8, order="codex, opencode"):
+    """The one canonical review limit question (by default: default settings, 6 used,
+    opencode approving); the plan and implement engine tests share it."""
+    return (f"Review limit reached: {used} of {limit} reviews used. Reviewers approving the current version: "
+            f"{approved}. Choose one: (1) continue with {grant} more reviews (new limit {new_limit}; next reviewers "
+            f"in order: {order}); (2) stop and end the run as exhausted; (3) accept the current version ({version}) "
+            "and end the run as accepted (accepted by the human, not approved by every reviewer).")
 
 
 class SharedStorageTests(unittest.TestCase):
@@ -281,7 +283,8 @@ class ReviewLimitTests(unittest.TestCase):
 
     def ask(self, state, used, approved=()):
         asked = []
-        reached = ask_at_limit(state, used, set(approved), lambda reason, questions: asked.append((reason, questions)))
+        reached = ask_at_limit(state, used, set(approved), "v1",
+                               lambda reason, questions: asked.append((reason, questions)))
         return reached, asked
 
     def test_reviews_left_change_nothing(self):
@@ -291,17 +294,15 @@ class ReviewLimitTests(unittest.TestCase):
 
     def test_the_limit_asks_the_canonical_question(self):
         state = self.state()
-        self.assertEqual(self.ask(state, 6, {"opencode"}), (True, [(REVIEW_LIMIT_REASON, [LIMIT_QUESTION])]))
+        self.assertEqual(self.ask(state, 6, {"opencode"}), (True, [(REVIEW_LIMIT_REASON, [limit_question("v1")])]))
         self.assertEqual(state["status"], "ready")  # The flow's escalate callback sets awaiting_human.
         reached, asked = self.ask(self.state(), 6)
         self.assertIn("Reviewers approving the current version: none.", asked[0][1][0])
 
     def test_one_round_is_every_configured_reviewer(self):
         reached, asked = self.ask(self.state(reviewers=("codex", "opencode", "second")), 6, {"second", "codex"})
-        self.assertEqual(asked[0][1][0],
-                         "Review limit reached: 6 of 6 reviews used. Reviewers approving the current version: "
-                         "codex, second. Continue with 3 more reviews (new limit 9; next reviewers in order: "
-                         "codex, opencode, second), or stop and end the run as exhausted?")
+        self.assertEqual(asked[0][1][0], limit_question("v1", approved="codex, second", grant=3, new_limit=9,
+                                                        order="codex, opencode, second"))
 
     def test_a_round_past_the_ceiling_ends_without_a_question(self):
         state = self.state(limit=98)
@@ -318,9 +319,13 @@ class ReviewLimitTests(unittest.TestCase):
         state = self.state()
         decide_at_limit(state, "stop", "ready")
         self.assertEqual((state["review_limit"], state["status"]), (6, "exhausted"))
+        # Accepting ends the run as accepted; like stop, it changes neither the limit nor anything else.
+        state = self.state()
+        decide_at_limit(state, "accept", "ready")
+        self.assertEqual(state, {**self.state(), "status": "accepted"})
         for decision in ("cancel", "", None):
             with self.subTest(decision=decision):
-                with self.assertRaises(DevFlowError):
+                with self.assertRaisesRegex(DevFlowError, "continue, stop or accept"):
                     decide_at_limit(self.state(), decision, "ready")
 
     def test_corrupt_limits_are_never_reset(self):
@@ -442,15 +447,15 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(git.call_args.kwargs["timeout"], GIT_FACT_SECONDS)
 
     def test_released_run_formats_have_names_and_unreleased_ones_are_generic(self):
-        self.assertEqual(runs.RELEASES, {1: "0.1.x", 2: "0.2.x", 3: "0.3.x", 6: "0.4.x", 7: "0.5.x"})
+        self.assertEqual(runs.RELEASES, {1: "0.1.x", 2: "0.2.x", 3: "0.3.x", 6: "0.4.x", 7: "0.5.x", 8: "0.6.x"})
         for version, release in runs.RELEASES.items():
             with self.subTest(version=version):
                 self.assertEqual(runs.release_name(version), release)
         # Formats 4 and 5 were never released (0.4.0 development); they are named generically.
-        self.assertGreater(runs.SCHEMA_VERSION, 7)
+        self.assertGreater(runs.SCHEMA_VERSION, 8)
         self.assertEqual(runs.release_name(4), "an older version (run format 4)")
         self.assertEqual(runs.release_name(5), "an older version (run format 5)")
-        self.assertEqual(runs.release_name(9), "an older version (run format 9)")
+        self.assertEqual(runs.release_name(10), "an older version (run format 10)")
 
 
 if __name__ == "__main__":

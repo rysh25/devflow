@@ -1093,7 +1093,7 @@ class RegistryTests(RuntimeFixture):
 
         class Dummy(Workflow):
             name = "dummy"
-            statuses = frozenset({"working", "completed", "exhausted", "cancelled"})
+            statuses = frozenset({"working", "completed", "exhausted", "cancelled", "accepted"})
 
             def normalize_args(self, raw, project):
                 return raw.strip()

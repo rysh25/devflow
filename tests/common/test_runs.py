@@ -17,7 +17,7 @@ from devflow_core.common.workflow import Workflow
 
 class Toy(Workflow):
     name = "toy"
-    statuses = frozenset({"working", "running", "paused_error", "completed", "exhausted", "cancelled"})
+    statuses = frozenset({"working", "running", "paused_error"}) | runs.TERMINAL
     inflight_statuses = frozenset({"running"})
     state_fields = frozenset({"note"})
 
@@ -351,13 +351,62 @@ class RunStoreTests(unittest.TestCase):
         info = self.store.inspect(third)
         self.assertEqual((info.format, info.schema_version), ("unsupported", 3))
         self.assertEqual(info.public()["message"], "Started with DevFlow 0.3.x; this version cannot continue it")
+        # 0.6.x wrote format 8; its unfinished runs are finished with 0.6.x.
+        sixth = runs.new_run_id()
+        atomic_json(self.store.root / sixth / "state.json", {"schema_version": 8, "run_id": sixth, "flow": "toy",
+                                                              "project": str(self.project), "status": "x"})
+        self.assertEqual(self.store.inspect(sixth).public()["message"],
+                         "Started with DevFlow 0.6.x; this version cannot continue it")
         bad = runs.new_run_id()
         (self.store.root / bad).mkdir()
         self.assertEqual((self.store.inspect(bad).format, self.store.inspect(bad).schema_version), ("invalid", None))
         listed, creating = self.store.scan()
         self.assertEqual(sorted(info.format for info in listed),
-                         ["current", "invalid", "unsupported", "unsupported", "unsupported"])
+                         ["current", "invalid", "unsupported", "unsupported", "unsupported", "unsupported"])
         self.assertEqual(creating, [])
+
+
+    def test_the_end_time_is_set_once_when_a_run_first_ends(self):
+        self.assertIsNone(self.state["finished_at"])
+        self.assertIn("accepted", runs.TERMINAL)
+        seen = {}
+        # The end time is there before before_save, so a terminal report can use it.
+        with patch.object(Toy, "before_save", lambda workflow, store, state: seen.update(at=state["finished_at"])):
+            with self.store.lock(self.run_id):
+                state = self.store.load(self.run_id)
+                state["status"] = "accepted"
+                self.store.save(state)
+        ended = self.store.read(self.run_id)
+        self.assertEqual(seen["at"], ended["finished_at"])
+        self.assertIsInstance(ended["finished_at"], str)
+        with self.store.lock(self.run_id):
+            state = self.store.load(self.run_id)
+            state["note"] = "later"
+            self.store.save(state)
+        self.assertEqual(self.store.read(self.run_id)["finished_at"], ended["finished_at"])
+        # A running run has no end time, and an ended one always has one.
+        for change in ({"finished_at": "2026-11-05T00:00:00+00:00"}, {"finished_at": 1}):
+            with self.subTest(change=change), self.assertRaises(DevFlowError):
+                self.store.validate(dict(self.state, **change), self.run_id)
+        with self.assertRaises(DevFlowError):
+            self.store.validate(dict(ended, finished_at=None), self.run_id)
+
+    def test_deeply_nested_json_is_an_ordinary_read_error(self):
+        with self.assertRaisesRegex(DevFlowError, "nested too deeply"):
+            storage.parse_json(b"[" * 100000 + b"]" * 100000, "deep.json")
+
+    def test_a_record_is_read_from_the_pending_save_or_verified_on_disk(self):
+        with self.store.lock(self.run_id):
+            state = self.store.load(self.run_id)
+            self.assertEqual(self.store.record(state, "input.txt"), b"data\n")
+            self.store.stage(state, "held.json", b'{"a": 1}')
+            # Not on disk yet: the next save writes it.
+            self.assertEqual(self.store.record_json(state, "held.json"), {"a": 1})
+            with self.assertRaisesRegex(DevFlowError, "Not a record"):
+                self.store.record(state, "other.txt")
+        (self.store.run_dir(self.run_id) / "input.txt").write_bytes(b"changed\n")
+        with self.assertRaisesRegex(DevFlowError, "changed or is missing"):
+            self.store.record(self.store.read(self.run_id), "input.txt")
 
 
 if __name__ == "__main__":

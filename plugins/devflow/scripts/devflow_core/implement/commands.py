@@ -45,7 +45,7 @@ COMMANDS = (
     Command("escalate", "Ask the human: JSON {reason:string,questions:string[]}",
             lambda e, a, run, s: e.escalate(run, s, a.questions_file), (Option("--questions-file", "draft"),)),
     Command("resolve", "Resolve with the event ID of a recorded human answer "
-            "(continue/stop for the review limit question, continue/cancel otherwise)",
+            "(continue/stop/accept for the review limit question, continue/cancel otherwise)",
             lambda e, a, run, s: e.resolve(run, s, a.event_id, a.decision, a.reason),
             (Option("--event-id", "event"), Option("--decision", "decision"), Option("--reason", "text"))),
     Command("cancel", "Keep all audit data and stop the run",

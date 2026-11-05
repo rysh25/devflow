@@ -475,6 +475,17 @@ def _brief(record: dict | None, keys=("mode", "size", "sha256", "binary")) -> di
     return None if record is None else {key: record[key] for key in keys}
 
 
+def _change(before: dict | None, after: dict | None) -> str | None:
+    """How one file changed between two listings (None: unchanged); never reads contents."""
+    if before is None and after is None:
+        return None
+    if before is None:
+        return "added"
+    if after is None:
+        return "deleted"
+    return None if (before["sha256"], before["mode"]) == (after["sha256"], after["mode"]) else "modified"
+
+
 def changes(baseline: dict, current: dict) -> dict:
     """The record of a checkpoint: every change since the start, without contents.
 
@@ -485,16 +496,36 @@ def changes(baseline: dict, current: dict) -> dict:
     result, binary_changes, unchanged = [], [], 0
     for path in sorted(set(old) | set(new)):
         before, after = old.get(path), new.get(path)
-        if before is not None and after is not None and (before["sha256"], before["mode"]) == (after["sha256"], after["mode"]):
+        change = _change(before, after)
+        if change is None:
             unchanged += 1
             continue
         if any(item is not None and item["binary"] for item in (before, after)):
             binary_changes.append(path)
-        result.append({"path": path, "change": "added" if before is None else "deleted" if after is None else "modified",
-                       "before": _brief(before), "after": _brief(after)})
+        result.append({"path": path, "change": change, "before": _brief(before), "after": _brief(after)})
     return {"schema_version": 1, "baseline_id": baseline["snapshot_id"], "snapshot_id": current["snapshot_id"],
             "changes": result, "binary_changes": binary_changes, "unchanged_count": unchanged,
             "file_count": current["file_count"], "total_bytes": current["total_bytes"]}
+
+
+def between(earlier: dict, later: dict) -> list[dict]:
+    """The files added, modified and deleted from one checkpoint record to another.
+
+    Both records list changes since the same start, so a path one record does not
+    list is in its start state, which the other record holds as ``before``.
+    Compared as ``changes`` compares; no contents are read.
+    """
+    first = {change["path"]: change for change in earlier["changes"]}
+    second = {change["path"]: change for change in later["changes"]}
+    result = []
+    for path in sorted(set(first) | set(second)):
+        start = (first.get(path) or second[path])["before"]
+        before = first[path]["after"] if path in first else start
+        after = second[path]["after"] if path in second else start
+        change = _change(before, after)
+        if change is not None:
+            result.append({"path": path, "change": change})
+    return result
 
 
 def packet_changes(record: dict) -> list[dict]:

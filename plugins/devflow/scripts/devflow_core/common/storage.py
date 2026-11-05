@@ -66,18 +66,30 @@ def _unique(pairs):
     return result
 
 
+def parse_json(data: bytes, name: object) -> dict:
+    """One JSON object, read as every record is: strict UTF-8, no duplicate keys or NaN."""
+    try:
+        value = json.loads(data.decode("utf-8"), object_pairs_hook=_unique,
+                           parse_constant=lambda x: (_ for _ in ()).throw(DevFlowError(f"Invalid JSON constant: {x}")))
+    except (UnicodeError, ValueError) as exc:
+        raise DevFlowError(f"Cannot read JSON {name}: {exc}") from exc
+    except RecursionError as exc:
+        # json.loads raises this, not ValueError, for deeply nested input.
+        raise DevFlowError(f"Cannot read JSON {name}: nested too deeply") from exc
+    if not isinstance(value, dict):
+        raise DevFlowError(f"Expected a JSON object: {name}")
+    return value
+
+
 def read_json(path: Path, limit: int = JSON_LIMIT) -> dict:
     no_symlinks(path)
     try:
         if path.stat().st_size > limit:
             raise DevFlowError(f"JSON exceeds {limit} bytes: {path}")
-        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique,
-                           parse_constant=lambda x: (_ for _ in ()).throw(DevFlowError(f"Invalid JSON constant: {x}")))
-    except (OSError, UnicodeError, ValueError) as exc:
+        data = path.read_bytes()
+    except OSError as exc:
         raise DevFlowError(f"Cannot read JSON {path}: {exc}") from exc
-    if not isinstance(value, dict):
-        raise DevFlowError(f"Expected a JSON object: {path}")
-    return value
+    return parse_json(data, path)
 
 
 def no_symlinks(path: Path) -> None:

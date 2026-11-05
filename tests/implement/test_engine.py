@@ -30,7 +30,7 @@ from devflow_core.implement.engine import Engine
 from devflow_core.implement.review import validate_review
 from devflow_core.workflows import WORKFLOWS
 from devflow_core.common.review import REVIEW_LIMIT_REASON
-from tests.common.test_common import LIMIT_QUESTION
+from tests.common.test_common import limit_question
 
 ACTIVITY = {"tool_call_count": 2, "tool_calls": {"command_execution": 2}, "other_events": {}}
 EVENT_ID = r"\A[a-f0-9]{32}\Z"
@@ -648,14 +648,14 @@ class EngineFlowTests(EngineFixture):
         self.assertEqual(asked["status"], "awaiting_human")
         self.assertEqual(asked["escalation"]["detail"]["kind"], "review_budget")
         self.assertEqual((asked["escalation"]["reason"], asked["escalation"]["questions"]),
-                         (REVIEW_LIMIT_REASON, [LIMIT_QUESTION]))
+                         (REVIEW_LIMIT_REASON, [limit_question(snapshot)]))
         self.assertEqual(read_json(self.run / asked["escalations"][-1])["detail"]["kind"], "review_budget")
         self.assertEqual(asked["approvals"], {"opencode": snapshot})
         # The resume command is never the answer.
         self.resume()
         self.assertEqual(self.engine.status(self.run_id)["human_events"], [])
         evidence = self.answer("Continue with two more reviews.")
-        with self.assertRaisesRegex(DevFlowError, "continue/stop"):
+        with self.assertRaisesRegex(DevFlowError, "continue/stop/accept"):
             self.engine.resolve(self.run_id, self.session, evidence, "cancel", "Cancel is not this question's answer.")
         continued = self.engine.resolve(self.run_id, self.session, evidence, "continue", "The user chose two more reviews.")
         self.assertEqual((continued["status"], continued["review_limit"], continued["remaining_reviews"],
@@ -1541,6 +1541,221 @@ class DirtyGitProjectTests(EngineFixture):
         self.assertEqual(result["escalations"], [])
         self.assertIsNone(result["escalation"])
         self.assertEqual(self.source.read_bytes(), original)
+
+
+class SummaryAndAcceptanceTests(EngineFixture):
+    """0.7.0: the review summary, accepting at the review limit, and the terminal report."""
+
+    def at_the_limit(self):
+        self.config["max_reviews"] = 2
+        self.write_config()
+        self.start()
+        self.ready()
+        self.review()  # codex approves checkpoint 1
+        self.response_kind = "changes_required"
+        self.review()  # opencode finds F1 in checkpoint 1
+        self.reflect()
+        self.ready(2)
+        asked = self.review()
+        self.assertEqual(asked["escalation"]["detail"]["kind"], "review_budget")
+        return asked
+
+    def accept(self):
+        evidence = self.answer("Accept and finish.")
+        return self.engine.resolve(self.run_id, self.session, evidence, "accept", "The user accepted this version.")
+
+    def with_output(self, lines, error=None):
+        """The reviewer CLI printed ``lines``; ``error`` fails the attempt after that."""
+        def reviewer(config, packet_path, work_dir, *args, **kwargs):
+            Path(work_dir).mkdir(parents=True, exist_ok=True)
+            (Path(work_dir) / "invocation.json").write_text(json.dumps({"cli_version": "codex-cli 9.9.9"}), encoding="utf-8")
+            (Path(work_dir) / "stdout.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+            if error is not None:
+                raise error
+            return self.respond(config, packet_path, work_dir, *args, **kwargs)
+        self.reviewer.side_effect = reviewer
+
+    def test_accepting_ends_as_accepted_with_the_verified_checkpoint(self):
+        asked = self.at_the_limit()
+        self.assertEqual(asked["review_summary"]["status"], "awaiting_human")
+        self.assertIn("- Status: awaiting_human (review limit question)", asked["review_summary_markdown"])
+        self.assertEqual(asked["review_summary"]["approval"]["current_version"]["label"], "checkpoint 2")
+        accepted = self.accept()
+        self.assertEqual((accepted["status"], accepted["review_limit"]), ("accepted", 2))
+        self.assertFinalReportSaved(accepted)
+        report = accepted["report"]
+        candidate = accepted["candidate"]["snapshot_id"]
+        resolution = read_json(self.run / accepted["resolutions"][-1])
+        self.assertEqual((resolution["decision"], resolution["snapshot_id"]), ("accept", candidate))
+        self.assertEqual(report["human_acceptance"], {
+            "event_ids": [resolution["human_event"]["event_id"]], "answer": resolution["human_event"]["answer_text"],
+            "version": candidate, "accepted_at": resolution["created_at"], "record": accepted["resolutions"][-1]})
+        self.assertEqual(report["warning"], "Accepted by the human at the review limit without approval from every reviewer.")
+        self.assertFalse(report["all_reviewers_approved"])
+        self.assertFalse(report["final_snapshot_reviewed"])
+        summary = report["review_summary"]
+        self.assertEqual(summary["approval"]["latest_version_reviewed"], report["final_snapshot_reviewed"])
+        self.assertEqual(summary["reviews"][1]["fix"]["file_changes"], [{"path": "module.py", "change": "modified"}])
+        self.assertEqual(summary["reviews"][1]["findings"][0]["location"], "module.py:1-1")
+        # After the end, status rebuilds the same summary from the report's capture.
+        self.assertEqual(accepted["review_summary"], summary)
+        self.assertIn("- Status: accepted — accepted by the human", accepted["review_summary_markdown"])
+        self.assertNotIn("review_summary_markdown", report)
+
+    def test_accepting_needs_the_checkpoint_in_the_workspace_and_its_validation(self):
+        self.at_the_limit()
+        self.source.write_text("VALUE = 99\n", encoding="utf-8")
+        with self.assertRaisesRegex(DevFlowError, "Cannot accept: Code changed since checkpoint.*Restore the workspace"):
+            self.accept()
+        self.assertEqual(self.state()["status"], "awaiting_human")
+        self.source.write_text("VALUE = 2\n", encoding="utf-8")
+        with self.engine._lock(self.run_id):
+            state = self.engine._state(self.run_id)
+            state["validation"] = None
+            with self.assertRaisesRegex(DevFlowError, "no passing checks or human validation"):
+                self.engine._accept_current(state)
+        self.assertEqual(self.accept()["status"], "accepted")
+
+    def test_cancel_never_changes_an_ended_run(self):
+        self.at_the_limit()
+        accepted = self.accept()
+        cancelled = self.engine.cancel(self.run_id, self.session, "Too late.")
+        self.assertEqual((cancelled["status"], cancelled["state_revision"], cancelled["report_path"]),
+                         ("accepted", accepted["state_revision"], accepted["report_path"]))
+
+    def test_a_completed_report_summarizes_the_review_saved_with_it(self):
+        self.start()
+        self.ready()
+        self.review()
+        completed = self.review()
+        self.assertEqual(completed["status"], "completed")
+        summary = completed["report"]["review_summary"]
+        self.assertEqual([entry["verdict"] for entry in summary["reviews"]], ["pass", "pass"])
+        self.assertTrue(summary["approval"]["all_reviewers_approved"])
+        self.assertIsNone(completed["report"]["warning"])
+
+    def test_the_terminal_summary_follows_the_reports_workspace_capture(self):
+        self.start()
+        self.ready()
+        self.review()
+        self.source.write_text("VALUE = 5\n", encoding="utf-8")  # changed after the review, never reviewed
+        cancelled = self.engine.cancel(self.run_id, self.session, "Stopping.")
+        report = cancelled["report"]
+        self.assertFalse(report["final_snapshot_reviewed"])
+        current = report["review_summary"]["approval"]["current_version"]
+        self.assertEqual(current, {"id": report["workspace_snapshot_id_at_report"],
+                                   "label": "workspace at report (not a checkpoint)"})
+        self.assertFalse(report["review_summary"]["approval"]["latest_version_reviewed"])
+        # Status never captures the workspace again.
+        with patch("devflow_core.implement.engine.snapshot.capture", side_effect=AssertionError("captured")):
+            self.assertEqual(self.engine.status(self.run_id)["review_summary"], report["review_summary"])
+
+    def test_a_failed_capture_is_unknown_in_the_summary(self):
+        self.start()
+        self.ready()
+        with patch("devflow_core.implement.engine.snapshot.capture", side_effect=DevFlowError("unreadable")):
+            cancelled = self.engine.cancel(self.run_id, self.session, "Stopping.")
+        summary = cancelled["report"]["review_summary"]
+        self.assertEqual(summary["approval"]["current_version"], {"id": None, "label": "unknown (workspace capture failed)"})
+        self.assertFalse(summary["approval"]["latest_version_reviewed"])
+        self.assertEqual(cancelled["review_summary"], summary)
+
+    def test_an_oversized_report_still_ends_the_run_and_status_shows_the_summary(self):
+        from devflow_core.common import summary as summary_module
+        from devflow_core.implement import workflow as workflow_module
+        real = workflow_module.check_json_size
+        def refuse_reports(name, data):
+            if name.startswith("reports/"):
+                raise DevFlowError("over the limit")
+            return real(name, data)
+        for ending in ("accept", "stop", "cancel"):
+            with self.subTest(ending=ending):
+                self.setUp()
+                self.at_the_limit()
+                with patch.object(workflow_module, "check_json_size", side_effect=refuse_reports):
+                    if ending == "accept":
+                        ended = self.accept()
+                    elif ending == "stop":
+                        ended = self.at_limit("stop")
+                    else:
+                        ended = self.engine.cancel(self.run_id, self.session, "Stopping.")
+                self.assertEqual(ended["status"], {"accept": "accepted", "stop": "exhausted", "cancel": "cancelled"}[ending])
+                report = ended["report"]
+                self.assertEqual((report["review_summary"], report["review_summary_error"]),
+                                 (None, summary_module.TOO_LARGE))
+                if ending == "accept":
+                    self.assertEqual(report["human_acceptance"]["version"], ended["candidate"]["snapshot_id"])
+                self.assertIsNotNone(ended["review_summary"])
+                self.assertIn("DevFlow review summary", ended["review_summary_markdown"])
+
+    def test_a_summary_that_cannot_be_built_never_blocks_the_end(self):
+        self.start()
+        self.ready()
+        with patch("devflow_core.implement.engine.summary_source", side_effect=DevFlowError("damaged record")):
+            cancelled = self.engine.cancel(self.run_id, self.session, "Stopping.")
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertIsNone(cancelled["report"]["review_summary"])
+        self.assertIn("damaged record", cancelled["report"]["review_summary_error"])
+
+    def test_attempts_keep_their_checkpoint_and_tokens_whatever_the_outcome(self):
+        self.start()
+        self.ready()
+        usage = {"type": "turn.completed", "usage": {"input_tokens": 11}}
+        self.with_output([usage])
+        self.review()
+        first = self.state()["attempts"][0]
+        self.assertEqual((first["snapshot_path"], first["tokens"]), ("snapshots/001.json", {"input_tokens": 11}))
+        step = {"type": "step_finish", "part": {"tokens": {"input": 4}}}
+        self.with_output([step], error=DevFlowError("invalid answer"))
+        self.review()
+        second = self.state()["attempts"][1]
+        self.assertEqual((second["status"], second["tokens"]), ("failed", {"input": 4}))
+        summary = self.engine.cancel(self.run_id, self.session, "Stopping.")["report"]["review_summary"]
+        self.assertEqual([entry["cli_version"] for entry in summary["reviews"]], ["codex-cli 9.9.9", "codex-cli 9.9.9"])
+        self.assertEqual(summary["reviews"][1]["error"], "invalid answer")
+
+    def test_a_recovered_attempt_keeps_its_tokens(self):
+        self.start()
+        self.ready()
+        self.with_output([{"type": "turn.completed", "usage": {"input_tokens": 3}}], error=KeyboardInterrupt())
+        with self.assertRaises(KeyboardInterrupt):
+            self.review()
+        recovered = self.engine.recover(self.run_id, confirmed=True)
+        attempt = recovered["attempts"][0]
+        self.assertEqual((attempt["status"], attempt["tokens"]), ("failed", {"input_tokens": 3}))
+
+    def test_cancelling_with_deeply_nested_process_records_still_ends_the_run(self):
+        self.start()
+        self.ready()
+        deep = "[" * 100000 + "]" * 100000
+        def reviewer(config, packet_path, work_dir, *args, **kwargs):
+            Path(work_dir).mkdir(parents=True, exist_ok=True)
+            (Path(work_dir) / "invocation.json").write_text(deep, encoding="utf-8")
+            (Path(work_dir) / "stdout.jsonl").write_text(deep + "\n", encoding="utf-8")
+            return self.respond(config, packet_path, work_dir, *args, **kwargs)
+        self.reviewer.side_effect = reviewer
+        reviewed = self.review()
+        self.assertIsNone(reviewed["attempts"][0]["tokens"])
+        cancelled = self.engine.cancel(self.run_id, self.session, "Stopping.")
+        self.assertEqual(cancelled["status"], "cancelled")
+        entry = cancelled["report"]["review_summary"]["reviews"][0]
+        self.assertEqual((entry["cli_version"], entry["cli_version_source"]),
+                         (None, "review-processes/01/invocation.json"))
+
+    def test_cancelling_with_metadata_a_record_cannot_hold_still_ends_the_run(self):
+        self.start()
+        self.ready()
+        def reviewer(config, packet_path, work_dir, *args, **kwargs):
+            Path(work_dir).mkdir(parents=True, exist_ok=True)
+            (Path(work_dir) / "invocation.json").write_text(json.dumps({"cli_version": "codex \ud800"}), encoding="utf-8")
+            (Path(work_dir) / "stdout.jsonl").write_text(json.dumps(
+                {"type": "turn.completed", "usage": {"\ud800": 1}}) + "\n", encoding="utf-8")
+            return self.respond(config, packet_path, work_dir, *args, **kwargs)
+        self.reviewer.side_effect = reviewer
+        self.assertIsNone(self.review()["attempts"][0]["tokens"])
+        cancelled = self.engine.cancel(self.run_id, self.session, "Stopping.")
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertIsNone(cancelled["report"]["review_summary"]["reviews"][0]["cli_version"])
 
 
 if __name__ == "__main__":

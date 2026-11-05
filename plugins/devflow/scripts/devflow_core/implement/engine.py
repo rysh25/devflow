@@ -1,15 +1,16 @@
 """Implement workflow engine: only Claude edits project code; the runner keeps score."""
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from . import checks, snapshot
 from .review import validate_review
 from .workspace import branch, verify_workspace
 from ..common.errors import DevFlowError
-from ..common.review import (REVIEW_BUDGET, after_failed_review, all_approved, ask_at_limit, decide_at_limit,
+from ..common.review import (LIMIT_DECISIONS, REVIEW_BUDGET, after_failed_review, all_approved, ask_at_limit, decide_at_limit,
                              next_reviewer)
-from ..common.reviewers import preflight, run_review
+from ..common import summary
+from ..common.reviewers import preflight, recorded_cli_version, review_tokens, run_review
 from ..common.engine import RunEngine
 from ..common.runs import RUNNER_WAIT, TERMINAL, open_escalation
 from ..common.sessions import approval_candidates
@@ -110,6 +111,20 @@ class Engine(RunEngine):
                 self._escalate(state,"binary_changes",["Review these binary changes independently and confirm whether their contents are acceptable: " + ", ".join(record["binary_changes"])],"ready_check","Text-only reviewers cannot inspect binary content")
             self._save(state)
         return self.status(run_id)
+
+    def _accept_current(self, state):
+        """The version the human accepts: the checkpoint the workspace still holds,
+        with the validation a review would need (as ``review`` requires)."""
+        try:
+            current = self._current(state)
+        except DevFlowError as exc:
+            raise DevFlowError(f"Cannot accept: {exc}. Restore the workspace to the checkpoint, "
+                               "or answer continue or stop") from exc
+        validation = state.get("validation") or {}
+        if validation.get("snapshot_id") != current["snapshot_id"] or validation.get("status") not in {"passed","human_attested"}:
+            raise DevFlowError("Cannot accept: the current checkpoint has no passing checks or human validation; "
+                               "answer continue or stop")
+        return current
 
     def _current(self, state):
         self._verify(state)
@@ -217,7 +232,7 @@ class Engine(RunEngine):
             current = self._current(state)
             approved = {reviewer for reviewer, snapshot_id in state["approvals"].items()
                         if snapshot_id == current["snapshot_id"]}
-            if ask_at_limit(state,len(state["attempts"]),approved,
+            if ask_at_limit(state,len(state["attempts"]),approved,current["snapshot_id"],
                             lambda reason, questions: self._escalate(state,REVIEW_BUDGET,questions,"ready_review",reason)):
                 return None
             validation = state.get("validation") or {}
@@ -234,6 +249,7 @@ class Engine(RunEngine):
             packet_relative = f"reviews/{number:02}/packet.json"
             self._artifact(state,packet_relative,packet)
             state["attempts"].append({"number":number,"reviewer_id":provider["id"],"snapshot_id":current["snapshot_id"],
+                "snapshot_path":state["candidate"]["path"],
                 "packet_path":packet_relative,"packet_sha256":digest(packet),"status":"dispatched","started_at":now()})
             # Reserved BEFORE dispatch, including unknown-outcome failures.
             return number, current["snapshot_id"], provider["id"], {
@@ -254,6 +270,8 @@ class Engine(RunEngine):
     def _finish_review(self,state,reservation,provider,result,error):
         number = reservation["number"]
         review = result["review"] if error is None else None
+        # The token counts the CLI printed, whatever the outcome.
+        tokens = review_tokens(provider, self._run(state["run_id"])/"review-processes"/f"{number:02}")
         current = None
         if error is None:
             try:
@@ -262,7 +280,7 @@ class Engine(RunEngine):
                 error = exc
         if error is not None:
             # What the reviewer did is kept when it ran to the end.
-            state["attempts"][-1].update(status="failed",error=str(error),finished_at=now(),
+            state["attempts"][-1].update(status="failed",error=str(error),finished_at=now(),tokens=tokens,
                                          **({"activity":result["activity"]} if result is not None else {}))
             # A reviewer failure says nothing about the code: approvals for this
             # snapshot stay (as in plan); this attempt never adds one.
@@ -270,7 +288,8 @@ class Engine(RunEngine):
             return
         review_path = f"reviews/{number:02}/review.json"
         self._artifact(state,review_path,json_bytes(review))
-        state["attempts"][-1].update(status="succeeded",verdict=review["verdict"],review_path=review_path,activity=result["activity"],finished_at=now())
+        state["attempts"][-1].update(status="succeeded",verdict=review["verdict"],review_path=review_path,activity=result["activity"],
+                                     finished_at=now(),tokens=tokens)
         critical = any(f["severity"] == "critical" for f in review["findings"])
         if review["verdict"] == "human_required" or critical:
             questions = review["questions"] or ["A critical issue was reported. Confirm the safe scope and remediation before continuing."]
@@ -341,14 +360,16 @@ class Engine(RunEngine):
                                    "in the session that owns the run; ordinary prompts and the resume command are not answers")
             kind = esc["detail"]["kind"]
             budget = kind == REVIEW_BUDGET
-            allowed = {"continue","stop"} if budget else {"continue","cancel"}
+            allowed = set(LIMIT_DECISIONS) if budget else {"continue","cancel"}
             if decision not in allowed or not isinstance(reason,str) or not reason.strip():
-                raise DevFlowError("Supply continue/stop for the review limit question (continue/cancel otherwise) "
+                raise DevFlowError("Supply continue/stop/accept for the review limit question (continue/cancel otherwise) "
                                    "and a faithful explanation of the human's decision")
             # Verify before holding new immutable artifacts: _current checks every
             # listed artifact, and a held one is not on disk until the save.
             if decision == "continue" and kind in {"manual_validation", "binary_changes"}:
                 self._current(state)
+            elif decision == "accept":
+                self._accept_current(state)
             else:
                 self._verify(state)
             value = {"escalation_id":esc["id"],"decision":decision,"interpretation":reason,"human_event":matches[0],
@@ -379,8 +400,10 @@ class Engine(RunEngine):
             self._owner(state,session_id)
             if state["status"] in {"reviewing","checking"}:
                 raise DevFlowError("Confirm active child processes stopped before cancellation")
-            state.update(status="cancelled",last_error=reason,approvals={})
-            self._save(state)
+            # As in plan, a run that has ended stays as it ended (with its report).
+            if state["status"] not in TERMINAL:
+                state.update(status="cancelled",last_error=reason,approvals={})
+                self._save(state)
         return self.status(run_id)
 
     def _before_dispatch(self, state):
@@ -410,8 +433,120 @@ def verify_source(state):
         raise DevFlowError("Original plan changed/missing. Resolve requirements and start a new run; do not silently replace it")
 
 
-def terminal_report(project, state, observed=(), observed_error=None):
-    """Evidence at the moment a run ends; later edits are not covered."""
+ACCEPTED_WARNING = "Accepted by the human at the review limit without approval from every reviewer."
+
+
+def _checkpoint_label(path: object) -> str:
+    """``snapshots/003.json`` is checkpoint 3."""
+    try:
+        return f"checkpoint {int(PurePosixPath(path).stem)}"
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def human_decisions(state: dict, read) -> tuple[list[dict], dict | None]:
+    """The human's answers (``common.summary`` shape), and the acceptance at the review
+    limit when the human accepted the code."""
+    questions = {}
+    for path in state["escalations"]:
+        value = read(path)
+        questions[value["id"]] = value["questions"]
+    decisions, acceptance = [], None
+    for path in state["resolutions"]:
+        value = read(path)
+        event = value["human_event"]
+        decisions.append({"at": value.get("created_at"), "review_number": None,
+                          "questions": questions.get(value["escalation_id"], []), "answer": event.get("answer_text"),
+                          "decision": value["decision"], "interpretation": value.get("interpretation"),
+                          "event_ids": [event["event_id"]]})
+        if value["decision"] == "accept":
+            acceptance = {"event_ids": [event["event_id"]], "answer": event.get("answer_text"),
+                          "version": value.get("snapshot_id"), "accepted_at": value.get("created_at"), "record": path}
+    return decisions, acceptance
+
+
+def summary_source(store, state: dict, workspace: dict | None = None) -> dict:
+    """This implement run in the shape of ``common.summary`` (see that module).
+
+    After the run ends, the current version is the workspace version the terminal
+    report captured (``workspace``: its ``snapshot_id`` and ``reviewed``, i.e.
+    ``final_snapshot_reviewed``); without ``workspace`` it is read from the saved
+    report, never captured again. Before the end it is the checkpoint, which
+    ``review`` has just verified before asking at the limit.
+    """
+    run = store.run_dir(state["run_id"])
+    read = lambda relative: store.record_json(state, relative)
+    attempts, candidate = state["attempts"], state.get("candidate") or {}
+    reviews = []
+    for index, attempt in enumerate(attempts):
+        outcome = attempt["status"] if attempt["status"] in {"succeeded", "failed"} else "in_progress"
+        entry = {"number": attempt["number"], "reviewer_id": attempt["reviewer_id"], "status": outcome,
+                 "cli_version": recorded_cli_version(run / "review-processes" / f"{attempt['number']:02}"),
+                 "cli_version_source": f"review-processes/{attempt['number']:02}/invocation.json",
+                 "started_at": attempt.get("started_at"), "finished_at": attempt.get("finished_at"),
+                 "version": {"id": attempt["snapshot_id"], "label": _checkpoint_label(attempt.get("snapshot_path"))},
+                 "verdict": attempt.get("verdict"), "error": attempt.get("error"), "findings": [], "fix": None,
+                 "tokens": attempt.get("tokens"), "record": attempt.get("review_path")}
+        if outcome == "succeeded":
+            review = read(attempt["review_path"])
+            reflected = f"decisions/review-{attempt['number']:02}.json"
+            reflection = read(reflected) if reflected in state["reflections"] else None
+            dispositions = {item["finding_id"]: item for item in (reflection or {}).get("decisions", [])}
+            entry["findings"] = [{"id": f["id"], "severity": f["severity"], "category": f["category"],
+                                  "location": f"{f['file']}:{f['line_start']}-{f['line_end']}",
+                                  "recommendation": f["recommendation"],
+                                  "action": dispositions.get(f["id"], {}).get("action"),
+                                  "reason": dispositions.get(f["id"], {}).get("reason")} for f in review["findings"]]
+            if reflection is not None:
+                # What changed from the reviewed checkpoint to the next one reviewed (or the latest).
+                earlier = attempt.get("snapshot_path")
+                later = attempts[index + 1].get("snapshot_path") if index + 1 < len(attempts) else candidate.get("path")
+                files = None
+                if earlier and later:
+                    files = [] if earlier == later else snapshot.between(read(earlier), read(later))
+                entry["fix"] = {"summary": reflection["summary"], "version_change": None, "file_changes": files}
+        reviews.append(entry)
+    decisions, acceptance = human_decisions(state, read)
+    approvals = state["approvals"]
+    if state["status"] in TERMINAL:
+        if workspace is None:
+            report = read(state["report_path"])
+            workspace = {"snapshot_id": report["workspace_snapshot_id_at_report"],
+                         "reviewed": report["final_snapshot_reviewed"]}
+        actual = workspace["snapshot_id"]
+        if actual is None:
+            current = {"id": None, "label": "unknown (workspace capture failed)"}
+        elif actual == candidate.get("snapshot_id"):
+            current = {"id": actual, "label": _checkpoint_label(candidate.get("path"))}
+        else:
+            current = {"id": actual, "label": "workspace at report (not a checkpoint)"}
+        reviewed = bool(actual) and bool(workspace["reviewed"])
+        approving = [reviewer for reviewer, snapshot_id in approvals.items() if actual is not None and snapshot_id == actual]
+    elif candidate:
+        current = {"id": candidate["snapshot_id"], "label": _checkpoint_label(candidate.get("path"))}
+        reviewed = any(a["status"] == "succeeded" and a["snapshot_id"] == candidate["snapshot_id"] for a in attempts)
+        approving = [reviewer for reviewer, snapshot_id in approvals.items() if snapshot_id == candidate["snapshot_id"]]
+    else:
+        current, reviewed, approving = {"id": None, "label": "none (no checkpoint yet)"}, False, []
+    return {
+        "flow": "implement", "run_id": state["run_id"], "status": state["status"],
+        "pending_question": ((state["escalation"] or {}).get("detail") or {}).get("kind"),
+        "created_at": state["created_at"], "finished_at": state["finished_at"],
+        "review_count": len(attempts), "review_limit": state["review_limit"],
+        "reviewers": [{"id": r["id"], "requested_model": r["model"], "requested_effort": r["effort"],
+                       "timeout_seconds": r["timeout_seconds"]} for r in state["config"]["reviewers"]],
+        "current_version": current, "latest_version_reviewed": reviewed, "approving_current": approving,
+        "reviews": reviews, "human_decisions": decisions, "human_acceptance": acceptance}
+
+
+def terminal_report(store, state, observed=(), observed_error=None):
+    """Evidence at the moment a run ends; later edits are not covered.
+
+    ``observed`` holds the prefilled question events (None: unreadable, with
+    ``observed_error``). The review summary is built from the same workspace
+    capture as ``final_snapshot_reviewed``.
+    """
+    project = store.project
     candidate = state.get("candidate") or {}
     actual = None
     capture_error = None
@@ -426,6 +561,18 @@ def terminal_report(project, state, observed=(), observed_error=None):
     matches = actual == candidate.get("snapshot_id") if actual and candidate else False if actual else None
     reviewed = bool(actual) and any(a["status"] == "succeeded" and a["snapshot_id"] == actual for a in state["attempts"])
     validation = state.get("validation") or {}
+    read = lambda relative: store.record_json(state, relative)
+    # Ending a run never depends on the summary: a summary that cannot be built is reported.
+    try:
+        review_summary = summary.build(summary_source(store, state, {"snapshot_id": actual, "reviewed": reviewed}), now())
+        review_summary_error = None
+    except (DevFlowError, OSError, ValueError, KeyError, TypeError) as exc:
+        review_summary, review_summary_error = None, f"The review summary cannot be built: {exc}"
+    try:
+        acceptance, acceptance_error = human_decisions(state, read)[1], None
+    except (DevFlowError, OSError, ValueError, KeyError, TypeError) as exc:
+        acceptance, acceptance_error = None, f"The human decisions cannot be read: {exc}"
+    warnings = [ACCEPTED_WARNING] if state["status"] == "accepted" else []
     return {"run_id":state["run_id"],"status":state["status"],"review_count":len(state["attempts"]),
         "review_limit":state["review_limit"],
         "snapshot_id":candidate.get("snapshot_id"),"all_reviewers_approved":bool(matches) and all_approved(state["config"]["reviewers"],state["approvals"],candidate["snapshot_id"]),
@@ -438,5 +585,8 @@ def terminal_report(project, state, observed=(), observed_error=None):
         "reviews":review_rounds(state),
         "prefilled_question_events":None if observed is None else list(observed),
         "prefilled_question_events_error":observed_error,
+        "human_acceptance":acceptance,"human_acceptance_error":acceptance_error,
+        "warning":" ".join(warnings) or None,
+        "review_summary":review_summary,"review_summary_error":review_summary_error,
         "reported_at":now(),"automatic_commit_push_deploy":False,
         "note":"This report describes its captured snapshot and time only. Later edits are not covered. Reviews/checks are not a correctness guarantee or permission to publish."}

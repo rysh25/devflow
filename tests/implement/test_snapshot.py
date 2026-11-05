@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 
 from devflow_core.common.git import content_timeout
-from devflow_core.implement.snapshot import capture, changes, diff, packet_changes, path_in_scope, validate_relative
+from devflow_core.implement.snapshot import between, capture, changes, diff, packet_changes, path_in_scope, validate_relative
 from devflow_core.implement import snapshot as snapshot_module
 from devflow_core.common.errors import DevFlowError
 
@@ -558,6 +558,41 @@ class SnapshotTests(unittest.TestCase):
         self.assertNotIn("gone.txt", capture(self.project, GIT)["files"])
         self.assertEqual(record["changes"][0]["change"], "deleted")
         self.assertIn("-hello\n", text)
+
+
+    def test_between_compares_two_checkpoint_records_without_contents(self):
+        self.write("kept.txt", "same\n")
+        self.write("edited.txt", "one\n")
+        self.write("reverted.txt", "start\n")
+        self.write("removed.txt", "bye\n")
+        baseline = self.start()
+        # Checkpoint 1: edited, reverted and removed changed; added is new.
+        self.write("edited.txt", "two\n")
+        self.write("reverted.txt", "changed\n")
+        self.write("added.txt", "new\n")
+        first = changes(baseline, self.snapshot())
+        # Checkpoint 2: edited again, reverted back to its start, removed deleted.
+        self.write("edited.txt", "three\n")
+        self.write("reverted.txt", "start\n")
+        (self.project / "removed.txt").unlink()
+        second = changes(baseline, self.snapshot())
+        self.assertEqual(between(first, second), [{"path": "edited.txt", "change": "modified"},
+                                                  {"path": "removed.txt", "change": "deleted"},
+                                                  {"path": "reverted.txt", "change": "modified"}])
+        self.assertEqual(between(second, first), [{"path": "edited.txt", "change": "modified"},
+                                                  {"path": "removed.txt", "change": "added"},
+                                                  {"path": "reverted.txt", "change": "modified"}])
+        self.assertEqual(between(first, first), [])
+        # From the start (no changes) to checkpoint 1 is checkpoint 1's own record.
+        start = changes(baseline, baseline)
+        self.assertEqual(between(start, first), [{"path": change["path"], "change": change["change"]}
+                                                 for change in first["changes"]])
+        # A mode change alone is a modification, as in changes().
+        self.write("kept.txt", "same\n")
+        os.chmod(self.project / "kept.txt", 0o755)
+        third = changes(baseline, self.snapshot())
+        if os.name != "nt":
+            self.assertIn({"path": "kept.txt", "change": "modified"}, between(second, third))
 
 
 if __name__ == "__main__":

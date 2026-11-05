@@ -40,7 +40,7 @@ class UvEntrypointTests(unittest.TestCase):
     def test_real_uv_entrypoint_without_exact_python_pin(self):
         result = self.run_cli("--version")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "devflow 0.6.0")
+        self.assertEqual(result.stdout.strip(), "devflow 0.7.0")
 
     def test_unrelated_hook_does_not_create_project_state(self):
         before = sorted(str(path.relative_to(self.project)) for path in self.project.rglob("*"))
@@ -70,14 +70,14 @@ class UvEntrypointTests(unittest.TestCase):
         (self.project / ".python-version").write_text("3.8\n", encoding="utf-8")
         result = self.run_cli("--version")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "devflow 0.6.0")
+        self.assertEqual(result.stdout.strip(), "devflow 0.7.0")
 
     def test_external_plugin_path_with_spaces_and_unicode(self):
         copied = self.base / "DevFlow plugin 日本語"
         shutil.copytree(PLUGIN, copied, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         result = self.run_cli("--version", plugin=copied)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "devflow 0.6.0")
+        self.assertEqual(result.stdout.strip(), "devflow 0.7.0")
         self.assertFalse(list(copied.rglob("__pycache__")))
 
 

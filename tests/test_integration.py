@@ -397,11 +397,36 @@ class HookCliEngineTests(FlowFixture):
         hook(self.event("PostToolUse", tool_name="AskUserQuestion", tool_use_id="stop-1", tool_input=question,
                         tool_response={"answers": {"May the API change?": "No."}}), PLUGIN)
         event = self.invoke("status")["human_events"][-1]
-        # The parser takes stop; the runner keeps it for the review limit question.
-        message = self.invoke("resolve", "--event-id", event["event_id"], "--decision", "stop",
-                              "--reason", "Stop is not this question's answer", expect=2)
-        self.assertIn("continue/stop for the review limit question (continue/cancel otherwise)", message)
-        self.assertEqual(self.engine.status(self.run_id)["status"], "awaiting_human")
+        # The parser takes stop and accept; the runner keeps them for the review limit question.
+        for decision in ("stop", "accept"):
+            with self.subTest(decision=decision):
+                message = self.invoke("resolve", "--event-id", event["event_id"], "--decision", decision,
+                                      "--reason", "Not this question's answer", expect=2)
+                self.assertIn("continue/stop/accept for the review limit question (continue/cancel otherwise)", message)
+                self.assertEqual(self.engine.status(self.run_id)["status"], "awaiting_human")
+
+    def test_accept_through_the_runner_ends_the_run_as_accepted(self):
+        self.config["max_reviews"] = 2
+        write_json(self.project / "devflow.config.json", {"schema_version": 1, "implement": self.config})
+        self.ready_review()
+        with patch("devflow_core.implement.engine.run_review", side_effect=review_pass):
+            self.invoke("review")
+        with patch("devflow_core.implement.engine.run_review", side_effect=DevFlowError("reviewer crashed")):
+            self.invoke("review")  # the second and last attempt fails
+        asked = self.invoke("review")
+        self.assertEqual(asked["escalation"]["detail"]["kind"], "review_budget")
+        self.assertIn("(3) accept the current version", asked["escalation"]["questions"][0])
+        self.assertEqual([entry["status"] for entry in asked["review_summary"]["reviews"]], ["succeeded", "failed"])
+        question = {"questions": [{"question": asked["escalation"]["questions"][0]}]}
+        hook(self.event("PreToolUse", tool_name="AskUserQuestion", tool_use_id="limit-1", tool_input=question), PLUGIN)
+        hook(self.event("PostToolUse", tool_name="AskUserQuestion", tool_use_id="limit-1", tool_input=question,
+                        tool_response={"answers": {asked["escalation"]["questions"][0]: "Accept and finish"}}), PLUGIN)
+        event = self.invoke("status")["human_events"][-1]
+        accepted = self.invoke("resolve", "--event-id", event["event_id"], "--decision", "accept",
+                               "--reason", "The user accepted the current version.")
+        self.assertEqual(accepted["status"], "accepted")
+        self.assertEqual(accepted["report"]["human_acceptance"]["version"], accepted["candidate"]["snapshot_id"])
+        self.assertIn("- Status: accepted", accepted["review_summary_markdown"])
 
     def test_resume_command_cannot_be_reused_as_human_answer(self):
         self.start()
@@ -589,7 +614,7 @@ class BashTimeoutTests(FlowFixture):
         started = self.start()
         self.assertEqual(started["bash_timeout_ms"], {"review": 400000})
         state = read_json(Path(started["run_dir"]) / "state.json")
-        for status in ("completed", "exhausted", "cancelled"):
+        for status in ("completed", "exhausted", "cancelled", "accepted"):
             with self.subTest(status=status):
                 self.assertEqual(WORKFLOWS["implement"].bash_timeouts(dict(state, status=status)), {})
 

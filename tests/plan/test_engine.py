@@ -20,7 +20,7 @@ from devflow_core.plan import engine as engine_module
 from devflow_core.plan.engine import Engine
 from devflow_core.plan.review import validate_review
 from devflow_core.workflows import WORKFLOWS
-from tests.common.test_common import LIMIT_QUESTION
+from tests.common.test_common import limit_question
 
 PLUGIN_ROOT = paths.PLUGIN_ROOT
 RESOURCES = WORKFLOWS["plan"].resource_dir
@@ -149,7 +149,8 @@ class EngineTests(unittest.TestCase):
 
     def at_limit(self, decision):
         """Answer the pending review limit question and resolve it with ``decision``."""
-        actual = self.limit_answer("Continue with two more reviews." if decision == "continue" else "Stop here.")
+        actual = self.limit_answer({"continue": "Continue with two more reviews.", "stop": "Stop here.",
+                                    "accept": "Accept and finish."}.get(decision, "Stop here."))
         return self.resolve(self.draft("limit-answer.json", {"answer": actual["answer_text"],
                                                             "event_ids": [actual["event_id"]], "decision": decision}))
 
@@ -365,7 +366,7 @@ class EngineTests(unittest.TestCase):
             state = self.engine._state(self.run_id)
             state["review_count"] = 1
             # The reviewed plan hash no longer matches: the round fails.
-            reservation = {"number": 1, "target": "0" * 64}
+            reservation = {"number": 1, "target": "0" * 64, "started_at": "2026-11-05T00:00:00+00:00"}
             self.engine._finish_review(state, reservation, "reviews/01", provider, adapter_result(review_value()), None)
             self.engine._save(state)
         status = self.engine.status(self.run_id)
@@ -527,8 +528,7 @@ class EngineTests(unittest.TestCase):
         self.assertTrue((self.run / "reviews" / "02" / "recovery.json").is_file())
         asked = self.ask_at_limit()
         self.assertEqual(asked["escalation"]["questions"], [
-            "Review limit reached: 2 of 2 reviews used. Reviewers approving the current version: none. Continue with "
-            "2 more reviews (new limit 4; next reviewers in order: codex, opencode), or stop and end the run as exhausted?"])
+            limit_question(asked["plan_hash"], used=2, limit=2, approved="none", new_limit=4)])
         self.assertFalse(self.engine.report(self.run_id)["converged"])
 
     def reach_limit_with_opencode_approving(self):
@@ -543,7 +543,7 @@ class EngineTests(unittest.TestCase):
         asked = self.reach_limit_with_opencode_approving()
         self.assertEqual(asked["status"], "awaiting_human")
         self.assertEqual((asked["escalation"]["reason"], asked["escalation"]["questions"]),
-                         (REVIEW_LIMIT_REASON, [LIMIT_QUESTION]))
+                         (REVIEW_LIMIT_REASON, [limit_question(asked["plan_hash"])]))
         record = read_json(self.run / f"escalations/{asked['escalation']['id']}.json")
         self.assertEqual(record["detail"], {"review_number": 6, "kind": "review_budget"})
         # The resume command is never the answer.
@@ -553,7 +553,7 @@ class EngineTests(unittest.TestCase):
         for value in ({"answer": actual["answer_text"], "event_ids": [actual["event_id"]]},
                       {"answer": actual["answer_text"], "event_ids": [actual["event_id"]], "decision": "cancel"}):
             with self.subTest(value=value):
-                with self.assertRaisesRegex(DevFlowError, "continue or stop"):
+                with self.assertRaisesRegex(DevFlowError, "continue, stop or accept"):
                     self.resolve(self.draft("limit-answer.json", value))
         continued = self.resolve(self.draft("limit-answer.json", {
             "answer": actual["answer_text"], "event_ids": [actual["event_id"]], "decision": "continue"}))
@@ -586,9 +586,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual((eighth["status"], eighth["review_count"]), ("ready", 8))
         asked = self.ask_at_limit()
         self.assertEqual(asked["escalation"]["questions"], [
-            "Review limit reached: 8 of 8 reviews used. Reviewers approving the current version: opencode. Continue "
-            "with 2 more reviews (new limit 10; next reviewers in order: codex, opencode), or stop and end the run "
-            "as exhausted?"])
+            limit_question(asked["plan_hash"], used=8, limit=8, new_limit=10)])
 
     def test_a_limit_answer_grants_no_authority_over_later_findings(self):
         (self.project / "devflow.config.json").write_text('{"max_reviews":2}', encoding="utf-8")
@@ -605,7 +603,7 @@ class EngineTests(unittest.TestCase):
         self.ready()
         self.submit(review_value("human_required", human=True))
         actual = self.limit_answer("Keep scope")
-        with self.assertRaisesRegex(DevFlowError, "continue or stop"):
+        with self.assertRaisesRegex(DevFlowError, "continue, stop or accept"):
             self.resolve(self.draft("answer.json", {"answer": actual["answer_text"], "event_ids": [actual["event_id"]],
                                                     "decision": "continue"}))
         resolved = self.resolve(self.draft("answer.json", {"answer": actual["answer_text"],
@@ -1169,12 +1167,15 @@ class EngineTests(unittest.TestCase):
             with self.assertRaises(InjectedCrash):
                 self.engine.publish(self.run_id)
         target = self.project / "docs" / "plans" / "REVIEW-10.md"
-        before = target.read_bytes()
+        approval = target.with_name("REVIEW-10.approval.md")
+        before, before_approval = target.read_bytes(), approval.read_bytes()
         self.assertEqual(self.engine.status(self.run_id)["publication"]["status"], "publishing")
         recovered = Engine(self.project).publish(self.run_id)
-        self.assertEqual(recovered["publication"]["path"], "docs/plans/REVIEW-10.md")
-        self.assertEqual(target.read_bytes(), before)
-        self.assertEqual(len(list(target.parent.iterdir())), 1)
+        self.assertEqual((recovered["publication"]["path"], recovered["publication"]["approval_path"]),
+                         ("docs/plans/REVIEW-10.md", "docs/plans/REVIEW-10.approval.md"))
+        # The resumed publication writes the same bytes: the approval record was made once, with the intent.
+        self.assertEqual((target.read_bytes(), approval.read_bytes()), (before, before_approval))
+        self.assertEqual(sorted(path.name for path in target.parent.iterdir()), ["REVIEW-10.approval.md", "REVIEW-10.md"])
 
     def test_removed_or_changed_published_plan_never_silently_overwritten(self):
         self.completed("/devflow:plan REVIEW-10")
@@ -1431,6 +1432,358 @@ class EngineTests(unittest.TestCase):
         after = read_json(self.run / "state.json")
         self.assertEqual(len(after["event_ids"]), len(before["event_ids"]) + 1)
         self.assertEqual(after["event_ids"][-1], current)
+
+
+    # -- 0.7.0: review summary, acceptance at the limit, approval records ----------------------
+    def submit_with_output(self, value, *, lines=(), error=None, raw=""):
+        """A review whose CLI printed ``lines`` (then ``raw`` text) to its stdout log; ``error`` fails the attempt."""
+        def reviewer(provider, packet, work_dir, schema, instructions, validate, probe, *, cwd):
+            work_dir.mkdir(parents=True, exist_ok=True)
+            (work_dir / "invocation.json").write_text(json.dumps({"cli_version": "codex-cli 9.9.9"}), encoding="utf-8")
+            (work_dir / "stdout.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines) + raw,
+                                                   encoding="utf-8")
+            if error is not None:
+                raise error
+            return adapter_result(validate(value))
+        with patch(RUN_REVIEW, side_effect=reviewer):
+            return self.engine.review(self.run_id)
+
+    def at_the_limit(self, max_reviews=2):
+        """A run at its review limit after reviews with findings, waiting at the question."""
+        (self.project / "devflow.config.json").write_text(json.dumps({"max_reviews": max_reviews}), encoding="utf-8")
+        self.ready()
+        for _ in range(max_reviews):
+            self.reflect(self.submit(review_value("changes_required")))
+        return self.ask_at_limit()
+
+    def test_review_records_keep_times_tokens_and_the_plan_version(self):
+        self.ready()
+        usage = {"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 2}}
+        self.submit_with_output(review_value("changes_required"), lines=[usage])
+        record = read_json(self.run / "reviews" / "01" / "review.json")
+        self.assertEqual(record["schema_version"], 2)
+        self.assertEqual(record["tokens"], {"input_tokens": 10, "output_tokens": 2})
+        self.assertEqual(record["plan_version"], 0)
+        self.assertLessEqual(record["started_at"], record["finished_at"])
+        self.reflect(self.engine.status(self.run_id))
+        reflection = read_json(self.run / "reviews" / "01" / "reflection.json")
+        self.assertEqual((reflection["previous_plan_version"], reflection["plan_version"],
+                          reflection["lines_added"], reflection["lines_removed"]), (0, 1, 2, 0))
+        # A failed attempt (the second reviewer, OpenCode) keeps the counts its CLI printed,
+        # though its answer was not accepted.
+        step = {"type": "step_finish", "part": {"tokens": {"input": 5, "cache": {"read": 3}}}}
+        self.submit_with_output(None, lines=[step, usage], error=ReviewerError("invalid answer"))
+        failed = read_json(self.run / "reviews" / "02" / "error.json")
+        self.assertEqual((failed["tokens"], failed["plan_version"]), ({"cache.read": 3, "input": 5}, 1))
+        self.assertIn("started_at", failed)
+        self.assertIn("finished_at", failed)
+
+    def test_a_recovered_review_keeps_its_time_and_tokens(self):
+        self.ready()
+        def interrupted(provider, packet, work_dir, *args, **kwargs):
+            work_dir.mkdir(parents=True, exist_ok=True)
+            (work_dir / "stdout.jsonl").write_text(json.dumps(
+                {"type": "turn.completed", "usage": {"input_tokens": 7}}) + "\n", encoding="utf-8")
+            raise KeyboardInterrupt
+        with patch(RUN_REVIEW, side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                self.engine.review(self.run_id)
+        self.engine.recover(self.run_id, confirmed=True, expected_review=1)
+        record = read_json(self.run / "reviews" / "01" / "recovery.json")
+        self.assertEqual((record["tokens"], record["plan_version"]), ({"input_tokens": 7}, 0))
+        self.assertLessEqual(record["started_at"], record["finished_at"])
+
+    def test_line_counts_are_counted_once_and_exactly(self):
+        count = engine_module.count_lines
+        self.assertEqual(count("a\nb\nc\n", "a\nB\nc\nd\n"), (2, 1))
+        # Lines starting like diff headers are ordinary lines.
+        self.assertEqual(count("x\n--- y\n++ z\n", "x\n+++ y\n-- z\n"), (2, 2))
+        # A one-line change among many repeated lines stays one line, quickly.
+        repeated = "## Heading\n- the same bullet item\n" * 8000
+        changed = repeated.replace("- the same bullet item\n", "- changed\n", 1)
+        started = __import__("time").monotonic()
+        self.assertEqual(count(repeated, changed), (1, 1))
+        self.assertLess(__import__("time").monotonic() - started, 1.0)
+        # The summary reads the stored numbers and never compares versions again.
+        self.ready()
+        self.reflect(self.submit(review_value("changes_required")))
+        with patch.object(engine_module, "count_lines", side_effect=AssertionError("compared again")):
+            summary = self.engine.report(self.run_id)["review_summary"]
+        self.assertEqual(summary["reviews"][0]["fix"]["version_change"],
+                         {"from": "v000", "to": "v001", "lines_added": 2, "lines_removed": 0})
+
+    def test_versions_are_labelled_from_records_even_when_content_returns(self):
+        self.ready()
+        first = Path(self.engine.status(self.run_id)["current_plan"]).read_text(encoding="utf-8")
+        self.reflect(self.submit(review_value("changes_required")))  # v001 differs
+        state = self.submit(review_value("changes_required"))
+        plan = self.draft("revised.md", first)  # v002 has v000's content again
+        reflection = self.draft("reflection.json", {"review_number": 2, "summary": "Went back to the first text.",
+                                                    "decisions": [{"finding_id": "F1", "action": "accept",
+                                                                   "reason": "The first text was right."}]})
+        self.engine.apply(self.run_id, plan, reflection, state["plan_hash"])
+        summary = self.engine.report(self.run_id)["review_summary"]
+        self.assertEqual([entry["version"]["label"] for entry in summary["reviews"]], ["v000", "v001"])
+        self.assertEqual(summary["reviews"][1]["fix"]["version_change"]["to"], "v002")
+        self.assertEqual(summary["approval"]["current_version"]["label"], "v002")
+
+    def test_accepting_at_the_limit_ends_as_accepted_with_the_current_plan(self):
+        asked = self.at_the_limit()
+        self.assertEqual(asked["review_summary"]["status"], "awaiting_human")
+        self.assertIn("Status: awaiting_human (review limit question)", asked["review_summary_markdown"])
+        accepted = self.at_limit("accept")
+        self.assertEqual((accepted["status"], accepted["review_limit"]), ("accepted", 2))
+        self.assertIsNotNone(accepted["finished_at"])
+        # The last revision was never reviewed, and is the version accepted.
+        self.assertFalse(accepted["final_plan_reviewed"])
+        answer = read_json(self.run / f"escalations/{asked['escalation']['id']}-answer.json")
+        self.assertEqual((answer["decision"], answer["plan_hash"]), ("accept", accepted["plan_hash"]))
+        self.assertIn("created_at", answer)
+        report = self.engine.report(self.run_id)
+        self.assertFalse(report["converged"])
+        self.assertEqual(report["human_acceptance"], {
+            "event_ids": answer["event_ids"], "answer": answer["answer"], "version": accepted["plan_hash"],
+            "accepted_at": answer["created_at"], "record": f"escalations/{asked['escalation']['id']}-answer.json"})
+        self.assertTrue(report["warning"].startswith(engine_module.ACCEPTED_WARNING))
+        summary = report["review_summary"]
+        self.assertFalse(summary["approval"]["all_reviewers_approved"])
+        self.assertEqual(summary["approval"]["human_acceptance"], report["human_acceptance"])
+        self.assertEqual(summary["human_decisions"][0]["decision"], "accept")
+        self.assertIn("- Status: accepted — accepted by the human", report["review_summary_markdown"])
+        # Nothing is written into report.json that is rendered for display.
+        self.assertNotIn("review_summary_markdown", read_json(self.run / "report.json"))
+
+    def test_the_summary_is_in_status_only_at_the_limit_question_and_after_the_end(self):
+        self.ready()
+        self.assertNotIn("review_summary", self.engine.status(self.run_id))
+        self.submit(review_value("human_required", human=True))
+        self.assertNotIn("review_summary", self.engine.status(self.run_id))  # another question
+        self.engine.cancel(self.run_id)
+        ended = self.engine.status(self.run_id)
+        self.assertEqual((ended["review_summary"]["status"], ended["review_summary_error"]), ("cancelled", None))
+
+    def test_a_summary_exists_for_every_end_including_runs_without_a_plan(self):
+        self.start_interview()
+        cancelled = self.engine.cancel(self.run_id)
+        summary = cancelled["review_summary"]
+        self.assertEqual((summary["approval"]["current_version"], summary["reviews"]),
+                         ({"id": None, "label": "none (no plan yet)"}, []))
+        self.assertIn("No reviews yet.", cancelled["review_summary_markdown"])
+        self.assertEqual(self.engine.report(self.run_id)["review_summary"]["status"], "cancelled")
+
+    def test_an_exhausted_run_has_a_summary_and_report(self):
+        self.at_the_limit()
+        stopped = self.at_limit("stop")
+        self.assertEqual(stopped["review_summary"]["status"], "exhausted")
+        report = self.engine.report(self.run_id)
+        self.assertEqual(report["review_summary"]["remaining_findings"]["count"], 2)
+        self.assertTrue(report["warning"].startswith("Not a converged plan."))
+
+    def test_a_summary_that_cannot_be_built_is_reported_not_raised(self):
+        self.completed()
+        with patch.object(engine_module, "summary_source", side_effect=DevFlowError("damaged")):
+            status = self.engine.status(self.run_id)
+            report = self.engine.report(self.run_id)
+        self.assertEqual((status["review_summary"], status["review_summary_markdown"]), (None, None))
+        self.assertIn("damaged", status["review_summary_error"])
+        self.assertIn("damaged", report["review_summary_error"])
+
+    def test_an_oversized_summary_is_left_out_of_report_json_but_shown(self):
+        self.completed()
+        with patch.object(engine_module, "check_json_size", side_effect=DevFlowError("too large")):
+            report = self.engine.report(self.run_id)
+        saved = read_json(self.run / "report.json")
+        self.assertEqual((saved["review_summary"], saved["review_summary_error"]),
+                         (None, engine_module.summary.TOO_LARGE))
+        self.assertIsNotNone(report["review_summary"])
+        self.assertIn("DevFlow review summary", report["review_summary_markdown"])
+
+    def test_completed_publication_writes_the_approval_record(self):
+        self.completed("/devflow:plan REVIEW-10")
+        published = self.engine.publish(self.run_id)
+        publication = published["publication"]
+        self.assertEqual(publication["approval_path"], "docs/plans/REVIEW-10.approval.md")
+        receipt = read_json(self.run / "publication.json")
+        self.assertEqual((receipt["schema_version"], receipt["approval"], receipt["approval_path"]),
+                         (2, "reviewers", "docs/plans/REVIEW-10.approval.md"))
+        self.assertEqual(receipt["published_at"], publication["intent_at"])
+        state = read_json(self.run / "state.json")
+        record = (self.project / "docs" / "plans" / "REVIEW-10.approval.md").read_text(encoding="utf-8")
+        self.assertEqual(record, "\n".join([
+            "# DevFlow plan approval record", "",
+            "This file records how the plan beside it was approved. The plan file is the exact approved bytes "
+            "and is not changed by DevFlow.", "",
+            "- Plan: REVIEW-10.md", "- Approval: reviewers", "- Approved by: codex, opencode",
+            f"- Approved plan SHA-256: {state['plan_hash']}", f"- Run ID: {self.run_id}",
+            f"- Approved at: {state['finished_at']}", f"- Published at: {publication['intent_at']}",
+            "- Reviews: 2 (limit 6)", "- Remaining findings: 0", "- Last version reviewed: yes"]) + "\n")
+        self.assertEqual((self.run / "approval.md").read_text(encoding="utf-8"), record)
+        report = self.engine.report(self.run_id)
+        self.assertTrue(report["published_plan_matches_at_report"])
+        self.assertTrue(report["published_approval_matches_at_report"])
+        self.assertIsNone(report["warning"])
+
+    def test_an_accepted_plan_is_published_as_a_human_approval(self):
+        self.at_the_limit()
+        accepted = self.at_limit("accept")
+        published = self.engine.publish(self.run_id)
+        target = self.project / published["publication"]["path"]
+        self.assertEqual(target.read_bytes(), Path(accepted["current_plan"]).read_bytes())
+        receipt = read_json(self.run / "publication.json")
+        self.assertEqual(receipt["approval"], "human")
+        record = (self.project / published["publication"]["approval_path"]).read_text(encoding="utf-8")
+        answer = read_json(self.run / f"escalations/{accepted['resolved_escalations'][-1]['id']}-answer.json")
+        self.assertIn("- Approval: human\n", record)
+        self.assertIn(f"- Approved by: human (AskUserQuestion answer event {answer['event_ids'][0]})\n", record)
+        self.assertIn("- Remaining findings: 2\n- Last version reviewed: no\n", record)
+        self.assertTrue(record.endswith(
+            "- Note: accepted by the human at the review limit, not approved by every reviewer.\n"))
+        self.assertEqual(self.engine.report(self.run_id)["warning"], engine_module.ACCEPTED_WARNING)
+
+    def test_only_completed_or_accepted_plans_are_published(self):
+        self.at_the_limit()
+        self.at_limit("stop")
+        with self.assertRaisesRegex(DevFlowError, "or the plan the human accepted"):
+            self.engine.publish(self.run_id)
+
+    def test_publication_names_need_both_the_plan_and_its_record_free(self):
+        for existing in ("REVIEW-10.md", "REVIEW-10.approval.md"):
+            with self.subTest(existing=existing):
+                self.setUp()
+                self.completed("/devflow:plan REVIEW-10")
+                directory = self.project / "docs" / "plans"
+                directory.mkdir(parents=True)
+                (directory / existing).write_text("Someone else's file\n", encoding="utf-8")
+                published = self.engine.publish(self.run_id)["publication"]
+                self.assertEqual((published["path"], published["approval_path"]),
+                                 (f"docs/plans/REVIEW-10-{self.run_id}.md",
+                                  f"docs/plans/REVIEW-10-{self.run_id}.approval.md"))
+                self.assertEqual((directory / existing).read_text(encoding="utf-8"), "Someone else's file\n")
+        self.setUp()
+        self.completed("/devflow:plan REVIEW-10")
+        directory = self.project / "docs" / "plans"
+        directory.mkdir(parents=True)
+        (directory / "REVIEW-10.approval.md").write_text("x\n", encoding="utf-8")
+        (directory / f"REVIEW-10-{self.run_id}.md").write_text("y\n", encoding="utf-8")
+        with self.assertRaisesRegex(DevFlowError, "or their approval records"):
+            self.engine.publish(self.run_id)
+
+    def test_a_removed_or_changed_approval_record_is_never_rewritten(self):
+        self.completed("/devflow:plan REVIEW-10")
+        self.engine.publish(self.run_id)
+        record = self.project / "docs" / "plans" / "REVIEW-10.approval.md"
+        record.write_text("Changed by hand\n", encoding="utf-8")
+        report = self.engine.report(self.run_id)
+        self.assertEqual((report["published_plan_matches_at_report"], report["published_approval_matches_at_report"]),
+                         (True, False))
+        self.assertIn("approval record is missing or changed", report["warning"])
+        with self.assertRaisesRegex(DevFlowError, "it was not overwritten"):
+            self.engine.publish(self.run_id)
+        self.assertEqual(record.read_text(encoding="utf-8"), "Changed by hand\n")
+        record.unlink()
+        with self.assertRaisesRegex(DevFlowError, "approval record was removed"):
+            self.engine.publish(self.run_id)
+        self.assertFalse(record.exists())
+
+    def test_accepted_runs_keep_the_acceptance_warning_with_publication_warnings(self):
+        self.at_the_limit()
+        self.at_limit("accept")
+        pending = self.engine.report(self.run_id)["warning"]
+        self.assertEqual(pending, engine_module.ACCEPTED_WARNING + " Reviews completed, but no successful "
+                         "publication has been recorded. Run plan publish or resolve the reported error.")
+        directory = self.project / "docs" / "plans"
+        directory.mkdir(parents=True)
+        with patch.object(engine_module, "write_new", side_effect=OSError("disk full")):
+            with self.assertRaises(DevFlowError):
+                self.engine.publish(self.run_id)
+        failed = self.engine.report(self.run_id)["warning"]
+        self.assertTrue(failed.startswith(engine_module.ACCEPTED_WARNING + " Reviews completed"))
+        published = self.engine.publish(self.run_id)
+        (self.project / published["publication"]["path"]).write_text("changed\n", encoding="utf-8")
+        changed = self.engine.report(self.run_id)["warning"]
+        self.assertEqual(changed, engine_module.ACCEPTED_WARNING + " The plan was published, but its current file "
+                         "or approval record is missing or changed. Inspect before implementation.")
+
+    def test_the_cli_version_names_its_unhashed_source(self):
+        self.ready()
+        self.submit_with_output(review_value("changes_required"))
+        entry = self.engine.report(self.run_id)["review_summary"]["reviews"][0]
+        self.assertEqual((entry["cli_version"], entry["cli_version_source"]),
+                         ("codex-cli 9.9.9", "review-processes/01/invocation.json"))
+
+    def test_deeply_nested_process_output_never_stops_a_review_or_recovery(self):
+        deep = "[" * 100000 + "]" * 100000 + "\n"
+        usage = {"type": "turn.completed", "usage": {"input_tokens": 3}}
+        self.ready()
+        finished = self.submit_with_output(review_value("changes_required"), lines=[usage], raw=deep)
+        self.assertEqual(finished["status"], "awaiting_revision")
+        self.assertEqual(read_json(self.run / "reviews" / "01" / "review.json")["tokens"], {"input_tokens": 3})
+        self.reflect(finished)
+        def interrupted(provider, packet, work_dir, *args, **kwargs):
+            work_dir.mkdir(parents=True, exist_ok=True)
+            (work_dir / "stdout.jsonl").write_text(deep, encoding="utf-8")
+            (work_dir / "invocation.json").write_text(deep, encoding="utf-8")
+            raise KeyboardInterrupt
+        with patch(RUN_REVIEW, side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                self.engine.review(self.run_id)
+        recovered = self.engine.recover(self.run_id, confirmed=True, expected_review=2)
+        self.assertIsNone(recovered["inflight"])
+        self.assertIsNone(read_json(self.run / "reviews" / "02" / "recovery.json")["tokens"])
+        self.assertIsNone(self.engine.report(self.run_id)["review_summary"]["reviews"][1]["cli_version"])
+
+    def test_a_refused_retry_keeps_reporting_the_earlier_publication(self):
+        self.completed("/devflow:plan REVIEW-10")
+        self.engine.publish(self.run_id)
+        (self.project / "docs" / "plans" / "REVIEW-10.approval.md").unlink()
+        with self.assertRaisesRegex(DevFlowError, "approval record was removed"):
+            self.engine.publish(self.run_id)
+        report = self.engine.report(self.run_id)
+        self.assertEqual(report["publication"]["status"], "error")
+        self.assertEqual((report["published_plan_matches_at_report"], report["published_approval_matches_at_report"]),
+                         (True, False))
+        self.assertTrue(report["published_approval"].endswith("REVIEW-10.approval.md"))
+        self.assertEqual(report["warning"], "The plan was published, but its current file or approval record is "
+                         "missing or changed. Inspect before implementation.")
+
+    def test_metadata_a_record_cannot_hold_never_stops_a_review_or_recovery(self):
+        bad = {"type": "turn.completed", "usage": {"\ud800": 5, "input_tokens": 2}}
+        self.ready()
+        finished = self.submit_with_output(review_value("changes_required"), lines=[bad])
+        self.assertEqual(finished["status"], "awaiting_revision")
+        self.assertEqual(read_json(self.run / "reviews" / "01" / "review.json")["tokens"], {"input_tokens": 2})
+        self.reflect(finished)
+        def interrupted(provider, packet, work_dir, *args, **kwargs):
+            work_dir.mkdir(parents=True, exist_ok=True)
+            (work_dir / "stdout.jsonl").write_text(json.dumps({"type": "step_finish", "part": {"tokens": {"\ud800": 1}}}),
+                                                   encoding="utf-8")
+            (work_dir / "invocation.json").write_text(json.dumps({"cli_version": "\ud800"}), encoding="utf-8")
+            raise KeyboardInterrupt
+        with patch(RUN_REVIEW, side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                self.engine.review(self.run_id)
+        recovered = self.engine.recover(self.run_id, confirmed=True, expected_review=2)
+        self.assertIsNone(recovered["inflight"])
+        self.assertIsNone(read_json(self.run / "reviews" / "02" / "recovery.json")["tokens"])
+        self.assertIsNone(self.engine.report(self.run_id)["review_summary"]["reviews"][1]["cli_version"])
+
+    def test_token_counts_that_cannot_be_written_never_stop_a_review_or_recovery(self):
+        huge = "".join('{"type": "turn.completed", "thread_id": "%s", "usage": {"input_tokens": %s}}\n' % (thread, "9" * 4300)
+                       for thread in ("main", "sub"))
+        self.ready()
+        finished = self.submit_with_output(review_value("changes_required"), raw=huge)
+        self.assertEqual(finished["status"], "awaiting_revision")
+        self.assertIsNone(read_json(self.run / "reviews" / "01" / "review.json")["tokens"])
+        self.reflect(finished)
+        def interrupted(provider, packet, work_dir, *args, **kwargs):
+            work_dir.mkdir(parents=True, exist_ok=True)
+            (work_dir / "stdout.jsonl").write_text(huge, encoding="utf-8")
+            raise KeyboardInterrupt
+        with patch(RUN_REVIEW, side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                self.engine.review(self.run_id)
+        recovered = self.engine.recover(self.run_id, confirmed=True, expected_review=2)
+        self.assertIsNone(recovered["inflight"])
 
 
 if __name__ == "__main__":

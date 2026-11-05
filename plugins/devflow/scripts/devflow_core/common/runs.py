@@ -21,17 +21,19 @@ from uuid import uuid4
 
 from .errors import DevFlowError
 from .storage import (atomic_json, check_json_file, check_json_size, digest, digest_file, file_lock, json_bytes,
-                      no_symlinks, now, read_json, replace_file, within, write_new)
+                      no_symlinks, now, parse_json, read_json, replace_file, within, write_new)
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 # Older run formats and the releases that wrote them; they are never continued.
 # A format that was never released has no name and is shown generically.
-RELEASES = {1: "0.1.x", 2: "0.2.x", 3: "0.3.x", 6: "0.4.x", 7: "0.5.x"}
+RELEASES = {1: "0.1.x", 2: "0.2.x", 3: "0.3.x", 6: "0.4.x", 7: "0.5.x", 8: "0.6.x"}
 
 
 def release_name(version: int) -> str:
     return RELEASES.get(version, f"an older version (run format {version})")
-TERMINAL = frozenset({"completed", "exhausted", "cancelled"})
+#: How a run ends. ``completed`` only when every reviewer approved the same version;
+#: ``accepted`` when the human accepted the current version at the review limit.
+TERMINAL = frozenset({"completed", "exhausted", "cancelled", "accepted"})
 RUN_ID = re.compile(r"[0-9]{8}T[0-9]{6}Z-[a-f0-9]{12}\Z")
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}\Z")
 EVENT_ID = re.compile(r"[a-f0-9]{32}\Z")
@@ -45,7 +47,7 @@ RUNNER_WAIT = 10.0
 HOOK_WAIT = 5.0
 ENVELOPE = frozenset({
     "schema_version", "flow", "run_id", "project", "status", "owner_session", "created_at",
-    "updated_at", "state_revision", "artifacts", "event_ids", "inflight", "escalation",
+    "updated_at", "finished_at", "state_revision", "artifacts", "event_ids", "inflight", "escalation",
 })
 ESCALATION = frozenset({"id", "reason", "questions", "boundary", "session_id", "return_status", "detail"})
 
@@ -193,6 +195,9 @@ class RunStore:
                 or not isinstance(state["status"], str) or state["status"] not in workflow.statuses
                 or not isinstance(state["owner_session"], str) or not SESSION_ID.fullmatch(state["owner_session"])
                 or not isinstance(state["created_at"], str) or not isinstance(state["updated_at"], str)
+                # A run's end time is set once, when it first becomes terminal.
+                or (not isinstance(state["finished_at"], str) if state["status"] in TERMINAL
+                    else state["finished_at"] is not None)
                 or type(state["state_revision"]) is not int or state["state_revision"] < 0
                 or not isinstance(state["artifacts"], dict)
                 or any(not isinstance(k, str) or not isinstance(v, str) for k, v in state["artifacts"].items())
@@ -293,6 +298,9 @@ class RunStore:
         """
         run_id = state["run_id"]
         self._require_lock(run_id)
+        # The end time is set before before_save, so a terminal report uses it.
+        if state["status"] in TERMINAL and state["finished_at"] is None:
+            state["finished_at"] = now()
         self.workflow.before_save(self, state)
         writes = state.pop("_pending_writes", {})
         base_revision = state["state_revision"]
@@ -322,6 +330,32 @@ class RunStore:
             if not target.is_file() or target.is_symlink():
                 raise DevFlowError(f"Refusing to replace a non-file at an artifact place: {relative}")
             replace_file(target, data)
+
+    def record(self, state: dict, relative: str) -> bytes:
+        """The bytes of one listed record: held for the next save, or on disk and verified.
+
+        A terminal report is made in the same save as the run's last records, so a
+        record may not be on disk yet.
+        """
+        if relative not in state["artifacts"]:
+            raise DevFlowError(f"Not a record of this run: {relative}")
+        held = state.get("_pending_writes", {})
+        if relative in held:
+            return held[relative]
+        run = self.run_dir(state["run_id"])
+        path = within(run / relative, run)
+        no_symlinks(path)
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise DevFlowError(f"Cannot read the record {relative}: {exc}") from exc
+        if digest(data) != state["artifacts"][relative]:
+            raise DevFlowError(f"Immutable artifact changed or is missing: {relative}; stop and investigate")
+        return data
+
+    def record_json(self, state: dict, relative: str):
+        """A listed JSON record (see ``record``)."""
+        return parse_json(self.record(state, relative), relative)
 
     def verify_artifacts(self, state: dict) -> None:
         run = self.run_dir(state["run_id"])
@@ -388,7 +422,7 @@ class RunStore:
             created = now()
             state = {**fields, "schema_version": SCHEMA_VERSION, "flow": self.flow, "run_id": run_id,
                      "project": str(self.project), "owner_session": owner, "created_at": created,
-                     "updated_at": created, "state_revision": 0, "artifacts": hashes,
+                     "updated_at": created, "finished_at": None, "state_revision": 0, "artifacts": hashes,
                      "event_ids": [first_event["event_id"]], "inflight": None,
                      "escalation": fields.get("escalation")}
             if state["escalation"] is not None:

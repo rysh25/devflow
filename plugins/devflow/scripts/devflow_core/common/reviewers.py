@@ -37,6 +37,7 @@ from .environment import PROBE_SECONDS, version_warnings
 from .errors import DevFlowError, ReviewerError
 from .process import run_bounded
 from .settings import validate_reviewer
+from .storage import json_bytes, read_json
 
 MAX_PACKET_BYTES = 32 * 1024 * 1024
 #: Share of a reviewer's time limit after which it is asked to start writing its answer.
@@ -107,7 +108,7 @@ def _events(lines, activity: Activity):
             continue
         try:
             event = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):  # RecursionError: nested too deeply
             event = None
         if isinstance(event, dict):
             yield event
@@ -346,12 +347,36 @@ def _read_text(path: Path, limit: int | None) -> str:
         raise ReviewerError(f"Cannot read reviewer file {path.name}: {exc}") from exc
 
 
+def _writable(text: str) -> bool:
+    """Whether a string from a CLI's output can be saved: JSON accepts escaped lone
+    surrogates, which records (UTF-8) cannot hold."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _add_tokens(totals: dict[str, int], values: dict, prefix: str = "") -> None:
+    """Add a CLI's token counts under its own names; nested names are joined with ".".
+    Only non-negative integers (not booleans) under names a record can hold count."""
+    for name, value in values.items():
+        key = f"{prefix}{name}"
+        if not _writable(key):
+            continue
+        if isinstance(value, dict):
+            _add_tokens(totals, value, key + ".")
+        elif type(value) is int and value >= 0:
+            totals[key] = totals.get(key, 0) + value
+
+
 class CLI:
     """What DevFlow needs to know about one reviewer CLI.
 
     Adding a CLI means adding one subclass to ``CLIS`` (and its kind to
     ``settings.REVIEWER_KINDS``): the subcommand, the arguments, the standard
-    input, and how to read the answer and the activity from the output.
+    input, how to read the answer and the activity from the output, and
+    optionally how to read its token counts.
     """
 
     subcommand = ""
@@ -372,6 +397,11 @@ class CLI:
     def answer(self, output: Path, work_dir: Path) -> tuple[Any, dict]:
         """The answer as strict JSON, and what the run did; ``output`` is the stdout log."""
         raise NotImplementedError
+
+    def tokens(self, output: Path) -> dict[str, int] | None:
+        """The token counts in the stdout log, under the CLI's own names (flat), or
+        None when the output reports none or the CLI is not taught to read them."""
+        return None
 
 
 class Codex(CLI):
@@ -395,6 +425,23 @@ class Codex(CLI):
             raise ReviewerError("Codex finished without an answer")
         return json_value(final), activity
 
+    def tokens(self, output):
+        """``turn.completed`` carries its thread's running total (``codex exec --json``
+        reports the thread's total token usage), so the last one of each thread
+        counts, and only threads are added together. An event without a thread
+        belongs to the main thread, as in ``parse_codex_events``."""
+        main, last = None, {}
+        for event in _events(_lines(output), Activity()):
+            kind, thread = event.get("type"), event.get("thread_id")
+            if kind == "thread.started" and main is None and isinstance(thread, str):
+                main = thread
+            elif kind == "turn.completed" and isinstance(event.get("usage"), dict):
+                last[thread if isinstance(thread, str) else main] = event["usage"]
+        totals: dict[str, int] = {}
+        for usage in last.values():
+            _add_tokens(totals, usage)
+        return dict(sorted(totals.items())) or None
+
 
 class OpenCode(CLI):
     """``opencode run``: the prompt as an attached file and a closed standard input (it would wait for input)."""
@@ -409,12 +456,49 @@ class OpenCode(CLI):
     def answer(self, output, work_dir):
         return parse_opencode_events(_lines(output))
 
+    def tokens(self, output):
+        """Each ``step_finish`` reports one step's tokens; every step of every session is added."""
+        totals: dict[str, int] = {}
+        for event in _events(_lines(output), Activity()):
+            part = event.get("part")
+            if event.get("type") == "step_finish" and isinstance(part, dict) and isinstance(part.get("tokens"), dict):
+                _add_tokens(totals, part["tokens"])
+        return dict(sorted(totals.items())) or None
+
 
 #: The reviewer CLIs by kind.
 CLIS = {"codex": Codex(), "opencode": OpenCode()}
 
 #: What every reviewer is asked, whatever the workflow: added after its instructions.
 RULES = Path(__file__).with_name("reviewer-rules.md")
+
+
+def review_tokens(config: dict, work_dir: Path) -> dict[str, int] | None:
+    """The token counts one review attempt's CLI printed, whether or not its answer was
+    valid; None when there is no output, it reports none, or it cannot be read.
+    Reading them never fails a review."""
+    output = Path(work_dir) / "stdout.jsonl"
+    try:
+        if output.is_symlink() or not output.is_file():
+            return None
+        tokens = CLIS[config["kind"]].tokens(output)
+        # The counts go into a record: one that cannot be written (a sum past Python's
+        # integer-to-text limit, say) is unknown, never a failed save.
+        json_bytes(tokens)
+        return tokens
+    except (DevFlowError, OSError, KeyError, TypeError, ValueError, RecursionError):
+        return None
+
+
+def recorded_cli_version(work_dir: Path) -> str | None:
+    """The CLI version recorded for one attempt (``invocation.json``, written before the
+    CLI starts), or None when the attempt never started it. A process record, not a
+    hashed run record."""
+    try:
+        value = read_json(Path(work_dir) / "invocation.json").get("cli_version")
+    except DevFlowError:
+        return None
+    return value if isinstance(value, str) and _writable(value) else None
 
 
 def _utc_now() -> datetime:

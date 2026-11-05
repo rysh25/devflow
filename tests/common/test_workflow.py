@@ -33,6 +33,11 @@ class CommandTableTests(unittest.TestCase):
                 recover = next(c for c in workflow.commands if c.name == "recover")
                 self.assertIn("confirm", [option.kind for option in recover.options])
 
+    def test_a_decision_option_takes_every_answer_including_accept(self):
+        implement = subcommands(subcommands(cli.parser())["implement"])["resolve"]
+        decision = next(action for action in implement._actions if action.dest == "decision")
+        self.assertEqual(set(decision.choices), {"continue", "cancel", "stop", "accept"})
+
 
 class OwnerTests(unittest.TestCase):
     def test_every_change_to_a_run_needs_the_owning_session_except_a_humans_recover(self):
