@@ -91,6 +91,7 @@ def human_decisions(state: dict, read) -> tuple[list[dict], dict | None]:
         answer_path = f"escalations/{item['id']}-answer.json"
         answer = read(answer_path)
         decisions.append({"at": answer.get("created_at"), "review_number": item["review_number"],
+                          "question_kind": (question.get("detail") or {}).get("kind"),
                           "questions": question["questions"], "answer": answer["answer"],
                           "decision": answer.get("decision"), "interpretation": None, "event_ids": answer["event_ids"]})
         if answer.get("decision") == "accept":
@@ -108,7 +109,8 @@ def summary_source(store, state: dict) -> dict:
         entry = {"number": number, "status": outcome,
                  "cli_version": recorded_cli_version(run / "review-processes" / f"{number:02d}"),
                  "cli_version_source": f"review-processes/{number:02d}/invocation.json", "verdict": None,
-                 "error": None, "findings": [], "fix": None, "tokens": None, "record": None}
+                 "error": None, "findings": [], "fix": None, "tokens": None, "tool_call_count": None,
+                 "record": None}
         if record is None:
             inflight = state["inflight"] or {}
             entry.update(reviewer_id=inflight.get("reviewer_id"), started_at=inflight.get("started_at"),
@@ -117,6 +119,8 @@ def summary_source(store, state: dict) -> dict:
             continue
         entry.update(reviewer_id=record["provider"], started_at=record.get("started_at"),
                      finished_at=record.get("finished_at"), tokens=record.get("tokens"),
+                     # What the reviewer did is recorded only when it ran to the end.
+                     tool_call_count=(record.get("activity") or {}).get("tool_call_count"),
                      version={"id": record["plan_hash"], "label": _version_label(record.get("plan_version"))},
                      record=relative)
         if outcome == "failed":
@@ -294,7 +298,7 @@ class Engine(RunEngine):
             approved = {item["provider"] for item in state["passes"] if item["plan_hash"] == state["plan_hash"]}
             if ask_at_limit(state, state["review_count"], approved, state["plan_hash"],
                             lambda reason, questions: self._escalate(
-                                state, {"reason": reason, "questions": questions}, "ready", kind=REVIEW_BUDGET)):
+                                state, {"reason": reason, "questions": questions}, "ready", REVIEW_BUDGET)):
                 return None
             if next_reviewer(state["config"]["reviewers"], state["review_count"], state["review_limit"]) != provider:
                 raise DevFlowError("The run changed during the reviewer check; inspect status and retry.")
@@ -355,7 +359,8 @@ class Engine(RunEngine):
                 "previous_plan_version": state["plan_version"], "plan_version": state["plan_version"],
                 "lines_added": None, "lines_removed": None}))
         elif review["verdict"] == "human_required":
-            self._escalate(state, {"reason": review["summary"], "questions": [q["question"] for q in review["questions"]]}, "awaiting_revision")
+            self._escalate(state, {"reason": review["summary"], "questions": [q["question"] for q in review["questions"]]},
+                           "awaiting_revision", "review_decision")
         else:
             state["status"] = "awaiting_revision"
 
@@ -407,10 +412,12 @@ class Engine(RunEngine):
             self._save(state)
         return self.status(run_id)
 
-    def _escalate(self, state: dict, reason: dict, return_status: str, kind: str | None = None) -> None:
+    def _escalate(self, state: dict, reason: dict, return_status: str, kind: str) -> None:
+        """Ask the human. Every question records its kind (as in implement) and the
+        number of reviews so far."""
         escalation_id = uuid4().hex
         value = open_escalation(state, escalation_id, reason["reason"], reason["questions"], return_status,
-                                {"review_number": state["review_count"], **({"kind": kind} if kind else {})})
+                                {"review_number": state["review_count"], "kind": kind})
         self._artifact(state, f"escalations/{escalation_id}.json", json_bytes(value))
         state["status"] = "awaiting_human"
 
@@ -423,7 +430,7 @@ class Engine(RunEngine):
             value = read_json(self._draft(run_id, reason_file))
             if set(value) != {"reason", "questions"} or not isinstance(value["reason"], str) or not value["reason"].strip() or not isinstance(value["questions"], list) or not value["questions"] or any(not isinstance(q, str) or not q.strip() for q in value["questions"]):
                 raise DevFlowError("Escalation needs a nonempty reason and an array of questions.")
-            self._escalate(state, value, state["status"])
+            self._escalate(state, value, state["status"], "plan_decision")
             self._save(state)
         return self.status(run_id)
 

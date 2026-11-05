@@ -72,8 +72,9 @@ class Engine(RunEngine):
         index = len(state["escalations"]) + 1
         identifier = f"E{index:03}"
         snapshot_id = (state.get("candidate") or {}).get("snapshot_id")
+        # The number of reviews so far is recorded as in plan.
         value = open_escalation(state, identifier, reason, questions, return_status,
-                                {"kind": kind, "snapshot_id": snapshot_id})
+                                {"kind": kind, "snapshot_id": snapshot_id, "review_number": len(state["attempts"])})
         path = f"escalations/{index:03}.json"
         self._artifact(state, path, json_bytes({**value, "created_at": now()}))
         state["escalations"].append(path)
@@ -448,17 +449,21 @@ def _checkpoint_label(path: object) -> str:
 
 def human_decisions(state: dict, read) -> tuple[list[dict], dict | None]:
     """The human's answers (``common.summary`` shape), and the acceptance at the review
-    limit when the human accepted the code."""
-    questions = {}
+    limit when the human accepted the code. The number of reviews and the question's
+    kind come from the question's record (a 0.7.1 record has no number)."""
+    escalations = {}
     for path in state["escalations"]:
         value = read(path)
-        questions[value["id"]] = value["questions"]
+        escalations[value["id"]] = value
     decisions, acceptance = [], None
     for path in state["resolutions"]:
         value = read(path)
         event = value["human_event"]
-        decisions.append({"at": value.get("created_at"), "review_number": None,
-                          "questions": questions.get(value["escalation_id"], []), "answer": event.get("answer_text"),
+        escalation = escalations.get(value["escalation_id"], {})
+        detail = escalation.get("detail") or {}
+        decisions.append({"at": value.get("created_at"), "review_number": detail.get("review_number"),
+                          "question_kind": detail.get("kind"),
+                          "questions": escalation.get("questions", []), "answer": event.get("answer_text"),
                           "decision": value["decision"], "interpretation": value.get("interpretation"),
                           "event_ids": [event["event_id"]]})
         if value["decision"] == "accept":
@@ -488,7 +493,10 @@ def summary_source(store, state: dict, workspace: dict | None = None) -> dict:
                  "started_at": attempt.get("started_at"), "finished_at": attempt.get("finished_at"),
                  "version": {"id": attempt["snapshot_id"], "label": _checkpoint_label(attempt.get("snapshot_path"))},
                  "verdict": attempt.get("verdict"), "error": attempt.get("error"), "findings": [], "fix": None,
-                 "tokens": attempt.get("tokens"), "record": attempt.get("review_path")}
+                 "tokens": attempt.get("tokens"),
+                 # What the reviewer did is recorded only when it ran to the end.
+                 "tool_call_count": (attempt.get("activity") or {}).get("tool_call_count"),
+                 "record": attempt.get("review_path")}
         if outcome == "succeeded":
             review = read(attempt["review_path"])
             reflected = f"decisions/review-{attempt['number']:02}.json"

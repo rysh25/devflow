@@ -108,7 +108,8 @@ class ImplementWorkflow(Workflow):
         if baseline.get("git", {}) and baseline["git"].get("dirty") and not config["allow_dirty"]:
             escalation = {"id": "E001", "reason": "Existing changes require explicit acknowledgement",
                           "questions": ["The worktree has existing changes. Preserve them and continue from this captured baseline?"],
-                          "return_status": "implementing", "detail": {"kind": "dirty_worktree", "snapshot_id": None}}
+                          "return_status": "implementing",
+                          "detail": {"kind": "dirty_worktree", "snapshot_id": None, "review_number": 0}}
             artifacts["escalations/001.json"] = json_bytes({**escalation, "boundary": 1, "created_at": now()})
             fields.update(status="awaiting_human", escalation=escalation, escalations=["escalations/001.json"])
         return fields, artifacts

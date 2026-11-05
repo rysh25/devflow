@@ -692,7 +692,8 @@ class EngineTests(unittest.TestCase):
         state = self.submit(review_value("human_required", human=True))
         self.assertEqual(state["status"], "awaiting_human")
         self.assertEqual(state["human_events"], [])
-        self.assertEqual(state["escalation"]["detail"], {"review_number": 1})
+        # Every question records its kind (0.7.2) and the number of reviews so far.
+        self.assertEqual(state["escalation"]["detail"], {"review_number": 1, "kind": "review_decision"})
         resumed = self.resume("new-session")
         self.session = "new-session"
         self.assertEqual(resumed["status"], "awaiting_human")
@@ -1628,6 +1629,51 @@ class EngineTests(unittest.TestCase):
                          (None, engine_module.summary.TOO_LARGE))
         self.assertIsNotNone(report["review_summary"])
         self.assertIn("DevFlow review summary", report["review_summary_markdown"])
+
+    # -- 0.7.2: the short summary's tool calls and question kinds ------------------------------
+    def test_the_summary_counts_tool_calls_from_the_records(self):
+        self.ready()
+        self.reflect(self.submit(review_value("changes_required")))
+        # A reviewer that did not run to the end recorded no tool calls.
+        self.submit_with_output(None, error=ReviewerError("timed out"))
+        self.engine.cancel(self.run_id)
+        report = self.engine.report(self.run_id)
+        self.assertEqual([entry["tool_call_count"] for entry in report["review_summary"]["reviews"]],
+                         [ACTIVITY["tool_call_count"], None])
+        text = report["review_summary_markdown"]
+        self.assertIn("| 1 | codex | v000 | changes_required | medium 1; accept 1 | 3 |", text)
+        self.assertIn("| 2 | opencode | v001 | failed | — | unknown |", text)
+        self.assertIn("  - Review 2 (opencode): timed out", text)
+
+    def test_every_question_records_its_kind_and_the_summary_shows_it(self):
+        self.ready()
+        self.submit(review_value("human_required", human=True))
+        answer = self.limit_answer("Keep the five-minute limit.")
+        resolved = self.resolve(self.draft("answer.json", {"answer": answer["answer_text"],
+                                                           "event_ids": [answer["event_id"]]}))
+        self.reflect(resolved)
+        paused = self.engine.pause(self.run_id, self.draft("pause.json", {
+            "reason": "A scope question.", "questions": ["Include the rollback?"]}))
+        self.assertEqual(paused["escalation"]["detail"], {"review_number": 1, "kind": "plan_decision"})
+        answer = self.limit_answer("Include it.")
+        self.resolve(self.draft("answer.json", {"answer": answer["answer_text"], "event_ids": [answer["event_id"]]}))
+        self.engine.cancel(self.run_id)
+        report = self.engine.report(self.run_id)
+        self.assertEqual([(item["review_number"], item["question_kind"], item["decision"])
+                          for item in report["review_summary"]["human_decisions"]],
+                         [(1, "review_decision", None), (1, "plan_decision", None)])
+        self.assertRegex(report["review_summary_markdown"],
+                         r"- Human decisions:\n  - After 1 review, review_decision: answered \(.+\)\n"
+                         r"  - After 1 review, plan_decision: answered \(.+\)\n$")
+
+    def test_a_question_recorded_without_a_kind_is_a_question(self):
+        # Before 0.7.2 only the review limit question recorded its kind.
+        records = {"escalations/x.json": {"questions": ["Include the rollback?"], "detail": {"review_number": 2}},
+                   "escalations/x-answer.json": {"created_at": "2026-11-05T00:00:00+00:00", "answer": "Yes.",
+                                                 "event_ids": ["e1"]}}
+        decisions, acceptance = engine_module.human_decisions(
+            {"resolved_escalations": [{"id": "x", "review_number": 2}]}, records.__getitem__)
+        self.assertEqual((decisions[0]["review_number"], decisions[0]["question_kind"], acceptance), (2, None, None))
 
     def test_completed_publication_writes_the_approval_record(self):
         self.completed("/devflow:plan REVIEW-10")

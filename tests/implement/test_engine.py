@@ -22,10 +22,11 @@ from unittest.mock import patch
 
 from devflow_core import router
 from devflow_core.common import runs, sessions
-from devflow_core.common.errors import DevFlowError
+from devflow_core.common.errors import DevFlowError, ReviewerError
 from devflow_core.common.paths import PLUGIN_ROOT
 from devflow_core.common.storage import atomic_write_json, digest, json_bytes, read_json
 from devflow_core.implement import checks as checks_module
+from devflow_core.implement import engine as engine_module
 from devflow_core.implement.engine import Engine
 from devflow_core.implement.review import validate_review
 from devflow_core.workflows import WORKFLOWS
@@ -1480,6 +1481,8 @@ class DirtyGitProjectTests(EngineFixture):
         result = self.start()
         self.assertEqual(result["status"], "awaiting_human")
         self.assertEqual(result["escalation"]["detail"]["kind"], "dirty_worktree")
+        # Asked before any review (0.7.2: every question records the number of reviews).
+        self.assertEqual(result["escalation"]["detail"]["review_number"], 0)
         self.assertEqual(result["escalation"]["boundary"], 1)
         self.assertEqual(result["escalation"]["session_id"], self.session)
         baseline = read_json(self.run / "baseline.json")
@@ -1757,6 +1760,41 @@ class SummaryAndAcceptanceTests(EngineFixture):
         cancelled = self.engine.cancel(self.run_id, self.session, "Stopping.")
         self.assertEqual(cancelled["status"], "cancelled")
         self.assertIsNone(cancelled["report"]["review_summary"]["reviews"][0]["cli_version"])
+
+    # -- 0.7.2: the short summary's tool calls and question records ----------------------------
+    def test_the_limit_question_records_the_number_of_reviews(self):
+        asked = self.at_the_limit()
+        self.assertEqual(asked["escalation"]["detail"]["review_number"], 2)
+        self.assertEqual([entry["tool_call_count"] for entry in asked["review_summary"]["reviews"]],
+                         [ACTIVITY["tool_call_count"]] * 2)
+        self.assertIn("| 2 | opencode | checkpoint 1 | changes_required | high 1; accept 1 | 2 |",
+                      asked["review_summary_markdown"])
+        accepted = self.accept()
+        summary = accepted["report"]["review_summary"]
+        self.assertEqual([(item["review_number"], item["question_kind"], item["decision"])
+                          for item in summary["human_decisions"]], [(2, "review_budget", "accept")])
+        self.assertRegex(accepted["review_summary_markdown"],
+                         r"- Human decisions:\n  - After 2 reviews, review_budget: accept \(.+\)\n$")
+
+    def test_a_reviewer_that_did_not_run_to_the_end_has_no_tool_calls(self):
+        self.start()
+        self.ready()
+        self.with_output([], error=ReviewerError("timed out"))
+        self.review()
+        ended = self.engine.cancel(self.run_id, self.session, "Stop here.")
+        self.assertEqual([entry["tool_call_count"] for entry in ended["report"]["review_summary"]["reviews"]], [None])
+        self.assertIn("| 1 | codex | checkpoint 1 | failed | — | unknown |", ended["review_summary_markdown"])
+
+    def test_a_question_recorded_before_0_7_2_has_no_number(self):
+        records = {"escalations/001.json": {"id": "E001", "questions": ["Continue?"],
+                                            "detail": {"kind": "review_decision", "snapshot_id": None}},
+                   "resolutions/001.json": {"escalation_id": "E001", "decision": "continue", "interpretation": "Go on.",
+                                            "human_event": {"event_id": "e1", "answer_text": "Yes."},
+                                            "created_at": "2026-11-05T00:00:00+00:00"}}
+        decisions, acceptance = engine_module.human_decisions(
+            {"escalations": ["escalations/001.json"], "resolutions": ["resolutions/001.json"]}, records.__getitem__)
+        self.assertEqual((decisions[0]["review_number"], decisions[0]["question_kind"], decisions[0]["questions"],
+                          acceptance), (None, "review_decision", ["Continue?"], None))
 
 
 class UnwritableReviewerTextTests(EngineFixture):
