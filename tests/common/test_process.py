@@ -12,7 +12,11 @@ from devflow_core.common.errors import DevFlowError
 from devflow_core.common.process import run_bounded
 
 MIB = 1024 * 1024
-RETAIN = "import subprocess, sys; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'])"
+# A descendant that keeps the output pipes open after the command exits. It runs outside the
+# test's directory: Windows cannot stop it once its parent has exited, and it would keep that
+# directory in use.
+RETAIN = ("import subprocess, sys, tempfile; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'], "
+          "cwd=tempfile.gettempdir())")
 
 
 class SlowFile(io.BytesIO):
