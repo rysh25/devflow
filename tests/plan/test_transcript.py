@@ -146,6 +146,19 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(out["coverage"]["unknown_types"]["blocks"], {"future-visible-block": 1})
         self.assertNotIn("FUTURE-BLOCK", json.dumps(out))
 
+    def test_an_unknown_type_a_record_cannot_hold_is_counted_as_untyped(self):
+        from devflow_core.common.storage import json_bytes
+        marker = transcript_marker(str(self.path))
+        # An escaped unpaired surrogate in the JSONL makes a name a record cannot hold.
+        self.write(entry("user", "req"))
+        with self.path.open("a", encoding="utf-8", newline="\n") as stream:  # the escape as the JSONL holds it
+            stream.write(json.dumps(entry("assistant", [{"type": "\ud800-block", "text": "x"},
+                                                        {"type": "text", "text": "Q?"}])) + "\n")
+        self.write(entry("user", "A"))
+        out = capture_interview(marker, [self.prompt("req"), self.prompt("A")])
+        self.assertEqual(out["coverage"]["unknown_types"]["blocks"], {"(untyped)": 1})
+        json_bytes(out)  # interview.json can be written
+
     def test_user_text_without_a_hook_record_is_kept_and_marked(self):
         marker = transcript_marker(str(self.path))
         self.write(entry("user", "req"), entry("user", "text without a hook record"), entry("assistant", "Q?"))

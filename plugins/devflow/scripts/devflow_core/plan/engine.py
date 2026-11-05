@@ -17,7 +17,7 @@ from ..common.runs import RUNNER_WAIT, TERMINAL, open_escalation
 from ..common.sessions import approval_candidates
 from ..common import summary
 from ..common.storage import (atomic_json, check_json_size, checked_text, digest, json_bytes, no_symlinks, now,
-                              read_json, within, write_new)
+                              read_json, within, write_new, writable_text)
 from .review import validate_review
 from .transcript import capture_interview
 
@@ -329,7 +329,7 @@ class Engine(RunEngine):
                    "plan_version": state["plan_version"]}
         if error is not None:
             state["last_error"] = {"review_number": number, "provider": provider["id"],
-                                   "plan_hash": reservation["target"], "message": str(error),
+                                   "plan_hash": reservation["target"], "message": writable_text(str(error)),
                                    "retry_consumes_another_attempt": True, **attempt,
                                    # What the reviewer did, when it ran to the end.
                                    **({"activity": result["activity"]} if result is not None else {})}

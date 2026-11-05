@@ -20,6 +20,22 @@ from .errors import DevFlowError
 JSON_LIMIT = 64 * 1024 * 1024
 
 
+def writable(text: str) -> bool:
+    """Whether a string can be written into a record (as UTF-8). JSON accepts escaped
+    unpaired surrogates (\\ud800), which records cannot hold."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def writable_text(text: str) -> str:
+    """The text with every character a record cannot hold escaped (Python's
+    'backslashreplace', for example \\ud800); every other character unchanged."""
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 

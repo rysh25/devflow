@@ -14,7 +14,7 @@ from .errors import DevFlowError
 from .review import REVIEW_BUDGET
 from .runs import RUNNER_WAIT, TERMINAL, RunStore
 from .sessions import approval_candidates, prefilled_question_events
-from .storage import now, read_json
+from .storage import now, read_json, writable_text
 
 
 class RunEngine:
@@ -108,7 +108,7 @@ class RunEngine:
             result, error = None, exc
         with self._lock(run_id):
             state = self.store.claim(run_id, reservation, status,
-                                     {"result": result, "error": None if error is None else str(error)})
+                                     {"result": result, "error": None if error is None else writable_text(str(error))})
             finish(state, reservation, work, result, error)
             self._save(state)
         return self.status(run_id)

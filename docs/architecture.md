@@ -2,7 +2,7 @@
 
 ## 一つの配布と独立したワークフロー
 
-DevFlow 0.7.0 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
+DevFlow 0.7.1 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
 
 ```mermaid
 flowchart TD
@@ -55,7 +55,7 @@ Python コードは `plugins/devflow/scripts/devflow_core/` の1つのパッケ�
 | `settings.py` | `devflow.config.json` の重ね合わせと、レビュアー設定の共通規則 |
 | `workflow.py` | 各フローが実装する契約（`Workflow` クラス）と、動作の表（`Command` / `Option`）。CLI の登録、所有者が要る操作（`needs_owner`）、振り分けはこの表から導く。共通層はフロー固有の state の項目を直接読まず、`summary` や `frozen_config` などの契約を通す |
 | `environment.py` | 長い処理に要る Bash の待ち時間（`bash_timeout_ms`）、確かめた CLI の版と `doctor` の警告、MSYS2・Cygwin の Python の検出 |
-| `errors.py`、`storage.py`、`review.py`、`paths.py` | エラーの系統、原子的な保存とロック、回数と承認の判定、インストール先とプロジェクトの根（`project_root`） |
+| `errors.py`、`storage.py`、`review.py`、`paths.py` | エラーの系統、原子的な保存とロック、回数と承認の判定、インストール先とプロジェクトの根（`project_root`）。`storage.py` の `writable` と `writable_text` は、記録（UTF-8）に書けない文字（対にならないサロゲート）の確かめとエスケープ。使うのはレビュアーの CLI の出力が記録に入る所（答え、ツールと出来事の名前、CLI の出力から作るエラーの文を記録する Plan の `last_error` と `error.json`、Implement の回の `error` と `last_error`、`late/`、トークン数、CLI の版）。ほかから来る文字列（面接の transcript の本文、チェックの出力、公開のエラー、フックの入力、パス）は対象外 |
 
 import の向きは一方向です。`common` はフローや router を import せず、フロー同士も互いを import しません。フローを import するのは登録表だけです。`tools/package.py` がこの向きと、各フローのリソースが揃っていることと、登録表がフローのパッケージと一致することを静的に検査します。ワークフロー名の正本は登録表だけで、設定ファイルの最上位のキーも、登録表を持つ CLI と router が検査します。
 
@@ -151,9 +151,9 @@ checkpoint では、開始時からの変更の一覧（`snapshots/NNN.json`）�
 
 - Codex：最初の thread を主とし、主な thread の turn が失敗した、または完了しなかったとき。答えは Codex が書く最後のメッセージのファイルから読みます。
 - OpenCode：最初のセッションを主とし、主なセッションのエラー、最後に始まった段階が `stop` で終わらなかったとき（終わりの出来事がない場合を含む）、答えがないとき。
-- 両方：答えの JSON が厳密でない（重複キーなど）か、スキーマに合わないとき。
+- 両方：答えの JSON が厳密でない（重複キーなど）か、記録に書けない文字（対にならないサロゲート）を含むか、スキーマに合わないとき。答えは書き換えず、そのまま受け付けるか断るかのどちらかです。
 
-ツールの呼び出し、サブエージェント（ほかの thread・セッション）、CLI が立ち直ったエラー、知らない種類の出来事は、止めずに種類ごとに数えます（`activity`）。回ごとの数は、両フローとも `status` と最終レポートの `reviews` に出ます。`reviews` の各回は、番号、レビュアー、状態（`dispatched`・`succeeded`・`failed`）、受け付けた回の判定（`verdict`）と動きの数、対象（Implement は `snapshot_id`、Plan は `plan_hash`）を持ちます。
+ツールの呼び出し、サブエージェント（ほかの thread・セッション）、CLI が立ち直ったエラー、知らない種類の出来事は、止めずに種類ごとに数えます（`activity`）。名前が記録に書けないときは、名前がないときと同じく `(unnamed)` として数えます。CLI の出力から作ったエラーの文は、記録する所（Plan の `last_error` と `error.json`、Implement の回の `error` と `last_error`、`late/`）で `writable_text` を通します。回ごとの数は、両フローとも `status` と最終レポートの `reviews` に出ます。`reviews` の各回は、番号、レビュアー、状態（`dispatched`・`succeeded`・`failed`）、受け付けた回の判定（`verdict`）と動きの数、対象（Implement は `snapshot_id`、Plan は `plan_hash`）を持ちます。
 
 ## 長い処理と Claude Code の Bash
 
