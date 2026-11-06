@@ -18,6 +18,7 @@ from ..common.sessions import approval_candidates
 from ..common import summary
 from ..common.storage import (atomic_json, check_json_size, checked_text, digest, json_bytes, no_symlinks, now,
                               read_json, within, write_new, writable_text)
+from .config import FILENAME_DEFAULT, publish_name
 from .review import validate_review
 from .transcript import capture_interview
 
@@ -535,8 +536,9 @@ class Engine(RunEngine):
                 else:
                     directory = within(self.project / state["config"]["publish"]["directory"], self.project)
                     request = read_json(run / "request.json")["request"]
-                    identifier = re.search(r"(?<![A-Za-z0-9_])[A-Z][A-Z0-9]{0,31}-[0-9]{1,12}(?![A-Za-z0-9_])", request)
-                    name = identifier.group() if identifier else "plan-" + run_id
+                    # A run started before 0.7.3 has no filename and keeps the default rule.
+                    template = state["config"]["publish"].get("filename", FILENAME_DEFAULT)
+                    name = publish_name(template, request, run_id)
                     # The plan and its approval record take one name; neither file may exist.
                     for candidate in (name, name + "-" + run_id):
                         target = within(directory / (candidate + ".md"), self.project)

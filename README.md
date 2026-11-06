@@ -1,4 +1,4 @@
-# DevFlow 0.7.2 — Claude Code Plugin
+# DevFlow 0.7.3 — Claude Code Plugin
 
 人間との要件整理から計画作成、実装、独立レビューまでを支援する **単一の Claude Code Plugin** です。インストールするプラグインは `devflow` だけです。
 
@@ -39,7 +39,7 @@ claude plugin install devflow@devflow-marketplace --scope user
 
 GitHub に置く場合も公開リポジトリは必須ではありません。認証済みの private リポジトリを marketplace として登録できます。詳細は [インストールと環境設定](docs/installation.md) を参照してください。
 
-更新は、GitHub から導入した場合は次の2つを実行し、Claude Code を起動し直します。ZIP から導入した場合と、更新の前後の注意は [更新する](docs/installation.md#更新する) と「[0.7.2 への更新](#072-への更新)」（それより前の版から上げるときは「[0.7.1 への更新](#071-への更新)」「[0.7.0 への更新](#070-への更新)」「[0.6.0 への更新](#060-への更新)」「[0.5.1 への更新](#051-への更新)」「[0.5.0 への更新](#050-への更新)」「[0.4.0 への更新](#040-への更新)」も）を参照してください。
+更新は、GitHub から導入した場合は次の2つを実行し、Claude Code を起動し直します。ZIP から導入した場合と、更新の前後の注意は [更新する](docs/installation.md#更新する) と「[0.7.3 への更新](#073-への更新)」（それより前の版から上げるときは「[0.7.2 への更新](#072-への更新)」「[0.7.1 への更新](#071-への更新)」「[0.7.0 への更新](#070-への更新)」「[0.6.0 への更新](#060-への更新)」「[0.5.1 への更新](#051-への更新)」「[0.5.0 への更新](#050-への更新)」「[0.4.0 への更新](#040-への更新)」も）を参照してください。
 
 ```text
 claude plugin marketplace update devflow-marketplace
@@ -155,7 +155,7 @@ Implement は開始時のプランと作業ツリーを固定し、Claude Code �
   "max_reviews": 6,
   "plan": {
     "grill_skill": "grilling",
-    "publish": {"enabled": true, "directory": "docs/plans"}
+    "publish": {"enabled": true, "directory": "docs/plans", "filename": "{ticket}"}
   },
   "implement": {
     "allow_dirty": false,
@@ -165,6 +165,19 @@ Implement は開始時のプランと作業ツリーを固定し、Claude Code �
   }
 }
 ```
+
+`plan.publish` は、正式なプランの公開の設定です。
+
+- `enabled`：公開するか。
+- `directory`：保存先のディレクトリ（プロジェクトからの相対パス）。
+- `filename`：プランの名前のテンプレート。拡張子は書きません（プランには `.md`、承認の記録には `.approval.md` が付きます）。
+  - 使える値は `{run_id}`（run ID）と `{ticket}`（依頼の中の最初の、`REVIEW-10` のようなチケット ID）だけです。
+  - 既定の `"{ticket}"` では、チケット ID があればその ID、なければ `plan-<run-id>` です。テンプレートに `{ticket}` があって依頼にチケット ID がないときは、名前全体が `plan-<run-id>` になります。
+  - 例：`"{ticket}-plan"` は `REVIEW-10-plan.md` です。`"plan-{run_id}"` はチケット ID を使いません。`UTF-8` のような文字列もチケット ID と見なされるので、それを避けたいときにも使えます。
+  - 使える文字は ASCII の英数字・`_`・`.`・`-` です。先頭は英数字か `_` で、`.` で終わらず、Windows の予約名（`CON` など）は使えません。値をいちばん長いもの（チケット ID 45 文字、run ID 29 文字）に置き換えて 128 文字以内でなければなりません。守っていない設定は、run の開始時にエラーになります。
+  - 名前がもう使われているときは、`-<run-id>` を付けた名前で公開します（テンプレートに `{run_id}` があっても同じです）。
+
+`publish` の値は、ほかの設定と同じく run の開始時に固定されます。
 
 レビュアーを設定する場合は、最上位の `reviewers` に全員を書きます（配列は全体置換）。2人以上かつ `max_reviews` 以下で、異なる種類（`codex` / `opencode`）を2つ以上含む必要があります。
 
@@ -221,7 +234,7 @@ Implement は開始時のプランと作業ツリーを固定し、Claude Code �
 | `.devflow/runs/plan/<run-id>/` | 依頼、インタビュー、途中の計画、レビュー、採否、公開記録 | しない |
 | `.devflow/runs/implement/<run-id>/` | 入力プラン、基準コード、差分、検証、レビュー、結果 | しない |
 | `.devflow/sessions/` | Claude セッションと実行の対応 | しない |
-| `docs/plans/*.md` | 双方のレビューを通過した、またはレビューの上限で人間が受け入れた正式なプラン | 必要に応じて推奨 |
+| `docs/plans/*.md` | 双方のレビューを通過した、またはレビューの上限で人間が受け入れた正式なプラン（保存先は `plan.publish.directory`、名前は `plan.publish.filename` で決まる） | 必要に応じて推奨 |
 | `docs/plans/*.approval.md` | 横のプランの承認の記録（承認したのがレビュアーか人間か、版のハッシュ、run ID、日時など） | プランと同じ |
 | `devflow.config.json` | 共有可能なプロジェクト設定。秘密は書かない | 推奨 |
 
@@ -254,6 +267,15 @@ uv run --offline --no-project --no-config --no-python-downloads "PLUGIN_DIR/scri
 - push、公開、デプロイ、依存の追加、破壊的移行の前には、人間に確認するようスキルで頼んでいます。
 
 詳しくは [設計](docs/architecture.md)、[信頼の考え方と注意](docs/security.md)、[検証範囲](docs/validation.md) を参照してください。
+
+## 0.7.3 への更新
+
+0.7.2、0.7.1、0.7.0 の run は、そのまま続けられます（run の記録の形式は 9 のままです）。0.7.3 より前に始めた Plan の run は、今までの規則（依頼の最初のチケット ID、なければ `plan-<run-id>`）で公開します。
+
+変わったこと：
+
+- **公開するプランの名前を、設定 `plan.publish.filename` で変えられます。** `{run_id}` と `{ticket}` を使うテンプレートです（[プロジェクト設定](#プロジェクト設定)）。既定の `"{ticket}"` では、今までと同じ名前になります。承認の記録は、今までどおり `<名前>.approval.md` です。
+- 0.7.3 で始めた Plan の run は、固定した設定に `filename` を持ちます。0.7.2 以前はこの項目を知らないので、その run の `doctor` はエラーになり、公開では今までの規則で名前を付けます。0.7.2 以前へ戻すときは、先に 0.7.3 で始めた Plan の run を終えてください。
 
 ## 0.7.2 への更新
 

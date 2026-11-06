@@ -3,7 +3,7 @@
   "grill_skill": "grilling",
   "max_reviews": 6,
   "max_packet_bytes": 2097152,
-  "publish": {"enabled": true, "directory": "docs/plans"},
+  "publish": {"enabled": true, "directory": "docs/plans", "filename": "{ticket}"},
   "reviewers": [
     {
       "id": "codex",
