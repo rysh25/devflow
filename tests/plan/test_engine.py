@@ -17,6 +17,8 @@ from devflow_core.common.errors import DevFlowError, ReviewerError
 from devflow_core.common.review import REVIEW_LIMIT_REASON
 from devflow_core.common.storage import atomic_write_json, file_lock, read_json
 from devflow_core.plan import engine as engine_module
+from devflow_core.plan import config as config_module
+from devflow_core.plan.config import FILENAME_DEFAULT, load_config, publish_name, safe_name
 from devflow_core.plan.engine import Engine
 from devflow_core.plan.review import validate_review
 from devflow_core.workflows import WORKFLOWS
@@ -1240,6 +1242,124 @@ class EngineTests(unittest.TestCase):
                                        "publish.directory")
                 self.assertIsNone(self.bound_run())
 
+    # -- the published plan's name: publish.filename ------------------------------------
+    def publish_with_filename(self, template, request=None, existing=()):
+        """Publish a completed run whose project sets ``publish.filename`` and return the
+        plan's and the approval record's paths. ``existing`` names human-owned files
+        (``{run_id}`` filled in) placed before publication; they are never overwritten."""
+        (self.project / "devflow.config.json").write_text(
+            json.dumps({"plan": {"publish": {"filename": template}}}), encoding="utf-8")
+        state = self.completed(request)
+        directory = self.project / "docs" / "plans"
+        names = [name.format(run_id=self.run_id) for name in existing]
+        for name in names:
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / name).write_bytes(b"Human-owned existing plan\n")
+        publication = self.engine.publish(self.run_id)["publication"]
+        self.assertEqual(publication["status"], "published")
+        self.assertEqual((self.project / publication["path"]).read_bytes(), Path(state["current_plan"]).read_bytes())
+        self.assertTrue((self.project / publication["approval_path"]).is_file())
+        for name in names:
+            self.assertEqual((directory / name).read_bytes(), b"Human-owned existing plan\n")
+        return publication["path"], publication["approval_path"]
+
+    def assertPublishedAs(self, paths, name):
+        self.assertEqual(paths, (f"docs/plans/{name}.md", f"docs/plans/{name}.approval.md"))
+
+    def test_publish_filename_with_run_id_does_not_use_the_ticket(self):
+        paths = self.publish_with_filename("plan-{run_id}", "/devflow:plan REVIEW-10 を計画")
+        self.assertPublishedAs(paths, f"plan-{self.run_id}")
+
+    def test_publish_filename_with_ticket_uses_the_ticket(self):
+        paths = self.publish_with_filename("{ticket}-plan", "/devflow:plan REVIEW-10 を計画")
+        self.assertPublishedAs(paths, "REVIEW-10-plan")
+
+    def test_publish_filename_with_ticket_and_no_ticket_is_plan_and_run_id(self):
+        paths = self.publish_with_filename("{ticket}-plan")
+        self.assertPublishedAs(paths, f"plan-{self.run_id}")
+
+    def test_publish_filename_with_text_around_run_id(self):
+        paths = self.publish_with_filename("devflow-{run_id}", "/devflow:plan REVIEW-10 を計画")
+        self.assertPublishedAs(paths, f"devflow-{self.run_id}")
+
+    def test_publish_filename_without_values(self):
+        self.assertPublishedAs(self.publish_with_filename("plan"), "plan")
+
+    def test_publish_filename_without_values_in_use_adds_run_id(self):
+        paths = self.publish_with_filename("plan", existing=("plan.md",))
+        self.assertPublishedAs(paths, f"plan-{self.run_id}")
+
+    def test_publish_filename_with_run_id_in_use_still_adds_run_id(self):
+        paths = self.publish_with_filename("{run_id}", existing=("{run_id}.md",))
+        self.assertPublishedAs(paths, f"{self.run_id}-{self.run_id}")
+
+    def test_publish_filename_is_frozen(self):
+        (self.project / "devflow.config.json").write_text('{"plan":{"publish":{"filename":"frozen-{ticket}"}}}',
+                                                          encoding="utf-8")
+        self.completed("/devflow:plan REVIEW-10")
+        (self.project / "devflow.config.json").write_text('{"plan":{"publish":{"filename":"changed-{ticket}"}}}',
+                                                          encoding="utf-8")
+        result = self.engine.publish(self.run_id)
+        self.assertEqual((result["publication"]["path"], result["publication"]["approval_path"]),
+                         ("docs/plans/frozen-REVIEW-10.md", "docs/plans/frozen-REVIEW-10.approval.md"))
+
+    def test_unsafe_publish_filename_rejected_before_model_calls(self):
+        values = ["", "{date}", "{ticket", "ticket}", "{RUN_ID}", "a/b", "../x", ".hidden", "-x", "has space", "CON",
+                  "nul.{run_id}", "x.", 1, None,
+                  # Too long with the longest values: 129, 135 and 129 characters.
+                  "a" * 129, "{ticket}" * 3, "{ticket}-" + "a" * 83]
+        for value in values:
+            (self.project / "devflow.config.json").write_text(json.dumps({"plan": {"publish": {"filename": value}}}),
+                                                              encoding="utf-8")
+            with self.subTest(value=value):
+                self.assertNotAccepted(self.hook(self.event(prompt="/devflow:plan A request")), "plan",
+                                       "publish.filename")
+                self.assertIsNone(self.bound_run())
+        (self.project / "devflow.config.json").write_text('{"plan":{"publish":{"name":"plan"}}}', encoding="utf-8")
+        self.assertNotAccepted(self.hook(self.event(prompt="/devflow:plan A request")), "plan",
+                               "publish must contain enabled and directory, and may contain filename.")
+        self.assertIsNone(self.bound_run())
+
+    def test_publish_filename_at_the_length_limit_is_accepted(self):
+        # 128 characters, with the longest ticket ID (45 characters) for {ticket}.
+        for value in ("a" * 128, "{ticket}-" + "a" * 82):
+            (self.project / "devflow.config.json").write_text(json.dumps({"plan": {"publish": {"filename": value}}}),
+                                                              encoding="utf-8")
+            with self.subTest(value=value):
+                self.assertEqual(load_config(self.project, WORKFLOWS["plan"])["publish"]["filename"], value)
+
+    def start_before_filename(self, request):
+        """A run started before 0.7.3: its frozen configuration has no publish.filename."""
+        def without_filename(project, workflow):
+            config = original(project, workflow)
+            del config["publish"]["filename"]
+            return config
+        original = config_module.load_config
+        with patch("devflow_core.plan.config.load_config", side_effect=without_filename):
+            self.completed(request)
+        self.assertNotIn("filename", self.engine.status(self.run_id)["config"]["publish"])
+        self.assertNotIn("filename", read_json(self.run / "config.json")["publish"])
+
+    def test_run_without_filename_publishes_with_the_ticket_and_passes_doctor(self):
+        self.start_before_filename("/devflow:plan REVIEW-10 を計画")
+        code, report = self.runner("--run", self.run_id, "plan", "doctor")
+        self.assertEqual(code, 0, report)
+        self.assertEqual(report["configuration_source"], "frozen_run")
+        self.assertNotIn("filename", report["config"]["publish"])
+        self.assertEqual(report["errors"], [])
+        result = self.engine.publish(self.run_id)
+        self.assertEqual((result["publication"]["path"], result["publication"]["approval_path"]),
+                         ("docs/plans/REVIEW-10.md", "docs/plans/REVIEW-10.approval.md"))
+
+    def test_run_without_filename_and_ticket_publishes_with_run_id(self):
+        self.start_before_filename(None)
+        result = self.engine.publish(self.run_id)
+        self.assertEqual(result["publication"]["path"], f"docs/plans/plan-{self.run_id}.md")
+
+    def test_default_filename_is_the_default_setting(self):
+        self.assertEqual(FILENAME_DEFAULT, read_json(RESOURCES / "defaults.json")["publish"]["filename"])
+        self.assertEqual(load_config(self.project, WORKFLOWS["plan"])["publish"]["filename"], FILENAME_DEFAULT)
+
     # -- stopped saves: a save that stops before state.json is replaced is not committed --
     def stop_commit(self, when=lambda value: True):
         """Stop the saves (chosen by the new state) just before ``state.json`` is replaced."""
@@ -1893,6 +2013,37 @@ class EngineTests(unittest.TestCase):
         cancelled = self.engine.cancel(self.run_id)
         self.assertEqual(cancelled["status"], "cancelled")
         json.dumps(self.engine.report(self.run_id), ensure_ascii=False).encode("utf-8")
+
+
+class PublishNameTests(unittest.TestCase):
+    RUN = "20261106T050301Z-0017ac3e5025"
+
+    def test_publish_name(self):
+        cases = [
+            # The default: the first ticket ID, or plan-<run-id> without one.
+            (FILENAME_DEFAULT, "REVIEW-10 の計画", "REVIEW-10"),
+            (FILENAME_DEFAULT, "ABC-1 then DEF-2", "ABC-1"),
+            (FILENAME_DEFAULT, "計画だけ", "plan-" + self.RUN),
+            # {ticket} without a ticket ID makes the whole name plan-<run-id>.
+            ("{ticket}-plan", "REVIEW-10", "REVIEW-10-plan"),
+            ("{run_id}-{ticket}", "計画だけ", "plan-" + self.RUN),
+            ("{run_id}-{ticket}", "REVIEW-10", self.RUN + "-REVIEW-10"),
+            # Without {ticket}, the ticket ID is not used.
+            ("plan-{run_id}", "REVIEW-10", "plan-" + self.RUN),
+            ("plan", "REVIEW-10", "plan"),
+        ]
+        for template, request, name in cases:
+            with self.subTest(template=template, request=request):
+                self.assertEqual(publish_name(template, request, self.RUN), name)
+
+    def test_safe_name_is_the_directory_component_rule(self):
+        for part in ("docs", "plans", "_drafts", "v1.2-x", "COM0", "CONSOLE", "REVIEW-10", self.RUN):
+            with self.subTest(part=part):
+                self.assertTrue(safe_name(part))
+        for part in ("", ".", "..", ".git", ".devflow", ".claude", ".codex", ".opencode", ".agents", "CON", "con",
+                     "nul.md", "COM1.x", "LPT9", "x.", "-x", ".x", "a b", "a/b", "a\\b", "C:", "{run_id}", "é"):
+            with self.subTest(part=part):
+                self.assertFalse(safe_name(part))
 
 
 if __name__ == "__main__":

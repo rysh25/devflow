@@ -2,7 +2,7 @@
 
 ## 一つの配布と独立したワークフロー
 
-DevFlow 0.7.2 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
+DevFlow 0.7.3 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
 
 ```mermaid
 flowchart TD
@@ -71,7 +71,7 @@ import の向きは一方向です。`common` はフローや router を import 
 
 `completed` と `accepted` では、スキルが `plan publish` と `plan report` を呼びます。ほかの終わり方（`exhausted`、`cancelled`）でも `plan report` を呼び、レビューの要約を見せます。出版状態 `publication.status` は `pending` / `publishing` / `published` / `error` / `disabled` を区別します。`completed` や `accepted` だけでは正式ファイルの保存成功を意味しません。
 
-既定保存先は `docs/plans/`、ファイル名は依頼中の最初の `REVIEW-10` のようなチケット識別子、なければ `plan-<run-id>.md` です。公開するプランの横に、人が読める承認の記録 `<名前>.approval.md` を置きます。プランと承認の記録の両方の名前が空いている候補を、`<名前>`、`<名前>-<run-id>` の順に選び、どちらも使えなければ上書きせず止まります。正式ファイルはレビュー済み（`accepted` では人間が受け入れた）のバイト列と同じです。公開時に見出しやメタデータを付加して未レビューの変更を混ぜません。承認の情報は、横の承認の記録と `publication.json` にだけ書きます。
+既定保存先は `docs/plans/` です。ファイル名は設定 `publish.filename` のテンプレートに `.md` を付けたもので、テンプレートで使える値は `{run_id}` と `{ticket}`（依頼中の最初の `REVIEW-10` のようなチケット識別子）です。既定の `"{ticket}"` では、チケット識別子があればその識別子、なければ `plan-<run-id>` で、0.7.2 までと同じ名前です。テンプレートに `{ticket}` があって依頼にチケット識別子がなければ、名前全体を `plan-<run-id>` にします。テンプレートは run の開始時に検査します。値をいちばん長い見本（チケット識別子 45 文字、run ID 29 文字）に置き換え、保存先のディレクトリの各部分と同じ安全な名前の規則と 128 文字の上限を当てます。実際の値は安全な文字だけでできていて、見本より長くならず、予約名にもならない（必ず `-` を含む）ので、公開のときには検査し直しません。固定した設定に `filename` がない run（0.7.3 より前に開始）は、既定の規則で公開します。公開するプランの横に、人が読める承認の記録 `<名前>.approval.md` を置きます。プランと承認の記録の両方の名前が空いている候補を、`<名前>`、`<名前>-<run-id>` の順に選び、どちらも使えなければ上書きせず止まります。正式ファイルはレビュー済み（`accepted` では人間が受け入れた）のバイト列と同じです。公開時に見出しやメタデータを付加して未レビューの変更を混ぜません。承認の情報は、横の承認の記録と `publication.json` にだけ書きます。
 
 承認の記録の中身は、決まった英語の言葉で、プランのファイル名、承認の種類（`reviewers` か `human`）、承認した者（レビュアーの id、または人間と `AskUserQuestion` の答えの event ID）、承認した版のハッシュ、run ID、承認した時刻（run の `finished_at`）、公開した時刻、レビューの回数と上限、残っている指摘の数、最後の版がレビュー済みかです。中身は公開の予定と一緒に run の記録 `approval.md` として一度だけ作り、それを外へ写すので、途中で止まった公開を再開しても同じバイト列になります。受領 `publication.json`（`schema_version` 2）は、`approval`（`reviewers` か `human`）、`approval_path`、公開の予定の時刻と同じ `published_at` を持ちます。`plan report` は、公開したプランと承認の記録の両方が今もそのバイト列か（`published_plan_matches_at_report`、`published_approval_matches_at_report`）を確かめます。
 
