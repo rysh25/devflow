@@ -169,7 +169,7 @@ class ClaudeTests(unittest.TestCase):
             self.assertIn("--verbose", prepared.argv)
             self.assertEqual(prepared.argv[prepared.argv.index("--json-schema") + 1],
                              '{"description":"\\u65e5\\u672c\\u8a9e","type":"object"}')
-            self.assertEqual(list(root.iterdir()), [schema, instructions])
+            self.assertCountEqual(root.iterdir(), [schema, instructions])
             with patch.object(reviewers, "CLAUDE_INPUT_BYTES", 1):
                 with self.assertRaisesRegex(ReviewerError, "10,000,000"):
                     reviewers.prepare_review(config, b"packet", root / "process", schema, instructions, cwd=root, probe={})

@@ -153,7 +153,8 @@ class CliTests(unittest.TestCase):
         result = subprocess.run([sys.executable, "-B", str(SCRIPT), "--project", str(self.project), "plan", "--help"],
                                 cwd=str(self.project), capture_output=True, text=True, encoding="utf-8", timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertRegex(result.stdout, r"usage: devflow .* plan")
+        # argparse versions differ on including global arguments in subcommand usage.
+        self.assertRegex(result.stdout, r"usage: devflow(?: .*?)? plan\b")
         for action in ("seal", "review", "resolve", "recover"):
             self.assertIn(action, result.stdout)
         self.assertNotIn("resume", result.stdout)
