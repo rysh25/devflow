@@ -473,7 +473,7 @@ def emit(event):
 if mode == "exit-error":
     print("fixture failure", file=sys.stderr)
     raise SystemExit(7)
-stdin = sys.stdin.read()
+stdin = sys.stdin.buffer.read().decode("utf-8")
 (records / "seen.json").write_text(json.dumps({"args": args, "cwd": os.getcwd(), "pwd": os.environ.get("PWD"),
     "stdin": stdin, "env": {key: os.environ.get(key) for key in (
         "OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG_CONTENT", "OPENCODE_PERMISSION",
@@ -576,6 +576,7 @@ class ProcessTests(unittest.TestCase):
         return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
 
     def test_execution_uses_only_the_prepared_bytes_and_frozen_metadata(self):
+        self.packet.write_bytes("First line\r\n日本語\nFinal line\r".encode("utf-8"))
         config = self.config()
         probe = reviewers.preflight(config)
         prepared = reviewers.prepare_review(config, self.packet.read_bytes(), self.output,
@@ -643,7 +644,7 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(Path(seen["cwd"]), self.project)
         self.assertEqual(Path(seen["pwd"]), self.project)
         # The prompt arrives on standard input, which is then closed.
-        prompt = (self.output / "review-input.md").read_text(encoding="utf-8")
+        prompt = (self.output / "review-input.md").read_bytes().decode("utf-8")
         self.assertEqual(seen["stdin"], prompt)
         self.assertIn("日本語", prompt)
         self.assertIn("$(touch BAD)", prompt)
