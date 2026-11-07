@@ -7,36 +7,34 @@ blocking the tool or the prompt.
 """
 from __future__ import annotations
 
-import argparse
 import json
 from pathlib import Path
 import shutil
-import subprocess
+
 import sys
 
 from . import __version__, router
 from .common import paths
-from .common.environment import python_errors, version_numbers, version_warnings
-from .common.errors import DevFlowError, UsageError
+from .common.hosts import executable_name
+from .common.arguments import Parser
+from .common.hosts.diagnostics import MINIMUM_CLAUDE_CODE, claude_version, codex_version
+from .common.environment import python_errors, version_warnings
+from .common.errors import DevFlowError
 from .common.reviewers import preflight
 from .common.settings import validate_document
 from .workflows import WORKFLOWS
 
 PLUGIN_ROOT = paths.PLUGIN_ROOT
-MINIMUM_CLAUDE_CODE = "2.1.316"
 MAX_HOOK_BYTES = 16 * 1024 * 1024
-
-
-class Parser(argparse.ArgumentParser):
-    def error(self, message):  # argparse would print usage text and exit
-        raise UsageError(f"{self.prog}: {message}")
 
 
 def parser() -> Parser:
     result = Parser(prog="devflow", description="DevFlow: planning and implementation workflows with bounded independent reviews.")
     result.add_argument("--version", action="version", version="devflow " + __version__)
     result.add_argument("--project", type=Path, default=Path.cwd(), help="Project/worktree; global options precede the command")
-    result.add_argument("--session", help="Actual Claude Code session ID")
+    result.add_argument("--session", help="Actual host session ID")
+    result.add_argument("--host", choices=("claude", "codex"), required=True,
+                        help="The host whose session and records apply; always explicit")
     result.add_argument("--run", help="Existing run ID; required to inspect or act on a particular run")
     commands = result.add_subparsers(dest="command", required=True, parser_class=Parser)
     commands.add_parser("status", help="Overview, or the bound/selected run; changes nothing")
@@ -54,29 +52,9 @@ def emit(value) -> None:
         print(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False))
 
 
-def claude_version() -> dict:
-    executable = shutil.which("claude")
-    report = {"minimum_version": MINIMUM_CLAUDE_CODE, "path": executable,
-              "version": None, "supported": False, "reason": "Claude Code executable not found"}
-    if not executable:
-        return report
-    try:
-        result = subprocess.run([executable, "--version"], stdin=subprocess.DEVNULL,
-                                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                timeout=10, shell=False, check=False)
-        # A version probe is diagnostic only and does not authenticate or invoke a model.
-        found = version_numbers(result.stdout[:8192])
-        if result.returncode != 0 or not found:
-            report["reason"] = "Claude Code version could not be established"
-        else:
-            report.update(version=".".join(map(str, found)), supported=found >= version_numbers(MINIMUM_CLAUDE_CODE),
-                          reason="Hook input with agent_id is version-gated; real hook execution is not verified")
-    except (OSError, subprocess.SubprocessError) as exc:
-        report["reason"] = str(exc)
-    return report
 
 
-def doctor(project: Path) -> dict:
+def doctor(project: Path, host: str) -> dict:
     """Offline project-settings readiness for every workflow; changes nothing."""
     reports, cache, warnings = {}, {}, []
     validate_document(project, WORKFLOWS)
@@ -91,21 +69,21 @@ def doctor(project: Path) -> dict:
                 except Exception as exc:  # noqa: BLE001 - diagnostics report every failure
                     cache[key] = {"ready": False, "error": str(exc)}
             reviewers.append({"id": provider["id"], **cache[key]})
-        extra = workflow.doctor(project, config)
+        extra = workflow.doctor(project, config, host=host)
         warnings.extend(extra.get("warnings", []))
         ready = all(item["ready"] for item in reviewers) and extra.get("ready", True)
         reports[name] = {"config": config, "configuration_source": "project_settings", "reviewers": reviewers,
                          "reviewers_ready": all(item["ready"] for item in reviewers), "ready": ready,
                          **{key: value for key, value in extra.items() if key not in {"warnings", "ready"}}}
-    warnings.extend(router.blocking_warnings(project))
+    warnings.extend(router.blocking_warnings(project, host))
     for item in cache.values():
         warnings.extend(item.get("details", {}).get("version_warnings", []))
-    version = claude_version()
-    warnings.extend(version_warnings("claude", version["version"]))
-    executables = {name: shutil.which(name) for name in ("uv", "claude", "git")}
+    version = claude_version() if host == "claude" else codex_version()
+    warnings.extend(version_warnings(host, version["version"]))
+    executables = {name: shutil.which(name) for name in ("uv", executable_name(host), "git")}
     errors = python_errors()
     return {"plugin": "devflow", "version": __version__, "project": str(project),
-            "minimum_claude_code": MINIMUM_CLAUDE_CODE, "claude_code": version,
+            "minimum_claude_code": MINIMUM_CLAUDE_CODE, "claude_code": version if host == "claude" else None, "host": host, "host_diagnostics": version,
             "python": {"version": sys.version.split()[0], "requires": ">=3.11", "fixed_minor": False,
                        "platform": sys.platform},
             "executables": executables, "workflows": reports, "warnings": warnings, "errors": errors,
@@ -132,28 +110,48 @@ def main(argv=None) -> int:
     try:
         args = parser().parse_args(argv)
         command = args.command
+        host = args.host
         if command == "hook":
             if args.session or args.run:
                 raise DevFlowError("Hook context comes only from the actual stdin hook payload")
             payload = _hook()
-            emit(router.handle_hook(payload, PLUGIN_ROOT))
+            emit(router.handle_hook(payload, PLUGIN_ROOT, host=host))
             return 0
         project = router.project_root(args.project)
         if command == "status":
-            emit(router.status(project, args.session, args.run))
+            emit(router.status(project, args.session, args.run, host))
         elif command == "doctor":
-            emit(doctor(project))
+            if args.run:
+                flow, info = router.resolve_run(project, args.run, router.stores(project, host=host))
+                if info.format != "current":
+                    emit({"ready": False, **info.public()})
+                else:
+                    args.action = "doctor"
+                    emit(WORKFLOWS[flow].run_command(args, project, args.run, args.session, host))
+            else:
+                emit(doctor(project, host))
         elif args.action == "start":
             if args.run:
                 raise DevFlowError("A new start cannot target an existing run")
             options = WORKFLOWS[command].start_options(args)
-            emit(router.runner_start(project, args.session, command, args.start_value, options))
+            emit(router.runner_start(project, args.session, command, args.start_value, options, host=host))
         else:
-            run_id = router.selected_run(project, args.session, command, args.run)
+            args.pending_start = None
+            if args.action == "doctor" and args.session:
+                from .common.sessions import inspect_record, session_path
+                path = session_path(project, args.session)
+                info = inspect_record(path, WORKFLOWS) if path.exists() else None
+                if info is not None and (info.format != "current" or info.host != host):
+                    emit({"ready": False, "configuration_source": "session_record", "format": info.format,
+                          "session_host": info.host, "error": info.error or "Unsupported session record or host collision"})
+                    return 0
+                if info is not None:
+                    args.pending_start = info.record["pending_start"]
+            run_id = router.selected_run(project, args.session, command, args.run, host=host)
             if run_id is None:
                 # Without a run, an action reads the current project settings.
                 validate_document(project, WORKFLOWS)
-            emit(WORKFLOWS[command].run_command(args, project, run_id, args.session))
+            emit(WORKFLOWS[command].run_command(args, project, run_id, args.session, host))
         return 0
     except Exception as exc:  # noqa: BLE001 - every failure is reported, never retried
         if command == "hook":

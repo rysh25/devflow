@@ -12,7 +12,8 @@ from devflow_core.common.errors import ReviewerError
 from devflow_core.common.review import (REVIEW_LIMIT_REASON, all_approved, ask_at_limit, check_fields,
                                         check_review_budget, decide_at_limit, next_reviewer, review_budget,
                                         validate_limit)
-from devflow_core.common.settings import validate_document, workflow_overlay
+from devflow_core.common.settings import validate_document
+from devflow_core.workflows import WORKFLOWS
 from devflow_core.common.environment import (GIT_FACT_SECONDS, PROBE_SECONDS, REVIEW_SETUP_SECONDS, bash_timeout_ms,
                                               python_errors, review_timeout_ms)
 from devflow_core.common.paths import msys_path
@@ -245,31 +246,33 @@ class SharedSettingsTests(unittest.TestCase):
         self.path = self.project / "devflow.config.json"
 
     def test_empty_project_is_inert(self):
-        self.assertEqual(workflow_overlay(self.project, "plan"), {})
-        self.assertEqual(workflow_overlay(self.project, "implement"), {})
+        self.assertEqual(WORKFLOWS["plan"].load_config(self.project)["max_reviews"], 6)
+        self.assertEqual(WORKFLOWS["implement"].load_config(self.project)["max_reviews"], 6)
         self.assertEqual(list(self.project.iterdir()), [])
 
     def test_legacy_configuration_is_not_implicitly_imported(self):
         # Files named after the former standalone components are ignored.
         for name in ("plan" + "flow", "build" + "flow"):
             atomic_json(self.project / (name + ".config.json"), {"max_reviews": 2})
-        self.assertEqual(workflow_overlay(self.project, "plan"), {})
-        self.assertEqual(workflow_overlay(self.project, "implement"), {})
+        self.assertEqual(WORKFLOWS["plan"].load_config(self.project)["max_reviews"], 6)
+        self.assertEqual(WORKFLOWS["implement"].load_config(self.project)["max_reviews"], 6)
 
     def test_common_values_and_workflow_override_are_separate(self):
+        reviewers = WORKFLOWS["plan"].load_config(self.project)["reviewers"]
+        reviewers[0]["id"] = "synthetic"
         atomic_json(self.path, {"schema_version": 1, "max_reviews": 6,
-                              "reviewers": [{"id": "synthetic"}],
+                              "reviewers": reviewers,
                               "plan": {"max_reviews": 4, "grill_skill": "interview"},
                               "implement": {"checks": []}})
-        plan = workflow_overlay(self.project, "plan")
-        implement = workflow_overlay(self.project, "implement")
+        plan = WORKFLOWS["plan"].load_config(self.project)
+        implement = WORKFLOWS["implement"].load_config(self.project)
         self.assertEqual(plan["max_reviews"], 4)
         self.assertEqual(implement["max_reviews"], 6)
         self.assertNotIn("checks", plan)
         self.assertNotIn("grill_skill", implement)
         plan["reviewers"][0]["id"] = "changed"
         self.assertEqual(implement["reviewers"][0]["id"], "synthetic")
-        self.assertEqual(workflow_overlay(self.project, "plan")["reviewers"][0]["id"], "synthetic")
+        self.assertEqual(WORKFLOWS["plan"].load_config(self.project)["reviewers"][0]["id"], "synthetic")
 
     def test_unknown_top_level_and_schema_versions_fail(self):
         names = ("plan", "implement")
@@ -279,8 +282,8 @@ class SharedSettingsTests(unittest.TestCase):
                 atomic_json(self.path, value)
                 with self.assertRaises(DevFlowError):
                     validate_document(self.project, names)
-                    workflow_overlay(self.project, "plan")
-                    workflow_overlay(self.project, "implement")
+                    WORKFLOWS["plan"].load_config(self.project)
+                    WORKFLOWS["implement"].load_config(self.project)
 
     def test_top_level_keys_come_from_the_caller_registry(self):
         atomic_json(self.path, {"schema_version": 1, "deploy": {}})
@@ -296,7 +299,7 @@ class SharedSettingsTests(unittest.TestCase):
         except (OSError, NotImplementedError):
             self.skipTest("Creating symlinks requires OS permission")
         with self.assertRaises(DevFlowError):
-            workflow_overlay(self.project, "implement")
+            WORKFLOWS["implement"].load_config(self.project)
 
 
 class ReviewBudgetTests(unittest.TestCase):
@@ -486,7 +489,7 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(git.call_args.kwargs["timeout"], GIT_FACT_SECONDS)
 
     def test_released_run_formats_have_names_and_unreleased_ones_are_generic(self):
-        self.assertEqual(runs.RELEASES, {1: "0.1.x", 2: "0.2.x", 3: "0.3.x", 6: "0.4.x", 7: "0.5.x", 8: "0.6.x"})
+        self.assertEqual(runs.RELEASES, {1: "0.1.x", 2: "0.2.x", 3: "0.3.x", 6: "0.4.x", 7: "0.5.x", 8: "0.6.x", 9: "0.7.x"})
         for version, release in runs.RELEASES.items():
             with self.subTest(version=version):
                 self.assertEqual(runs.release_name(version), release)

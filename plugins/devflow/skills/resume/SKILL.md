@@ -3,7 +3,7 @@ name: resume
 description: Resume one explicitly selected DevFlow run without resetting its review budget or changing its frozen inputs and settings.
 argument-hint: "<run-id>"
 disable-model-invocation: true
-allowed-tools: Bash(uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *) PowerShell(uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *)
+allowed-tools: Bash(uv --no-cache run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *) PowerShell(uv --no-cache run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *)
 ---
 
 # Resume DevFlow
@@ -15,7 +15,7 @@ The user must provide exactly one existing ID. The prompt hook has already handl
 1. Run the following status command with the exact ID. Read the returned `flow` field; do not guess from filenames.
 
 ```text
-uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" --project "${CLAUDE_PROJECT_DIR}" --session "${CLAUDE_SESSION_ID}" --run RUN_ID status
+uv --no-cache run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" --host claude --project "${CLAUDE_PROJECT_DIR}" --session "${CLAUDE_SESSION_ID}" --run RUN_ID status
 ```
 
 2. There is no separate resume action to run. Do not invoke another Skill tool: read the workflow reference with Read instead.

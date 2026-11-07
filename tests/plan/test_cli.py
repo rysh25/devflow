@@ -29,7 +29,7 @@ class CliTests(unittest.TestCase):
     def cli(self, *args, stdin=""):
         out, err = io.StringIO(), io.StringIO()
         with patch("sys.stdin", io.StringIO(stdin)), redirect_stdout(out), redirect_stderr(err):
-            result = cli.main(["--project", str(self.project), *args])
+            result = cli.main(["--host", "claude", "--project", str(self.project), *args])
         return result, out.getvalue(), err.getvalue()
 
     def payload(self, session="cli-session", **extra):
@@ -145,7 +145,7 @@ class CliTests(unittest.TestCase):
         # The prompt goes through with a context message; it is never blocked.
         self.assertEqual((code, err), (0, ""))
         self.assertNotAccepted(out, "resume", "original Claude session")
-        self.assertIsNone(sessions.read_record(self.project, "new-session", WORKFLOWS))
+        self.assertIsNone(sessions.read_record(self.project, "new-session", WORKFLOWS, host="claude"))
         code, out, err = self.cli("--session", "cli-session", "plan", "status")
         self.assertEqual(json.loads(out)["owner_session"], "cli-session")
 
@@ -153,12 +153,12 @@ class CliTests(unittest.TestCase):
         result = subprocess.run([sys.executable, "-B", str(SCRIPT), "--project", str(self.project), "plan", "--help"],
                                 cwd=str(self.project), capture_output=True, text=True, encoding="utf-8", timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("usage: devflow plan", result.stdout)
+        self.assertRegex(result.stdout, r"usage: devflow .* plan")
         for action in ("seal", "review", "resolve", "recover"):
             self.assertIn(action, result.stdout)
         self.assertNotIn("resume", result.stdout)
         self.assertEqual(result.stderr, "")
-        result = subprocess.run([sys.executable, "-B", str(SCRIPT), "--project", str(self.project), "plan", "status"],
+        result = subprocess.run([sys.executable, "-B", str(SCRIPT), "--host", "claude", "--project", str(self.project), "plan", "status"],
                                 capture_output=True, text=True, encoding="utf-8", timeout=20)
         self.assertEqual(result.returncode, 2)
         self.assertEqual(json.loads(result.stdout)["error"], "DevFlowError")

@@ -87,6 +87,17 @@ class SnapshotTests(unittest.TestCase):
         self.assertNotIn("こんにちは", json.dumps(first, ensure_ascii=False))
         self.assertIsNone(first["git"])
 
+    def test_local_configuration_is_excluded_in_git_and_files_modes(self):
+        self.init_git()
+        self.write("keep.txt", "keep")
+        self.commit_all()
+        self.write("devflow.config.local.json", "private")
+        self.write("nested/DEVFLOW.CONFIG.LOCAL.JSON", "private")
+        for mode in ("files", "git"):
+            with self.subTest(mode=mode):
+                captured = capture(self.project, {"snapshot": {"mode": mode, "exclude": []}})
+                self.assertEqual(set(captured["files"]), {"keep.txt"})
+
     def test_added_deleted_modified_without_contents(self):
         self.write("modify.txt", "old\n")
         self.write("delete.txt", "deleted")
@@ -249,6 +260,17 @@ class SnapshotTests(unittest.TestCase):
             self.snapshot(context_paths=["missing.py"])
         result = self.snapshot(context_paths=["app.py"])
         self.assertEqual(result["context_paths"], ["app.py"])
+
+    def test_excluded_local_configuration_context_uses_the_standard_scope_error(self):
+        self.init_git()
+        self.write("app.py", "pass\n")
+        self.commit_all()
+        for relative in ("devflow.config.local.json", "nested/DEVFLOW.CONFIG.LOCAL.JSON"):
+            self.write(relative, "{}")
+            for mode in ("git", "files"):
+                with self.subTest(path=relative, mode=mode):
+                    with self.assertRaisesRegex(DevFlowError, "Requested context file is not in the captured scope"):
+                        self.snapshot(mode=mode, context_paths=[relative])
 
     def test_large_files_and_many_files_never_stop_and_hold_no_contents(self):
         self.init_git()

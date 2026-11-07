@@ -155,10 +155,10 @@ class Workflow:
     def load_config(self, project: Path) -> dict:
         raise NotImplementedError
 
-    def doctor(self, project: Path, config: dict) -> dict:
+    def doctor(self, project: Path, config: dict, *, host: str) -> dict:
         return {}
 
-    def engine(self, project: Path, session: str | None = None):
+    def engine(self, project: Path, session: str | None = None, *, host: str):
         raise NotImplementedError
 
     def register_commands(self, parsers: argparse._SubParsersAction) -> None:
@@ -178,7 +178,8 @@ class Workflow:
             for option in self.extra_start_options:
                 start.add_argument(option.flag, dest=option_name(option.flag), required=option.required)
 
-    def run_command(self, args: argparse.Namespace, project: Path, run_id: str | None, session: str | None) -> Any:
+    def run_command(self, args: argparse.Namespace, project: Path, run_id: str | None, session: str | None,
+                    host: str) -> Any:
         command = next(item for item in self.commands if item.name == args.action)
         if command.needs_run and not run_id:
             raise DevFlowError(f"No {self.name} run is bound to this session; use /devflow:{self.name} "
@@ -187,7 +188,7 @@ class Workflow:
         if owned and session is None:
             raise DevFlowError(f"{command.name} changes the run; pass --session with the session that owns it "
                                f"(or move the run to this session with /devflow:resume {run_id})")
-        engine = self.engine(project, session)
+        engine = self.engine(project, session, host=host)
         if owned:
             engine.require_owner(run_id, session)
         return command.run(engine, args, run_id, session)

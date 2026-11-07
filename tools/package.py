@@ -83,7 +83,8 @@ def _collect(root: Path) -> dict[str, bytes]:
                 continue
             if name == ".DS_Store" or name.casefold() == "thumbs.db":
                 continue
-            _require(not name.startswith(".env") and path.suffix.lower() not in {".pem", ".key", ".p12", ".pfx"}, f"Potential secret must not be included in distribution: {relative}")
+            _require(not name.startswith(".env") and name.casefold() != "devflow.config.local.json"
+                     and path.suffix.lower() not in {".pem", ".key", ".p12", ".pfx"}, f"Potential secret must not be included in distribution: {relative}")
             before = _no_link(path)
             _require(stat.S_ISREG(before.st_mode), f"Not a regular package file: {relative}")
             _require(before.st_size <= MAX_BYTES - total, "Package inputs exceed the 64 MiB size limit")
@@ -100,6 +101,8 @@ def _collect(root: Path) -> dict[str, bytes]:
 
 
 def _validate_files(files: dict[str, bytes]) -> dict:
+    _require(not any(Path(path).name.casefold() == "devflow.config.local.json" for path in files),
+             "Potential secret must not be included in distribution: devflow.config.local.json")
     def document(name):
         _require(name in files, f"Missing package file: {name}")
         value = _json(files[name], name)
@@ -147,12 +150,15 @@ def _validate_files(files: dict[str, bytes]) -> dict:
                 _require(matcher.get("matcher") == "AskUserQuestion", f"{event} hook must match only AskUserQuestion")
             for hook in matcher["hooks"]:
                 _require(isinstance(hook, dict) and hook.get("type") == "command" and hook.get("command") == "uv", "Unexpected unified hook command")
-                expected = ["run", "--offline", "--no-project", "--no-config", "--no-python-downloads", "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py", "hook"]
+                expected = ["--no-cache", "run", "--offline", "--no-project", "--no-config", "--no-python-downloads", "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py", "--host", "claude", "hook"]
                 _require(hook.get("args") == expected, f"Hook must use exact portable exec argv: {event}")
                 _require(hook.get("onFailure") != "block", f"Hook must never block on failure: {event}")
     skill_prefix = plugin + "/skills/"
     skills = [path for path in files if path.startswith(skill_prefix) and path.endswith("/SKILL.md")]
-    for required in ("plan", "implement", "resume", "status"):
+    operations = {"plan", "implement", "resume", "status", "doctor"}
+    _require(set(skills) == {skill_prefix + name + "/SKILL.md" for name in operations},
+             "Claude must ship exactly five manual skills")
+    for required in operations:
         _require(skill_prefix + required + "/SKILL.md" in files, f"Missing root skill: {required}")
     for path in skills:
         text = files[path].decode("utf-8")
@@ -164,6 +170,54 @@ def _validate_files(files: dict[str, bytes]) -> dict:
         _require(re.search(r"(?m)^disable-model-invocation:\s*true\s*$", frontmatter), f"Skill must require manual invocation: {path}")
         _require("--python 3.11" not in text, f"Obsolete exact Python pin in {path}")
         _require("${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" in text, f"Skill bypasses unified runner: {path}")
+        _require("--host claude" in text and "uv --no-cache run" in text,
+                 f"Claude skill must use explicit host and cache-free bootstrap: {path}")
+    codex_manifest = document(plugin + "/.codex-plugin/plugin.json")
+    _require(codex_manifest.get("name") == "devflow" and
+             codex_manifest.get("version") == manifests["devflow"]["version"], "Host manifest versions/names differ")
+    _require(codex_manifest.get("skills") == "./codex-skills/" and
+             codex_manifest.get("hooks") == "./hooks/codex.json", "Codex paths must stay inside the plugin")
+    codex_hooks = document(plugin + "/hooks/codex.json").get("hooks")
+    _require(isinstance(codex_hooks, dict) and set(codex_hooks) == set(hooks),
+             "Codex hooks must be exactly UserPromptSubmit, PreToolUse and PostToolUse")
+    expected = ('uv --no-cache run --offline --no-project --no-config --no-python-downloads '
+                '"${PLUGIN_ROOT}/scripts/devflow.py" --host codex hook')
+    for event, matchers in codex_hooks.items():
+        _require(isinstance(matchers, list) and len(matchers) == 1, f"Invalid Codex hook matcher: {event}")
+        matcher = matchers[0]
+        _require(isinstance(matcher, dict), "Invalid Codex hook matcher")
+        _require(matcher.get("matcher") == (None if event == "UserPromptSubmit" else "request_user_input"),
+                 f"Codex {event} must match only the native question tool")
+        commands = matcher.get("hooks")
+        _require(isinstance(commands, list) and len(commands) == 1, "Invalid Codex hook command list")
+        hook = commands[0]
+        _require(isinstance(hook, dict) and hook.get("type") == "command" and hook.get("command") == expected,
+                 "Codex hooks must invoke the bundled runner with explicit --host codex")
+        _require(hook.get("onFailure") != "block", "Codex hooks must never block on failure")
+    codex_prefix = plugin + "/codex-skills/"
+    codex_skills = [path for path in files if path.startswith(codex_prefix) and path.endswith("/SKILL.md")]
+    _require(set(codex_skills) == {codex_prefix + name + "/SKILL.md" for name in operations},
+             "Codex must ship exactly five manual skills")
+    contract_path = plugin + "/references/codex-runner.md"
+    _require(contract_path in files, "Missing shared Codex runner contract")
+    contract = files[contract_path].decode("utf-8")
+    _require("--host codex" in contract and "uv --no-cache run" in contract,
+             "Codex runner contract bypasses the host-aware runner")
+    for path in codex_skills:
+        text = files[path].decode("utf-8")
+        name = Path(path).parent.name
+        _require(text.startswith("---\n") and re.search(rf"(?m)^name:\s*{name}\s*$", text), "Invalid Codex skill metadata")
+        _require("(../../references/codex-runner.md)" in text,
+                 "Codex skill must reference the bundled runner contract")
+        policy = str(Path(path).parent / "agents/openai.yaml").replace("\\", "/")
+        _require(policy in files and files[policy].decode("utf-8").strip() == "policy:\n  allow_implicit_invocation: false",
+                 "Codex skills must disable implicit invocation")
+    catalog = document(".agents/plugins/marketplace.json")
+    _require(catalog.get("name") == marketplace["name"] and isinstance(catalog.get("plugins"), list)
+             and len(catalog["plugins"]) == 1, "Codex marketplace must list the same single plugin")
+    entry = catalog["plugins"][0]
+    _require(isinstance(entry, dict) and entry.get("name") == "devflow" and entry.get("source") ==
+             {"source": "local", "path": "./plugins/devflow"}, "Codex marketplace must point inside the same plugin")
     _validate_package(files)
     for path, data in files.items():
         if path.endswith(".py"):

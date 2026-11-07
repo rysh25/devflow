@@ -78,7 +78,7 @@ class EngineFixture(unittest.TestCase):
             "checks": [{"id": "verify", "argv": [sys.executable, "-c", "print('validation-ok')"], "timeout_seconds": 10, "required": True}],
         }
         self.write_config()
-        self.engine = Engine(self.project)
+        self.engine = Engine(self.project, host="claude")
         self.session = "claude-engine-session"
         self.run_id = None
         self.packets = []
@@ -97,7 +97,7 @@ class EngineFixture(unittest.TestCase):
 
     def hook(self, event, session=None, **fields):
         payload = {"hook_event_name": event, "cwd": str(self.project), "session_id": session or self.session, **fields}
-        return router.handle_hook(payload, PLUGIN_ROOT)
+        return router.handle_hook(payload, PLUGIN_ROOT, host="claude")
 
     def prompt(self, text, session=None):
         """Submit a real prompt; return the event ID it was recorded as (None if not recorded)."""
@@ -125,7 +125,7 @@ class EngineFixture(unittest.TestCase):
     def start(self, session=None):
         identity = session or self.session
         self.prompt(f'/devflow:implement "{self.plan}"', identity)
-        status = router.runner_start(self.project, identity, "implement", str(self.plan))
+        status = router.runner_start(self.project, identity, "implement", str(self.plan), host="claude")
         self.run_id = status["run_id"]
         self.run = Path(status["run_dir"])
         self.draft = Path(status["draft_dir"])
@@ -159,15 +159,16 @@ class EngineFixture(unittest.TestCase):
         self.session = identity
         return self.engine.status(self.run_id)
 
-    def respond(self, config, packet_path, work_dir, schema_path, instructions_path, validate, probe, *, cwd):
-        packet = read_json(packet_path)
+    def respond(self, prepared, validate):
+        config, work_dir, cwd, probe = prepared.config, prepared.work_dir, prepared.cwd, prepared.probe
+        packet = json.loads(prepared.packet)
         self.packets.append(packet)
         self.reviewers.append(copy.deepcopy(config))
         self.assertNotEqual(Path(work_dir).resolve(), self.project)
         # The reviewer starts in the workspace and reads the code itself.
         self.assertEqual(Path(cwd), Path(packet["workspace"]["path"]))
-        self.assertTrue(Path(schema_path).is_file())
-        self.assertTrue(Path(instructions_path).is_file())
+        self.assertTrue(json.loads(prepared.schema))
+        self.assertIn(WORKFLOWS["implement"].resource("reviewer.md").read_text().rstrip(), prepared.prompt.decode("utf-8"))
         self.assertIs(validate, validate_review)
         self.assertEqual(probe, {"available": True, "offline_probe": True})
         review = {"schema_version": 1, "snapshot_id": packet["snapshot_id"], "verdict": self.response_kind,
@@ -250,7 +251,7 @@ class EngineFlowTests(EngineFixture):
         self.prompt(f'/devflow:implement "{self.plan}"')
         with patch("devflow_core.implement.snapshot.capture", side_effect=change_after_capture):
             with self.assertRaisesRegex(DevFlowError, "plan changed during startup"):
-                router.runner_start(self.project, self.session, "implement", str(self.plan))
+                router.runner_start(self.project, self.session, "implement", str(self.plan), host="claude")
         self.assertEqual(self.runs(), [])
         self.reviewer.assert_not_called()
 
@@ -261,7 +262,7 @@ class EngineFlowTests(EngineFixture):
             with self.assertRaisesRegex(DevFlowError, r"Record baseline.json would be .* over the 64 MiB JSON limit; "
                                                       r"it was not saved\. The snapshot scope has 1 files; narrow "
                                                       r"snapshot.include or snapshot.exclude and start again"):
-                router.runner_start(self.project, self.session, "implement", str(self.plan))
+                router.runner_start(self.project, self.session, "implement", str(self.plan), host="claude")
         self.assertEqual(self.runs(), [])  # No run, no creation or scratch directory left.
         self.reviewer.assert_not_called()
 
@@ -283,7 +284,7 @@ class EngineFlowTests(EngineFixture):
             with self.subTest(raw=raw):
                 self.plan.write_bytes(raw)
                 with self.assertRaises(DevFlowError):
-                    router.runner_start(self.project, self.session, "implement", str(self.plan))
+                    router.runner_start(self.project, self.session, "implement", str(self.plan), host="claude")
         self.assertEqual(self.runs(), [])
         self.preflight.assert_not_called()
         self.reviewer.assert_not_called()
@@ -329,18 +330,18 @@ class EngineFlowTests(EngineFixture):
 
     def test_start_requires_real_explicit_intent_and_exact_plan_path(self):
         with self.assertRaisesRegex(DevFlowError, "explicit /devflow:implement"):
-            router.runner_start(self.project, self.session, "implement", str(self.plan))
+            router.runner_start(self.project, self.session, "implement", str(self.plan), host="claude")
         self.prompt(f'/devflow:implement "{self.plan}"')
         other = self.base / "different.md"
         other.write_text("Do something different.\n", encoding="utf-8")
         with self.assertRaisesRegex(DevFlowError, "does not match"):
-            router.runner_start(self.project, self.session, "implement", str(other))
+            router.runner_start(self.project, self.session, "implement", str(other), host="claude")
         with self.assertRaisesRegex(DevFlowError, "explicit /devflow:implement"):
-            router.runner_start(self.project, "another-session", "implement", str(self.plan))
+            router.runner_start(self.project, "another-session", "implement", str(self.plan), host="claude")
         self.assertEqual(self.runs(), [])
         # The same file spelled with a redundant "." component is the same request.
         started = router.runner_start(self.project, self.session, "implement",
-                                      os.path.join(str(self.base), ".", self.plan.name))
+                                      os.path.join(str(self.base), ".", self.plan.name), host="claude")
         self.assertEqual(started["plan_source"], str(self.plan))
         self.reviewer.assert_not_called()
 
@@ -467,6 +468,18 @@ class EngineFlowTests(EngineFixture):
         self.assertEqual(result["review_count"], 1)
         self.assertIsNone(result["inflight"])
 
+    def test_final_prompt_rejected_before_artifacts_and_reservation(self):
+        self.start()
+        self.ready()
+        before = (self.run / "state.json").read_bytes()
+        with patch("devflow_core.common.reviewers.MAX_PACKET_BYTES", 1):
+            with self.assertRaisesRegex(ReviewerError, "byte limit"):
+                self.engine.review(self.run_id, self.session)
+        self.reviewer.assert_not_called()
+        self.assertEqual((self.run / "state.json").read_bytes(), before)
+        self.assertFalse((self.run / "reviews").exists())
+        self.assertFalse((self.run / "review-processes").exists())
+
     def test_preflight_failure_before_dispatch_does_not_consume_attempt(self):
         self.start()
         self.ready()
@@ -521,7 +534,7 @@ class EngineFlowTests(EngineFixture):
                 resumed = self.resume()
                 self.assertEqual(resumed["review_count"], number)
                 self.assertEqual(resumed["status"], "ready_review")
-        self.assertEqual([call.args[0]["kind"] for call in self.reviewer.call_args_list], ["codex", "opencode"] * 3)
+        self.assertEqual([call.args[0].config["kind"] for call in self.reviewer.call_args_list], ["codex", "opencode"] * 3)
         self.assertEqual((result["remaining_reviews"], result["next_reviewer"]), (0, None))
         self.assertEqual(self.review()["status"], "awaiting_human")
         self.assertEqual(self.reviewer.call_count, 6)
@@ -844,7 +857,7 @@ class HumanEvidenceTests(EngineFixture):
         stored = self.state()
         self.assertEqual(result["escalation"]["boundary"], len(stored["event_ids"]))
         # The old session keeps only a stale pointer; its audit trail stays in the run.
-        stale = router.status(self.project, old_session, None)
+        stale = router.status(self.project, old_session, None, host="claude")
         self.assertEqual((stale["status"], stale["owner_matches"]), ("stale", False))
         self.assertIn(old_event, stored["event_ids"])
         self.assertTrue((self.run / "events" / (old_event + ".json")).is_file())
@@ -1013,7 +1026,7 @@ class RecoveryAndIntegrityTests(EngineFixture):
         identity = "another-start-session"
         self.assertNotAccepted(f'/devflow:implement "{self.plan}"', "unfinished", identity)
         with self.assertRaises(DevFlowError):
-            router.runner_start(self.project, identity, "implement", str(self.plan))
+            router.runner_start(self.project, identity, "implement", str(self.plan), host="claude")
         self.assertEqual(self.runs(), [original_id])
         self.assertEqual(self.state()["status"], "implementing")
         self.assertEqual(self.resume()["owner_session"], self.session)
@@ -1051,7 +1064,7 @@ class RecoveryAndIntegrityTests(EngineFixture):
         self.write_config()
         self.prompt(f'/devflow:implement "{self.plan}"')
         with self.assertRaises(DevFlowError):
-            router.runner_start(self.project, self.session, "implement", str(self.plan))
+            router.runner_start(self.project, self.session, "implement", str(self.plan), host="claude")
         self.assertEqual(self.runs(), [])
         self.reviewer.assert_not_called()
 
@@ -1207,7 +1220,7 @@ class RecoveryAndIntegrityTests(EngineFixture):
         lock = self.run / "state.lock"
         content = json_bytes({"token": "old-token", "pid": 999999999, "host": "unreachable-host", "created_at": "2000-01-01T00:00:00+00:00"})
         lock.write_bytes(content)
-        impatient = Engine(self.project, lock_wait=0.2)
+        impatient = Engine(self.project, lock_wait=0.2, host="claude")
         with self.assertRaisesRegex(DevFlowError, "locked"):
             impatient.checkpoint(self.run_id, self.session, self.draft_text("summary.md", "Blocked by a stale lock."))
         self.assertEqual(lock.read_bytes(), content)
@@ -1260,7 +1273,7 @@ class RecoveryAndIntegrityTests(EngineFixture):
         def dispatch(*args, **kwargs):
             recorded.append(in_thread(lambda: self.prompt("A note typed while the reviewer runs.")))
             recorded.append(in_thread(lambda: self.engine.store.append_event(
-                self.run_id, {"session_id": self.session, "hook_event_name": "UserPromptSubmit",
+                self.run_id, {"host": "claude", "session_id": self.session, "hook_event_name": "UserPromptSubmit",
                               "prompt": "A second note."}, "prompt")))
             self.assertEqual(self.state()["status"], "reviewing")
             return self.respond(*args, **kwargs)
@@ -1301,7 +1314,7 @@ class RecoveryAndIntegrityTests(EngineFixture):
             for action in (lambda other: other.review(self.run_id, self.session),
                            lambda other: other.check(self.run_id, self.session)):
                 with self.assertRaisesRegex(DevFlowError, "reviewing") as caught:
-                    in_thread(lambda: action(Engine(self.project)))
+                    in_thread(lambda: action(Engine(self.project, host="claude")))
                 refusals.append(str(caught.exception))
             return self.respond(*args, **kwargs)
 
@@ -1320,7 +1333,7 @@ class RecoveryAndIntegrityTests(EngineFixture):
 
         def during():
             with self.assertRaisesRegex(DevFlowError, "checking") as caught:
-                in_thread(lambda: Engine(self.project).check(self.run_id, self.session))
+                in_thread(lambda: Engine(self.project, host="claude").check(self.run_id, self.session))
             refusals.append(str(caught.exception))
 
         with self.run_checks_with(during):
@@ -1391,7 +1404,7 @@ class RecoveryAndIntegrityTests(EngineFixture):
 
         def recover_meanwhile(*args, **kwargs):
             # A human wrongly recovers while the reviewer is still running.
-            in_thread(lambda: Engine(self.project).recover(self.run_id, confirmed=True))
+            in_thread(lambda: Engine(self.project, host="claude").recover(self.run_id, confirmed=True))
             frozen["state"] = (self.run / "state.json").read_bytes()
             return self.respond(*args, **kwargs)
 
@@ -1406,8 +1419,8 @@ class RecoveryAndIntegrityTests(EngineFixture):
         self.resume()
 
         def recover_and_cancel_meanwhile(*args, **kwargs):
-            in_thread(lambda: Engine(self.project).recover(self.run_id, confirmed=True))
-            in_thread(lambda: Engine(self.project).cancel(self.run_id, self.session, "Stop this run."))
+            in_thread(lambda: Engine(self.project, host="claude").recover(self.run_id, confirmed=True))
+            in_thread(lambda: Engine(self.project, host="claude").cancel(self.run_id, self.session, "Stop this run."))
             frozen["state"] = (self.run / "state.json").read_bytes()
             raise DevFlowError("Reviewer failed after the run was cancelled")
 
@@ -1425,8 +1438,8 @@ class RecoveryAndIntegrityTests(EngineFixture):
         frozen = {}
 
         def recover_and_cancel_meanwhile():
-            in_thread(lambda: Engine(self.project).recover(self.run_id, confirmed=True))
-            in_thread(lambda: Engine(self.project).cancel(self.run_id, self.session, "Stop this run."))
+            in_thread(lambda: Engine(self.project, host="claude").recover(self.run_id, confirmed=True))
+            in_thread(lambda: Engine(self.project, host="claude").cancel(self.run_id, self.session, "Stop this run."))
             frozen["state"] = (self.run / "state.json").read_bytes()
 
         with self.run_checks_with(recover_and_cancel_meanwhile):
@@ -1444,7 +1457,7 @@ class RecoveryAndIntegrityTests(EngineFixture):
         frozen = {}
 
         def recover_then_fail():
-            in_thread(lambda: Engine(self.project).recover(self.run_id, confirmed=True))
+            in_thread(lambda: Engine(self.project, host="claude").recover(self.run_id, confirmed=True))
             frozen["state"] = (self.run / "state.json").read_bytes()
             raise DevFlowError("Check process could not be launched")
 
@@ -1570,13 +1583,14 @@ class SummaryAndAcceptanceTests(EngineFixture):
 
     def with_output(self, lines, error=None):
         """The reviewer CLI printed ``lines``; ``error`` fails the attempt after that."""
-        def reviewer(config, packet_path, work_dir, *args, **kwargs):
+        def reviewer(prepared, validate):
+            work_dir = prepared.work_dir
             Path(work_dir).mkdir(parents=True, exist_ok=True)
             (Path(work_dir) / "invocation.json").write_text(json.dumps({"cli_version": "codex-cli 9.9.9"}), encoding="utf-8")
             (Path(work_dir) / "stdout.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
             if error is not None:
                 raise error
-            return self.respond(config, packet_path, work_dir, *args, **kwargs)
+            return self.respond(prepared, validate)
         self.reviewer.side_effect = reviewer
 
     def test_accepting_ends_as_accepted_with_the_verified_checkpoint(self):
@@ -1732,11 +1746,12 @@ class SummaryAndAcceptanceTests(EngineFixture):
         self.start()
         self.ready()
         deep = "[" * 100000 + "]" * 100000
-        def reviewer(config, packet_path, work_dir, *args, **kwargs):
+        def reviewer(prepared, validate):
+            work_dir = prepared.work_dir
             Path(work_dir).mkdir(parents=True, exist_ok=True)
             (Path(work_dir) / "invocation.json").write_text(deep, encoding="utf-8")
             (Path(work_dir) / "stdout.jsonl").write_text(deep + "\n", encoding="utf-8")
-            return self.respond(config, packet_path, work_dir, *args, **kwargs)
+            return self.respond(prepared, validate)
         self.reviewer.side_effect = reviewer
         reviewed = self.review()
         self.assertIsNone(reviewed["attempts"][0]["tokens"])
@@ -1749,12 +1764,13 @@ class SummaryAndAcceptanceTests(EngineFixture):
     def test_cancelling_with_metadata_a_record_cannot_hold_still_ends_the_run(self):
         self.start()
         self.ready()
-        def reviewer(config, packet_path, work_dir, *args, **kwargs):
+        def reviewer(prepared, validate):
+            work_dir = prepared.work_dir
             Path(work_dir).mkdir(parents=True, exist_ok=True)
             (Path(work_dir) / "invocation.json").write_text(json.dumps({"cli_version": "codex \ud800"}), encoding="utf-8")
             (Path(work_dir) / "stdout.jsonl").write_text(json.dumps(
                 {"type": "turn.completed", "usage": {"\ud800": 1}}) + "\n", encoding="utf-8")
-            return self.respond(config, packet_path, work_dir, *args, **kwargs)
+            return self.respond(prepared, validate)
         self.reviewer.side_effect = reviewer
         self.assertIsNone(self.review()["attempts"][0]["tokens"])
         cancelled = self.engine.cancel(self.run_id, self.session, "Stopping.")
@@ -1813,8 +1829,8 @@ class UnwritableReviewerTextTests(EngineFixture):
                 json.dumps(self.engine.status(self.run_id), ensure_ascii=False).encode("utf-8")  # runner output
                 self.resume()
         # A successful review whose activity names cannot be held counts them as unnamed.
-        def with_unwritable_names(config, packet_path, *args, **kwargs):
-            return {**self.respond(config, packet_path, *args, **kwargs), "activity": unwritable_activity()}
+        def with_unwritable_names(prepared, validate):
+            return {**self.respond(prepared, validate), "activity": unwritable_activity()}
         self.reviewer.side_effect = with_unwritable_names
         reviewed = self.review()
         self.assertEqual(reviewed["attempts"][4]["activity"]["tool_calls"], {"(unnamed)": 1})

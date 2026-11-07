@@ -2,7 +2,7 @@
 name: doctor
 description: Check DevFlow prerequisites and project settings offline without invoking a model, installing tools, or changing the project.
 disable-model-invocation: true
-allowed-tools: Bash(uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *) PowerShell(uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *)
+allowed-tools: Bash(uv --no-cache run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *) PowerShell(uv --no-cache run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *)
 ---
 
 # DevFlow diagnostics
@@ -10,7 +10,7 @@ allowed-tools: Bash(uv run --offline --no-project --no-config --no-python-downlo
 Run:
 
 ```text
-uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" --project "${CLAUDE_PROJECT_DIR}" --session "${CLAUDE_SESSION_ID}" doctor
+uv --no-cache run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" --host claude --project "${CLAUDE_PROJECT_DIR}" --session "${CLAUDE_SESSION_ID}" doctor
 ```
 
 Explain missing executables, invalid settings, reviewer CLIs that lack a flag DevFlow passes, and missing checks. A warning that Claude Code or a reviewer CLI is newer than the version DevFlow was checked with stops nothing; point to the version check in DevFlow's docs/validation.md. Inspect `workflows.plan.interview_skill` separately from `workflows.implement`: Plan needs the configured model-invocable interview skill (default `grilling`); Implement does not. Explain blocked, missing, ambiguous, invalid, and unverified results using the reported locations and reason. Do not equate a file's existence with permission to invoke it, or an unverified plugin skill with a known-missing skill. Static readiness never proves that the Skill tool can run successfully.

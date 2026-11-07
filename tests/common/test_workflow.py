@@ -4,7 +4,7 @@ import inspect
 import unittest
 
 from devflow_core import cli
-from devflow_core.common.errors import DevFlowError
+from devflow_core.common.errors import DevFlowError, UsageError
 from devflow_core.common.workflow import OPTION_KINDS, Option
 from devflow_core.workflows import WORKFLOWS
 
@@ -50,7 +50,7 @@ class OwnerTests(unittest.TestCase):
                     # Without --session, a change never runs (the owner is checked before the action).
                     args = argparse.Namespace(action=command.name)
                     with self.assertRaisesRegex(DevFlowError, "pass --session"):
-                        workflow.run_command(args, None, "20260101T000000Z-000000000000", None)
+                        workflow.run_command(args, None, "20260101T000000Z-000000000000", None, host="claude")
 
 
 class StartContractTests(unittest.TestCase):
@@ -63,14 +63,14 @@ class StartContractTests(unittest.TestCase):
     def test_start_options_come_only_from_the_declared_extra_options(self):
         parser = cli.parser()
         implement = WORKFLOWS["implement"]
-        args = parser.parse_args(["implement", "start", "--plan", "plan.md", "--workspace", "../worktree"])
+        args = parser.parse_args(["--host", "claude", "implement", "start", "--plan", "plan.md", "--workspace", "../worktree"])
         self.assertEqual(implement.start_options(args), {"workspace": "../worktree"})
-        args = parser.parse_args(["implement", "start", "--plan", "plan.md"])
+        args = parser.parse_args(["--host", "claude", "implement", "start", "--plan", "plan.md"])
         self.assertEqual(implement.start_options(args), {"workspace": None})
         # Plan declares no extra start option: nothing is read from args (not even workspace).
         self.assertEqual(WORKFLOWS["plan"].start_options(argparse.Namespace()), {})
-        with self.assertRaises(cli.UsageError):
-            parser.parse_args(["implement", "start", "--plan", "plan.md", "--unknown", "x"])
+        with self.assertRaises(UsageError):
+            parser.parse_args(["--host", "claude", "implement", "start", "--plan", "plan.md", "--unknown", "x"])
 
 
 if __name__ == "__main__":

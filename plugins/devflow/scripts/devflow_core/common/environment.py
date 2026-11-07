@@ -34,7 +34,7 @@ def review_timeout_ms(reviewer_seconds: int) -> int:
 #: The versions DevFlow was last checked with (docs/validation.md). A newer one is
 #: reported by doctor as a warning, never refused. A reviewer kind without an entry
 #: (a CLI added later) gets no warning.
-CHECKED_VERSIONS = {"claude": ("Claude Code", "2.1.317"), "codex": ("Codex", "0.166.0"),
+CHECKED_VERSIONS = {"claude": ("Claude Code", "2.1.319"), "codex": ("Codex", "0.166.0"),
                     "opencode": ("OpenCode", "2.2.5")}
 
 

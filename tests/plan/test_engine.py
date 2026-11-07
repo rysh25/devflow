@@ -102,7 +102,7 @@ class EngineTests(unittest.TestCase):
         (self.project / ".git").mkdir()
         self.transcript = self.project / "claude-transcript.jsonl"
         self.session = "claude-test-session-1"
-        self.engine = Engine(self.project)
+        self.engine = Engine(self.project, host="claude")
         self.run_id = None
         # The reviewer CLI check happens before every reservation; it is a
         # local process probe, so tests replace it with a successful result.
@@ -112,7 +112,7 @@ class EngineTests(unittest.TestCase):
 
     # -- hooks and runner -----------------------------------------------------------------
     def event(self, name="UserPromptSubmit", session=None, **extra):
-        return {"hook_event_name": name, "cwd": str(self.project), "session_id": session or self.session,
+        return {"host": "claude", "hook_event_name": name, "cwd": str(self.project), "session_id": session or self.session,
                 "transcript_path": str(self.transcript), **extra}
 
     def question(self, response, tool_use_id="question-1", session=None, **extra):
@@ -120,7 +120,7 @@ class EngineTests(unittest.TestCase):
                           tool_input={"questions": [{"question": "Scope?"}]}, tool_response=response, **extra)
 
     def hook(self, payload):
-        return router.handle_hook(payload, PLUGIN_ROOT)
+        return router.handle_hook(payload, PLUGIN_ROOT, host="claude")
 
     def ask(self, payload):
         """The PreToolUse call before an AskUserQuestion result: the question as
@@ -162,13 +162,13 @@ class EngineTests(unittest.TestCase):
         return self.engine.status(self.run_id)
 
     def bound_run(self, session=None):
-        record = sessions.read_record(self.project, session or self.session, WORKFLOWS)
+        record = sessions.read_record(self.project, session or self.session, WORKFLOWS, host="claude")
         return record["run"]["run_id"] if record and record["run"] else None
 
     def runner(self, *args):
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
-            code = cli.main(["--project", str(self.project), *args])
+            code = cli.main(["--host", "claude", "--project", str(self.project), *args])
         return code, json.loads(out.getvalue())
 
     def resolve(self, answer_file, session=None):
@@ -206,7 +206,7 @@ class EngineTests(unittest.TestCase):
         self.raw_request = request or "/devflow:plan 実装せず、移行計画を作る。\nKeep exact wording."
         result = self.hook(self.event(prompt=self.raw_request))
         self.assertNotIn("did not accept", result["hookSpecificOutput"]["additionalContext"])
-        self.run_id = router.status(self.project, self.session, None)["run"]["run_id"]
+        self.run_id = router.status(self.project, self.session, None, host="claude")["run"]["run_id"]
         self.assertEqual(self.bound_run(), self.run_id)
         self.run = Path(self.engine.status(self.run_id)["run_dir"])
         self.draft_dir = self.run / "draft"
@@ -242,7 +242,8 @@ class EngineTests(unittest.TestCase):
 
     def submit(self, value):
         # Like the real run_review, return only what the workflow's validator accepts.
-        def reviewer(provider, packet, work_dir, schema, instructions, validate, probe, *, cwd):
+        def reviewer(prepared, validate):
+            work_dir, cwd, probe = prepared.work_dir, prepared.cwd, prepared.probe
             return adapter_result(validate(value))
         with patch(RUN_REVIEW, side_effect=reviewer) as call:
             result = self.engine.review(self.run_id)
@@ -272,7 +273,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(second["plan_hash"], initial["plan_hash"])
         self.assertTrue(second["final_plan_reviewed"])
         self.assertIsNone(second["inflight"])
-        self.assertEqual([c.args[0]["id"] for c in call.call_args_list], ["codex", "opencode"])
+        self.assertEqual([c.args[0].config["id"] for c in call.call_args_list], ["codex", "opencode"])
         self.assertTrue(self.engine.report(self.run_id)["converged"])
         self.assertTrue((self.run / "reviews" / "01" / "reflection.json").is_file())
 
@@ -280,8 +281,9 @@ class EngineTests(unittest.TestCase):
         self.append("user", "PREVIOUS SESSION SECRET")
         initial = self.ready()
         captured = {}
-        def reviewer(provider, packet, work_dir, schema, instructions, validate, probe, *, cwd):
-            captured["packet"] = packet.read_text(encoding="utf-8")
+        def reviewer(prepared, validate):
+            work_dir, cwd, probe = prepared.work_dir, prepared.cwd, prepared.probe
+            captured["packet"] = prepared.packet.decode("utf-8")
             captured["work_dir"] = work_dir
             captured["cwd"] = cwd
             return adapter_result(review_value())
@@ -318,8 +320,9 @@ class EngineTests(unittest.TestCase):
         self.reflect(first)
         captured = {}
 
-        def reviewer(provider, packet, work_dir, schema, instructions, validate, probe, *, cwd):
-            captured["packet"] = json.loads(packet.read_text(encoding="utf-8"))
+        def reviewer(prepared, validate):
+            work_dir, cwd, probe = prepared.work_dir, prepared.cwd, prepared.probe
+            captured["packet"] = json.loads(prepared.packet.decode("utf-8"))
             return adapter_result(review_value())
         with patch(RUN_REVIEW, side_effect=reviewer):
             self.engine.review(self.run_id)
@@ -333,17 +336,18 @@ class EngineTests(unittest.TestCase):
     def test_packet_is_review_data_without_reviewer_instructions(self):
         self.ready()
         captured = {}
-        def reviewer(provider, packet, work_dir, schema, instructions, validate, probe, *, cwd):
-            captured.update(packet=packet.read_text(encoding="utf-8"), schema=schema,
-                            instructions=instructions, validate=validate, probe=probe)
+        def reviewer(prepared, validate):
+            work_dir, cwd, probe = prepared.work_dir, prepared.cwd, prepared.probe
+            captured.update(packet=prepared.packet.decode("utf-8"), prompt=prepared.prompt.decode("utf-8"),
+                            schema=prepared.schema, validate=validate, probe=probe)
             return adapter_result(review_value())
         with patch(RUN_REVIEW, side_effect=reviewer):
             self.engine.review(self.run_id)
         packet = captured["packet"]
         # The packet is review data only; common.reviewers adds the instructions once.
         self.assertIsInstance(json.loads(packet), dict)
-        self.assertEqual(captured["instructions"], RESOURCES / "reviewer.md")
-        self.assertEqual(captured["schema"], RESOURCES / "review.schema.json")
+        self.assertEqual(captured["schema"], (RESOURCES / "review.schema.json").read_bytes())
+        self.assertIn((RESOURCES / "reviewer.md").read_text(encoding="utf-8").rstrip(), captured["prompt"])
         instructions = (RESOURCES / "reviewer.md").read_text(encoding="utf-8")
         lines = [line.strip() for line in instructions.splitlines() if len(line.strip()) >= 30]
         self.assertTrue(lines)
@@ -356,7 +360,8 @@ class EngineTests(unittest.TestCase):
     def test_alternation_six_changed_last_revision_stops_unreviewed(self):
         self.ready()
         seen = []
-        def reviewer(provider, *args, **kwargs):
+        def reviewer(prepared, validate):
+            provider = prepared.config
             seen.append(provider["id"])
             return adapter_result(review_value("changes_required"))
         with patch(RUN_REVIEW, side_effect=reviewer) as call:
@@ -428,7 +433,7 @@ class EngineTests(unittest.TestCase):
             self.engine.require_owner(self.run_id, self.session)
         with patch(RUN_REVIEW, return_value=adapter_result(review_value())) as call:
             next_state = self.engine.review(self.run_id)
-        self.assertEqual(call.call_args.args[0]["id"], "opencode")
+        self.assertEqual(call.call_args.args[0].config["id"], "opencode")
         self.assertEqual(next_state["review_count"], 2)
         self.assertEqual(next_state["status"], "ready")
 
@@ -446,13 +451,13 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(final["status"], "completed")
         self.assertEqual(final["review_count"], 4)
         self.assertEqual(final["plan_hash"], initial["plan_hash"])
-        self.assertEqual([c.args[0]["id"] for c in call.call_args_list], ["codex", "opencode", "codex", "opencode"])
+        self.assertEqual([c.args[0].config["id"] for c in call.call_args_list], ["codex", "opencode", "codex", "opencode"])
         for number in ("02", "03"):
             self.assertTrue((self.run / "reviews" / number / "error.json").is_file(), number)
 
     def test_ownership_moving_during_preflight_stops_the_old_owner_from_reviewing(self):
         self.ready()
-        caller = Engine(self.project, session=self.session)
+        caller = Engine(self.project, session=self.session, host="claude")
 
         def move_ownership(provider):
             self.resume("session-that-took-over")
@@ -481,8 +486,19 @@ class EngineTests(unittest.TestCase):
         self.assertIsNone(after["inflight"])
         with patch(RUN_REVIEW, return_value=adapter_result(review_value())) as call:
             reviewed = self.engine.review(self.run_id)
-        self.assertEqual(call.call_args.args[0]["id"], "codex")
+        self.assertEqual(call.call_args.args[0].config["id"], "codex")
         self.assertEqual(reviewed["review_count"], 1)
+
+    def test_final_prompt_rejected_before_artifacts_and_reservation(self):
+        self.ready()
+        before = (self.run / "state.json").read_bytes()
+        with patch("devflow_core.common.reviewers.MAX_PACKET_BYTES", 1), patch(RUN_REVIEW) as call:
+            with self.assertRaisesRegex(ReviewerError, "byte limit"):
+                self.engine.review(self.run_id)
+        call.assert_not_called()
+        self.assertEqual((self.run / "state.json").read_bytes(), before)
+        self.assertFalse((self.run / "reviews").exists())
+        self.assertFalse((self.run / "review-processes").exists())
 
     def test_invalid_semantic_review_is_a_consumed_failure(self):
         self.ready()
@@ -596,7 +612,8 @@ class EngineTests(unittest.TestCase):
         answer = read_json(self.run / f"escalations/{asked['escalation']['id']}-answer.json")
         self.assertEqual(answer["decision"], "continue")
         seen = []
-        def reviewer(provider, *args, **kwargs):
+        def reviewer(prepared, validate):
+            provider = prepared.config
             seen.append(provider["id"])
             return adapter_result(review_value())
         with patch(RUN_REVIEW, side_effect=reviewer):
@@ -609,7 +626,8 @@ class EngineTests(unittest.TestCase):
         self.reach_limit_with_opencode_approving()
         self.at_limit("continue")
         seen = []
-        def reviewer(provider, *args, **kwargs):
+        def reviewer(prepared, validate):
+            provider = prepared.config
             seen.append(provider["id"])
             return adapter_result(review_value("changes_required" if len(seen) == 1 else "pass"))
         with patch(RUN_REVIEW, side_effect=reviewer):
@@ -751,7 +769,7 @@ class EngineTests(unittest.TestCase):
         state = self.engine.status(self.run_id)
         self.assertIsNone(state["escalation"])
         self.assertEqual(state["human_events"], [])
-        self.assertEqual(router.status(self.project, None, self.run_id)["human_events"], [])
+        self.assertEqual(router.status(self.project, None, self.run_id, host="claude")["human_events"], [])
 
     def test_resolve_requires_the_owning_session(self):
         self.ready()
@@ -939,7 +957,7 @@ class EngineTests(unittest.TestCase):
     def test_state_lock_fails_safely_without_dispatch(self):
         self.ready()
         lock = self.run / "state.lock"
-        engine = Engine(self.project, lock_wait=0.05)  # Do not wait for the runner's full lock timeout.
+        engine = Engine(self.project, lock_wait=0.05, host="claude")  # Do not wait for the runner's full lock timeout.
         with file_lock(lock), patch(RUN_REVIEW) as call:
             with self.assertRaisesRegex(DevFlowError, "locked"):
                 engine.review(self.run_id)
@@ -1019,7 +1037,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.bound_run(), self.run_id)
         self.assertIsNone(self.hook(self.event(prompt="Now I have a separate request.")))
         self.assertIsNone(self.bound_run())
-        self.assertEqual(router.status(self.project, self.session, None)["status"], "idle")
+        self.assertEqual(router.status(self.project, self.session, None, host="claude")["status"], "idle")
         # The prompt that released the finished run is not recorded in it.
         self.assertEqual(read_json(self.run / "state.json")["event_ids"], events_before)
         self.assertIsNone(self.hook(write))
@@ -1204,7 +1222,7 @@ class EngineTests(unittest.TestCase):
         approval = target.with_name("REVIEW-10.approval.md")
         before, before_approval = target.read_bytes(), approval.read_bytes()
         self.assertEqual(self.engine.status(self.run_id)["publication"]["status"], "publishing")
-        recovered = Engine(self.project).publish(self.run_id)
+        recovered = Engine(self.project, host="claude").publish(self.run_id)
         self.assertEqual((recovered["publication"]["path"], recovered["publication"]["approval_path"]),
                          ("docs/plans/REVIEW-10.md", "docs/plans/REVIEW-10.approval.md"))
         # The resumed publication writes the same bytes: the approval record was made once, with the intent.
@@ -1487,7 +1505,8 @@ class EngineTests(unittest.TestCase):
         self.ready()
         newer_state = {}
         calls = []
-        def reviewer(provider, *args, **kwargs):
+        def reviewer(prepared, validate):
+            provider = prepared.config
             calls.append(provider["id"])
             if len(calls) == 2:
                 # A separate newer dispatch is now durably reserved. It remains
@@ -1546,7 +1565,8 @@ class EngineTests(unittest.TestCase):
     def test_stale_success_after_recover_is_kept_late_without_changing_state(self):
         self.ready()
         after_recover = {}
-        def reviewer(provider, *args, **kwargs):
+        def reviewer(prepared, validate):
+            provider = prepared.config
             # A human confirmed the process stopped, but its result still arrives.
             self.engine.recover(self.run_id, confirmed=True, expected_review=1)
             after_recover.update(read_json(self.run / "state.json"))
@@ -1589,7 +1609,8 @@ class EngineTests(unittest.TestCase):
     # -- 0.7.0: review summary, acceptance at the limit, approval records ----------------------
     def submit_with_output(self, value, *, lines=(), error=None, raw=""):
         """A review whose CLI printed ``lines`` (then ``raw`` text) to its stdout log; ``error`` fails the attempt."""
-        def reviewer(provider, packet, work_dir, schema, instructions, validate, probe, *, cwd):
+        def reviewer(prepared, validate):
+            work_dir, cwd, probe = prepared.work_dir, prepared.cwd, prepared.probe
             work_dir.mkdir(parents=True, exist_ok=True)
             (work_dir / "invocation.json").write_text(json.dumps({"cli_version": "codex-cli 9.9.9"}), encoding="utf-8")
             (work_dir / "stdout.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines) + raw,
@@ -1632,7 +1653,8 @@ class EngineTests(unittest.TestCase):
 
     def test_a_recovered_review_keeps_its_time_and_tokens(self):
         self.ready()
-        def interrupted(provider, packet, work_dir, *args, **kwargs):
+        def interrupted(prepared, validate):
+            work_dir = prepared.work_dir
             work_dir.mkdir(parents=True, exist_ok=True)
             (work_dir / "stdout.jsonl").write_text(json.dumps(
                 {"type": "turn.completed", "usage": {"input_tokens": 7}}) + "\n", encoding="utf-8")
@@ -1916,7 +1938,8 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(finished["status"], "awaiting_revision")
         self.assertEqual(read_json(self.run / "reviews" / "01" / "review.json")["tokens"], {"input_tokens": 3})
         self.reflect(finished)
-        def interrupted(provider, packet, work_dir, *args, **kwargs):
+        def interrupted(prepared, validate):
+            work_dir = prepared.work_dir
             work_dir.mkdir(parents=True, exist_ok=True)
             (work_dir / "stdout.jsonl").write_text(deep, encoding="utf-8")
             (work_dir / "invocation.json").write_text(deep, encoding="utf-8")
@@ -1950,7 +1973,8 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(finished["status"], "awaiting_revision")
         self.assertEqual(read_json(self.run / "reviews" / "01" / "review.json")["tokens"], {"input_tokens": 2})
         self.reflect(finished)
-        def interrupted(provider, packet, work_dir, *args, **kwargs):
+        def interrupted(prepared, validate):
+            work_dir = prepared.work_dir
             work_dir.mkdir(parents=True, exist_ok=True)
             (work_dir / "stdout.jsonl").write_text(json.dumps({"type": "step_finish", "part": {"tokens": {"\ud800": 1}}}),
                                                    encoding="utf-8")
@@ -1972,7 +1996,8 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(finished["status"], "awaiting_revision")
         self.assertIsNone(read_json(self.run / "reviews" / "01" / "review.json")["tokens"])
         self.reflect(finished)
-        def interrupted(provider, packet, work_dir, *args, **kwargs):
+        def interrupted(prepared, validate):
+            work_dir = prepared.work_dir
             work_dir.mkdir(parents=True, exist_ok=True)
             (work_dir / "stdout.jsonl").write_text(huge, encoding="utf-8")
             raise KeyboardInterrupt

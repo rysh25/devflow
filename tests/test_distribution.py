@@ -66,11 +66,11 @@ class DistributionTests(unittest.TestCase):
     def test_static_validate_current_bundle(self):
         result = package.validate(ROOT)
         self.assertEqual(result["marketplace"], "devflow-marketplace")
-        self.assertEqual(result["plugins"], {"devflow": "0.7.3"})
+        self.assertEqual(result["plugins"], {"devflow": "0.8.0"})
 
     def test_release_versions_are_consistent(self):
         manifest = json.loads((ROOT / "plugins/devflow/.claude-plugin/plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.7.3")
+        self.assertEqual(manifest["version"], "0.8.0")
         package = ROOT / "plugins/devflow/scripts/devflow_core"
         defining = []
         for source in sorted(package.rglob("*.py")):
@@ -107,7 +107,9 @@ class DistributionTests(unittest.TestCase):
     def test_user_documents_only_describe_current_single_plugin(self):
         paths = [ROOT / "README.md"] + sorted((ROOT / "docs").rglob("*.md")) + sorted((ROOT / "examples").rglob("*.md"))
         old_names = ("plan" + "flow", "build" + "flow")
-        obsolete = ("旧版", "移行手順", "grill-me", *old_names)
+        # Upgrade instructions are required for 0.8.0's host/record changes;
+        # the generic term must not be confused with the removed plugins.
+        obsolete = ("旧版", "grill-me", *old_names)
         for path in paths:
             text = path.read_text(encoding="utf-8").casefold()
             for phrase in obsolete:
@@ -241,6 +243,10 @@ class DistributionTests(unittest.TestCase):
         allowed = {("README.md", "## 0.4.0 への更新"): {"protocol_version"},
                    ("docs/security.md", "## 秘密を守りたいとき"): {"拒否"},
                    ("docs/validation.md", "## 実際の CLI で確かめたこと"): {"read-only", "読み取り専用"},
+                   # Native CLI observations, not new reviewer restrictions.
+                   ("docs/codex-host-validation.md", "## 配布・フック・5操作"): {"読み取り専用"},
+                   ("docs/codex-host-validation.md", "## サンドボックスとランナー起動"): {"--sandbox", "読み取り専用", "拒否"},
+                   ("docs/validation.md", "## 0.8.0 実装の検証（2026-11-07）"): {"拒否"},
                    ("tools/package.py", None): {"onfailure"}}
         names, texts = removed_patterns(JAPANESE_WORDING)
         paths = [ROOT / "README.md", *(ROOT / "docs").glob("*.md"), *(ROOT / "examples").iterdir(),
@@ -300,6 +306,19 @@ class DistributionTests(unittest.TestCase):
         with self.assertRaisesRegex(package.PackagingError, "symlink/reparse"):
             package.validate(cloned)
 
+    def test_local_configuration_file_is_never_packaged(self):
+        files = package._collect(ROOT)
+        files["nested/devflow.config.local.json"] = b"{}"
+        with self.assertRaisesRegex(package.PackagingError, "Potential secret"):
+            package._validate_files(files)
+        cloned = self.clone()
+        local = cloned / "nested" / "DEVFLOW.CONFIG.LOCAL.JSON"
+        local.parent.mkdir()
+        local.write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(package.PackagingError, "Potential secret"):
+            package.build(cloned, self.base / "private.zip")
+        self.assertFalse((self.base / "private.zip").exists())
+
     def test_extracted_plugin_runs_without_repository_shared(self):
         archive_path = package.build(ROOT, self.base / "release.zip")
         extracted = self.base / "extracted"
@@ -307,14 +326,14 @@ class DistributionTests(unittest.TestCase):
             # All paths were generated and checked in this test, not untrusted ZIP input.
             archive.extractall(extracted)
         release = extracted / "devflow"
-        self.assertEqual(package.validate(release)["version"], "0.7.3")
+        self.assertEqual(package.validate(release)["version"], "0.8.0")
         independent = self.base / "devflow-only"
         shutil.copytree(release / "plugins" / "devflow", independent)
         self.assertFalse((independent / "shared").exists())
         result = subprocess.run([sys.executable, "-B", str(independent / "scripts" / "devflow.py"), "--version"],
             cwd=self.base, capture_output=True, encoding="utf-8", timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("0.7.3", result.stdout)
+        self.assertIn("0.8.0", result.stdout)
         for flow in ("plan", "implement"):
             with self.subTest(flow=flow):
                 result = subprocess.run([sys.executable, "-B", str(independent / "scripts" / "devflow.py"), flow, "--help"],
@@ -325,7 +344,7 @@ class DistributionTests(unittest.TestCase):
         for command in ("status", "doctor"):
             with self.subTest(command=command):
                 result = subprocess.run([sys.executable, "-B", str(independent / "scripts" / "devflow.py"),
-                                         "--project", str(project), command],
+                                         "--host", "claude", "--project", str(project), command],
                     cwd=self.base, capture_output=True, encoding="utf-8", timeout=60)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(json.loads(result.stdout)["plugin"], "devflow")

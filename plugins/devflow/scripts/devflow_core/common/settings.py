@@ -9,39 +9,72 @@ from .errors import DevFlowError
 from .storage import no_symlinks, read_json
 
 
-REVIEWER_KINDS = frozenset({"codex", "opencode"})
+REVIEWER_KINDS = frozenset({"codex", "opencode", "claude"})
 REVIEWER_FIELDS = frozenset({"id", "kind", "command", "model", "effort", "timeout_seconds"})
 REVIEWER_REQUIRED = REVIEWER_FIELDS
+CONFIG_FILES = ("devflow.config.json", "devflow.config.local.json")
 
 
-def _document(project: Path) -> dict:
-    path = Path(project) / "devflow.config.json"
-    no_symlinks(path)
-    if not path.exists():
-        return {}
-    document = read_json(path)
-    version = document.get("schema_version", 1)
-    if type(version) is not int or version != 1:
-        raise DevFlowError("Unsupported devflow.config.json schema_version; expected 1")
-    return document
+def _documents(project: Path):
+    for name in CONFIG_FILES:
+        path = Path(project) / name
+        try:
+            no_symlinks(path)
+            if not path.exists():
+                continue
+            document = read_json(path)
+            version = document.get("schema_version", 1)
+            if type(version) is not int or version != 1:
+                raise DevFlowError("Unsupported schema_version; expected 1")
+        except DevFlowError as exc:
+            raise DevFlowError(f"{name}: {exc}") from exc
+        yield name, document
 
 
 def validate_document(project: Path, workflows) -> None:
     """Reject unknown top-level keys; the caller passes the registered workflow names."""
-    document = _document(project)
     allowed = {"schema_version", "reviewers", "max_reviews", *workflows}
-    if set(document) - allowed:
-        raise DevFlowError("Unknown devflow.config.json keys: " + ", ".join(sorted(set(document) - allowed)))
+    for name, document in _documents(project):
+        if set(document) - allowed:
+            raise DevFlowError(f"Unknown {name} keys: " + ", ".join(sorted(set(document) - allowed)))
+        for workflow in workflows:
+            if workflow in document and not isinstance(document[workflow], dict):
+                raise DevFlowError(f"{name} {workflow} must contain an object")
 
 
-def workflow_overlay(project: Path, workflow: str) -> dict:
-    """Only the requested workflow's section plus the shared reviewer policy."""
-    document = _document(project)
+def _layers(name: str, document: dict, workflow: str):
     if workflow in document and not isinstance(document[workflow], dict):
-        raise DevFlowError("devflow.config.json " + workflow + " must contain an object")
-    result = {name: copy.deepcopy(document[name]) for name in ("reviewers", "max_reviews") if name in document}
-    result.update(copy.deepcopy(document.get(workflow, {})))
-    return result
+        raise DevFlowError(f"{name} {workflow} must contain an object")
+    return ({key: document[key] for key in ("reviewers", "max_reviews") if key in document},
+            document.get(workflow, {}))
+
+
+def _merge(value: dict, overlay: dict) -> dict:
+    value = copy.deepcopy(value)
+    for key, item in overlay.items():
+        # Only these public objects merge by member; arrays always replace.
+        if key in {"publish", "snapshot"} and isinstance(item, dict) and isinstance(value.get(key), dict):
+            value[key].update(copy.deepcopy(item))
+        else:
+            value[key] = copy.deepcopy(item)
+    return value
+
+
+def load_workflow_config(project: Path, workflow, validate) -> dict:
+    """Resolve both files without allowing a later file to hide an invalid one."""
+    defaults = read_json(workflow.resource("defaults.json"))
+    result = defaults
+    for name, document in _documents(project):
+        try:
+            standalone = defaults
+            for layer in _layers(name, document, workflow.name):
+                standalone = _merge(standalone, layer)
+                validate(standalone)
+                result = _merge(result, layer)
+            validate(result)
+        except DevFlowError as exc:
+            raise DevFlowError(f"{name}: {exc}") from exc
+    return validate(result)
 
 
 def validate_reviewers(reviewers: object, max_reviews: int) -> list:
@@ -86,7 +119,8 @@ def validate_reviewer(reviewer: object) -> dict:
     # ``model_reasoning_effort="E"`` and OpenCode's ``M#E``), so they must not start
     # with "-" (an option), or hold spaces, double quotes, backslashes or "#" (the separator).
     for field in ("model", "effort"):
-        if not isinstance(reviewer[field], str) or not re.fullmatch(r'(?!-)[^\x00-\x20\x7f"\\#]+', reviewer[field]):
+        if (not isinstance(reviewer[field], str) or any(ch.isspace() for ch in reviewer[field])
+                or not re.fullmatch(r'(?!-)[^\x00-\x20\x7f"\\#]+', reviewer[field])):
             raise DevFlowError(f"Invalid reviewer {field}")
     timeout = reviewer["timeout_seconds"]
     if type(timeout) is not int or not 5 <= timeout <= 3600:

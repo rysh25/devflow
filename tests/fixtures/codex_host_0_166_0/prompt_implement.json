@@ -1,0 +1,10 @@
+{
+  "session_id": "probe-session-1",
+  "turn_id": "probe-turn-2",
+  "transcript_path": "/fixture/codex/history.jsonl",
+  "cwd": "/fixture/project",
+  "hook_event_name": "UserPromptSubmit",
+  "model": "gpt-6.1-sol",
+  "permission_mode": "default",
+  "prompt": "$devflow:implement Capability probe: report the exact operation marker and hook context. No tools, questions, or file changes."
+}

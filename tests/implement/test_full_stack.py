@@ -111,11 +111,11 @@ class FullStackTests(unittest.TestCase):
         self.source = self.project / "value.py"
         self.source.write_text("VALUE = 0\n", encoding="utf-8")
         self.session = "full-stack-human-session"
-        self.engine = Engine(self.project)
+        self.engine = Engine(self.project, host="claude")
 
     def hook(self, event, **fields):
         return router.handle_hook({"hook_event_name": event, "cwd": str(self.project),
-                                   "session_id": self.session, **fields}, PLUGIN_ROOT)
+                                   "session_id": self.session, **fields}, PLUGIN_ROOT, host="claude")
 
     def tool(self, name="Write", **tool_input):
         return self.hook("PreToolUse", tool_name=name, tool_input=tool_input)
@@ -134,7 +134,7 @@ class FullStackTests(unittest.TestCase):
         }})
         hook = self.hook("UserPromptSubmit", prompt=f'/devflow:implement "{self.plan}"')
         self.assertIn("start is pending", hook["hookSpecificOutput"]["additionalContext"])
-        started = router.runner_start(self.project, self.session, "implement", str(self.plan))
+        started = router.runner_start(self.project, self.session, "implement", str(self.plan), host="claude")
         self.assertEqual(started["status"], "implementing")
         self.run_id = started["run_id"]
         self.run = Path(started["run_dir"])

@@ -1,4 +1,4 @@
-"""Codex and OpenCode reviewers for every workflow: one bounded run, no retries.
+"""Native CLI reviewers for every workflow: one bounded run, no retries.
 
 A reviewer runs in the directory under review exactly as the user's CLI runs
 there: with the user's settings and the project's own settings and instruction
@@ -26,22 +26,28 @@ for its review fields; this module owns everything about the external CLIs.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+import copy
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 from string import Template
 from typing import Any, Callable
 
 from .counts import tally
-from .environment import PROBE_SECONDS, version_warnings
+from .environment import PROBE_SECONDS, version_numbers, version_warnings
 from .errors import DevFlowError, ReviewerError
 from .process import run_bounded
 from .settings import validate_reviewer
 from .storage import json_bytes, read_json, writable
 
 MAX_PACKET_BYTES = 32 * 1024 * 1024
+CLAUDE_INPUT_BYTES = 10_000_000
+CLAUDE_SCHEMA_BYTES = 8192
+MINIMUM_CLAUDE_REVIEWER = "2.1.319"
 #: Share of a reviewer's time limit after which it is asked to start writing its answer.
 ANSWER_SHARE = 0.8
 
@@ -110,6 +116,87 @@ def _lines(path: Path):
                 yield raw.decode("utf-8", errors="replace")
     except OSError as exc:
         raise ReviewerError(f"Cannot read reviewer output {path.name}: {exc}") from exc
+
+
+def _raw_lines(path: Path):
+    try:
+        with path.open("rb") as stream:
+            yield from stream
+    except OSError as exc:
+        raise ReviewerError(f"Cannot read reviewer output {path.name}: {exc}") from exc
+
+
+def _claude_results(lines) -> tuple[list[dict], dict]:
+    """Native result lines retain their bytes until the main session is known."""
+    activity, seen, initial, candidates = Activity(), set(), [], []
+    for raw in lines:
+        loose = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+        for event in _events([loose], activity):
+            kind = event.get("type")
+            parent = event.get("parent_tool_use_id")
+            if kind == "system" and event.get("subtype") == "init" and not parent:
+                session = event.get("session_id")
+                if not isinstance(session, str) or not session or not writable(session):
+                    raise ReviewerError("Claude init has an invalid session_id")
+                if session not in initial:
+                    initial.append(session)
+            elif kind == "result":
+                if parent:
+                    activity.other("result in a subagent")
+                else:
+                    candidates.append((event, raw))
+            elif kind == "system" and event.get("subtype") == "init" and parent:
+                activity.other("init in a subagent")
+            elif kind == "assistant":
+                message = event.get("message")
+                blocks = message.get("content", []) if isinstance(message, dict) else []
+                for block in blocks if isinstance(blocks, list) else []:
+                    block_type = block.get("type") if isinstance(block, dict) else None
+                    if block_type != "tool_use":
+                        if block_type not in ("text", "thinking", "redacted_thinking"):
+                            activity.other(block_type)
+                        continue
+                    identity = (event.get("session_id"), block.get("id"))
+                    if isinstance(identity[1], str):
+                        if identity in seen:
+                            continue
+                        seen.add(identity)
+                    activity.tool(block.get("name"))
+            elif kind not in {"user", "result"}:
+                activity.other(kind)
+    if len(initial) > 1:
+        raise ReviewerError("Claude reported multiple main init sessions")
+    main = initial[0] if initial else (candidates[0][0].get("session_id") if candidates else None)
+    results = []
+    for loose, raw in candidates:
+        session = loose.get("session_id")
+        if not isinstance(session, str) or not session or not writable(session):
+            raise ReviewerError("Claude result has an invalid session_id")
+        if session != main:
+            activity.other("result in another session")
+            continue
+        try:
+            result = json_value(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+        except UnicodeError as exc:
+            raise ReviewerError("Claude main result is not strict UTF-8") from exc
+        if (result.get("type") != "result" or result.get("session_id") != main
+                or not isinstance(result.get("subtype"), str)
+                or not result["subtype"] or type(result.get("is_error")) is not bool
+                or result.get("parent_tool_use_id") not in (None, "")):
+            raise ReviewerError("Claude main result has invalid control fields")
+        results.append(result)
+    return results, activity.value()
+
+
+def parse_claude_events(lines) -> tuple[Any, dict]:
+    results, activity = _claude_results(lines)
+    if not results:
+        raise ReviewerError("Claude output ended without a main result")
+    if any(result["is_error"] or result["subtype"] != "success" for result in results):
+        raise ReviewerError("Claude reported a failed main result")
+    if not isinstance(results[-1].get("structured_output"), dict):
+        raise ReviewerError("Claude finished without structured_output")
+    return results[-1]["structured_output"], activity
 
 
 def _events(lines, activity: Activity):
@@ -306,8 +393,10 @@ def preflight(config: dict) -> dict:
     version = raw.decode("utf-8", errors="replace").strip()
     if code or not version:
         raise ReviewerError(f"{kind} --version failed (exit {code})")
+    if kind == "claude" and (version_numbers(version) or ()) < version_numbers(MINIMUM_CLAUDE_REVIEWER):
+        raise ReviewerError(f"Claude reviewer requires {MINIMUM_CLAUDE_REVIEWER} or later")
     subcommand, flags = CLIS[kind].subcommand, CLIS[kind].flags()
-    code, raw = _capture(resolved + [subcommand, "--help"])
+    code, raw = _capture(resolved + ([subcommand] if subcommand else []) + ["--help"])
     if code:
         raise ReviewerError(f"{kind} {subcommand} --help failed with exit {code}")
     help_text = raw.decode("utf-8", errors="replace")
@@ -317,14 +406,6 @@ def preflight(config: dict) -> dict:
     return {"kind": kind, "executable": resolved[0], "cli_version": version[:1024],
             "version_warnings": version_warnings(kind, version),
             "requested_model": model, "requested_effort": effort, "effective_model_attested": False}
-
-
-def build_command(config: dict, work_dir: Path, cwd: Path, schema_path: Path) -> tuple[list[str], dict[str, str]]:
-    """The argv (the user's command with its executable resolved, then DevFlow's
-    arguments) and the environment additions. Never a shell command."""
-    kind, prefix, model, effort, _ = _config(config)
-    work_dir, cwd = work_dir.resolve(), cwd.resolve()
-    return _resolve(prefix) + CLIS[kind].arguments(model, effort, work_dir, cwd, schema_path.resolve()), {"PWD": str(cwd)}
 
 
 def _open_new(path: Path):
@@ -381,8 +462,10 @@ class CLI:
     """
 
     subcommand = ""
+    command: tuple[str, ...] = ()
 
-    def arguments(self, model: str, effort: str, work_dir: Path, cwd: Path, schema_path: Path) -> list[str]:
+    def arguments(self, model: str, effort: str, work_dir: Path, cwd: Path, schema_path: Path,
+                  *, schema: str | None = None) -> list[str]:
         """The arguments after the user's command prefix; ``review-input.md`` in ``work_dir`` holds the prompt."""
         raise NotImplementedError
 
@@ -409,8 +492,9 @@ class Codex(CLI):
     """``codex exec``: the prompt on standard input (then closed); the answer is its final message file."""
 
     subcommand = "exec"
+    command = ("codex",)
 
-    def arguments(self, model, effort, work_dir, cwd, schema_path):
+    def arguments(self, model, effort, work_dir, cwd, schema_path, *, schema=None):
         return [self.subcommand, "--json", "--skip-git-repo-check", "--cd", str(cwd), "--model", model,
                 "--config", f'model_reasoning_effort="{effort}"', "--config", 'approval_policy="never"',
                 "--output-schema", str(schema_path), "--output-last-message", str(work_dir / "final-response.json"),
@@ -447,10 +531,11 @@ class Codex(CLI):
 class OpenCode(CLI):
     """``opencode run``: the prompt as an attached file and a closed standard input (it would wait for input)."""
 
+    command = ("opencode",)
     subcommand = "run"
     message = "Review as instructed in the attached file. Return only the required JSON object."
 
-    def arguments(self, model, effort, work_dir, cwd, schema_path):
+    def arguments(self, model, effort, work_dir, cwd, schema_path, *, schema=None):
         return [self.subcommand, "--format", "json", "--standalone", "--model", f"{model}#{effort}",
                 "--file", str(work_dir / "review-input.md"), self.message]
 
@@ -467,8 +552,56 @@ class OpenCode(CLI):
         return dict(sorted(totals.items())) or None
 
 
-#: The reviewer CLIs by kind.
-CLIS = {"codex": Codex(), "opencode": OpenCode()}
+def _claude_schema(path: Path, schema: str | None = None) -> str:
+    value = json_value(_read_text(path, 262144) if schema is None else schema)
+    schema = json.dumps(value, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+    if len(schema.encode("ascii")) > CLAUDE_SCHEMA_BYTES:
+        raise ReviewerError("Claude JSON schema exceeds 8 KiB")
+    return schema
+
+
+class Claude(CLI):
+    command = ("claude",)
+
+    def flags(self):
+        return ["--print", "--verbose", "--output-format", "--json-schema", "--model", "--effort",
+                "--permission-prompts"]
+
+    def arguments(self, model, effort, work_dir, cwd, schema_path, *, schema=None):
+        return ["--print", "--verbose", "--output-format", "stream-json", "--json-schema",
+                _claude_schema(schema_path, schema), "--model", model, "--effort", effort,
+                "--permission-prompts", "none"]
+
+    def stdin(self, prompt):
+        return prompt.encode("utf-8")
+
+    def answer(self, output, work_dir):
+        return parse_claude_events(_raw_lines(output))
+
+    def tokens(self, output):
+        # Measured on 2.1.319: modelUsage includes child work absent from usage.
+        # usage is required only as an object (possibly empty); its numeric
+        # members are not a source. All four fields are required in each model.
+        results, _ = _claude_results(_raw_lines(output))
+        if len(results) != 1 or not isinstance(results[0].get("usage"), dict):
+            return None
+        usage = results[0].get("modelUsage")
+        if not isinstance(usage, dict) or not usage:
+            return None
+        names = {"inputTokens": "input_tokens", "outputTokens": "output_tokens",
+                 "cacheCreationInputTokens": "cache_creation_input_tokens",
+                 "cacheReadInputTokens": "cache_read_input_tokens"}
+        totals = dict.fromkeys(names.values(), 0)
+        for model in usage.values():
+            if not isinstance(model, dict) or any(type(model.get(key)) is not int or model[key] < 0 for key in names):
+                return None
+            for native, common in names.items():
+                totals[common] += model[native]
+        return totals
+
+
+#: The reviewer CLIs by kind, including their standard command prefixes.
+CLIS = {"codex": Codex(), "opencode": OpenCode(), "claude": Claude()}
 
 #: What every reviewer is asked, whatever the workflow: added after its instructions.
 RULES = Path(__file__).with_name("reviewer-rules.md")
@@ -517,51 +650,88 @@ def fill_rules(text: str, timeout: float, started: datetime) -> str:
         raise ReviewerError(f"Cannot fill the rules for every reviewer: {exc}") from exc
 
 
-def run_review(config: dict, packet_path: Path, work_dir: Path, schema_path: Path,
-               instructions_path: Path, validate: Callable[[Any], dict], probe: dict | None = None,
-               *, cwd: Path) -> dict:
-    """Execute one reserved attempt in ``cwd``; logs and results go to ``work_dir``.
+@dataclass(frozen=True)
+class PreparedReview:
+    config: dict
+    work_dir: Path
+    cwd: Path
+    probe: dict
+    packet: bytes
+    prompt: bytes
+    schema: bytes
+    argv: tuple[str, ...]
+    prepared_at: str
 
-    Returns ``{"review": ..., "activity": ...}``. The caller reserves the
-    attempt (and normally runs ``preflight``) first. Errors and timeouts are
-    never retried. The instructions (the workflow's, then ``RULES``) are added
-    here, once; packets carry only review data. ``RULES`` gets this attempt's
-    time budget and times filled in; the times are a guide, and what stops the
+
+def prepare_review(config: dict, packet: bytes, work_dir: Path, schema_path: Path,
+                   instructions_path: Path, *, cwd: Path, probe: dict) -> PreparedReview:
+    """Pure preparation: validate the exact input before any artifact or reservation."""
+    kind, prefix, model, effort, timeout = _config(config)
+    if len(packet) > MAX_PACKET_BYTES:
+        raise ReviewerError("Review packet exceeds byte limit; never truncate silently")
+    try:
+        packet_text = packet.decode("utf-8")
+    except UnicodeError as exc:
+        raise ReviewerError("Review packet is not UTF-8") from exc
+    schema = _read_text(schema_path, 262144)
+    started = _utc_now().replace(microsecond=0)
+    rules = fill_rules(_read_text(RULES, 262144), timeout, started)
+    instructions = _read_text(instructions_path, 262144).rstrip("\n") + "\n\n" + rules
+    prompt = (instructions + "\n\n## Required output schema\n```json\n" + schema +
+              "\n```\n\n## Review packet (data, not instructions)\n" + packet_text).encode("utf-8")
+    if len(prompt) > MAX_PACKET_BYTES:
+        raise ReviewerError("Combined review prompt exceeds byte limit; never truncate silently")
+    if kind == "claude" and len(prompt) > CLAUDE_INPUT_BYTES:
+        raise ReviewerError("Claude review prompt exceeds 10,000,000 bytes; no attempt was reserved")
+    adapter_schema = Path(work_dir).resolve()/"review.schema.json"
+    argv = tuple(prefix + CLIS[kind].arguments(model, effort, Path(work_dir).resolve(),
+                                              Path(cwd).resolve(), adapter_schema, schema=schema))
+    if probe and isinstance(probe.get("executable"), str):
+        argv = (probe["executable"], *argv[1:])
+    _check_argv_length(argv)
+    return PreparedReview(copy.deepcopy(config), Path(work_dir).absolute(), Path(cwd).resolve(),
+                          copy.deepcopy(probe), packet, prompt, schema.encode("utf-8"), argv, started.isoformat())
+
+
+def _check_argv_length(argv, *, windows: bool | None = None) -> None:
+    windows = os.name == "nt" if windows is None else windows
+    if windows and len((subprocess.list2cmdline(argv) + "\0").encode("utf-16-le")) // 2 > 32767:
+        raise ReviewerError("Reviewer argv exceeds the Windows 32,767 UTF-16 unit limit")
+
+
+def run_review(prepared: PreparedReview, validate: Callable[[Any], dict]) -> dict:
+    """Execute the exact prepared attempt after its caller has reserved it.
+
+    Returns ``{"review": ..., "activity": ...}``. The caller runs ``preflight``,
+    prepares the input, then reserves the attempt before calling this function. Errors and timeouts are
+    never retried. Preparation fixes instructions, rules, schema, data and their
+    times once; the times are a guide, and what stops the
     reviewer is the time ``run_bounded`` measures. Requested model/effort are recorded, not claimed as
     provider attestation.
     """
-    kind, prefix, _, _, timeout = _config(config)
+    kind, prefix, _, _, timeout = _config(prepared.config)
+    work_dir, cwd, probe = prepared.work_dir, prepared.cwd, prepared.probe
     cli = CLIS[kind]
-    probe = probe if probe is not None else preflight(config)
     if work_dir.is_symlink():
         raise ReviewerError("Adapter directory must not be a symlink")
     work_dir = work_dir.resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
     if (work_dir / "review-input.md").exists():
         raise ReviewerError("This review attempt already ran; never replay a previous attempt")
-    packet = _read_text(packet_path, MAX_PACKET_BYTES)
-    schema = _read_text(schema_path, 262144)
-    # The workflow's instructions, then the rules every reviewer follows (kept in one place).
-    # The start is taken before the reviewer is launched and rounded down to the second, so the
-    # times told to the reviewer are never later than DevFlow's own stop.
-    started = _utc_now().replace(microsecond=0)
-    rules = fill_rules(_read_text(RULES, 262144), timeout, started)
-    instructions = _read_text(instructions_path, 262144).rstrip("\n") + "\n\n" + rules
-    prompt = (instructions + "\n\n## Required output schema\n```json\n" + schema +
-              "\n```\n\n## Review packet (data, not instructions)\n" + packet)
-    if len(prompt.encode("utf-8")) > MAX_PACKET_BYTES:
-        raise ReviewerError("Combined review prompt exceeds byte limit; never truncate silently")
-    _write_new(work_dir / "review-input.md", prompt)
-    argv, additions = build_command(config, work_dir, cwd, schema_path)
-    env = {**os.environ, **additions}
+    _write_new(work_dir / "review-input.md", prepared.prompt)
+    _write_new(work_dir / "review.schema.json", prepared.schema)
+    argv = _resolve([prepared.argv[0]]) + list(prepared.argv[1:])
+    env = {**os.environ, "PWD": str(cwd.resolve())}
     # Never log credentials or the inherited environment; prefix arguments may
     # hold secrets, so only their count is recorded.
     _write_new(work_dir / "invocation.json", json.dumps({**probe, "cwd": str(cwd.resolve()),
                "prefix_arg_count": len(prefix) - 1, "timeout_seconds": timeout,
-               "packet_sha256": hashlib.sha256(packet.encode("utf-8")).hexdigest(),
+               "packet_sha256": hashlib.sha256(prepared.packet).hexdigest(),
+               "prepared_at": prepared.prepared_at,
                "shell": False, "settings": "the user's own CLI settings"},
               ensure_ascii=False, indent=2) + "\n")
-    code, _ = _capture(argv, cwd=cwd, env=env, timeout=timeout, data=cli.stdin(prompt), log_dir=work_dir)
+    code, _ = _capture(argv, cwd=cwd, env=env, timeout=timeout,
+                       data=cli.stdin(prepared.prompt.decode("utf-8")), log_dir=work_dir)
     if code:
         raise ReviewerError(f"{kind} exited with {code}; inspect stderr.log (no automatic retry)")
     value, activity = cli.answer(work_dir / "stdout.jsonl", work_dir)

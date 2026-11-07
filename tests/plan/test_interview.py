@@ -21,6 +21,23 @@ from devflow_core.workflows import WORKFLOWS
 RESOURCES = WORKFLOWS["plan"].resource_dir
 
 
+class CodexDiscoveryTests(unittest.TestCase):
+    def test_codex_discovery_does_not_apply_claude_invocation_metadata(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            project=root/'project';project.mkdir()
+            home=root/'home';home.mkdir()
+            skill=home/'.agents/skills/grilling/SKILL.md'
+            skill.parent.mkdir(parents=True)
+            skill.write_text('---\nname: grilling\ndescription: Interview\ndisable-model-invocation: true\n---\nNative instructions.\n')
+            with patch.dict(os.environ,{'CODEX_HOME':str(root/'codex')}):
+                report=interview.inspect_interview_skill(project,'grilling',config_dir=home,host='codex')
+            self.assertEqual(report['status'],'available')
+            self.assertFalse(report['runtime_verified'])
+            self.assertIsNone(report['model_invocable'])
+            self.assertFalse(report['candidates'][0]['metadata']['native_policy_verified'])
+
+
 class InterviewFixture(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="devflow interview ")
@@ -42,7 +59,7 @@ class InterviewFixture(unittest.TestCase):
         return path
 
     def inspect(self, name="grilling"):
-        return interview.inspect_interview_skill(self.project, name)
+        return interview.inspect_interview_skill(self.project, name, host="claude")
 
 
 class InterviewInspectionTests(InterviewFixture):
@@ -193,7 +210,7 @@ class InterviewInspectionTests(InterviewFixture):
 
     def test_missing_skill_makes_component_doctor_not_ready(self):
         with patch("devflow_core.plan.config.shutil.which", return_value="/fixture/tool"):
-            report = diagnose(self.project, WORKFLOWS["plan"])
+            report = diagnose(self.project, WORKFLOWS["plan"], host="claude")
         self.assertEqual(report["configuration_source"], "project_settings")
         self.assertFalse(report["ready"])
         self.assertEqual(report["interview_skill"]["status"], "missing")
@@ -204,7 +221,7 @@ class FrozenDoctorTests(InterviewFixture):
         """``devflow [selectors] plan doctor`` through the single runner."""
         output = io.StringIO()
         with redirect_stdout(output), patch("devflow_core.plan.config.shutil.which", return_value="/fixture/tool"):
-            code = cli.main(["--project", str(self.project), *selectors, "plan", "doctor"])
+            code = cli.main(["--host", "claude", "--project", str(self.project), *selectors, "plan", "doctor"])
         return code, json.loads(output.getvalue())
 
     def start_frozen_wrapper(self):
@@ -214,10 +231,10 @@ class FrozenDoctorTests(InterviewFixture):
         atomic_json(settings, {"schema_version": 1, "plan": {"grill_skill": "grill-me"}})
         transcript = self.base / "transcript.jsonl"
         transcript.write_text("", encoding="utf-8")
-        router.handle_hook(self.prompt("/devflow:plan Human request"), paths.PLUGIN_ROOT)
-        run_id = sessions.read_record(self.project, "interview-session", WORKFLOWS)["run"]["run_id"]
+        router.handle_hook(self.prompt("/devflow:plan Human request"), paths.PLUGIN_ROOT, host="claude")
+        run_id = sessions.read_record(self.project, "interview-session", WORKFLOWS, host="claude")["run"]["run_id"]
         atomic_json(settings, {"schema_version": 1, "plan": {"grill_skill": "grilling"}})
-        return Engine(self.project), run_id
+        return Engine(self.project, host="claude"), run_id
 
     def prompt(self, text):
         return {"hook_event_name": "UserPromptSubmit", "cwd": str(self.project), "session_id": "interview-session",
@@ -250,8 +267,8 @@ class FrozenDoctorTests(InterviewFixture):
         engine, run_id = self.start_frozen_wrapper()
         # A finished run is released by the session's next real prompt.
         engine.cancel(run_id)
-        self.assertIsNone(router.handle_hook(self.prompt("Something else"), paths.PLUGIN_ROOT))
-        self.assertIsNone(sessions.read_record(self.project, "interview-session", WORKFLOWS))
+        self.assertIsNone(router.handle_hook(self.prompt("Something else"), paths.PLUGIN_ROOT, host="claude"))
+        self.assertIsNone(sessions.read_record(self.project, "interview-session", WORKFLOWS, host="claude"))
         code, report = self.doctor("--session", "interview-session")
         self.assertEqual(code, 0)
         self.assertEqual(report["configuration_source"], "project_settings")

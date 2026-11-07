@@ -54,14 +54,14 @@ def adapter_result(review):
     return {"review": review, "activity": dict(ACTIVITY)}
 
 
-def review_pass(provider, packet_path, *_, **__):
-    packet = json.loads(Path(packet_path).read_text(encoding="utf-8"))
+def review_pass(prepared, validate):
+    packet = json.loads(prepared.packet)
     return adapter_result({"schema_version": 1, "snapshot_id": packet["snapshot_id"], "verdict": "pass",
                            "summary": "Synthetic review: no unresolved findings.", "findings": [], "questions": []})
 
 
-def review_changes(provider, packet_path, *_, **__):
-    packet = json.loads(Path(packet_path).read_text(encoding="utf-8"))
+def review_changes(prepared, validate):
+    packet = json.loads(prepared.packet)
     return adapter_result({"schema_version": 1, "snapshot_id": packet["snapshot_id"], "verdict": "changes_required",
             "summary": "Synthetic review: one fix needed.", "questions": [],
             "findings": [{"id": "F1", "severity": "medium", "category": "correctness", "file": "feature.py",
@@ -180,8 +180,8 @@ class FlowFixture(unittest.TestCase):
         self.source.write_text("VALUE = 1\n", encoding="utf-8")
         self.session = "integration-session-1"
         self.transcript = self.base / "claude-transcript.jsonl"
-        self.engine = BuildEngine(self.project, BUILD_PLUGIN)
-        self.plan_engine = PlanEngine(self.project, PLAN_PLUGIN)
+        self.engine = BuildEngine(self.project, BUILD_PLUGIN, host="claude")
+        self.plan_engine = PlanEngine(self.project, PLAN_PLUGIN, host="claude")
         self.run_id = None
         self.draft = None
         for target in ("devflow_core.implement.engine.preflight", "devflow_core.plan.engine.preflight",
@@ -191,18 +191,18 @@ class FlowFixture(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     def event(self, name="UserPromptSubmit", session=None, **extra):
-        return {"hook_event_name": name, "cwd": str(self.project), "session_id": session or self.session,
+        return {"host": "claude", "hook_event_name": name, "cwd": str(self.project), "session_id": session or self.session,
                 "transcript_path": str(self.transcript), **extra}
 
     def submit(self, prompt, session=None):
-        return hook(self.event(session=session, prompt=prompt), PLUGIN)
+        return hook(self.event(session=session, prompt=prompt), PLUGIN, host="claude")
 
     def record(self, session=None):
-        return sessions.read_record(self.project, session or self.session, WORKFLOWS)
+        return sessions.read_record(self.project, session or self.session, WORKFLOWS, host="claude")
 
     def invoke(self, action, *options, session=None, run=True, expect=0):
         session = session or self.session
-        arguments = ["--project", str(self.project), "--session", session]
+        arguments = ["--host", "claude", "--project", str(self.project), "--session", session]
         if run:
             self.assertIsNotNone(self.run_id)
             arguments += ["--run", self.run_id]
@@ -213,7 +213,7 @@ class FlowFixture(unittest.TestCase):
         ])
         # The hooks never stop the runner call (or any other tool).
         self.assertIsNone(hook(self.event("PreToolUse", session=session, tool_name="Bash",
-                                          tool_input={"command": command}), PLUGIN))
+                                          tool_input={"command": command}), PLUGIN, host="claude"))
         stdout, stderr = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             result = cli.main(arguments)
@@ -231,7 +231,7 @@ class FlowFixture(unittest.TestCase):
         return state
 
     def edit(self, path, text, session=None):
-        result = hook(self.event("PreToolUse", session=session, tool_name="Write", tool_input={"file_path": str(path)}), PLUGIN)
+        result = hook(self.event("PreToolUse", session=session, tool_name="Write", tool_input={"file_path": str(path)}), PLUGIN, host="claude")
         self.assertIsNone(result)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
@@ -253,7 +253,7 @@ class FlowFixture(unittest.TestCase):
 
     def plan_start(self):
         request = "/devflow:plan Make a tested pure function; do not implement."
-        hook(self.event(prompt=request), PLUGIN)
+        hook(self.event(prompt=request), PLUGIN, host="claude")
         self.plan_append("user", request)
         return self.record()["run"]["run_id"]
 
@@ -261,7 +261,7 @@ class FlowFixture(unittest.TestCase):
         run_id = self.plan_start()
         self.plan_append("assistant", "grill-me: Must the old API remain compatible?")
         answer = "Yes. Keep the API compatible and add a regression test."
-        hook(self.event(prompt=answer), PLUGIN)
+        hook(self.event(prompt=answer), PLUGIN, host="claude")
         self.plan_append("user", answer)
         draft = Path(self.plan_engine.status(run_id)["draft_dir"])
         decisions = draft / "decisions.json"
@@ -297,12 +297,12 @@ class HookCliEngineTests(FlowFixture):
         self.assertTrue(report["final_snapshot_reviewed"])
         self.assertFalse(report["unreviewed_final_changes"])
         self.assertIsNone(report["workspace_capture_error"])
-        self.assertEqual([call.args[0]["id"] for call in dispatch.call_args_list], ["codex", "opencode"])
+        self.assertEqual([call.args[0].config["id"] for call in dispatch.call_args_list], ["codex", "opencode"])
         self.assertEqual(first["candidate"]["snapshot_id"], second["candidate"]["snapshot_id"])
         # DevFlow does not stop tools (D1), even after completion; the report
         # above records the exact snapshot that was reviewed.
         self.assertIsNone(hook(self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(self.source)}),
-                               PLUGIN))
+                               PLUGIN, host="claude"))
 
     def test_status_command_is_usable_in_its_documented_form(self):
         self.start()
@@ -315,10 +315,10 @@ class HookCliEngineTests(FlowFixture):
         packets = []
         providers = []
 
-        def review_with_one_correction(provider, packet_path, *args, **kwargs):
-            packets.append(read_json(Path(packet_path)))
-            providers.append(provider["id"])
-            review = review_pass(provider, packet_path, *args)
+        def review_with_one_correction(prepared, validate):
+            packets.append(json.loads(prepared.packet))
+            providers.append(prepared.config["id"])
+            review = review_pass(prepared, validate)
             if len(providers) == 1:
                 review["review"].update(verdict="changes_required", findings=[{
                     "id": "F1", "severity": "high", "category": "correctness", "file": "feature.py",
@@ -377,9 +377,9 @@ class HookCliEngineTests(FlowFixture):
         question = {"questions": [{"question": "Keep compatibility?"}]}
         # The question as Claude sent it (PreToolUse), then the human's answer (PostToolUse).
         hook(self.event("PreToolUse", tool_name="AskUserQuestion", tool_use_id="human-resolution-1",
-                        tool_input=question), PLUGIN)
+                        tool_input=question), PLUGIN, host="claude")
         hook(self.event("PostToolUse", tool_name="AskUserQuestion", tool_use_id="human-resolution-1",
-                        tool_input=question, tool_response={"answers": {"Keep compatibility?": actual}}), PLUGIN)
+                        tool_input=question, tool_response={"answers": {"Keep compatibility?": actual}}), PLUGIN, host="claude")
         after_answer = self.invoke("status")
         event = after_answer["human_events"][-1]
         resolved = self.invoke("resolve", "--event-id", event["event_id"], "--decision", "continue", "--reason", "Preserve the existing API")
@@ -393,9 +393,9 @@ class HookCliEngineTests(FlowFixture):
         self.edit(questions, json.dumps({"reason": "Need a decision.", "questions": ["May the API change?"]}))
         self.invoke("escalate", "--questions-file", questions)
         question = {"questions": [{"question": "May the API change?"}]}
-        hook(self.event("PreToolUse", tool_name="AskUserQuestion", tool_use_id="stop-1", tool_input=question), PLUGIN)
+        hook(self.event("PreToolUse", tool_name="AskUserQuestion", tool_use_id="stop-1", tool_input=question), PLUGIN, host="claude")
         hook(self.event("PostToolUse", tool_name="AskUserQuestion", tool_use_id="stop-1", tool_input=question,
-                        tool_response={"answers": {"May the API change?": "No."}}), PLUGIN)
+                        tool_response={"answers": {"May the API change?": "No."}}), PLUGIN, host="claude")
         event = self.invoke("status")["human_events"][-1]
         # The parser takes stop and accept; the runner keeps them for the review limit question.
         for decision in ("stop", "accept"):
@@ -418,9 +418,9 @@ class HookCliEngineTests(FlowFixture):
         self.assertIn("(3) accept the current version", asked["escalation"]["questions"][0])
         self.assertEqual([entry["status"] for entry in asked["review_summary"]["reviews"]], ["succeeded", "failed"])
         question = {"questions": [{"question": asked["escalation"]["questions"][0]}]}
-        hook(self.event("PreToolUse", tool_name="AskUserQuestion", tool_use_id="limit-1", tool_input=question), PLUGIN)
+        hook(self.event("PreToolUse", tool_name="AskUserQuestion", tool_use_id="limit-1", tool_input=question), PLUGIN, host="claude")
         hook(self.event("PostToolUse", tool_name="AskUserQuestion", tool_use_id="limit-1", tool_input=question,
-                        tool_response={"answers": {asked["escalation"]["questions"][0]: "Accept and finish"}}), PLUGIN)
+                        tool_response={"answers": {asked["escalation"]["questions"][0]: "Accept and finish"}}), PLUGIN, host="claude")
         event = self.invoke("status")["human_events"][-1]
         accepted = self.invoke("resolve", "--event-id", event["event_id"], "--decision", "accept",
                                "--reason", "The user accepted the current version.")
@@ -452,7 +452,7 @@ class HookCliEngineTests(FlowFixture):
         # resumes again or the run ends.
         for tool, data in (("Bash", {"command": "normal user work"}), ("Write", {"file_path": str(self.source)}),
                            ("Read", {"file_path": str(self.source)})):
-            self.assertIsNone(hook(self.event("PreToolUse", tool_name=tool, tool_input=data), PLUGIN))
+            self.assertIsNone(hook(self.event("PreToolUse", tool_name=tool, tool_input=data), PLUGIN, host="claude"))
         before = len(read_json(Path(self.engine.status(self.run_id)["run_dir"]) / "state.json")["event_ids"])
         context = self.submit("Keep going here")["hookSpecificOutput"]["additionalContext"]
         self.assertIn("/devflow:resume " + self.run_id, context)
@@ -499,7 +499,7 @@ class HookCliEngineTests(FlowFixture):
         report_path = Path(cancelled["run_dir"]) / cancelled["report_path"]
         # DevFlow does not stop a write, even to its own records (D1). A
         # recorded report must still fail its integrity check when read.
-        decision = hook(self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(report_path)}), PLUGIN)
+        decision = hook(self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(report_path)}), PLUGIN, host="claude")
         self.assertIsNone(decision)
         forged = dict(cancelled["report"], all_reviewers_approved=True)
         write_json(report_path, forged)
@@ -510,7 +510,7 @@ class HookCliEngineTests(FlowFixture):
 class WorkflowIndependenceTests(FlowFixture):
     def test_no_workflow_creates_runtime_state_for_an_unrelated_session(self):
         payload = self.event("PreToolUse", tool_name="Bash", tool_input={"command": "normal project work"})
-        self.assertIsNone(hook(payload, PLUGIN))
+        self.assertIsNone(hook(payload, PLUGIN, host="claude"))
         self.assertFalse((self.project / ".devflow").exists())
 
     def test_plan_start_does_not_create_an_implementation_run(self):
@@ -518,12 +518,12 @@ class WorkflowIndependenceTests(FlowFixture):
         self.assertFalse((self.project / ".devflow" / "runs" / "implement").exists())
         # A Plan run does not stop tools either; the hook only adds context to prompts.
         payload = self.event("PreToolUse", tool_name="Bash", tool_input={"command": "rm -rf build"})
-        self.assertIsNone(hook(payload, PLUGIN))
+        self.assertIsNone(hook(payload, PLUGIN, host="claude"))
 
     def test_implementation_start_does_not_create_a_plan_run(self):
         self.start()
         payload = self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(self.source)})
-        self.assertIsNone(hook(payload, PLUGIN))
+        self.assertIsNone(hook(payload, PLUGIN, host="claude"))
         self.assertFalse((self.project / ".devflow" / "runs" / "plan").exists())
 
     def test_a_background_reviews_completion_notice_releases_the_binding_but_run_actions_still_work(self):
@@ -536,7 +536,7 @@ class WorkflowIndependenceTests(FlowFixture):
         def plan(action, *selector, expect=0):
             stdout, stderr = io.StringIO(), io.StringIO()
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                result = cli.main(["--project", str(self.project), "--session", self.session, *selector, "plan", action])
+                result = cli.main(["--host", "claude", "--project", str(self.project), "--session", self.session, *selector, "plan", action])
             self.assertEqual(result, expect, stdout.getvalue() + stderr.getvalue())
             return json.loads(stdout.getvalue())
 
@@ -559,7 +559,7 @@ class WorkflowIndependenceTests(FlowFixture):
         self.assertEqual(state["plan_source"], str(plan_file))
         self.assertEqual(self.plan_engine.status(plan_run)["status"], "completed")
         payload = self.event("PreToolUse", tool_name="Write", tool_input={"file_path": str(self.source)})
-        self.assertIsNone(hook(payload, PLUGIN))
+        self.assertIsNone(hook(payload, PLUGIN, host="claude"))
 
 
 
@@ -623,14 +623,14 @@ class BashTimeoutTests(FlowFixture):
             with self.subTest(env=env), patch.dict(os.environ, env):
                 doctor = self.invoke("doctor", run=False)
                 self.assertFalse([item for item in doctor["warnings"] if "BASH_" in item], doctor["warnings"])
-                self.assertFalse([item for item in cli.doctor(self.project)["warnings"] if "BASH_" in item])
+                self.assertFalse([item for item in cli.doctor(self.project, host="claude")["warnings"] if "BASH_" in item])
         with patch.dict(os.environ, {"BASH_MAX_TIMEOUT_MS": "60000"}):
             started = self.start()
         self.assertNotIn("warnings", started)
         self.assertEqual(started["bash_timeout_ms"]["review"], 400000)
 
     def test_plan_start_context_gives_the_review_timeout_and_finished_plan_has_none(self):
-        context = hook(self.event(prompt="/devflow:plan Make a tested pure function."), PLUGIN)
+        context = hook(self.event(prompt="/devflow:plan Make a tested pure function."), PLUGIN, host="claude")
         text = context["hookSpecificOutput"]["additionalContext"]
         self.assertIn('"bash_timeout_ms": {"review": 1900000}', text)
         self.assertIn("pass bash_timeout_ms as the Bash timeout, unchanged", text)

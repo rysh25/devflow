@@ -14,10 +14,12 @@ import re
 import stat
 
 from ..common.errors import DevFlowError
+from ..common.hosts.skills import skill_locations
 
 
 MAX_FRONTMATTER_BYTES = 64 * 1024
 MAX_FRONTMATTER_LINES = 256
+INTERVIEW_NAME_PATTERN = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 _KEY = re.compile(r"([A-Za-z][A-Za-z0-9_-]*):(?:[ \t]+(.*)|[ \t]*)$")
 _TRUE = {"true", "yes", "on", "1"}
 _FALSE = {"false", "no", "off", "0"}
@@ -62,7 +64,7 @@ def _scalar(value: str) -> str:
     return value
 
 
-def _metadata(data: bytes) -> dict:
+def _metadata(data: bytes, host: str) -> dict:
     lines = data.splitlines(keepends=True)
     if not lines or not data.strip():
         raise _MetadataError("The skill file is empty.")
@@ -104,7 +106,7 @@ def _metadata(data: bytes) -> dict:
         if key in fields:
             raise _MetadataError("Duplicate frontmatter field: " + key)
         raw = re.split(r"\s+#", raw, maxsplit=1)[0].strip() if not raw.startswith(("'", '"')) else raw
-        if key in {"disable-model-invocation", "user-invocable"} and raw.startswith(("'", '"')):
+        if host == "claude" and key in {"disable-model-invocation", "user-invocable"} and raw.startswith(("'", '"')):
             raise _MetadataError("Quoted invocation booleans require runtime verification; use documented unquoted values.", "unverified")
         if re.fullmatch(r"[|>](?:[1-9][+-]?|[+-][1-9]?)?", raw):
             if key in {"name", "disable-model-invocation", "user-invocable", "context"}:
@@ -113,6 +115,8 @@ def _metadata(data: bytes) -> dict:
             block = True
         else:
             fields[key] = _scalar(raw)
+    if host == "codex":
+        return {"frontmatter": True, "name": fields.get("name"), "native_policy_verified": False}
     disabled = fields.get("disable-model-invocation", "false").casefold()
     if disabled not in _TRUE | _FALSE:
         raise _MetadataError("disable-model-invocation is not a recognized boolean.")
@@ -125,7 +129,7 @@ def _metadata(data: bytes) -> dict:
             "disable_model_invocation": disabled in _TRUE, "context": context}
 
 
-def _inspect_candidate(path: Path, scope: str, kind: str) -> dict | None:
+def _inspect_candidate(path: Path, scope: str, kind: str, host: str) -> dict | None:
     candidate = {"path": str(path), "scope": scope, "kind": kind}
     try:
         info = path.stat()
@@ -148,12 +152,14 @@ def _inspect_candidate(path: Path, scope: str, kind: str) -> dict | None:
             if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
                 return {**candidate, "status": "invalid", "reason": "The skill path is not a regular file."}
             data = handle.read(MAX_FRONTMATTER_BYTES + 1)
-        metadata = _metadata(data)
+        metadata = _metadata(data, host)
     except _MetadataError as exc:
         return {**candidate, "status": exc.status, "reason": str(exc)}
     except (OSError, ValueError, RuntimeError) as exc:
         return {**candidate, "status": "unverified", "reason": "Cannot read skill metadata: " + type(exc).__name__}
     candidate["metadata"] = metadata
+    if host == "codex":
+        return {**candidate, "status": "available", "reason": "Skill file is discoverable; native catalog policy and runtime use are unverified."}
     if metadata["disable_model_invocation"]:
         return {**candidate, "status": "blocked", "reason": "disable-model-invocation is true; Claude must not invoke or reproduce this skill automatically."}
     if metadata["context"] == "fork":
@@ -161,35 +167,48 @@ def _inspect_candidate(path: Path, scope: str, kind: str) -> dict | None:
     return {**candidate, "status": "available", "reason": "Local metadata permits model invocation in the main conversation; runtime invocation remains unverified."}
 
 
-def inspect_interview_skill(project: Path, configured_name: str, *, config_dir: Path | None = None) -> dict:
-    """Inspect four exact paths at most; a positive result is not runtime proof."""
+def inspect_interview_skill(project: Path, configured_name: str, *, config_dir: Path | None = None,
+                            host: str) -> dict:
+    """Inspect exact native locations; a positive result is not runtime proof."""
     report = {"configured_name": configured_name, "status": "unverified", "static_ready": False,
               "model_invocable": None, "runtime_verified": False, "source": None,
               "checked_locations": [], "candidates": [], "limitations": list(_LIMITATIONS)}
-    if not isinstance(configured_name, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", configured_name):
+    if host == "codex":
+        report["limitations"] = ["Offline file discovery only; the native catalog determines execution policy.",
+                                 "Question tool availability and actual skill execution are unverified."]
+    if not isinstance(configured_name, str) or not INTERVIEW_NAME_PATTERN.fullmatch(configured_name):
         return {**report, "status": "invalid", "reason": "The configured skill name is not a bounded portable name."}
-    if ":" in configured_name:
-        return {**report, "reason": "Namespaced skills need Claude Code's runtime registry; this offline checker cannot resolve their installation or callability."}
-    if configured_name in {".", ".."} or configured_name.casefold() in {"synced", "anthropic-skills"}:
+    if configured_name in {".", ".."} or (host == "claude" and configured_name.casefold() in {"synced", "anthropic-skills"}):
         return {**report, "status": "invalid", "reason": "The configured name is reserved or not a skill directory name."}
+    if ":" in configured_name:
+        return {**report, "reason": "Namespaced skills require the host's native runtime catalog; installation and callability are unverified."}
     try:
-        personal = (config_dir if config_dir is not None else
-                    Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))).expanduser().absolute()
-        project_config = Path(project).absolute() / ".claude"
-        locations = []
-        seen = set()
-        for scope, directory in (("personal", personal), ("project", project_config)):
-            for kind, path in (("skill", directory / "skills" / configured_name / "SKILL.md"),
-                               ("command", directory / "commands" / (configured_name + ".md"))):
-                identity = str(path.resolve(strict=False))
-                if identity not in seen:
-                    seen.add(identity)
-                    locations.append((scope, kind, path))
+        locations = skill_locations(project, configured_name, host=host, config_dir=config_dir)
     except (OSError, ValueError, RuntimeError) as exc:
         return {**report, "reason": "Cannot resolve configured search locations: " + type(exc).__name__}
+    if host == "codex":
+        paths = [str(path) for _, _, path in locations]
+        candidates, seen = [], set()
+        for value in paths:
+            candidate = _inspect_candidate(Path(value), "native", "skill", host)
+            if candidate is not None:
+                identity = candidate.get("resolved_path", candidate["path"])
+                if identity not in seen:
+                    seen.add(identity)
+                    candidates.append(candidate)
+        if len(candidates) != 1:
+            return {**report, "checked_locations": paths, "candidates": candidates,
+                    "status": "ambiguous" if candidates else "missing",
+                    "reason": "Select the configured skill from Codex's native catalog; no fallback is chosen."}
+        candidate = candidates[0]
+        available = candidate["status"] == "available"
+        return {**report, "checked_locations": paths, "candidates": candidates,
+                "source": candidate["path"], "status": candidate["status"], "static_ready": available,
+                "reason": "Skill text is discoverable; actual native skill use and questions remain unverified.",
+                "invocation": "Use the exact configured skill from the native catalog and read its instructions."}
     report["checked_locations"] = [str(path) for _, _, path in locations]
     candidates = [candidate for scope, kind, path in locations
-                  if (candidate := _inspect_candidate(path, scope, kind)) is not None]
+                  if (candidate := _inspect_candidate(path, scope, kind, host)) is not None]
     report["candidates"] = candidates
     if not candidates:
         return {**report, "status": "missing", "reason": "No skill or command file was found at the checked personal/project paths. Other runtime sources and aliases are unverified, not proven absent."}

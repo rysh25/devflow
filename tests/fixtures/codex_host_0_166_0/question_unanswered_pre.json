@@ -1,0 +1,30 @@
+{
+  "session_id": "probe-session-2",
+  "turn_id": "probe-turn-6",
+  "transcript_path": "/fixture/codex/history.jsonl",
+  "cwd": "/fixture/project",
+  "hook_event_name": "PreToolUse",
+  "model": "gpt-6.1-sol",
+  "permission_mode": "default",
+  "tool_name": "request_user_input",
+  "tool_input": {
+    "questions": [
+      {
+        "header": "Probe",
+        "id": "probe_option",
+        "question": "Which probe option do you choose?",
+        "options": [
+          {
+            "label": "Alpha",
+            "description": "Choose Alpha."
+          },
+          {
+            "label": "Beta",
+            "description": "Choose Beta."
+          }
+        ]
+      }
+    ]
+  },
+  "tool_use_id": "probe-tool-1"
+}

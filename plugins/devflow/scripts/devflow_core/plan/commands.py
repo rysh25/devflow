@@ -2,23 +2,39 @@
 from __future__ import annotations
 
 from ..common.environment import python_errors
+from ..common.hosts.codex import diagnose_conversation
 from ..common.workflow import Command, Option
 from .config import diagnose
 
 
 def doctor(engine, args, run_id, session) -> dict:
-    """Offline checks of the frozen (selected) or project configuration; repairs nothing."""
+    """Check settings; probe Codex only for the explicit session owning this run."""
     frozen = engine.read_frozen_config(run_id) if run_id else None
-    report = diagnose(engine.project, engine.workflow, effective_config=frozen)
+    report = diagnose(engine.project, engine.workflow, effective_config=frozen, host=engine.host)
     errors = python_errors()
-    warnings = engine.workflow.doctor(engine.project, report["config"])["warnings"]
+    checks = engine.workflow.doctor(engine.project, report["config"], host=engine.host)
+    warnings = checks["warnings"]
+    if engine.host == "codex":
+        owner = engine.store.read(run_id) if run_id else None
+        if owner and (owner["owner_host"] != engine.host or owner["owner_session"] != session):
+            api = {**checks["conversation_api"],
+                   "reason": "The caller's host and session do not match this run's owner session; API not probed",
+                   "scope": "Frozen run settings only; no conversation API probe for a different owner"}
+        else:
+            api = diagnose_conversation(engine.project, session)
+        report["conversation_api"] = api
+        if api["checked"]:
+            report["ready"] = report["ready"] and api["ready"]
+            report["readiness_scope"] = "Settings/PATH and native conversation API initialization, root identity and first page only"
+            report["note"] = "No model calls. Full pagination, question availability and later seal capture remain unverified."
     return {**report, "run_id": run_id or None, "warnings": warnings, "errors": errors,
             "ready": report["ready"] and not errors}
 
 
 COMMANDS = (
     Command("status", "Inspect the bound or named plan run", lambda e, a, run, s: e.status(run), needs_owner=False),
-    Command("doctor", "Offline config/PATH checks only; no model calls", doctor, needs_run=False, needs_owner=False),
+    Command("doctor", "Config/PATH checks; Codex --session also probes the native conversation API; no model calls",
+            doctor, needs_run=False, needs_owner=False),
     Command("seal", "Freeze the verbatim interview and human decisions",
             lambda e, a, run, s: e.seal(run, a.decisions_file),
             (Option("--decisions-file", "draft"),)),

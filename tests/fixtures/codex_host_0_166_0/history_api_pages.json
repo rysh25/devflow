@@ -1,0 +1,332 @@
+{
+  "read": {
+    "id": 2,
+    "result": {
+      "thread": {
+        "id": "probe-session-1",
+        "sessionId": "probe-session-1",
+        "parentThreadId": null,
+        "source": "cli",
+        "threadSource": "user",
+        "historyMode": "paginated",
+        "cliVersion": "0.166.0"
+      },
+      "readState": {
+        "firstUnread": {
+          "type": "turn",
+          "turnId": "probe-turn-1"
+        },
+        "revision": "probe-api-id-7"
+      }
+    }
+  },
+  "pages": [
+    {
+      "id": 3,
+      "result": {
+        "data": [
+          {
+            "turnId": "probe-turn-1",
+            "item": {
+              "type": "userMessage",
+              "id": "probe-api-id-8",
+              "clientId": "probe-api-id-9",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "$devflow:plan  Please report the operation marker and delivered hook context. Do not use tools, ask questions, or modify files.",
+                  "text_elements": [
+                    {
+                      "byteRange": {
+                        "start": 0,
+                        "end": 13
+                      },
+                      "placeholder": "$devflow:plan"
+                    }
+                  ]
+                }
+              ],
+              "startedAtMs": 1700000000000,
+              "completedAtMs": 1700000000000
+            },
+            "startedAtMs": 1700000000000,
+            "completedAtMs": 1700000000000
+          },
+          {
+            "turnId": "probe-turn-1",
+            "item": {
+              "type": "reasoning",
+              "id": "probe-api-id-10",
+              "summary": [],
+              "content": [],
+              "startedAtMs": 1700000003215,
+              "completedAtMs": 1700000003215
+            },
+            "startedAtMs": 1700000003215,
+            "completedAtMs": 1700000003215
+          }
+        ],
+        "nextCursor": "probe-api-cursor-1",
+        "backwardsCursor": "probe-api-cursor-2"
+      }
+    },
+    {
+      "id": 4,
+      "result": {
+        "data": [
+          {
+            "turnId": "probe-turn-1",
+            "item": {
+              "type": "agentMessage",
+              "id": "probe-api-id-11",
+              "text": "DEVFLOW_PROBE_SKILL=plan\nDEVFLOW_PROBE_CONTEXT host=codex session_id=probe-session-1 project=/fixture/project runner=/fixture/codex/plugins/cache/devflow-probe/devflow/0.0.0-probe/scripts/record.py",
+              "phase": "final_answer",
+              "memoryCitation": null,
+              "delivery": null,
+              "questions": null,
+              "startedAtMs": 1700000003221,
+              "completedAtMs": 1700000005122
+            },
+            "startedAtMs": 1700000003221,
+            "completedAtMs": 1700000005122
+          },
+          {
+            "turnId": "probe-api-id-12",
+            "item": {
+              "type": "userMessage",
+              "id": "probe-api-id-13",
+              "clientId": "probe-api-id-14",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "$devflow:plan Use the native request_user_input tool to ask exactly: \"Which probe option do you choose?\" with options \"Alpha\" and \"Beta\". Wait for the real answer. If the tool is unavailable, report NATIVE_QUESTION_UNAVAILABLE and do not ask a text question. Do not use other tools or change files.",
+                  "text_elements": []
+                }
+              ],
+              "startedAtMs": 1700000035233,
+              "completedAtMs": 1700000035233
+            },
+            "startedAtMs": 1700000035233,
+            "completedAtMs": 1700000035233
+          }
+        ],
+        "nextCursor": "probe-api-cursor-3",
+        "backwardsCursor": "probe-api-cursor-4"
+      }
+    },
+    {
+      "id": 5,
+      "result": {
+        "data": [
+          {
+            "turnId": "probe-api-id-12",
+            "item": {
+              "type": "reasoning",
+              "id": "probe-api-id-15",
+              "summary": [],
+              "content": [],
+              "startedAtMs": 1700000044833,
+              "completedAtMs": 1700000044833
+            },
+            "startedAtMs": 1700000044833,
+            "completedAtMs": 1700000044833
+          },
+          {
+            "turnId": "probe-api-id-12",
+            "item": {
+              "type": "agentMessage",
+              "id": "probe-api-id-16",
+              "text": "DEVFLOW_PROBE_SKILL=plan\nDEVFLOW_PROBE_CONTEXT host=codex session_id=probe-session-1 project=/fixture/project runner=/fixture/codex/plugins/cache/devflow-probe/devflow/0.0.0-probe/scripts/record.py\nNATIVE_QUESTION_UNAVAILABLE",
+              "phase": "final_answer",
+              "memoryCitation": null,
+              "delivery": null,
+              "questions": null,
+              "startedAtMs": 1700000044837,
+              "completedAtMs": 1700000046071
+            },
+            "startedAtMs": 1700000044837,
+            "completedAtMs": 1700000046071
+          }
+        ],
+        "nextCursor": "probe-api-cursor-5",
+        "backwardsCursor": "probe-api-cursor-6"
+      }
+    },
+    {
+      "id": 6,
+      "result": {
+        "data": [
+          {
+            "turnId": "probe-turn-2",
+            "item": {
+              "type": "userMessage",
+              "id": "probe-api-id-17",
+              "clientId": "probe-api-id-18",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "$devflow:implement Capability probe: report the exact operation marker and hook context. No tools, questions, or file changes.",
+                  "text_elements": []
+                }
+              ],
+              "startedAtMs": 1700000131738,
+              "completedAtMs": 1700000131738
+            },
+            "startedAtMs": 1700000131738,
+            "completedAtMs": 1700000131738
+          },
+          {
+            "turnId": "probe-turn-2",
+            "item": {
+              "type": "agentMessage",
+              "id": "probe-api-id-19",
+              "text": "DEVFLOW_PROBE_SKILL=implement\nDEVFLOW_PROBE_CONTEXT host=codex session_id=probe-session-1 project=/fixture/project runner=/fixture/codex/plugins/cache/devflow-probe/devflow/0.0.0-probe/scripts/record.py",
+              "phase": "final_answer",
+              "memoryCitation": null,
+              "delivery": null,
+              "questions": null,
+              "startedAtMs": 1700000134468,
+              "completedAtMs": 1700000137034
+            },
+            "startedAtMs": 1700000134468,
+            "completedAtMs": 1700000137034
+          }
+        ],
+        "nextCursor": "probe-api-cursor-7",
+        "backwardsCursor": "probe-api-cursor-8"
+      }
+    },
+    {
+      "id": 7,
+      "result": {
+        "data": [
+          {
+            "turnId": "probe-turn-3",
+            "item": {
+              "type": "userMessage",
+              "id": "probe-api-id-20",
+              "clientId": "probe-api-id-21",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "$devflow:status Capability probe: report the exact operation marker and hook context. No tools, questions, or file changes.",
+                  "text_elements": []
+                }
+              ],
+              "startedAtMs": 1700000156130,
+              "completedAtMs": 1700000156130
+            },
+            "startedAtMs": 1700000156130,
+            "completedAtMs": 1700000156130
+          },
+          {
+            "turnId": "probe-turn-3",
+            "item": {
+              "type": "agentMessage",
+              "id": "probe-api-id-22",
+              "text": "DEVFLOW_PROBE_SKILL=status\nDEVFLOW_PROBE_CONTEXT host=codex session_id=probe-session-1 project=/fixture/project runner=/fixture/codex/plugins/cache/devflow-probe/devflow/0.0.0-probe/scripts/record.py",
+              "phase": "final_answer",
+              "memoryCitation": null,
+              "delivery": null,
+              "questions": null,
+              "startedAtMs": 1700000159174,
+              "completedAtMs": 1700000160960
+            },
+            "startedAtMs": 1700000159174,
+            "completedAtMs": 1700000160960
+          }
+        ],
+        "nextCursor": "probe-api-cursor-9",
+        "backwardsCursor": "probe-api-cursor-10"
+      }
+    },
+    {
+      "id": 8,
+      "result": {
+        "data": [
+          {
+            "turnId": "probe-turn-4",
+            "item": {
+              "type": "userMessage",
+              "id": "probe-api-id-23",
+              "clientId": "probe-api-id-24",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "$devflow:resume Capability probe: report the exact operation marker and hook context. No tools, questions, or file changes.",
+                  "text_elements": []
+                }
+              ],
+              "startedAtMs": 1700000162235,
+              "completedAtMs": 1700000162235
+            },
+            "startedAtMs": 1700000162235,
+            "completedAtMs": 1700000162235
+          },
+          {
+            "turnId": "probe-turn-4",
+            "item": {
+              "type": "agentMessage",
+              "id": "probe-api-id-25",
+              "text": "DEVFLOW_PROBE_SKILL=resume\nDEVFLOW_PROBE_CONTEXT host=codex session_id=probe-session-1 project=/fixture/project runner=/fixture/codex/plugins/cache/devflow-probe/devflow/0.0.0-probe/scripts/record.py",
+              "phase": "final_answer",
+              "memoryCitation": null,
+              "delivery": null,
+              "questions": null,
+              "startedAtMs": 1700000164792,
+              "completedAtMs": 1700000165683
+            },
+            "startedAtMs": 1700000164792,
+            "completedAtMs": 1700000165683
+          }
+        ],
+        "nextCursor": "probe-api-cursor-11",
+        "backwardsCursor": "probe-api-cursor-12"
+      }
+    },
+    {
+      "id": 9,
+      "result": {
+        "data": [
+          {
+            "turnId": "probe-turn-5",
+            "item": {
+              "type": "userMessage",
+              "id": "probe-api-id-26",
+              "clientId": "probe-api-id-27",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "$devflow:doctor Capability probe: report the exact operation marker and hook context. No tools, questions, or file changes.",
+                  "text_elements": []
+                }
+              ],
+              "startedAtMs": 1700000167695,
+              "completedAtMs": 1700000167695
+            },
+            "startedAtMs": 1700000167695,
+            "completedAtMs": 1700000167695
+          },
+          {
+            "turnId": "probe-turn-5",
+            "item": {
+              "type": "agentMessage",
+              "id": "probe-api-id-28",
+              "text": "DEVFLOW_PROBE_SKILL=doctor\nDEVFLOW_PROBE_CONTEXT host=codex session_id=probe-session-1 project=/fixture/project runner=/fixture/codex/plugins/cache/devflow-probe/devflow/0.0.0-probe/scripts/record.py",
+              "phase": "final_answer",
+              "memoryCitation": null,
+              "delivery": null,
+              "questions": null,
+              "startedAtMs": 1700000170265,
+              "completedAtMs": 1700000172091
+            },
+            "startedAtMs": 1700000170265,
+            "completedAtMs": 1700000172091
+          }
+        ],
+        "nextCursor": null,
+        "backwardsCursor": "probe-api-cursor-13"
+      }
+    }
+  ]
+}

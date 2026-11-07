@@ -8,6 +8,7 @@ venv/
 node_modules/
 dist/
 .devflow/
+/devflow.config.local.json
 docs/plans/
 .env
 .env.*

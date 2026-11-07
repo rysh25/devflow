@@ -1,0 +1,16 @@
+{
+  "cli_version": "2.1.319",
+  "captured_at": "2026-11-07",
+  "source": "Actual claude --print --verbose --output-format stream-json --model opus --effort high --json-schema with DevFlow Plan schema",
+  "processing": "Raw result lines with textual path/session redaction; not parsed/reserialized. Malformed tests derive separate variants from these bytes.",
+  "environment": "Both synthetic inherited parent/session/child/peer variables and standalone environment were tested. Native child reports have parent_tool_use_id; root never used that tool.",
+  "token_observation": "child result usage differs from modelUsage; root Agent call completed; modelUsage names select only four token fields",
+  "isolation": "Separate root session, no dummy peer socket connection, no host DevFlow or synthetic host transcript changes; no environment stripping needed.",
+  "derived_test_cases": {
+    "storage": "Created only in memory by tests; not additional native CLI captures",
+    "cases": [
+      "Unknown assistant blocks, including unnamed and unpaired-surrogate type names, added before a captured valid result",
+      "Known text/thinking/redacted_thinking and repeated tool-use blocks preserve answer and tool counts"
+    ]
+  }
+}

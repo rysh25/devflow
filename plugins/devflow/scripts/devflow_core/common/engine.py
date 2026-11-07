@@ -19,16 +19,17 @@ from .storage import now, read_json, writable_text
 
 class RunEngine:
     def __init__(self, project: Path, workflow, resources: Path | None = None,
-                 lock_wait: float = RUNNER_WAIT, session: str | None = None):
+                 lock_wait: float = RUNNER_WAIT, session: str | None = None, *, host: str):
         self.project = Path(project).resolve()
         if not self.project.is_dir():
             raise DevFlowError("Project must be an existing directory")
         self.workflow = workflow
         self.resources = Path(resources).resolve() if resources else workflow.resource_dir
-        self.store = RunStore(self.project, workflow, lock_wait)
+        self.store = RunStore(self.project, workflow, lock_wait, host=host)
         # When set, every locked change verifies that this session still owns
         # the run: ownership can move while the lock is not held.
         self.session = session
+        self.host = host
 
     def _run(self, run_id: str) -> Path:
         return self.store.run_dir(run_id)
@@ -41,15 +42,17 @@ class RunEngine:
         if not self.store.holds(run_id):
             return self.store.read(run_id)
         state = self.store.load(run_id)
+        if state["owner_host"] != self.host:
+            raise DevFlowError("Cross-host mutation is unsupported; use the run's original host")
         owner = session if session is not None else self.session
         if owner is not None:
             self._require_owner(state, owner)
         return state
 
-    @staticmethod
-    def _require_owner(state: dict, session: str | None) -> None:
-        if not session or state["owner_session"] != session:
-            raise DevFlowError("This session does not own the run; use /devflow:resume RUN_ID first.")
+    def _require_owner(self, state: dict, session: str | None) -> None:
+        if not session or (state["owner_host"], state["owner_session"]) != (self.host, session):
+            raise DevFlowError("This host/session does not own the run; cross-host mutation is unsupported. "
+                               "Use /devflow:resume RUN_ID in the original host first.")
 
     def require_owner(self, run_id: str, session: str | None) -> dict:
         state = self.store.read(run_id)

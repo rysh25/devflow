@@ -8,6 +8,8 @@ from ..common.errors import UsageError
 from ..common.review import after_failed_review, check_review_budget, check_review_config, review_budget
 from ..common.runs import TERMINAL
 from ..common.storage import json_bytes, now
+from ..common.operations import public_command
+from ..common.startup import override_reviewers, parse_start
 from ..common.workflow import Workflow
 from .commands import COMMANDS
 
@@ -38,25 +40,31 @@ class PlanWorkflow(Workflow):
     def build_start(self, project: Path, pending: dict, options: dict,
                     scratch: Path) -> tuple[dict, dict[str, bytes]]:
         # Plan starts inside the prompt hook and has no extra start options; ``options`` is unused.
-        from .config import load_config
+        from .config import load_config, validate_config
         from .transcript import transcript_marker
         payload = pending["event"]["payload"]
         prompt = payload["prompt"]
         # Keep the request byte-exact apart from the command itself.
-        request = re.sub(r"^/devflow:plan(?:\s+|$)", "", prompt, count=1)
-        config = load_config(project, self)
+        host = payload["host"]
+        if host == "codex" and (not isinstance(payload.get("turn_id"), str) or not payload["turn_id"]):
+            raise UsageError("Codex Plan requires the actual start turn ID from its hook; do not guess")
+        startup = parse_start(public_command(prompt, host)[1])
+        request = startup.body
+        config = validate_config(override_reviewers(load_config(project, self), startup))
         fields = {
             "status": "interview", "review_count": 0, "review_limit": config["max_reviews"],
             "plan_version": None, "plan_hash": None,
             "current_plan": None, "passes": [], "config": config,
-            "transcript_marker": transcript_marker(payload.get("transcript_path")),
+            "transcript_marker": (transcript_marker(payload.get("transcript_path")) if host == "claude" else
+                                  {"host": "codex", "session_id": payload["session_id"],
+                                   "turn_id": payload.get("turn_id")}),
             "resolved_escalations": [], "last_error": None, "last_review": None,
             "final_plan_reviewed": False, "escalation": None,
             "publication": {"status": "pending" if config["publish"]["enabled"] else "disabled"},
         }
         artifacts = {
             "request.json": json_bytes({"schema_version": 1, "raw_prompt": prompt, "request": request,
-                                        "source": "Claude Code UserPromptSubmit", "session_id": payload["session_id"]}),
+                                        "source": host + " UserPromptSubmit", "session_id": payload["session_id"]}),
             "config.json": json_bytes(config),
         }
         return fields, artifacts
@@ -68,7 +76,8 @@ class PlanWorkflow(Workflow):
     def can_transfer(self, state: dict, session: str) -> str | None:
         unsealed = "interview.json" not in state["artifacts"]
         if unsealed and state["status"] not in TERMINAL and state["owner_session"] != session:
-            return "An unsealed interview must resume its original Claude session so its transcript remains complete."
+            host_name = "Codex" if state["owner_host"] == "codex" else "Claude"
+            return f"An unsealed interview must resume its original {host_name} session so its transcript remains complete."
         return None
 
     def on_transfer(self, state: dict) -> None:
@@ -114,18 +123,20 @@ class PlanWorkflow(Workflow):
         from .config import load_config
         return load_config(project, self)
 
-    def doctor(self, project: Path, config: dict) -> dict:
+    def doctor(self, project: Path, config: dict, *, host: str) -> dict:
         from .interview import inspect_interview_skill
-        inspection = inspect_interview_skill(project, config["grill_skill"])
+        from ..common.hosts.codex import diagnose_conversation
+        inspection = inspect_interview_skill(project, config["grill_skill"], host=host)
         return {"interview_skill": inspection, "ready": inspection["static_ready"],
+                **({"conversation_api": diagnose_conversation(project)} if host == "codex" else {}),
                 "warnings": ([] if inspection["static_ready"] else
                              ["Planning interview skill " + inspection["configured_name"] + ": " + inspection["reason"]])
                             + ["Interview skill callability is not runtime-verified; static metadata cannot "
                                "establish effective permissions or skillOverrides"]}
 
-    def engine(self, project: Path, session: str | None = None):
+    def engine(self, project: Path, session: str | None = None, *, host: str):
         from .engine import Engine
-        return Engine(project, session=session)
+        return Engine(project, session=session, host=host)
 
 
 WORKFLOW = PlanWorkflow()

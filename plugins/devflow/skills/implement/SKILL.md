@@ -1,9 +1,9 @@
 ---
 name: implement
 description: Implement an explicitly selected Markdown plan, run approved project checks, and alternate independent Codex and OpenCode reviews up to max_reviews attempts, which only the human can raise at the limit. Use only when the user invokes /devflow:implement with a plan file.
-argument-hint: "<plan-file>"
+argument-hint: "[--reviewer AGENT MODEL EFFORT ... --] <plan-file>"
 disable-model-invocation: true
-allowed-tools: Bash(uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *) PowerShell(uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *)
+allowed-tools: Bash(uv --no-cache run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *) PowerShell(uv --no-cache run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *)
 ---
 
 # DevFlow implementation
@@ -20,9 +20,9 @@ Implement the file specified by `$ARGUMENTS`. Call the DevFlow runner from this 
 Runner template; replace placeholders with actual paths/IDs, keep global options before the `implement` selector, and run it alone (never joined with other commands):
 
 ```text
-uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" --project "ABSOLUTE_PROJECT_PATH" --session "${CLAUDE_SESSION_ID}" implement doctor
-uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" --project "ABSOLUTE_PROJECT_PATH" --session "${CLAUDE_SESSION_ID}" implement start --plan "ABSOLUTE_PLAN_PATH"
-uv run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" --project "ABSOLUTE_PROJECT_PATH" --session "${CLAUDE_SESSION_ID}" implement start --plan "ABSOLUTE_PLAN_PATH" --workspace "WORKSPACE_PATH"
+uv --no-cache run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" --host claude --project "ABSOLUTE_PROJECT_PATH" --session "${CLAUDE_SESSION_ID}" implement doctor
+uv --no-cache run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" --host claude --project "ABSOLUTE_PROJECT_PATH" --session "${CLAUDE_SESSION_ID}" implement start --plan "ABSOLUTE_PLAN_PATH"
+uv --no-cache run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" --host claude --project "ABSOLUTE_PROJECT_PATH" --session "${CLAUDE_SESSION_ID}" implement start --plan "ABSOLUTE_PLAN_PATH" --workspace "WORKSPACE_PATH"
 ```
 
 `--project` is always the project that holds `devflow.config.json` and `.devflow`, even when the workspace is another worktree.
@@ -33,7 +33,7 @@ For later actions, insert `--run RUN_ID` before the `implement` selector. Use th
 
 DevFlow records and verifies; it does not limit tools. It assumes you follow these rules.
 
-- Preserve all pre-existing changes. Write runner input files in the run's draft directory. Do not edit the input plan, `devflow.config.json`, or DevFlow's run records and counters; the runner manages them and stops the run when they do not match.
+- Preserve all pre-existing changes. Write runner input files in the run's draft directory. Do not edit the input plan, `devflow.config.json`, `devflow.config.local.json`, or DevFlow's run records and counters; the runner manages them and stops the run when they do not match.
 - You may run tests, builds and other commands while implementing. Only the runner's `check` results count as validation evidence; never invent results. If no checks are configured, human validation is required; recommend configuring checks before a fresh run.
 - Ask the human before pushing, publishing, deploying, adding dependencies or running irreversible migrations, unless the human explicitly asked for it or the project's rules (`CLAUDE.md`, `AGENTS.md` and the like) say how to handle it. Committing is not limited.
 - Source code changes invalidate prior approvals; the runner owns that decision. Never reset or replace a run to obtain additional reviews; at the review limit the runner asks the human.
@@ -43,3 +43,5 @@ DevFlow records and verifies; it does not limit tools. It assumes you follow the
 ## Provenance and shared workspace
 
 Use AskUserQuestion without prefilled answers when a human decision is necessary. Never schedule this skill or invoke it from another agent's message. A UserPromptSubmit event alone is not proof of a human origin. Keep automated messages out of a decision-waiting session. Records live under the project's `.devflow/runs/implement/RUN_ID`; do not edit them or other runs. The plan workflow is not a prerequisite.
+
+Startup reviewer arguments replace the complete reviewer list for this run. Without them the effective project settings apply unchanged. The hook parses options; never invent or replay the start event. Plan handoff commands do not inherit these arguments.

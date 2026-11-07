@@ -1,6 +1,6 @@
-# DevFlow 0.7.3 — Claude Code Plugin
+# DevFlow 0.8.0 — Claude Code / Codex CLI Plugin
 
-人間との要件整理から計画作成、実装、独立レビューまでを支援する **単一の Claude Code Plugin** です。インストールするプラグインは `devflow` だけです。
+人間との要件整理から計画作成、実装、独立レビューまでを支援する **両ホストで使える単一のプラグイン** です。インストールするプラグインは `devflow` だけです。
 
 | コマンド | 入力と役割 |
 | --- | --- |
@@ -12,9 +12,70 @@
 
 Plan と Implement はファイルで接続します。Implement は Plan の run-id、会話履歴、内部状態を必要とせず、人間や別のツールが書いた Markdown でも開始できます。Plan 完了後に実装を勝手に始めることはありません。
 
+## 0.8.0 の利用方法
+
+Claude Code の5コマンドは従来の `/devflow:...` のままです。Codex CLI では
+`$devflow:plan`、`$devflow:implement`、`$devflow:status`、`$devflow:resume`、
+`$devflow:doctor` を明示的に呼びます。Codex の対象はローカル CLI 0.166.0 以降です。
+導入・フックの信頼と、質問機能の明示的な有効化は [導入手順](docs/installation.md) を参照してください。
+両ホストの run は、それぞれ開始したホストで再開します。
+両ホストで Plan から Implement まで通した結果は [検証範囲](docs/validation.md#製品の両ホストでの全フロー確認) に記録しています。
+
+Plan / Implement の起動時にレビュアーの種類・モデル・effort を指定できます。
+実際の選択画面は追加しません。次はレビュアー一覧を Claude と Codex の2人で置き換える例です。
+
+```text
+/devflow:plan --reviewer claude opus high --reviewer codex gpt-6.1-sol xhigh -- REVIEW-42 を計画して
+$devflow:implement --reviewer claude opus high --reviewer codex gpt-6.1-sol xhigh -- docs/plans/REVIEW-42.md
+```
+
+指定しなければ、設定ファイルと既定値の従来の選び方で動きます。
+`--` で始まる起動引数は常にオプションとして解析し、本文の前の単独の `--` が必須です。
+綴り間違い・未知のオプション・省略形はエラーで止まります。`-- 依頼` も使えます。
+同じ種類の既存レビュアーの command・timeout がすべて同じなら、その値を引き継ぎます。
+候補は設定をすべて解決した最終一覧です。異なる値があればエラーです。
+候補がなければ種類ごとの標準コマンドと1800秒を使います。
+一覧にない種類には command・timeout を指定する起動オプションはありません。
+2種類以上、max_reviews 以下の人数が必要です。順番と設定は開始時に固定され、
+resume では選び直しません。Plan の Implement 用案内にこの指定は引き継ぎません。
+
+プロジェクト直下の `devflow.config.local.json` は、`devflow.config.json` と同じ形式1の
+ローカル設定です。すべての公開設定項目を使えます。優先順位は
+既定値 → 共有の共通項目 → 共有のフロー別 → ローカルの共通項目 → ローカルのフロー別 → 起動指定です。
+`publish` / `snapshot` は項目単位でマージし、reviewers・checks などの配列は全体置換します。
+どちらのファイルも個別に検査し、エラーにはファイル名を出します。
+
+利用者自身で `.gitignore` に `/devflow.config.local.json` を加えてください。
+DevFlow は利用者の設定・権限・`.gitignore` を自動編集しません。
+ローカル設定もプロジェクト起点の目印になります。両設定ファイルは Implement のスナップショットに入れず、
+ローカル設定を明示的な context_paths に入れるとエラーです。配布物にローカル設定があると作成を止めます。
+
+`status` / `doctor` は、開始待ち・紐付け・イベントを変更しません。
+両ホストで、この操作入力と注入文は面接・回答数から除外します。通常のアシスタントの状態説明は残ります。
+Claude では通常の人間の返信も数えますが、Codex では出所を確認できた標準質問ツールの実回答だけを数えます。
+
+### 0.8.0 への更新とバージョンを戻す場合
+
+**ランナーCLIの破壊的変更：`--host` は全実操作で必須です。** 0.7.xまでの手動コマンド、
+外部スクリプト、復旧手順も、プラグイン更新と同時に `--host claude` または `--host codex` を
+グローバル引数へ追加してください。省略した `devflow.py status` / `doctor` は引数エラーになります。
+0.7.xの手動コマンドは、そのままでは動きません。Claude を暗黙に選ぶ互換動作は設けません。`--help` / `--version` は指定なしで使えます。
+更新後の復旧例は[保存場所と再開](#保存場所と再開)を参照してください。
+
+run 形式は10、セッション形式は3です。0.7.x の run（形式9）は unsupported となり、
+0.8.0 で続けられません。進行中の run は0.7.3で完了させてから更新してください。
+形式1・2のセッション記録は Claude の記録として扱い、新しい開始を妨げません。
+同じホストの次の通常入力で紐付け・開始待ちを外します。データ変換は行いません。
+
+0.8.0 から0.7.3へ戻して、そのまま run を開くことはサポートしません。
+0.7.3 は形式10・3を invalid とし、新しい開始も止まる場合があります。
+形式9を維持する分割案でも kind: claude の run は0.7.3で使えません。
+プロセスをすべて止め、更新前の `.devflow` と共有・ローカル設定のバックアップを戻すか、
+`.devflow` 全体を保管して空の状態から始めてください。形式番号や固定済み設定を書き換えないでください。
+
 ## DevFlow がすること、しないこと
 
-DevFlow は、Claude Code（計画と実装）と外部レビュアー（Codex、OpenCode）の機能を制限しません。どのツールも止めず、フックも失敗したときに止めません。各エージェントは、利用者のそれぞれの設定とモードのまま動きます。
+DevFlow は、Claude Code（計画と実装）と外部レビュアー（Codex、OpenCode、Claude Code）の機能を制限しません。どのツールも止めず、フックも失敗したときに止めません。各エージェントは、利用者のそれぞれの設定とモードのまま動きます。
 
 DevFlow がするのは、記録と確認です。
 
@@ -70,7 +131,7 @@ DevFlow 0.4.0 は、Claude Code 2.1.317、codex-cli 0.166.0、OpenCode 2.2.5 で
 # ///
 ```
 
-hooks は `uv run --offline --no-project --no-config --no-python-downloads` で起動します。互換 Python を選び、対象プロジェクトの依存をインストールせず、Python 自体も自動ダウンロードしません。互換 Python が一つもなければ起動できないので、必要な環境は人間が用意してください。
+両ホストの hooks とスキルは `uv --no-cache run --offline --no-project --no-config --no-python-downloads` でランナーを起動します。uv のキャッシュを使わず、互換 Python を選び、対象プロジェクトの依存をインストールせず、Python 自体も自動ダウンロードしません。互換 Python が一つもなければ起動できないので、必要な環境は人間が用意してください。
 
 Windows ネイティブと WSL は別環境です。Claude Code を WSL で使うなら、`uv`、Python、Codex、OpenCode もその WSL から起動できる必要があります。Windows 側に導入済みであるだけでは十分でない場合があります（[Windows](docs/installation.md#windows)）。
 
@@ -247,14 +308,16 @@ run-id は一回の作業を識別する自動生成 ID です。レビューご
 
 `.devflow/.gitignore` は非公開の実行データを無視するために作成します。プロジェクト直下の `.gitignore` を勝手に変更しません。Git で既に追跡済みのファイルは `.gitignore` では追跡解除されません。正式プランを保存しても `git add` / `commit` / `push` は実行しません。
 
-run を変えるランナーの操作（`cancel` など）は、run を所有する会話のセッションからだけ使えます。人間が自分の端末からランナーで操作するときは `--session` にそのセッションの ID を渡すか、先に `/devflow:resume RUN_ID` で今の会話へ引き継いでください。`status` と `doctor` は、どこからでも使えます。
+ランナーでは、読み取りも含めて常に `--host claude` または `--host codex` を明示します。`--help` と `--version` はホスト指定なしで表示できます。run を変える操作（`cancel` など）は、run を所有する会話のセッションからだけ使えます。人間が自分の端末からランナーで操作するときは `--session` にそのセッションの ID を渡すか、先に `/devflow:resume RUN_ID` で今の会話へ引き継いでください。`status` と `doctor` は、どこからでも使えます。
 
 外部処理（チェック・レビュー）の途中で Claude Code を閉じた場合などは、run が処理中のまま残ります。関係するプロセスが止まったことを確かめてから、人間が自分の端末でランナーの `recover` を実行します。その回は使用済みのままです。`PLUGIN_DIR` はインストールしたプラグインのディレクトリ、`PROJECT_DIR` は対象プロジェクトです。Plan の `--expected-review` には、処理中だったレビューの回（`/devflow:status` の `review_count`）を渡します。
 
 ```text
-uv run --offline --no-project --no-config --no-python-downloads "PLUGIN_DIR/scripts/devflow.py" --project "PROJECT_DIR" --run RUN_ID implement recover --confirm-process-stopped
-uv run --offline --no-project --no-config --no-python-downloads "PLUGIN_DIR/scripts/devflow.py" --project "PROJECT_DIR" --run RUN_ID plan recover --expected-review N --confirm-process-stopped
+uv --no-cache run --offline --no-project --no-config --no-python-downloads "PLUGIN_DIR/scripts/devflow.py" --host claude --project "PROJECT_DIR" --run RUN_ID implement recover --confirm-process-stopped
+uv --no-cache run --offline --no-project --no-config --no-python-downloads "PLUGIN_DIR/scripts/devflow.py" --host claude --project "PROJECT_DIR" --run RUN_ID plan recover --expected-review N --confirm-process-stopped
 ```
+
+上の例は Claude の run 用です。Codex の run を復旧するときは `--host codex` を指定します。
 
 ## 制約と安全性
 

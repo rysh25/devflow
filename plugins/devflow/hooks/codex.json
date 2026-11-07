@@ -1,0 +1,39 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv --no-cache run --offline --no-project --no-config --no-python-downloads \"${PLUGIN_ROOT}/scripts/devflow.py\" --host codex hook",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv --no-cache run --offline --no-project --no-config --no-python-downloads \"${PLUGIN_ROOT}/scripts/devflow.py\" --host codex hook",
+            "timeout": 30
+          }
+        ],
+        "matcher": "request_user_input"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv --no-cache run --offline --no-project --no-config --no-python-downloads \"${PLUGIN_ROOT}/scripts/devflow.py\" --host codex hook",
+            "timeout": 30
+          }
+        ],
+        "matcher": "request_user_input"
+      }
+    ]
+  }
+}

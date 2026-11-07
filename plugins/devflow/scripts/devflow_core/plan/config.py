@@ -7,11 +7,12 @@ from pathlib import Path
 import re
 import shutil
 
+from ..common.hosts import executable_name
+
 from ..common.errors import DevFlowError
-from ..common.storage import read_json
-from .interview import inspect_interview_skill
+from .interview import INTERVIEW_NAME_PATTERN, inspect_interview_skill
 from ..common.review import validate_limit
-from ..common.settings import validate_reviewers, workflow_overlay
+from ..common.settings import load_workflow_config, validate_reviewers
 
 
 # The published plan's name: a template whose only values are {run_id} and {ticket}.
@@ -55,7 +56,7 @@ def validate_config(config: dict) -> dict:
     if type(config.get("schema_version")) is not int or config.get("schema_version") != 1:
         raise DevFlowError("Unsupported configuration schema_version (expected 1).")
     skill = config.get("grill_skill")
-    if not isinstance(skill, str) or not re.fullmatch(r"[a-zA-Z0-9_.:-]+", skill):
+    if not isinstance(skill, str) or not INTERVIEW_NAME_PATTERN.fullmatch(skill):
         raise DevFlowError("grill_skill must be an installed skill name, with no leading slash.")
     count = validate_limit(config.get("max_reviews"))
     limit = config.get("max_packet_bytes")
@@ -86,20 +87,14 @@ def validate_config(config: dict) -> dict:
 
 
 def load_config(project: Path, workflow) -> dict:
-    value = read_json(workflow.resource("defaults.json"))
-    overlay = workflow_overlay(project, workflow.name)
-    if "publish" in overlay and isinstance(overlay["publish"], dict):
-        overlay["publish"] = {**value["publish"], **overlay["publish"]}
-    # Lists replace in full. Review order is an explicit, immutable contract.
-    value.update(overlay)
-    return validate_config(value)
+    return load_workflow_config(project, workflow, validate_config)
 
 
-def diagnose(project: Path, workflow, effective_config: dict | None = None) -> dict:
+def diagnose(project: Path, workflow, effective_config: dict | None = None, *, host: str) -> dict:
     config = load_config(project, workflow) if effective_config is None else validate_config(effective_config)
-    interview = inspect_interview_skill(project, config["grill_skill"])
+    interview = inspect_interview_skill(project, config["grill_skill"], host=host)
     binaries = {}
-    for name in ("uv", "claude", *[p["command"][0] for p in config["reviewers"]]):
+    for name in ("uv", executable_name(host), *[p["command"][0] for p in config["reviewers"]]):
         found = shutil.which(name)
         binaries[name] = {"found": bool(found), "path": found}
     return {
