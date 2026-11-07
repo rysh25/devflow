@@ -3,19 +3,23 @@
 Hooks are session-scoped: a session without a record is inert and never
 creates files. Hooks never deny a tool or block a prompt; they record human
 events and add context. Starts and resumes enforce one unfinished run per
-project. Ownership is decided only by a run's ``owner_session``. This module
+project. Ownership is decided by the run's (``owner_host``, ``owner_session``). This module
 never dispatches a model itself.
 """
 from __future__ import annotations
 
 from contextlib import contextmanager
 import os
+import json
 from pathlib import Path
 
 from . import __version__
 from .common import notices, sessions
 from .common.paths import hook_project, project_root
 from .common.errors import DevFlowError
+from .common.hosts import question_context, question_tool_name
+from .common.operations import public_command as detect_command
+from .common.startup import parse_start
 from .common.runs import (HOOK_WAIT, RUNNER_WAIT, TERMINAL, RunStore, data_root, ensure_data_root,
                           event_bytes, make_event, new_run_id, unsupported_message, validate_run_id)
 from .common.settings import validate_document
@@ -25,18 +29,19 @@ from .workflows import WORKFLOWS
 RESUME = "resume"
 
 
-def stores(project: Path, wait: float = RUNNER_WAIT) -> dict[str, RunStore]:
-    return {name: RunStore(project, workflow, wait) for name, workflow in WORKFLOWS.items()}
+def public_command(prompt: str, host: str) -> tuple[str | None, str]:
+    return detect_command(prompt, host, (*WORKFLOWS, RESUME, "status", "doctor"))
 
 
-def public_command(prompt: str) -> tuple[str | None, str]:
-    for name in (*WORKFLOWS, RESUME):
-        command = "/devflow:" + name
-        if prompt == command:
-            return name, ""
-        if prompt.startswith(command) and prompt[len(command):len(command) + 1].isspace():
-            return name, prompt[len(command):].strip()
-    return None, ""
+def _entry_context(operation: str, session: str, project: Path, plugin_root: Path) -> dict:
+    return notices.context("UserPromptSubmit", "DevFlow Codex entry context: " + json.dumps({
+        "operation": operation, "host": "codex", "session_id": session, "project": str(project),
+        "runner": str(notices.runner_path(plugin_root)),
+        "global_arguments": ["--host", "codex", "--project", str(project), "--session", session]}, ensure_ascii=False))
+
+
+def stores(project: Path, wait: float = RUNNER_WAIT, *, host: str) -> dict[str, RunStore]:
+    return {name: RunStore(project, workflow, wait, host=host) for name, workflow in WORKFLOWS.items()}
 
 
 @contextmanager
@@ -72,7 +77,10 @@ def assert_available(project: Path, session: str, all_stores: dict[str, RunStore
                                    "preserve it for human recovery before starting another")
             if info.format == "current" and info.state["status"] not in TERMINAL:
                 raise DevFlowError(f"Another unfinished {flow} run exists ({info.run_id}); resume or cancel it first")
-    for name, record, error in sessions.scan_records(project, WORKFLOWS):
+    for info in sessions.scan_records(project, WORKFLOWS):
+        if info.format == "unsupported":
+            continue
+        name, record, error = info.name, info.record, info.error
         if error:
             raise DevFlowError(f"Session record {name} is invalid ({error}); a human must move it out of "
                                ".devflow/sessions/ before another start")
@@ -92,7 +100,7 @@ def _create(project: Path, session: str, pending: dict, all_stores: dict[str, Ru
     with store.scratch(pending["run_id"]) as scratch:
         fields, artifacts = workflow.build_start(project, pending, dict(options or {}), scratch)
         return store.create(fields, artifacts, run_id=pending["run_id"], owner=session,
-                            first_event=pending["event"])
+                            first_event=pending["event"], owner_host=store.host)
 
 
 def _bound(record: dict, flow: str, run_id: str) -> dict:
@@ -132,7 +140,7 @@ def _start(project: Path, session: str, flow: str, argument: str, payload: dict,
     current = sessions.binding(project, record, all_stores)
     if current is not None and not current.terminal:
         raise DevFlowError("Finish or cancel this session's active workflow before starting another")
-    args = workflow.normalize_args(argument, project)
+    args = workflow.normalize_args(parse_start(argument).body, project)
     validate_document(project, WORKFLOWS)
     assert_available(project, session, all_stores)
     pending = {"flow": flow, "run_id": new_run_id(), "args": args, "event": make_event(payload, "prompt"),
@@ -141,7 +149,9 @@ def _start(project: Path, session: str, flow: str, argument: str, payload: dict,
     sessions.write_record(project, record, WORKFLOWS)
     if workflow.start_option is not None:
         extra = "".join(f" {option.flag} is optional." for option in workflow.extra_start_options)
-        return notices.context("UserPromptSubmit", (
+        entry = (_entry_context(flow, session, project, plugin_root)["hookSpecificOutput"]["additionalContext"]
+                 if all_stores[flow].host == "codex" else "")
+        return notices.context("UserPromptSubmit", (entry + " " +
             f"DevFlow {flow} start is pending. Run the {flow} start action with {workflow.start_option} naming "
             f"exactly this input.{extra} Runner: {notices.runner_path(plugin_root)}. Pending input: {args}"))
     try:
@@ -157,7 +167,7 @@ def _start(project: Path, session: str, flow: str, argument: str, payload: dict,
 
 def _resume(project: Path, session: str, argument: str, payload: dict, record: dict,
             all_stores: dict[str, RunStore], plugin_root: Path) -> dict:
-    run_id = validate_run_id(argument)
+    run_id = validate_run_id(argument.strip())
     flow, info = resolve_run(project, run_id, all_stores)
     if info.format == "unsupported":
         raise DevFlowError(unsupported_message(run_id, info.schema_version))
@@ -178,14 +188,15 @@ def _resume(project: Path, session: str, argument: str, payload: dict, record: d
     return _context("UserPromptSubmit", flow, state, store, plugin_root, state["event_ids"][-1])
 
 
-def runner_start(project: Path, session: str | None, flow: str, raw: str, options: dict | None = None) -> dict:
+def runner_start(project: Path, session: str | None, flow: str, raw: str, options: dict | None = None,
+                 *, host: str) -> dict:
     """``FLOW start`` from the runner: creates exactly the run the user asked for."""
     if not session:
-        raise DevFlowError("start requires the actual current Claude session ID")
+        raise DevFlowError("start requires the actual current host session ID")
     workflow = WORKFLOWS[flow]
-    all_stores = stores(project)
+    all_stores = stores(project, host=host)
     with dispatch_lock(project, RUNNER_WAIT):
-        record = sessions.read_record(project, session, WORKFLOWS)
+        record = sessions.read_record(project, session, WORKFLOWS, host)
         pending = record and record["pending_start"]
         if not pending or pending["flow"] != flow:
             raise DevFlowError(f"Start only from an explicit /devflow:{flow} command in this session")
@@ -195,13 +206,14 @@ def runner_start(project: Path, session: str | None, flow: str, raw: str, option
         assert_available(project, session, all_stores)
         state = _create(project, session, pending, all_stores, options)
         sessions.write_record(project, _bound(record, flow, state["run_id"]), WORKFLOWS)
-    return workflow.engine(project).status(state["run_id"])
+    return workflow.engine(project, host=host).status(state["run_id"])
 
 
-def selected_run(project: Path, session: str | None, flow: str, explicit: str | None) -> str | None:
+def selected_run(project: Path, session: str | None, flow: str, explicit: str | None,
+                 *, host: str) -> str | None:
     """The run a workflow command acts on: an explicit ``--run`` or the session's binding."""
     if explicit:
-        selected_flow, info = resolve_run(project, explicit, stores(project))
+        selected_flow, info = resolve_run(project, explicit, stores(project, host=host))
         if selected_flow != flow:
             raise DevFlowError("The selected run belongs to another workflow")
         if info.format == "unsupported":
@@ -209,17 +221,17 @@ def selected_run(project: Path, session: str | None, flow: str, explicit: str | 
         return explicit
     if not session:
         return None
-    record = sessions.read_record(project, session, WORKFLOWS)
+    record = sessions.read_record(project, session, WORKFLOWS, host)
     if record and record["run"] and record["run"]["flow"] == flow:
         run_id = record["run"]["run_id"]
-        info = RunStore(project, WORKFLOWS[flow]).inspect(run_id)
+        info = RunStore(project, WORKFLOWS[flow], host=host).inspect(run_id)
         if info.format == "unsupported":
             raise DevFlowError(unsupported_message(run_id, info.schema_version))
         return run_id
     return None
 
 
-def handle_hook(payload: dict, plugin_root: Path, environ=None) -> dict | None:
+def handle_hook(payload: dict, plugin_root: Path, environ=None, *, host: str) -> dict | None:
     """Record human events and add context; never deny a tool or block a prompt.
 
     A failure is raised for the CLI to report without blocking. A question that
@@ -230,27 +242,40 @@ def handle_hook(payload: dict, plugin_root: Path, environ=None) -> dict | None:
         raise DevFlowError("Hook input must be a JSON object")
     event = payload.get("hook_event_name")
     # hooks.json registers these three events only (tools/package.py checks it):
-    # Claude Code sends no other event to this hook.
+    # Supported hosts send only these configured events to this hook.
     if event not in {"UserPromptSubmit", "PreToolUse", "PostToolUse"}:
         return None
     cwd, session = payload.get("cwd"), payload.get("session_id")
     if not isinstance(cwd, str) or not cwd or not isinstance(session, str) or not sessions.SESSION_ID.fullmatch(session):
-        raise DevFlowError("Hook requires project cwd and a valid Claude session ID")
-    project = hook_project(Path(cwd), os.environ if environ is None else environ)
-    all_stores = stores(project, HOOK_WAIT)
-    record = sessions.read_record(project, session, WORKFLOWS)
+        raise DevFlowError("Hook requires project cwd and a valid host session ID")
+    from .common.hosts import validate_host
+    validate_host(host)
+    payload = dict(payload, host=host, source=payload)
+    project = (hook_project(Path(cwd), os.environ if environ is None else environ) if host == "claude"
+               else project_root(Path(cwd)))
+    all_stores = stores(project, HOOK_WAIT, host=host)
+    if event == "UserPromptSubmit" and isinstance(payload.get("prompt"), str):
+        operation = public_command(payload["prompt"], host)[0]
+        if operation in {"status", "doctor"}:
+            return _entry_context(operation, session, project, plugin_root) if host == "codex" else None
+    path = sessions.session_path(project, session)
+    info = sessions.inspect_record(path, WORKFLOWS) if path.exists() else None
+    if info is not None and info.host is not None and info.host != host:
+        raise DevFlowError("Session host collision; no records were changed")
+    record = (info.record if info is not None and info.format == "unsupported"
+              else sessions.read_record(project, session, WORKFLOWS, host))
     if event == "UserPromptSubmit":
         prompt = payload.get("prompt")
         if not isinstance(prompt, str):
             raise DevFlowError("UserPromptSubmit requires the original prompt")
-        command, argument = public_command(prompt)
+        command, argument = public_command(prompt, host)
         if record is None and command is None:
             return None
         try:
             if command == RESUME:
-                validate_run_id(argument)
+                validate_run_id(argument.strip())
             elif command in WORKFLOWS:
-                WORKFLOWS[command].normalize_args(argument, project)
+                WORKFLOWS[command].normalize_args(parse_start(argument).body, project)
                 event_bytes(make_event(payload, "prompt"))
             return _submit(project, session, command, argument, payload, all_stores, plugin_root)
         except (DevFlowError, OSError, ValueError) as exc:
@@ -259,11 +284,13 @@ def handle_hook(payload: dict, plugin_root: Path, environ=None) -> dict | None:
                     f"DevFlow did not accept /devflow:{command} ({exc}). Check the runner's status before "
                     "continuing, and tell the human this reason."))
             return notices.context(event, _unrecorded(record, exc, "this prompt was not recorded as a run event."))
+    if info is not None and info.format == "unsupported":
+        return None
     if record is None or record["pending_start"]:
         return None  # No run exists yet, so nothing is recorded as evidence.
+    if payload.get("tool_name") != question_tool_name(host):
+        return None
     if event == "PreToolUse":
-        if payload.get("tool_name") != "AskUserQuestion":
-            return None
         return _tool_event(project, event, payload, record, all_stores, plugin_root)
     try:
         return _tool_event(project, event, payload, record, all_stores, plugin_root)
@@ -284,7 +311,14 @@ def _submit(project: Path, session: str, command: str | None, argument: str, pay
     """UserPromptSubmit for a session with a record or a DevFlow command."""
     event = "UserPromptSubmit"
     with dispatch_lock(project, HOOK_WAIT):
-        original = sessions.read_record(project, session, WORKFLOWS) or sessions.empty_record(session)
+        host = payload["host"]
+        path = sessions.session_path(project, session)
+        info = sessions.inspect_record(path, WORKFLOWS) if path.exists() else None
+        if info is not None and info.format == "unsupported":
+            original = sessions.empty_record(session, host)
+            sessions.write_record(project, original, WORKFLOWS)
+        else:
+            original = sessions.read_record(project, session, WORKFLOWS, host) or sessions.empty_record(session, host)
         record = _settle(project, original, all_stores)
         if record != original:
             # Kept even if the command below fails (e.g. resuming a run from an older format).
@@ -312,11 +346,10 @@ def _tool_event(project: Path, event: str, payload: dict, record: dict, all_stor
     if current is None or not current.owner or not current.supported:
         return None  # Never recorded: this session does not own a current run.
     store = all_stores[current.flow]
+    payload = question_context(payload, store.events(store.read(current.run_id)))
     if event == "PreToolUse":
-        # The question as Claude sent it, before the screen adds the human's answers.
+        # The native question, before the screen adds the human's answers.
         store.append_event(current.run_id, payload, "observation")
-        return None
-    if payload.get("tool_name") != "AskUserQuestion":
         return None
     event_id = store.append_event(current.run_id, payload, "question")
     if event_id is None:
@@ -340,7 +373,12 @@ def _overview(project: Path, all_stores: dict[str, RunStore], session: str | Non
                     item.update(format="invalid", error=f"Cannot summarize run: {type(exc).__name__}: {exc}")
             runs.append(item)
     blocking, invalid = [], []
-    for name, record, error in sessions.scan_records(project, WORKFLOWS):
+    unsupported = []
+    for info in sessions.scan_records(project, WORKFLOWS):
+        if info.format == "unsupported":
+            unsupported.append({"record": info.name, "host": info.host, "schema_version": info.schema_version})
+            continue
+        name, record, error = info.name, info.record, info.error
         if error:
             invalid.append({"record": name, "error": error})
             continue
@@ -355,24 +393,32 @@ def _overview(project: Path, all_stores: dict[str, RunStore], session: str | Non
         if not created:
             blocking.append({"record": name, "flow": pending["flow"], "args": pending["args"],
                              "created_at": pending["created_at"]})
-    return {"runs": runs, "sessions": {"pending_starts": blocking, "invalid_records": invalid},
+    return {"runs": runs, "sessions": {"pending_starts": blocking, "invalid_records": invalid,
+                                      "unsupported_records": unsupported},
             "incomplete_creations": creating}
 
 
-def status(project: Path, session: str | None, run_id: str | None) -> dict:
+def status(project: Path, session: str | None, run_id: str | None, host: str) -> dict:
     """Changes nothing: never creates, repairs or releases anything."""
-    all_stores = stores(project)
+    all_stores = stores(project, host=host)
     if run_id:
         flow, info = resolve_run(project, run_id, all_stores)
         if info.format == "unsupported":
             return {"plugin": "devflow", **info.public()}
         if info.format == "invalid":
             raise DevFlowError(f"Run {run_id} cannot be read: {info.error}")
-        return {"plugin": "devflow", "flow": flow, **WORKFLOWS[flow].engine(project).status(run_id)}
+        return {"plugin": "devflow", "flow": flow, **WORKFLOWS[flow].engine(project, host=host).status(run_id)}
     record, record_error, current = None, None, None
     if session:
         try:
-            record = sessions.read_record(project, session, WORKFLOWS)
+            path = sessions.session_path(project, session)
+            info = sessions.inspect_record(path, WORKFLOWS) if path.exists() else None
+            if info is not None and info.format == "unsupported":
+                return {"plugin": "devflow", "status": "unsupported", "session_host": info.host,
+                        "session_schema_version": info.schema_version, "owner_matches": False,
+                        "session_record_error": (None if info.host == host else "Session host collision"),
+                        **_overview(project, all_stores, session)}
+            record = sessions.read_record(project, session, WORKFLOWS, host)
             current = sessions.binding(project, record, all_stores)
         except DevFlowError as exc:
             record_error = str(exc)
@@ -387,11 +433,11 @@ def status(project: Path, session: str | None, run_id: str | None) -> dict:
             **_overview(project, all_stores, session)}
 
 
-def blocking_warnings(project: Path) -> list[str]:
+def blocking_warnings(project: Path, host: str) -> list[str]:
     """What would stop a start, for doctor; changes nothing."""
     if not data_root(project).exists():
         return []
-    overview = _overview(project, stores(project))
+    overview = _overview(project, stores(project, host=host))
     warnings = [f"Pending {item['flow']} start in session record {item['record']} blocks new starts"
                 for item in overview["sessions"]["pending_starts"]]
     warnings += [f"Invalid session record {item['record']}: {item['error']}" for item in overview["sessions"]["invalid_records"]]

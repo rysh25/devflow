@@ -69,7 +69,7 @@ class Fixture(unittest.TestCase):
 
     # -- real hooks and runs --------------------------------------------------------------
     def hook(self, payload):
-        return router.handle_hook(payload, self.plugin)
+        return router.handle_hook(payload, self.plugin, host="claude")
 
     def submit(self, prompt, session=None):
         return self.hook({"hook_event_name": "UserPromptSubmit", "cwd": str(self.project),
@@ -89,11 +89,11 @@ class Fixture(unittest.TestCase):
         identity = session or self.session_id
         if submit:
             self.submit("/devflow:implement feature.md", identity)
-        status = router.runner_start(self.project, identity, "implement", "feature.md")
+        status = router.runner_start(self.project, identity, "implement", "feature.md", host="claude")
         self.run_id = status["run_id"]
         self.run = Path(status["run_dir"])
         self.draft = Path(status["draft_dir"])
-        self.store = RunStore(self.project, WORKFLOW)
+        self.store = RunStore(self.project, WORKFLOW, host="claude")
         return status
 
     def stored(self):
@@ -130,7 +130,7 @@ class Fixture(unittest.TestCase):
     def escalate(self):
         path = self.draft / "questions.json"
         atomic_write_json(path, {"reason": "A product decision is required.", "questions": ["Continue?"]})
-        return Engine(self.project).escalate(self.run_id, self.session_id, path)
+        return Engine(self.project, host="claude").escalate(self.run_id, self.session_id, path)
 
 
 class ToolCallTests(Fixture):
@@ -238,7 +238,7 @@ class ToolCallTests(Fixture):
         with self.assertRaisesRegex(DevFlowError, "different content"):
             self.hook(changed)
         # Both were prefilled by the model; status counts only those.
-        self.assertEqual(Engine(self.project).status(self.run_id)["prefilled_questions"], 2)
+        self.assertEqual(Engine(self.project, host="claude").status(self.run_id)["prefilled_questions"], 2)
 
     def test_pending_resume_is_bound_to_user_selected_run(self):
         # The user's /devflow:resume names the run; the hook moves exactly that run.
@@ -266,7 +266,7 @@ class SessionCaptureTests(Fixture):
         prompt = '/devflow:implement "feature.md"'
         output = self.submit(prompt)
         stored = self.record()
-        self.assertEqual(stored["schema_version"], 2)
+        self.assertEqual(stored["schema_version"], 3)
         self.assertIsNone(stored["run"])
         pending = stored["pending_start"]
         self.assertEqual(pending["flow"], "implement")
@@ -284,8 +284,8 @@ class SessionCaptureTests(Fixture):
         self.assertIsNone(self.hook(self.payload(tool="Write", file_path=str(self.project / "x.py"))))
         self.assertIsNone(self.hook(self.payload(tool="AskUserQuestion", questions=[])))
         # The run created by the runner keeps the hook's original start event.
-        router.runner_start(self.project, self.session_id, "implement", "feature.md")
-        self.store = RunStore(self.project, WORKFLOW)
+        router.runner_start(self.project, self.session_id, "implement", "feature.md", host="claude")
+        self.store = RunStore(self.project, WORKFLOW, host="claude")
         self.run_id = pending["run_id"]
         self.assertEqual(self.stored()["event_ids"], [pending["event"]["event_id"]])
         self.assertEqual(self.events()[0], pending["event"])
@@ -305,7 +305,7 @@ class SessionCaptureTests(Fixture):
 
     def test_missing_or_malformed_start_is_not_accepted(self):
         for prompt, reason in (("/devflow:implement", "one plan-file path"),
-                               ("/devflow:implement --plan other", "not runner options"),
+                               ("/devflow:implement --plan other", "standalone --"),
                                ('/devflow:implement "unterminated', "unmatched quotes"),
                                ("/devflow:implement foo\n/other:skill", "one plan-file path")):
             with self.subTest(prompt=prompt):
@@ -316,7 +316,7 @@ class SessionCaptureTests(Fixture):
         status = self.bind()
         other = "claude-session-456"
         self.submit("/devflow:resume " + status["run_id"], other)
-        self.assertEqual(self.record(other), {"schema_version": 2, "session_id": other,
+        self.assertEqual(self.record(other), {"schema_version": 3, "host": "claude", "session_id": other,
                                               "run": {"flow": "implement", "run_id": status["run_id"]},
                                               "pending_start": None})
         self.assertEqual(self.events()[-1]["payload"]["prompt"], "/devflow:resume " + status["run_id"])
@@ -334,7 +334,7 @@ class SessionCaptureTests(Fixture):
         self.assertIsNone(self.record())
         self.assertIsNone(self.hook(self.payload(tool="Bash", command="normal command")))
         with self.assertRaises(DevFlowError):
-            router.runner_start(self.project, self.session_id, "implement", "feature.md")
+            router.runner_start(self.project, self.session_id, "implement", "feature.md", host="claude")
 
     def test_draft_and_source_writes_are_never_stopped_before_or_after_start(self):
         self.submit("/devflow:implement feature.md")
@@ -415,7 +415,7 @@ class SessionCaptureTests(Fixture):
         return self.hook(payload)
 
     def candidates(self):
-        return Engine(self.project).status(self.run_id)["human_events"]
+        return Engine(self.project, host="claude").status(self.run_id)["human_events"]
 
     def test_question_response_is_stored_verbatim_and_deduplicated(self):
         self.bind()
@@ -467,7 +467,7 @@ class SessionCaptureTests(Fixture):
         self.assertEqual([event["kind"] for event in self.events()][-2:], ["observation", "question"])
         self.assertEqual(self.candidates(), [])
         with self.assertRaisesRegex(DevFlowError, "event ID of a successful AskUserQuestion"):
-            Engine(self.project).resolve(self.run_id, self.session_id, self.events()[-1]["event_id"],
+            Engine(self.project, host="claude").resolve(self.run_id, self.session_id, self.events()[-1]["event_id"],
                                          "continue", "The model answered itself")
 
     def test_prefill_recorded_before_the_escalation_still_excludes_the_answer(self):
@@ -506,7 +506,7 @@ class SessionCaptureTests(Fixture):
         self.assertEqual(len(self.stored()["event_ids"]), 1 + 2 * len(responses))  # Observation and answer.
         for event_id in self.stored()["event_ids"][1:]:
             with self.assertRaises(DevFlowError):
-                Engine(self.project).resolve(self.run_id, self.session_id, event_id, "continue", "Not an answer.")
+                Engine(self.project, host="claude").resolve(self.run_id, self.session_id, event_id, "continue", "Not an answer.")
         self.answer(dict(self.question("tool-text"), tool_response="Yes, keep compatibility"))
         self.assertEqual([item["answer_text"] for item in self.candidates()], ["Yes, keep compatibility"])
 
@@ -615,11 +615,11 @@ class ApprovalTests(Fixture):
         return event_id
 
     def candidates(self):
-        return [item["event_id"] for item in Engine(self.project).status(self.run_id)["human_events"]]
+        return [item["event_id"] for item in Engine(self.project, host="claude").status(self.run_id)["human_events"]]
 
     def assert_cannot_resolve(self, event_id):
         with self.assertRaisesRegex(DevFlowError, "event ID of a successful AskUserQuestion"):
-            Engine(self.project).resolve(self.run_id, self.session_id, event_id, "continue", "The human agreed.")
+            Engine(self.project, host="claude").resolve(self.run_id, self.session_id, event_id, "continue", "The human agreed.")
         self.assertEqual(self.stored()["status"], "awaiting_human")
 
     def test_an_answer_without_a_recorded_question_is_not_a_candidate(self):
@@ -648,7 +648,7 @@ class ApprovalTests(Fixture):
         event_id = self.reply("asked")
         self.assertEqual([event["kind"] for event in self.events()[-2:]], ["observation", "question"])
         self.assertEqual(self.candidates(), [event_id])
-        result = Engine(self.project).resolve(self.run_id, self.session_id, event_id, "continue", "The human agreed.")
+        result = Engine(self.project, host="claude").resolve(self.run_id, self.session_id, event_id, "continue", "The human agreed.")
         self.assertNotEqual(result["status"], "awaiting_human")
 
     def test_a_subagent_answer_is_not_a_candidate(self):

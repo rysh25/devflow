@@ -1,8 +1,8 @@
 """Session records and human answers shared by every workflow.
 
-A session record says which run a Claude session is looking at (``run``) or
+A session record says which run a host session is looking at (``run``) or
 which start it is waiting for (``pending_start``), never both. Ownership itself
-lives only in the run state's ``owner_session``. Records are written only while
+lives only in the run state's (``owner_host``, ``owner_session``). Records are written only while
 the project's dispatch lock is held.
 """
 from __future__ import annotations
@@ -15,10 +15,11 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .errors import CaptureError, DevFlowError
+from .hosts import HOSTS
 from .runs import (RUN_ID, SESSION_ID, TERMINAL, RunStore, data_root, validate_event)
 from .storage import atomic_json, no_symlinks, read_json
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_SESSIONS = 10000
 
 
@@ -28,7 +29,7 @@ def sessions_dir(project: Path) -> Path:
 
 def session_path(project: Path, session_id: str) -> Path:
     if not isinstance(session_id, str) or not SESSION_ID.fullmatch(session_id):
-        raise DevFlowError("A valid Claude session ID is required")
+        raise DevFlowError("A valid host session ID is required")
     return sessions_dir(project) / (hashlib.sha256(session_id.encode("utf-8")).hexdigest() + ".json")
 
 
@@ -45,11 +46,13 @@ def _known(flow: object, workflows: Mapping[str, Any]) -> bool:
 
 
 def _validate_record(record: object, path: Path, workflows: Mapping[str, Any]) -> dict:
-    if not isinstance(record, dict) or set(record) != {"schema_version", "session_id", "run", "pending_start"}:
+    if not isinstance(record, dict) or set(record) != {"schema_version", "host", "session_id", "run", "pending_start"}:
         raise DevFlowError("Session record fields are not recognized")
     if type(record["schema_version"]) is not int or record["schema_version"] != SCHEMA_VERSION:
         raise DevFlowError("Unsupported session record schema_version")
     session = record["session_id"]
+    if record["host"] not in HOSTS:
+        raise DevFlowError("Session record has an invalid host")
     if not isinstance(session, str) or not SESSION_ID.fullmatch(session):
         raise DevFlowError("Session record has an invalid session ID")
     if path.name != hashlib.sha256(session.encode("utf-8")).hexdigest() + ".json":
@@ -73,19 +76,49 @@ def _validate_record(record: object, path: Path, workflows: Mapping[str, Any]) -
     return record
 
 
-def read_record(project: Path, session_id: str, workflows: Mapping[str, Any]) -> dict | None:
+@dataclass(frozen=True)
+class SessionInfo:
+    name: str
+    format: str
+    record: dict | None = None
+    error: str | None = None
+    schema_version: int | None = None
+    host: str | None = None
+
+def inspect_record(path: Path, workflows: Mapping[str, Any]) -> SessionInfo:
+    try:
+        no_symlinks(path)
+        record = read_json(path, limit=8 * 1024 * 1024)
+        session, version = record.get("session_id"), record.get("schema_version")
+        if (not isinstance(session, str) or not SESSION_ID.fullmatch(session)
+                or path.name != hashlib.sha256(session.encode()).hexdigest() + ".json"):
+            raise DevFlowError("Session record file name does not match its session ID or session identity is invalid")
+        if type(version) is int and 1 <= version < SCHEMA_VERSION:
+            return SessionInfo(path.name, "unsupported", record, None, version, "claude")
+        record = validate_record(record, path, workflows)
+        return SessionInfo(path.name, "current", record, None, version, record["host"])
+    except (DevFlowError, OSError) as exc:
+        return SessionInfo(path.name, "invalid", error=str(exc))
+
+
+def read_record(project: Path, session_id: str, workflows: Mapping[str, Any], host: str) -> dict | None:
     path = session_path(project, session_id)
     no_symlinks(path)
     if not path.exists():
         return None
-    record = validate_record(read_json(path, limit=8 * 1024 * 1024), path, workflows)
+    info = inspect_record(path, workflows)
+    if info.format != "current":
+        raise DevFlowError(info.error or "Unsupported session record schema_version")
+    record = info.record
+    if info.host != host:
+        raise DevFlowError(f"Session record belongs to {info.host}, not {host}; host collision")
     if record["session_id"] != session_id:
         raise DevFlowError("Session record does not belong to this session")
     return record
 
 
-def empty_record(session_id: str) -> dict:
-    return {"schema_version": SCHEMA_VERSION, "session_id": session_id, "run": None, "pending_start": None}
+def empty_record(session_id: str, host: str) -> dict:
+    return {"schema_version": SCHEMA_VERSION, "host": host, "session_id": session_id, "run": None, "pending_start": None}
 
 
 def write_record(project: Path, record: dict, workflows: Mapping[str, Any]) -> None:
@@ -93,6 +126,12 @@ def write_record(project: Path, record: dict, workflows: Mapping[str, Any]) -> N
     path = session_path(project, record["session_id"])
     validate_record(record, path, workflows)
     no_symlinks(path)
+    if path.exists():
+        previous = inspect_record(path, workflows)
+        if previous.format == "invalid":
+            raise DevFlowError(previous.error)
+        if previous.host != record["host"]:
+            raise DevFlowError("Session host collision; refusing to overwrite or delete another host's record")
     if record["run"] is None and record["pending_start"] is None:
         path.unlink(missing_ok=True)
         return
@@ -100,8 +139,8 @@ def write_record(project: Path, record: dict, workflows: Mapping[str, Any]) -> N
     atomic_json(path, record)
 
 
-def scan_records(project: Path, workflows: Mapping[str, Any]) -> list[tuple[str, dict | None, str | None]]:
-    """Every session record as (file name, record or None, error or None)."""
+def scan_records(project: Path, workflows: Mapping[str, Any]) -> list[SessionInfo]:
+    """Classify every session record without changing or converting it."""
     directory = sessions_dir(project)
     no_symlinks(directory)
     if not directory.exists():
@@ -118,9 +157,9 @@ def scan_records(project: Path, workflows: Mapping[str, Any]) -> list[tuple[str,
             no_symlinks(path)
             if not path.is_file():
                 raise DevFlowError("Not a session record file")
-            result.append((path.name, validate_record(read_json(path, limit=8 * 1024 * 1024), path, workflows), None))
+            result.append(inspect_record(path, workflows))
         except (DevFlowError, OSError) as exc:
-            result.append((path.name, None, str(exc)))
+            result.append(SessionInfo(path.name, "invalid", error=str(exc)))
     return result
 
 
@@ -154,7 +193,8 @@ def binding(project: Path, record: dict | None, stores: Mapping[str, RunStore]) 
         return Binding(record["session_id"], flow, run_id, info.state, False, False, info.schema_version)
     if info.format != "current":
         raise DevFlowError(f"The bound {flow} run {run_id} cannot be read: {info.error or info.format}")
-    return Binding(record["session_id"], flow, run_id, info.state, info.state["owner_session"] == record["session_id"],
+    return Binding(record["session_id"], flow, run_id, info.state,
+                   (info.state["owner_host"], info.state["owner_session"]) == (record["host"], record["session_id"]),
                    True, info.schema_version)
 
 
@@ -163,7 +203,7 @@ def pending_created(pending: dict, store: RunStore) -> bool:
     return os.path.lexists(store.root / pending["run_id"])
 
 
-def pending_applied(pending: dict, session_id: str, store: RunStore) -> bool | None:
+def pending_applied(pending: dict, session_id: str, store: RunStore, host: str) -> bool | None:
     """True: the run exists and this session owns it; False: not created (or from an
     older DevFlow format, which is never continued); None: owned elsewhere."""
     run = store.root / pending["run_id"]
@@ -175,7 +215,7 @@ def pending_applied(pending: dict, session_id: str, store: RunStore) -> bool | N
         return False
     if info.format != "current":
         raise DevFlowError(f"The started run {pending['run_id']} cannot be read: {info.error or info.format}")
-    return True if info.state["owner_session"] == session_id else None
+    return True if (info.state["owner_host"], info.state["owner_session"]) == (host, session_id) else None
 
 
 def settle_pending_start(record: dict, stores: Mapping[str, RunStore]) -> dict:
@@ -186,7 +226,7 @@ def settle_pending_start(record: dict, stores: Mapping[str, RunStore]) -> dict:
     pending = record["pending_start"]
     if not pending:
         return record
-    if pending_applied(pending, record["session_id"], stores[pending["flow"]]):
+    if pending_applied(pending, record["session_id"], stores[pending["flow"]], record["host"]):
         return dict(record, run={"flow": pending["flow"], "run_id": pending["run_id"]}, pending_start=None)
     return dict(record, pending_start=None)
 
@@ -250,11 +290,31 @@ def prefilled_question(data: object) -> bool:
     return isinstance(data, dict) and any(data.get(field) for field in SCREEN_FILLED_QUESTION_FIELDS)
 
 
+def question_matches(observation: dict, result: dict) -> bool:
+    """The same native call and model-written question, before and after its UI."""
+    for field in ("host", "session_id", "tool_use_id"):
+        value = observation.get(field)
+        if not isinstance(value, str) or not value or result.get(field) != value:
+            return False
+    before, after = observation.get("tool_input"), result.get("tool_input")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return False
+    # The question screen may add or reshape these fields after PreToolUse.
+    # Compare everything the model wrote about the questions on both hosts.
+    if ({key: value for key, value in before.items() if key not in SCREEN_FILLED_QUESTION_FIELDS}
+            != {key: value for key, value in after.items() if key not in SCREEN_FILLED_QUESTION_FIELDS}):
+        return False
+    if observation["host"] == "codex":
+        turn = observation.get("turn_id")
+        return isinstance(turn, str) and bool(turn) and result.get("turn_id") == turn
+    return observation["host"] == "claude"
+
+
 def prefilled_question_events(events: list[dict]) -> list[str]:
     """IDs of the main conversation's AskUserQuestion calls whose answers the model filled in itself
     (a subagent's questions are not the interview's, as in ``approval_candidates``)."""
     return [event["event_id"] for event in events
-            if event["kind"] == "observation" and not event["payload"].get("agent_id")
+            if event["kind"] == "observation" and event["payload"].get("agent_scope") == "main"
             and prefilled_question(event["payload"].get("tool_input"))]
 
 
@@ -277,17 +337,24 @@ def approval_candidates(state: dict, events: list[dict]) -> list[dict]:
     for event in events:
         if event["kind"] == "observation":
             payload = event["payload"]
-            key = (payload.get("session_id"), payload.get("tool_use_id"))
-            asked[key] = asked.get(key, True) and not prefilled_question(payload.get("tool_input"))
+            if payload.get("agent_scope") != "main":
+                continue
+            key = (payload["host"], payload.get("session_id"), payload.get("tool_use_id"))
+            asked.setdefault(key, []).append(payload)
     result = []
     for event in events[escalation["boundary"]:]:
         payload = event["payload"]
         if (event["kind"] != "question" or payload.get("is_error")
                 or payload.get("session_id") != state["owner_session"]
+                or payload["host"] != state["owner_host"]
                 or payload.get("hook_event_name") != "PostToolUse" or payload.get("tool_name") != "AskUserQuestion"
                 # Only answers in the main conversation count, not a subagent's.
-                or payload.get("agent_id")
-                or not asked.get((payload.get("session_id"), payload.get("tool_use_id")), False)):
+                or payload.get("outcome") != "answered"
+                or payload.get("agent_scope") != "main"):
+            continue
+        observations = asked.get((payload["host"], payload.get("session_id"), payload.get("tool_use_id")), [])
+        if not observations or any(prefilled_question(before.get("tool_input"))
+                                   or not question_matches(before, payload) for before in observations):
             continue
         try:
             text = human_answer_text(payload.get("tool_response"))

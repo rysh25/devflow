@@ -15,6 +15,7 @@ import hashlib
 import json
 import math
 import re
+from ..common.operations import public_command
 from pathlib import Path
 from typing import Any
 from ..common.counts import tally
@@ -183,6 +184,15 @@ def _scaffolding(text: str, record: dict) -> bool:
     ))
 
 
+def _diagnostic_input(text: str) -> bool:
+    if public_command(text, "claude")[0] in {"status", "doctor"}:
+        return True
+    if text.lstrip().startswith(("<command-message>", "<command-name>")):
+        command = re.search(r"<command-name>(.*?)</command-name>", text, re.S)
+        return bool(command and public_command(command.group(1), "claude")[0] in {"status", "doctor"})
+    return False
+
+
 def _claude_code_text(content: Any) -> bool:
     """User-role content consisting only of Claude Code-generated text."""
     if isinstance(content, list):
@@ -260,6 +270,8 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
         if event_name == "UserPromptSubmit":
             if not isinstance(event.get("prompt"), str):
                 raise CaptureError("UserPromptSubmit is missing its exact prompt")
+            if _diagnostic_input(event["prompt"]):
+                continue
             prompts.append({"event_index": index, "text": event["prompt"], "used": False,
                             "prompt_id": event.get("prompt_id")})
         elif event_name == "PostToolUse" and event.get("tool_name") == "AskUserQuestion" and not event.get("agent_id"):
@@ -367,6 +379,8 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
                 if duplicate(record, attachment):
                     continue
                 text, images = read_text(attachment.get("prompt"), _QUEUED_IN_ANOTHER_FORM)
+                if _diagnostic_input(text):
+                    continue
                 omit("image", images)
                 if text.strip():
                     # Claude Code marks the origin human; link a matching hook event if any.
@@ -514,6 +528,8 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
             else:
                 skip_unknown("blocks", block_type)
         if text_parts:
+            if _diagnostic_input("\n".join(text_parts)):
+                continue
             matching = take([p for p in prompts if not p["used"] and _prompt_matches(p["text"], text_parts, record)],
                             record.get("promptId"))
             if matching:

@@ -23,17 +23,17 @@ class Toy(Workflow):
 
 
 def prompt(session="owner", text="hello"):
-    return {"hook_event_name": "UserPromptSubmit", "session_id": session, "prompt": text}
+    return {"host": "claude", "hook_event_name": "UserPromptSubmit", "session_id": session, "prompt": text}
 
 
 def question(session="owner", use_id="q1", answer="yes"):
-    return {"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "session_id": session,
+    return {"host": "claude", "hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "session_id": session,
             "tool_use_id": use_id, "tool_input": {"questions": [{"question": "Q?"}]}, "tool_response": answer}
 
 
 def asked(session="owner", use_id="q1", **fields):
     """An AskUserQuestion as Claude sent it, recorded at PreToolUse (an observation)."""
-    return {"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "session_id": session,
+    return {"host": "claude", "hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "session_id": session,
             "tool_use_id": use_id, "tool_input": {"questions": [{"question": "Q?"}], **fields}}
 
 
@@ -42,7 +42,7 @@ class RunStoreTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="devflow runs ")
         self.addCleanup(temporary.cleanup)
         self.project = Path(temporary.name).resolve()
-        self.store = RunStore(self.project, Toy(), lock_wait=0.2)
+        self.store = RunStore(self.project, Toy(), lock_wait=0.2, host="claude")
         self.run_id = runs.new_run_id()
         self.state = self.store.create({"status": "working", "note": "n", "escalation": None},
                                        {"input.txt": b"data\n"}, run_id=self.run_id, owner="owner",
@@ -56,6 +56,24 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual((self.project / ".devflow" / ".gitignore").read_text(), "# Private DevFlow records; never publish them.\n*\n")
         self.assertEqual(self.state["schema_version"], runs.SCHEMA_VERSION)
         self.assertEqual(len(self.state["event_ids"]), 1)
+
+    def test_recovery_requires_the_original_host_and_preserves_foreign_records(self):
+        with self.store.lock(self.run_id):
+            state = self.store.load(self.run_id)
+            self.store.reserve(state, "running", "review", 1, "target", "reviewer")
+        path = self.store.run_dir(self.run_id) / "state.json"
+        before = path.read_bytes()
+        other = RunStore(self.project, Toy(), lock_wait=0.2, host="codex")
+        with patch.object(other.workflow, "on_recover", side_effect=lambda store, state: state.update(status="working")) as callback:
+            with self.assertRaisesRegex(DevFlowError, "Cross-host recovery"):
+                other.recover(self.run_id)
+        callback.assert_not_called()
+        self.assertEqual(path.read_bytes(), before)
+        with patch.object(self.store.workflow, "on_recover", side_effect=lambda store, state: state.update(status="working")):
+            recovered = self.store.recover(self.run_id)
+        self.assertEqual(recovered["status"], "working")
+        self.assertEqual(recovered["owner_host"], "claude")
+        self.assertIsNone(recovered["inflight"])
 
     def test_failed_creation_leaves_no_run_directory(self):
         identifier = runs.new_run_id()
@@ -204,7 +222,7 @@ class RunStoreTests(unittest.TestCase):
     def test_scratch_creates_the_record_directories_of_a_new_project(self):
         project = self.project / "fresh project"
         project.mkdir()
-        store = RunStore(project, Toy())
+        store = RunStore(project, Toy(), host="claude")
         with store.scratch(runs.new_run_id()) as scratch:
             self.assertTrue(scratch.is_dir())
         self.assertTrue((project / ".devflow" / ".gitignore").is_file())
@@ -266,7 +284,7 @@ class RunStoreTests(unittest.TestCase):
 
         thread = threading.Thread(target=hold)
         thread.start()
-        identifier = RunStore(self.project, Toy(), lock_wait=2).append_event(self.run_id, prompt(), "prompt")
+        identifier = RunStore(self.project, Toy(), lock_wait=2, host="claude").append_event(self.run_id, prompt(), "prompt")
         thread.join()
         self.assertIn(identifier, self.store.read(self.run_id)["event_ids"])
 
@@ -295,7 +313,7 @@ class RunStoreTests(unittest.TestCase):
 
     def test_the_shared_engine_needs_no_workflow_fields(self):
         from devflow_core.common.engine import RunEngine
-        engine = RunEngine(self.project, Toy())
+        engine = RunEngine(self.project, Toy(), host="claude")
         status = engine.status(self.run_id)  # The toy has no config, budget or summary values.
         self.assertEqual((status["status"], status["human_events"]), ("working", []))
         engine._verify(engine.store.read(self.run_id))

@@ -1,0 +1,113 @@
+{
+  "cli_version": "0.166.0",
+  "captured_at": "2026-11-07",
+  "source": "Actual isolated Codex CLI, not inferred payloads",
+  "processing": "JSON values redacted and reserialized; no malformed byte fixture is included",
+  "redactions": [
+    "session_id",
+    "turn_id",
+    "tool_use_id",
+    "cwd",
+    "transcript_path",
+    "agent_id",
+    "agent_transcript_path"
+  ],
+  "preserved": [
+    "event order and identity relationships",
+    "field types and missing fields",
+    "synthetic prompts and native question input",
+    "tool_response as a JSON string"
+  ],
+  "files": [
+    "prompt_plan.json",
+    "prompt_implement.json",
+    "prompt_status.json",
+    "prompt_resume.json",
+    "prompt_doctor.json",
+    "question_unanswered_pre.json",
+    "question_unanswered_post.json",
+    "prompt_child_probe.json",
+    "subagent_start.json",
+    "question_child_pre.json",
+    "subagent_stop.json",
+    "question_child_error.txt",
+    "history_api_pages.json",
+    "prompt_human_answer.json",
+    "question_answered_pre.json",
+    "question_answered_post.json",
+    "question_cancel_pre.json",
+    "human_history_api_pages.json"
+  ],
+  "question_feature": "default_mode_request_user_input explicitly enabled for all native question trials",
+  "human_answer_observed": true,
+  "child_question_error_source": "Actual child transcript function_call_output; no successful child PostToolUse was fabricated",
+  "history_api": {
+    "methods": [
+      "initialize",
+      "thread/read",
+      "thread/items/list"
+    ],
+    "experimentalApi": true,
+    "limit": 2,
+    "pages": 7,
+    "raw_items": 14,
+    "redactions": [
+      "thread metadata projected to identity/source/version fields",
+      "opaque cursors replaced consistently",
+      "item and client identities replaced",
+      "paths replaced",
+      "timestamps shifted consistently",
+      "reasoning content and summary arrays cleared"
+    ],
+    "not_a_jsonl_parser": true
+  },
+  "human_answer_transport": "The user replied Alpha in the parent conversation; relayed as a native UI selection after PreToolUse, without model-prefilled answers.",
+  "negative_probe": {
+    "source": "question_cancel_pre.json",
+    "actions": [
+      "Escape while the question was pending",
+      "Ctrl-C to shut down the CLI"
+    ],
+    "observed": "No matching PostToolUse; no answer may be inferred",
+    "outcome": "unknown; native hooks do not establish separate cancellation/interruption reasons"
+  },
+  "human_history_api": {
+    "methods": [
+      "initialize",
+      "thread/read",
+      "thread/items/list"
+    ],
+    "experimentalApi": true,
+    "limit": 2,
+    "pages": 6,
+    "raw_items": 12,
+    "redactions": [
+      "thread metadata projected to identity/source/version fields",
+      "opaque cursors replaced consistently",
+      "item and client identities replaced",
+      "paths replaced",
+      "timestamps shifted consistently",
+      "reasoning content and summary arrays cleared"
+    ],
+    "not_a_jsonl_parser": true
+  },
+  "derived_test_cases": {
+    "storage": "Created only in memory by tests; not additional native captures",
+    "cases": [
+      "Rebind negative-trial session and turn IDs to the visible human-answer conversation",
+      "Mismatched question text, options, question IDs and turn",
+      "Multiple question IDs, partial answers and model-prefilled input",
+      "Unknown agent scope and cross-host/session root correlation",
+      "Backward clocks, coarse and equal timestamps",
+      "Unknown API item, non-text content block and async agent delivery",
+      "Screen-populated answers/annotations on a prefilled question, without treating the response as human evidence",
+      "Repeated PreToolUse input changes remain invalid",
+      "Unsupported string/object/null/numeric userMessage.content shapes fail capture",
+      "Native timestamps reversed within one turn with hook timestamps between them; only that turn is flagged ambiguous"
+    ],
+    "native_gaps_preserved": [
+      "No successful child PostToolUse was observed",
+      "No cancellation PostToolUse was observed; no cancellation reason is inferred"
+    ]
+  }
+}

@@ -10,6 +10,8 @@ from ..common.environment import bash_timeout_ms
 from ..common.review import after_failed_review, check_review_budget, check_review_config, review_budget
 from ..common.runs import TERMINAL
 from ..common.sessions import prefilled_question_events
+from ..common.operations import public_command
+from ..common.startup import override_reviewers, parse_start
 from ..common.storage import check_json_size, digest, json_bytes, no_symlinks, now
 from ..common.workflow import Option, Workflow
 from .commands import COMMANDS
@@ -23,6 +25,7 @@ def _checks_timeout_ms(config: dict) -> int:
 
 def plan_argument(argument: str) -> str:
     """The plan path exactly as the user typed it (quotes and '@' removed)."""
+    argument = argument.strip() if isinstance(argument, str) else argument
     if not isinstance(argument, str) or not argument or any(ord(ch) < 32 for ch in argument):
         raise UsageError("Use /devflow:implement followed by one plan-file path.")
     if argument[0] in {"\"", "'"}:
@@ -64,12 +67,14 @@ class ImplementWorkflow(Workflow):
     def build_start(self, project: Path, pending: dict, options: dict,
                     scratch: Path) -> tuple[dict, dict[str, bytes | Path]]:
         from . import snapshot
-        from .config import load_config
+        from .config import load_config, validate_config
         from .engine import _plan_bytes
         from .workspace import resolve_workspace
         plan = Path(pending["args"])
         no_symlinks(plan)
-        config = load_config(project, self)
+        payload = pending["event"]["payload"]
+        startup = parse_start(public_command(payload["prompt"], payload["host"])[1])
+        config = validate_config(override_reviewers(load_config(project, self), startup))
         if plan.suffix.lower() not in {".md", ".markdown"}:
             raise DevFlowError("The input plan must be a UTF-8 Markdown file")
         # The workspace is decided once, before anything is created, and frozen.
@@ -192,7 +197,7 @@ class ImplementWorkflow(Workflow):
         from .config import load_config
         return load_config(project, self)
 
-    def doctor(self, project: Path, config: dict) -> dict:
+    def doctor(self, project: Path, config: dict, *, host: str) -> dict:
         return {"warnings": ([] if config["checks"] else
                              ["No implementation checks configured; every revised snapshot requires actual human validation"])}
 
@@ -202,9 +207,9 @@ class ImplementWorkflow(Workflow):
             value["check"] = _checks_timeout_ms(state["config"])
         return value
 
-    def engine(self, project: Path, session: str | None = None):
+    def engine(self, project: Path, session: str | None = None, *, host: str):
         from .engine import Engine
-        return Engine(project, session=session)
+        return Engine(project, session=session, host=host)
 
 
 WORKFLOW = ImplementWorkflow()

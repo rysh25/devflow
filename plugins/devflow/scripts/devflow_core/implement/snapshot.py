@@ -30,13 +30,13 @@ CHUNK = 64 * 1024
 
 
 DEFAULT_EXCLUDES = [
-    ".git/", ".devflow/", "devflow.config.json", ".env", ".env.*",
+    ".git/", ".devflow/", "devflow.config.json", "devflow.config.local.json", ".env", ".env.*",
     ".ssh/", ".aws/", ".azure/", "secrets/", "*.pem", "*.key",
     "*.p12", "*.pfx", "node_modules/", ".venv/", "venv/", "__pycache__/",
     ".pytest_cache/", ".mypy_cache/", ".ruff_cache/", ".next/", ".nuxt/",
     "Library/", "Temp/", "Obj/", "Logs/", "UserSettings/", "bin/", "obj/",
 ]
-_ALWAYS_EXCLUDED = {".git", ".devflow", "devflow.config.json"}
+_ALWAYS_EXCLUDED = {".git", ".devflow", "devflow.config.json", "devflow.config.local.json"}
 _RESERVED = re.compile(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$", re.I)
 
 

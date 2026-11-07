@@ -237,30 +237,37 @@ class OpenCodeEventTests(unittest.TestCase):
 
 class CommandTests(unittest.TestCase):
     def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
         self.work = Path("run", "review-processes", "01").resolve()
         self.cwd = Path("project").resolve()
-        self.schema = Path("schema.json").resolve()
-        # The executable as configured (the real lookup is tested with the fake CLIs).
-        resolve = patch.object(reviewers, "_resolve", lambda prefix: prefix)
-        resolve.start()
-        self.addCleanup(resolve.stop)
+        self.schema = Path(temporary.name).resolve() / "schema.json"
+        self.schema.write_text('{"type":"object"}', encoding="utf-8")
+        self.instructions = Path(temporary.name) / "reviewer.md"
+        self.instructions.write_text("Review the supplied packet.", encoding="utf-8")
+
+    def prepare(self, config):
+        return reviewers.prepare_review(config, b"packet", self.work, self.schema, self.instructions,
+                                        cwd=self.cwd, probe={})
 
     def test_codex_runs_with_the_users_settings_in_the_directory_under_review(self):
-        argv, env = reviewers.build_command(reviewer(), self.work, self.cwd, self.schema)
+        prepared = self.prepare(reviewer())
+        argv = list(prepared.argv)
         self.assertEqual(argv, [
             "codex", "exec", "--json", "--skip-git-repo-check", "--cd", str(self.cwd), "--model", "gpt-6.1-sol",
             "--config", 'model_reasoning_effort="xhigh"', "--config", 'approval_policy="never"',
-            "--output-schema", str(self.schema),
+            "--output-schema", str(self.work / "review.schema.json"),
             "--output-last-message", str(self.work / "final-response.json"), "-"])
-        self.assertEqual(env, {"PWD": str(self.cwd)})
+        self.assertEqual(prepared.cwd, self.cwd)
 
     def test_opencode_runs_with_the_users_settings_in_the_directory_under_review(self):
-        argv, env = reviewers.build_command(reviewer("opencode"), self.work, self.cwd, self.schema)
+        prepared = self.prepare(reviewer("opencode"))
+        argv = list(prepared.argv)
         self.assertEqual(argv, [
             "opencode", "run", "--format", "json", "--standalone", "--model", "opencode-go/deepseek-v4.1-flash#high",
             "--file", str(self.work / "review-input.md"), reviewers.OpenCode.message])
         # Only the working directory: the project's own settings and instructions load as usual.
-        self.assertEqual(env, {"PWD": str(self.cwd)})
+        self.assertEqual(prepared.cwd, self.cwd)
 
     def test_each_cli_is_one_class_and_preflight_checks_the_options_it_passes(self):
         self.assertEqual(set(reviewers.CLIS), set(settings.REVIEWER_KINDS))
@@ -269,13 +276,15 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(reviewers.CLIS["opencode"].flags(), ["--format", "--standalone", "--model", "--file"])
         for kind, cli in reviewers.CLIS.items():
             with self.subTest(kind=kind):
-                self.assertEqual(cli.arguments("m", "high", self.work, self.cwd, self.schema)[0], cli.subcommand)
+                if kind == "claude":
+                    self.schema.write_text('{}', encoding="utf-8")
+                self.assertEqual(cli.arguments("m", "high", self.work, self.cwd, self.schema)[0],
+                                 cli.subcommand or "--print")
 
     def test_the_users_command_prefix_is_kept(self):
         for kind in ("codex", "opencode"):
             with self.subTest(kind=kind):
-                argv, _ = reviewers.build_command(reviewer(kind, command=["node", "/opt/cli.js", "--profile", "x"]),
-                                                  self.work, self.cwd, self.schema)
+                argv = list(self.prepare(reviewer(kind, command=["node", "/opt/cli.js", "--profile", "x"])).argv)
                 self.assertEqual(argv[:4], ["node", "/opt/cli.js", "--profile", "x"])
 
     def test_invalid_entries_are_reviewer_errors(self):
@@ -284,7 +293,7 @@ class CommandTests(unittest.TestCase):
         for config in (incomplete, reviewer(command="codex"), reviewer(model="gpt --flag"),
                        reviewer(max_output_bytes=1023), reviewer(timeout_seconds=0.2), reviewer(web=True)):
             with self.subTest(config=config), self.assertRaises(ReviewerError):
-                reviewers.build_command(config, self.work, self.cwd, self.schema)
+                self.prepare(config)
 
 
 class ReviewerSettingsTests(unittest.TestCase):
@@ -329,7 +338,8 @@ class ReviewerSettingsTests(unittest.TestCase):
         for identifier in ("Codex", "1codex", "", "a" * 65, 7):
             with self.subTest(identifier=identifier):
                 self.assertRejected(reviewer(id=identifier), "IDs")
-        self.assertRejected(reviewer(kind="claude"), "kind")
+        settings.validate_reviewer(reviewer(kind="claude"))
+        self.assertRejected(reviewer(kind="unknown"), "kind")
 
     def test_command_must_be_an_argv_array(self):
         for command in ("codex; touch BAD", [], [""], ["co\0dex"], [1], ["codex"] * 129):
@@ -463,7 +473,7 @@ def emit(event):
 if mode == "exit-error":
     print("fixture failure", file=sys.stderr)
     raise SystemExit(7)
-stdin = sys.stdin.read()
+stdin = sys.stdin.buffer.read().decode("utf-8")
 (records / "seen.json").write_text(json.dumps({"args": args, "cwd": os.getcwd(), "pwd": os.environ.get("PWD"),
     "stdin": stdin, "env": {key: os.environ.get(key) for key in (
         "OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG_CONTENT", "OPENCODE_PERMISSION",
@@ -549,8 +559,11 @@ class ProcessTests(unittest.TestCase):
         return reviewer(kind, command=[sys.executable, str(self.fake), mode], **changes)
 
     def run_fixture(self, kind="codex", mode="pass", validate=accept, probe=None, **changes):
-        return reviewers.run_review(self.config(kind, mode, **changes), self.packet, self.output,
-                                    self.schema, self.instructions, validate, probe, cwd=self.project)
+        config = self.config(kind, mode, **changes)
+        probe = probe if probe is not None else reviewers.preflight(config)
+        prepared = reviewers.prepare_review(config, self.packet.read_bytes(), self.output,
+                                            self.schema, self.instructions, cwd=self.project, probe=probe)
+        return reviewers.run_review(prepared, validate)
 
     def seen(self):
         return json.loads((self.output / "seen.json").read_text(encoding="utf-8"))
@@ -561,6 +574,23 @@ class ProcessTests(unittest.TestCase):
     def attempts(self):
         path = self.output / "attempts.txt"
         return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+    def test_execution_uses_only_the_prepared_bytes_and_frozen_metadata(self):
+        self.packet.write_bytes("First line\r\n日本語\nFinal line\r".encode("utf-8"))
+        config = self.config()
+        probe = reviewers.preflight(config)
+        prepared = reviewers.prepare_review(config, self.packet.read_bytes(), self.output,
+                                            self.schema, self.instructions, cwd=self.project, probe=probe)
+        self.assertFalse(self.output.exists())
+        for path in (self.packet, self.schema, self.instructions):
+            path.unlink()
+        config['model'] = 'changed-after-preparation'
+        probe['requested_model'] = 'changed-after-preparation'
+        with patch.object(reviewers, 'preflight', side_effect=AssertionError('Must not probe after reservation')):
+            result = reviewers.run_review(prepared, accept)
+        self.assertEqual(result['review'], FIXTURE_REVIEW)
+        self.assertEqual(self.seen()['stdin'].encode('utf-8'), prepared.prompt)
+        self.assertEqual(self.meta()['requested_model'], 'gpt-6.1-sol')
 
     def test_preflight_is_local_and_creates_nothing(self):
         result = reviewers.preflight(self.config())
@@ -602,8 +632,8 @@ class ProcessTests(unittest.TestCase):
         del incomplete["id"]
         for config in (incomplete, {**self.config(), "command": []}):
             with self.subTest(config=config), self.assertRaises(ReviewerError):
-                reviewers.run_review(config, self.packet, self.output, self.schema, self.instructions, accept,
-                                     cwd=self.project)
+                reviewers.prepare_review(config, self.packet.read_bytes(), self.output, self.schema,
+                                         self.instructions, cwd=self.project, probe={})
             self.assertFalse(self.output.exists())
 
     def test_codex_process(self):
@@ -614,7 +644,7 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(Path(seen["cwd"]), self.project)
         self.assertEqual(Path(seen["pwd"]), self.project)
         # The prompt arrives on standard input, which is then closed.
-        prompt = (self.output / "review-input.md").read_text(encoding="utf-8")
+        prompt = (self.output / "review-input.md").read_bytes().decode("utf-8")
         self.assertEqual(seen["stdin"], prompt)
         self.assertIn("日本語", prompt)
         self.assertIn("$(touch BAD)", prompt)
@@ -625,7 +655,7 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(set(meta), {"kind", "executable", "cli_version", "version_warnings", "requested_model",
                                      "requested_effort",
                                      "effective_model_attested", "cwd", "prefix_arg_count", "timeout_seconds",
-                                     "packet_sha256", "shell", "settings"})
+                                     "packet_sha256", "prepared_at", "shell", "settings"})
         self.assertFalse(meta["effective_model_attested"])
         self.assertEqual(Path(meta["cwd"]), self.project)
         self.assertFalse(meta["shell"])
@@ -651,7 +681,7 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(Path(seen["args"][seen["args"].index("--file") + 1]), self.output / "review-input.md")
         self.assertNotIn("credential-sentinel", (self.output / "invocation.json").read_text(encoding="utf-8"))
         self.assertEqual(sorted(path.name for path in self.output.iterdir()),
-                         ["attempts.txt", "invocation.json", "review-input.md", "seen.json", "stderr.log",
+                         ["attempts.txt", "invocation.json", "review-input.md", "review.schema.json", "seen.json", "stderr.log",
                           "stdout.jsonl"])
 
     def test_the_prompt_carries_this_attempts_time_budget(self):

@@ -1,0 +1,176 @@
+{
+  "captured_at": "2026-11-07",
+  "source": "Six real CLI calls through common.reviewers.run_review in isolated synthetic projects",
+  "purpose": "Schema transport and response validation, not approval of implementation changes",
+  "schema_policy": "One canonical draft-07 schema per workflow; no dialect rewriting in adapters",
+  "timeout_seconds": 120,
+  "redactions": "Only aggregate reports are published; raw stdout, stderr, paths, session IDs and authentication remain outside the repository",
+  "results": [
+    {
+      "workflow": "plan",
+      "kind": "codex",
+      "requested_model": "gpt-6.1-sol",
+      "requested_effort": "xhigh",
+      "timeout_seconds": 120,
+      "schema_dialect": "http://json-schema.org/draft-07/schema#",
+      "schema_ascii_bytes": 1072,
+      "ok": true,
+      "verdict": "pass",
+      "activity": {
+        "tool_call_count": 0,
+        "tool_calls": {},
+        "other_events": {}
+      },
+      "tokens": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 19584,
+        "input_tokens": 39426,
+        "output_tokens": 344,
+        "reasoning_output_tokens": 213
+      },
+      "stdout.jsonl_bytes": 766,
+      "stderr.log_bytes": 0,
+      "cli_version": "codex-cli 0.166.0"
+    },
+    {
+      "workflow": "plan",
+      "kind": "opencode",
+      "requested_model": "opencode-go/deepseek-v4.1-flash",
+      "requested_effort": "high",
+      "timeout_seconds": 120,
+      "schema_dialect": "http://json-schema.org/draft-07/schema#",
+      "schema_ascii_bytes": 1072,
+      "ok": true,
+      "verdict": "pass",
+      "activity": {
+        "tool_call_count": 1,
+        "tool_calls": {
+          "shell": 1
+        },
+        "other_events": {}
+      },
+      "tokens": {
+        "cache.read": 11904,
+        "cache.write": 0,
+        "input": 9194,
+        "output": 278,
+        "reasoning": 459
+      },
+      "stdout.jsonl_bytes": 3215,
+      "stderr.log_bytes": 0,
+      "cli_version": "opencode v2.2.5"
+    },
+    {
+      "workflow": "plan",
+      "kind": "claude",
+      "requested_model": "opus",
+      "requested_effort": "high",
+      "timeout_seconds": 120,
+      "schema_dialect": "http://json-schema.org/draft-07/schema#",
+      "schema_ascii_bytes": 1072,
+      "ok": true,
+      "verdict": "pass",
+      "activity": {
+        "tool_call_count": 1,
+        "tool_calls": {
+          "StructuredOutput": 1
+        },
+        "other_events": {
+          "rate_limit_event": 1,
+          "system": 6
+        }
+      },
+      "tokens": {
+        "input_tokens": 2,
+        "output_tokens": 379,
+        "cache_creation_input_tokens": 25773,
+        "cache_read_input_tokens": 0
+      },
+      "stdout.jsonl_bytes": 17197,
+      "stderr.log_bytes": 0,
+      "cli_version": "2.1.319 (Claude Code)"
+    },
+    {
+      "workflow": "implement",
+      "kind": "codex",
+      "requested_model": "gpt-6.1-sol",
+      "requested_effort": "xhigh",
+      "timeout_seconds": 120,
+      "schema_dialect": "http://json-schema.org/draft-07/schema#",
+      "schema_ascii_bytes": 1312,
+      "ok": true,
+      "verdict": "pass",
+      "activity": {
+        "tool_call_count": 0,
+        "tool_calls": {},
+        "other_events": {}
+      },
+      "tokens": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 19456,
+        "input_tokens": 39383,
+        "output_tokens": 202,
+        "reasoning_output_tokens": 57
+      },
+      "stdout.jsonl_bytes": 868,
+      "stderr.log_bytes": 0,
+      "cli_version": "codex-cli 0.166.0"
+    },
+    {
+      "workflow": "implement",
+      "kind": "opencode",
+      "requested_model": "opencode-go/deepseek-v4.1-flash",
+      "requested_effort": "high",
+      "timeout_seconds": 120,
+      "schema_dialect": "http://json-schema.org/draft-07/schema#",
+      "schema_ascii_bytes": 1312,
+      "ok": true,
+      "verdict": "pass",
+      "activity": {
+        "tool_call_count": 0,
+        "tool_calls": {},
+        "other_events": {}
+      },
+      "tokens": {
+        "cache.read": 1664,
+        "cache.write": 0,
+        "input": 8713,
+        "output": 186,
+        "reasoning": 168
+      },
+      "stdout.jsonl_bytes": 1699,
+      "stderr.log_bytes": 0,
+      "cli_version": "opencode v2.2.5"
+    },
+    {
+      "workflow": "implement",
+      "kind": "claude",
+      "requested_model": "opus",
+      "requested_effort": "high",
+      "timeout_seconds": 120,
+      "schema_dialect": "http://json-schema.org/draft-07/schema#",
+      "schema_ascii_bytes": 1312,
+      "ok": true,
+      "verdict": "pass",
+      "activity": {
+        "tool_call_count": 1,
+        "tool_calls": {
+          "StructuredOutput": 1
+        },
+        "other_events": {
+          "rate_limit_event": 1,
+          "system": 4
+        }
+      },
+      "tokens": {
+        "input_tokens": 2,
+        "output_tokens": 321,
+        "cache_creation_input_tokens": 26058,
+        "cache_read_input_tokens": 0
+      },
+      "stdout.jsonl_bytes": 14876,
+      "stderr.log_bytes": 0,
+      "cli_version": "2.1.319 (Claude Code)"
+    }
+  ]
+}

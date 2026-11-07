@@ -1,6 +1,6 @@
 """Run records for every workflow: one envelope and one way to save.
 
-The run state's ``owner_session`` is the only authority on which Claude session
+The run state's (``owner_host``, ``owner_session``) is the only authority on which host session
 owns a run. Runs appear by an atomic directory rename, so a run directory is
 never half-created. A save writes its new records first and then replaces
 ``state.json``, which is the moment it is committed: a save that stops earlier
@@ -20,13 +20,14 @@ import shutil
 from uuid import uuid4
 
 from .errors import DevFlowError
+from .hosts import HOSTS, CanonicalEvent, canonical_payload
 from .storage import (atomic_json, check_json_file, check_json_size, digest, digest_file, file_lock, json_bytes,
                       no_symlinks, now, parse_json, read_json, replace_file, within, write_new)
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 # Older run formats and the releases that wrote them; they are never continued.
 # A format that was never released has no name and is shown generically.
-RELEASES = {1: "0.1.x", 2: "0.2.x", 3: "0.3.x", 6: "0.4.x", 7: "0.5.x", 8: "0.6.x"}
+RELEASES = {1: "0.1.x", 2: "0.2.x", 3: "0.3.x", 6: "0.4.x", 7: "0.5.x", 8: "0.6.x", 9: "0.7.x"}
 
 
 def release_name(version: int) -> str:
@@ -37,7 +38,7 @@ TERMINAL = frozenset({"completed", "exhausted", "cancelled", "accepted"})
 RUN_ID = re.compile(r"[0-9]{8}T[0-9]{6}Z-[a-f0-9]{12}\Z")
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}\Z")
 EVENT_ID = re.compile(r"[a-f0-9]{32}\Z")
-#: ``observation``: the AskUserQuestion input as Claude sent it, recorded at
+#: ``observation``: the canonical question input as the host sent it, recorded at
 #: PreToolUse (before the question screen adds answers); never an answer itself.
 EVENT_KINDS = frozenset({"prompt", "question", "observation"})
 MAX_EVENT_BYTES = 4 * 1024 * 1024
@@ -46,10 +47,10 @@ CREATING = ".creating-"
 RUNNER_WAIT = 10.0
 HOOK_WAIT = 5.0
 ENVELOPE = frozenset({
-    "schema_version", "flow", "run_id", "project", "status", "owner_session", "created_at",
+    "schema_version", "flow", "run_id", "project", "status", "owner_host", "owner_session", "created_at",
     "updated_at", "finished_at", "state_revision", "artifacts", "event_ids", "inflight", "escalation",
 })
-ESCALATION = frozenset({"id", "reason", "questions", "boundary", "session_id", "return_status", "detail"})
+ESCALATION = frozenset({"id", "reason", "questions", "boundary", "host", "session_id", "return_status", "detail"})
 
 
 def validate_run_id(run_id: object) -> str:
@@ -79,10 +80,13 @@ def ensure_data_root(project: Path) -> Path:
     return root
 
 
-def make_event(payload: dict, kind: str) -> dict:
+def make_event(payload: dict, kind: str) -> CanonicalEvent:
     if kind not in EVENT_KINDS or not isinstance(payload, dict):
         raise DevFlowError("Unsupported human event")
-    return {"event_id": uuid4().hex, "recorded_at": now(), "kind": kind, "payload": payload}
+    recorded = now()
+    normalized = canonical_payload(payload, kind)
+    normalized["captured_at"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    return {"event_id": uuid4().hex, "recorded_at": recorded, "kind": kind, "payload": normalized}
 
 
 def event_bytes(event: dict) -> bytes:
@@ -99,6 +103,13 @@ def validate_event(value: object) -> dict:
             or not isinstance(value["recorded_at"], str) or value["kind"] not in EVENT_KINDS
             or not isinstance(value["payload"], dict)):
         raise DevFlowError("Invalid human event record")
+    payload = value["payload"]
+    if (type(payload.get("canonical_version")) is not int or payload["canonical_version"] != 1
+            or not isinstance(payload.get("host"), str) or payload["host"] not in HOSTS
+            or not isinstance(payload.get("agent_scope"), str)
+            or payload["agent_scope"] not in {"main", "subagent", "unknown"}
+            or not isinstance(payload.get("source"), dict)):
+        raise DevFlowError("Invalid canonical human event payload")
     return value
 
 
@@ -111,7 +122,8 @@ def open_escalation(state: dict, identifier: str, reason: str, questions: list, 
                     detail: dict | None = None) -> dict:
     """Pause for a human; only answers recorded after this point may resolve it."""
     value = {"id": identifier, "reason": reason, "questions": questions, "boundary": len(state["event_ids"]),
-             "session_id": state["owner_session"], "return_status": return_status, "detail": detail or {}}
+             "host": state["owner_host"], "session_id": state["owner_session"],
+             "return_status": return_status, "detail": detail or {}}
     state["escalation"] = value
     return value
 
@@ -127,6 +139,8 @@ class RunInfo:
 
     def public(self) -> dict:
         value = {"flow": self.flow, "run_id": self.run_id, "format": self.format}
+        if self.state is not None:
+            value["owner_host"] = "claude" if self.format == "unsupported" else self.state["owner_host"]
         if self.error:
             value["error"] = self.error
         if self.format == "unsupported":
@@ -140,9 +154,10 @@ class RunInfo:
 class RunStore:
     """All file access for one workflow's runs in one project."""
 
-    def __init__(self, project: Path, workflow, lock_wait: float = RUNNER_WAIT):
+    def __init__(self, project: Path, workflow, lock_wait: float = RUNNER_WAIT, *, host: str):
         self.project = Path(project)
         self.workflow = workflow
+        self.host = host
         self.flow = workflow.name
         self.lock_wait = lock_wait
         self.root = data_root(self.project) / "runs" / self.flow
@@ -194,6 +209,7 @@ class RunStore:
         if (state["flow"] != self.flow or state["run_id"] != run_id or state["project"] != str(self.project)
                 or not isinstance(state["status"], str) or state["status"] not in workflow.statuses
                 or not isinstance(state["owner_session"], str) or not SESSION_ID.fullmatch(state["owner_session"])
+                or state["owner_host"] not in HOSTS
                 or not isinstance(state["created_at"], str) or not isinstance(state["updated_at"], str)
                 # A run's end time is set once, when it first becomes terminal.
                 or (not isinstance(state["finished_at"], str) if state["status"] in TERMINAL
@@ -214,6 +230,7 @@ class RunStore:
         escalation = state["escalation"]
         if escalation is not None and (
                 not isinstance(escalation, dict) or set(escalation) != ESCALATION
+                or escalation["host"] != state["owner_host"]
                 or type(escalation["boundary"]) is not int
                 or not 0 <= escalation["boundary"] <= len(state["event_ids"])
                 or not isinstance(escalation["questions"], list)):
@@ -381,7 +398,7 @@ class RunStore:
             shutil.rmtree(path, ignore_errors=True)
 
     def create(self, fields: dict, artifacts: dict[str, bytes | Path], *, run_id: str, owner: str,
-               first_event: dict, directories: tuple[str, ...] = ()) -> dict:
+               first_event: dict, directories: tuple[str, ...] = (), owner_host: str | None = None) -> dict:
         """Build a complete run in a private directory, then publish it by rename.
 
         An artifact is bytes, or a ``Path`` to a file written with ``write_new``
@@ -421,12 +438,13 @@ class RunStore:
                     hashes[relative] = digest(data)
             created = now()
             state = {**fields, "schema_version": SCHEMA_VERSION, "flow": self.flow, "run_id": run_id,
-                     "project": str(self.project), "owner_session": owner, "created_at": created,
+                     "project": str(self.project), "owner_host": owner_host or self.host,
+                     "owner_session": owner, "created_at": created,
                      "updated_at": created, "finished_at": None, "state_revision": 0, "artifacts": hashes,
                      "event_ids": [first_event["event_id"]], "inflight": None,
                      "escalation": fields.get("escalation")}
             if state["escalation"] is not None:
-                state["escalation"] = dict(state["escalation"], boundary=1, session_id=owner)
+                state["escalation"] = dict(state["escalation"], boundary=1, session_id=owner, host=state["owner_host"])
             self.validate(state, run_id)
             atomic_json(staging / "state.json", state)
             os.rename(staging, final)
@@ -474,6 +492,8 @@ class RunStore:
         """
         with self.lock(run_id):
             state = self.load(run_id)
+            if state["owner_host"] != self.host:
+                raise DevFlowError(f"Cross-host recovery is unsupported; use --host {state['owner_host']}")
             if state["status"] not in self.workflow.inflight_statuses:
                 raise DevFlowError("Recovery applies only to an interrupted check or review")
             if expect is not None:
@@ -507,11 +527,12 @@ class RunStore:
         (whether or not the model filled in the answers); ``question`` is its
         PostToolUse result with the human's answers.
         """
+        payload = canonical_payload(payload, kind)
         with self.lock(run_id):
             state = self.load(run_id)
             if state["status"] in TERMINAL:
                 return None
-            if payload.get("session_id") != state["owner_session"]:
+            if (payload.get("session_id"), payload["host"]) != (state["owner_session"], state["owner_host"]):
                 raise DevFlowError("This run is owned by another session; stale-session events cannot become human evidence")
             if kind in ("question", "observation"):
                 use_id = payload.get("tool_use_id")
@@ -524,6 +545,7 @@ class RunStore:
                 for old in self.events(state):
                     earlier = old["payload"]
                     if (old["kind"] == kind and earlier.get("session_id") == payload["session_id"]
+                            and earlier.get("host") == payload["host"]
                             and earlier.get("tool_use_id") == use_id):
                         if (earlier.get("tool_input") != payload["tool_input"]
                                 or earlier.get("tool_response") != payload.get("tool_response")
@@ -541,6 +563,8 @@ class RunStore:
 
     def transfer_refusal(self, state: dict, session: str) -> str | None:
         """Why ownership cannot move now (checked on a freshly loaded state)."""
+        if state["owner_host"] != self.host:
+            return f"Cannot resume a {state['owner_host']} run from {self.host}; cross-host resume is unsupported"
         if state["status"] in self.workflow.inflight_statuses or state["inflight"] is not None:
             return "A process may still be running; a human must confirm it stopped and use recover"
         return self.workflow.can_transfer(state, session)
@@ -551,18 +575,20 @@ class RunStore:
         reason = self.transfer_refusal(state, session)
         if reason:
             raise DevFlowError(reason)
-        previous = state["owner_session"]
+        previous = (state["owner_host"], state["owner_session"])
         state["owner_session"] = session
+        state["owner_host"] = self.host
         event = make_event(payload, "prompt")
         data = event_bytes(event)
         if len(state["event_ids"]) >= MAX_EVENTS:
             raise DevFlowError("The resume request cannot be recorded within the event limits")
         self.stage(state, f"events/{event['event_id']}.json", data)
         state["event_ids"].append(event["event_id"])
-        if previous != session and state["escalation"] is not None:
+        if previous != (self.host, session) and state["escalation"] is not None:
             # Answers given before the move, and the resume command itself,
             # can no longer resolve the pending decision.
-            state["escalation"] = dict(state["escalation"], boundary=len(state["event_ids"]), session_id=session)
+            state["escalation"] = dict(state["escalation"], boundary=len(state["event_ids"]), session_id=session,
+                                       host=self.host)
         self.workflow.on_transfer(state)
         self.save(state)
         return state

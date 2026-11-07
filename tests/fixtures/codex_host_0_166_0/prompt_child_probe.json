@@ -1,0 +1,10 @@
+{
+  "session_id": "probe-session-3",
+  "turn_id": "probe-parent-turn",
+  "transcript_path": "/fixture/codex/history.jsonl",
+  "cwd": "/fixture/project",
+  "hook_event_name": "UserPromptSubmit",
+  "model": "gpt-6.1-sol",
+  "permission_mode": "default",
+  "prompt": "PROBE_CHILD_QUESTION: For this isolated capability test, spawn exactly one child agent with your standard spawn tool. Ask it only to test whether native request_user_input is callable from a child. If callable it should ask 'Child capability probe' with Alpha/Beta, without substituting text. If unavailable it must report CHILD_NATIVE_QUESTION_UNAVAILABLE. Neither agent may modify files, run shell commands, or create other agents. The parent must not ask a question itself. Report the native outcome."
+}

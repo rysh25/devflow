@@ -75,6 +75,20 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual([m["content"] for m in captured["messages"]], ["依頼\n  keep spaces", "予算はいくら？\n", "100 円\n"])
         self.assertEqual(captured["coverage"]["human_response_count"], 1)
 
+    def test_diagnostics_in_native_transcript_are_excluded_but_explanation_stays(self):
+        marker = transcript_marker(str(self.path))
+        self.write(entry('user', 'request'), entry('assistant', 'Question?'), entry('user', 'Answer'),
+                   entry('user', '/devflow:status', origin={'kind':'human'}),
+                   entry('user', '<command-name>/devflow:doctor</command-name>'),
+                   {'type':'attachment','attachment':{'type':'queued_command','commandMode':'prompt',
+                     'origin':{'kind':'human'},'prompt':'/devflow:status'}},
+                   entry('assistant', 'Current status explanation'))
+        out = capture_interview(marker, [self.prompt('request'), self.prompt('Answer')])
+        self.assertEqual([m['content'] for m in out['messages']],
+                         ['request','Question?','Answer','Current status explanation'])
+        self.assertEqual(out['coverage']['user_responses'], 1)
+        self.assertEqual(out['coverage']['human_response_count'], 1)
+
     def test_prefix_does_not_escape(self):
         self.write(entry("user", "OLDER SECRET"))
         marker = transcript_marker(str(self.path))

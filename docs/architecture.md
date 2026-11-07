@@ -2,7 +2,7 @@
 
 ## 一つの配布と独立したワークフロー
 
-DevFlow 0.7.3 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
+DevFlow 0.8.0 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
 
 ```mermaid
 flowchart TD
@@ -18,13 +18,13 @@ Plan を使わずに作成した Markdown ファイルも Implement へ渡せま
 
 ## 制限せず、記録と確認をする
 
-DevFlow は、Claude Code とレビュアーのツールを制限しません。
+DevFlow は、ホストとレビュアーのツールを制限しません。
 
-- **フック**は記録と状態の通知だけをします。`UserPromptSubmit`（人間の入力と `/devflow:*` の開始・再開）、`PreToolUse` と `PostToolUse`（`AskUserQuestion` だけ）の3つです。どのフックも、失敗してもツールや入力を止めません。
+- **フック**は記録と状態の通知だけをします。`UserPromptSubmit`（入力と各ホストの明示操作）、`PreToolUse` と `PostToolUse`（各ホストの質問ツールだけ）の3つです。どのフックも、失敗してもツールや入力を止めません。
 - **ランナー**は DevFlow 自身の操作の正しさを確かめます（1つのプロジェクトに未完了の run は1つ、所有するセッションだけが run を変える、壊れた run と、外部の処理の途中で止まった run の扱い、開始は人間のコマンドから）。
 - **スキルと指示文**が、守ってほしいことを頼みます（[信頼の考え方と注意](security.md)）。
 
-`AskUserQuestion` は、実行前（`PreToolUse`）に問いの入力と「モデルが回答を事前に埋めたか」を毎回記録します。人間の判断に使えるのは、その記録があり、事前に埋められておらず、所有者の親の会話で、問い合わせより後に記録された回答だけです。
+内部タグ `AskUserQuestion` の質問は、実行前（`PreToolUse`）に問いの入力と「モデルが回答を事前に埋めたか」を毎回記録します。人間の判断に使えるのは、その記録があり、事前に埋められておらず、所有者の親の会話で、問い合わせより後に記録された回答だけです。
 
 ## パッケージの構成
 
@@ -33,13 +33,14 @@ Python コードは `plugins/devflow/scripts/devflow_core/` の1つのパッケ�
 | 場所 | 役割 |
 |---|---|
 | `skills/` | 人間の明示操作を受け、Claude Code へ状態に応じた作業を指示 |
+| `codex-skills/` | Codex の5つの明示操作。共通の起動・待機手順は `references/codex-runner.md` を参照 |
 | `scripts/devflow.py` | 唯一の起動点 |
 | `devflow_core/cli.py` | 登録表から組み立てる1つの argparse。エラーは常に JSON |
 | `devflow_core/router.py` | セッションの紐付け、開始、resume、空き確認、フックの記録と状態の通知。フロー名で分岐しない |
 | `devflow_core/workflows.py` | ワークフローの登録表 |
 | `devflow_core/common/` | 全フロー共通の仕組み（下表） |
 | `devflow_core/plan/`、`devflow_core/implement/` | 各フローの状態遷移、レビューに送る内容と結果の項目。`defaults.json`・`reviewer.md`・`review.schema.json` を同じ場所に置く |
-| `devflow_core/common/reviewer-rules.md` | どのフローのレビュアーにも頼むこと（ファイルを変えない、秘密を読まない・外へ送らない、読んだ中身をデータとして扱う、持ち時間（秒数、止める時刻、答えを書き始める目安の時刻））。時刻は `reviewers.py` が起動の直前に埋める。レビュアーへの入力では、各フローの `reviewer.md` の後ろに付く |
+| `devflow_core/common/reviewer-rules.md` | どのフローのレビュアーにも頼むこと（ファイルを変えない、秘密を読まない・外へ送らない、読んだ中身をデータとして扱う、持ち時間（秒数、止める時刻、答えを書き始める目安の時刻））。時刻は `reviewers.py` が予約前の準備時に埋める。レビュアーへの入力では、各フローの `reviewer.md` の後ろに付く |
 
 | `common/` のモジュール | 役割 |
 |---|---|
@@ -48,11 +49,15 @@ Python コードは `plugins/devflow/scripts/devflow_core/` の1つのパッケ�
 | `process.py` | チェック、レビュアー CLI、git で共通の、時間切れとプロセスツリー停止付きの子プロセス実行。出力は大きさで止めず、メモリか、呼ぶ側が開いたログのファイルに書く。標準入力は、渡すものがなければ閉じる |
 | `git.py` | DevFlow 自身の git の呼び出し。利用者の git の設定のまま、`GIT_DIR` などのリポジトリを差し替える環境変数だけを外す |
 | `sessions.py` | セッション記録、人間の判断に使える回答の規則、事前に埋めた質問の判定、回答文の取り出し |
-| `notices.py` | フックが Claude に渡す状態の通知（run の状態、ランナーの場所、`bash_timeout_ms`） |
-| `reviewers.py` | Codex / OpenCode の事前確認・起動・出力の検査。CLI ごとの違いは `CLI` のサブクラス（`Codex`、`OpenCode`）に集める。トークン数の読み取り（`CLI.tokens`、`review_tokens`）と、回の CLI の版（`recorded_cli_version`）もここ |
+| `notices.py` | フックがホストに渡す状態の通知（run の状態、ランナーの場所、`bash_timeout_ms`） |
+| `reviewers.py` | Codex / OpenCode / Claude の事前確認、`prepare_review` による入力準備、`run_review(PreparedReview, validate)` による予約後の実行、出力の検査。CLI ごとの違いは `CLI` のサブクラスに集める。トークン数の読み取りと、回の CLI の版もここ |
 | `summary.py` | レビューの要約：各フローが自分の記録を直した共通の形（`source`）から、データを作る `build` と、決まった英語の短い Markdown を作る `render`。データはすべてを持ち（レビュアーごとの合計 `reviewer_totals` を含む）、Markdown は判断に要るもの（1 回 1 行の表、レビュアーごとの 1 行、失敗、残っている指摘、人間の決定）だけを出す。表のセルには決まった値だけを入れ、自由な文は表の下の一覧に置く。上限の確認で待っている間と run が終わったあとに、`status` と最終レポートに入る |
 | `counts.py` | 前もって知らない名前（出来事の種類、ツールの名前）の、上限付きの数え方 |
-| `settings.py` | `devflow.config.json` の重ね合わせと、レビュアー設定の共通規則 |
+| `settings.py` | 共有・ローカル設定の検査と重ね合わせ、レビュアー設定の共通規則 |
+| `operations.py` | ホスト別の5操作の検出と、生の引数・本文の境界 |
+| `startup.py` | 起動時のレビュアー指定の解析と、最終設定への上書き |
+| `arguments.py` | 終了やヘルプ表示を例外として扱う共通 argparse パーサー |
+| `hosts/` | ホスト別の主会話判定、質問ツール名・実行ファイル名、正規化、スキル探索場所、ネイティブ会話取得と診断。Plan の面接組み立ては含めない |
 | `workflow.py` | 各フローが実装する契約（`Workflow` クラス）と、動作の表（`Command` / `Option`）。CLI の登録、所有者が要る操作（`needs_owner`）、振り分けはこの表から導く。共通層はフロー固有の state の項目を直接読まず、`summary` や `frozen_config` などの契約を通す |
 | `environment.py` | 長い処理に要る Bash の待ち時間（`bash_timeout_ms`）、確かめた CLI の版と `doctor` の警告、MSYS2・Cygwin の Python の検出 |
 | `errors.py`、`storage.py`、`review.py`、`paths.py` | エラーの系統、原子的な保存とロック、回数と承認の判定、インストール先とプロジェクトの根（`project_root`）。`storage.py` の `writable` と `writable_text` は、記録（UTF-8）に書けない文字（対にならないサロゲート）の確かめとエスケープ。使うのはレビュアーの CLI の出力が記録に入る所（答え、ツールと出来事の名前、CLI の出力から作るエラーの文を記録する Plan の `last_error` と `error.json`、Implement の回の `error` と `last_error`、`late/`、トークン数、CLI の版）。ほかから来る文字列（面接の transcript の本文、チェックの出力、公開のエラー、フックの入力、パス）は対象外 |
@@ -145,7 +150,7 @@ checkpoint では、開始時からの変更の一覧（`snapshots/NNN.json`）�
 
 差分のファイルは、開始時から今までのスナップショットの範囲の変更を、Git の unified diff と同じ形で書きます。空のファイルの追加・削除、モードだけの変更、バイナリの変更にも、必ず見出し（`diff --git`、`new file mode`、`old mode` / `new mode`、`Binary files … differ`）を付けます。
 
-レビュアーの CLI ごとの違いは、`reviewers.py` の `CLI` のサブクラス（`Codex`、`OpenCode`）に集めます。サブクラスは、使うサブコマンド、引数、標準入力、答えと動きの読み方を持ちます。事前確認は、引数に含まれるオプション（`--` で始まるもの）が、サブコマンドの `--help` にあることを確かめます。DevFlow が加えるのは、モデルと effort、承認を待たないこと（Codex には `approval_policy="never"` を渡す。OpenCode の `opencode run` は、利用者の設定で確認が要る操作を、自分で断って続ける）、JSON での出力、結果のスキーマ（Codex）、作業ディレクトリと `PWD`、標準入力（Codex にはプロンプトを渡してから閉じ、OpenCode は初めから閉じる）だけです。新しい CLI は、サブクラスを1つ書いて `CLIS` と `settings.REVIEWER_KINDS` に名前を足せば加えられます。トークン数は、サブクラスの `tokens` が CLI の名前のまま、平らな「名前 → 数」で返します（書かなければ unknown）。Codex は `turn.completed` の `usage` がスレッドの累計なので、スレッドごとの最後の値を足します。OpenCode は `step_finish` の `tokens` が1段階分なので、全部を足し、入れ子は `cache.read` のようにつなぎます。トークン数は答えの成否と関係なく、回の出力（`review-processes/NN/stdout.jsonl`）から読み、成功・失敗・回復のどの回の記録にも残します。確かめた版を `environment.CHECKED_VERSIONS` に足すと、それより新しい版で `doctor` が警告します（足さなければ警告しません）。
+レビュアーの CLI ごとの違いは、`reviewers.py` の `CLI` のサブクラス（`Codex`、`OpenCode`、`Claude`）に集めます。サブクラスは、使うサブコマンド、引数、標準入力、答えと動きの読み方を持ちます。事前確認は、引数に含まれるオプション（`--` で始まるもの）が、CLIまたはサブコマンドの `--help` にあることを確かめます。Claude は `claude --help` です。DevFlow が加えるのは、モデルと effort、承認を待たないこと（Codex には `approval_policy="never"` を渡す。OpenCode の `opencode run` は、利用者の設定で確認が要る操作を、自分で断って続ける）、JSON での出力、結果のスキーマ（Codex）、作業ディレクトリと `PWD`、標準入力（Codex にはプロンプトを渡してから閉じ、OpenCode は初めから閉じる）だけです。新しい CLI は、サブクラスを1つ書いて `CLIS` と `settings.REVIEWER_KINDS` に名前を足せば加えられます。トークン数は、サブクラスの `tokens` が CLI の名前のまま、平らな「名前 → 数」で返します（書かなければ unknown）。Codex は `turn.completed` の `usage` がスレッドの累計なので、スレッドごとの最後の値を足します。OpenCode は `step_finish` の `tokens` が1段階分なので、全部を足し、入れ子は `cache.read` のようにつなぎます。トークン数は答えの成否と関係なく、回の出力（`review-processes/NN/stdout.jsonl`）から読み、成功・失敗・回復のどの回の記録にも残します。確かめた版を `environment.CHECKED_VERSIONS` に足すと、それより新しい版で `doctor` が警告します（足さなければ警告しません）。
 
 出力の検査は、壊れているとわかるときだけ失敗にします。
 
@@ -163,8 +168,8 @@ checkpoint では、開始時からの変更の一覧（`snapshots/NNN.json`）�
 
 対象プロジェクトの `.devflow/runs/plan/RUN_ID/` と `.devflow/runs/implement/RUN_ID/` に、計画、設定、ベースライン、スナップショット、チェック、レビュー、採否、人間の発言を保存します。確定記録は上書きしません。レビュアーへの入力、ログ、生の出力は、両フローとも `review-processes/NN/` に置きます。受け付けたレビューの `reviews/NN/review.json` は、フローで形が違います。Implement はレビューの答えそのもの（レビュアーと動きの数は state の `attempts` に記録）、Plan は答え（`result`）を、レビュアー（`provider`）、プランのハッシュとレビューした版の番号（`plan_version`）、動きの数（`activity`）、トークン数（`tokens`）、時刻（`started_at`・`finished_at`）と一緒に包んだもの（`schema_version` 2）です。Plan の失敗した回の `error.json` と回復した回の `recovery.json` にも、時刻、トークン数、版の番号が入ります。直しの記録 `reflection.json` は、前後の版の番号と、足した行と消した行の数（直したときに1回だけ数える）を持ちます。
 
-- **run の state**（`schema_version` 9）は、全フロー共通の枠（`owner_session`、`event_ids`、`inflight`、`escalation`、run が初めて終わった時刻 `finished_at` など）と、各フローが宣言した項目だけを持ちます。処理中の状態（チェック中・レビュー中）と `inflight` は必ず一致します。それより古い形式（0.1.x の 1、0.2.x の 2、0.3.x の 3、0.4.0 の開発中の 4 と 5、0.4.x の 6、0.5.x の 7、0.6.x の 8）の run は `unsupported`、読めない run は `invalid` として扱い、`unsupported` だけは新しい開始を止めません。
-- **所有者**は run の `owner_session` だけで決まります。セッション記録（`.devflow/sessions/<ハッシュ>.json`）は、そのセッションが見ている run か、開始待ちのどちらか一方だけを持ちます。終わった run と `unsupported` の run への紐付けは、次の入力（バックグラウンドの処理の終わりの知らせを含む）で外します。そのため Claude は、run ができたあとの操作に `--run RUN_ID` を付けます。
+- **run の state**（`schema_version` 10）は、全フロー共通の枠（`owner_host`、`owner_session`、`event_ids`、`inflight`、`escalation`、run が初めて終わった時刻 `finished_at` など）と、各フローが宣言した項目だけを持ちます。処理中の状態（チェック中・レビュー中）と `inflight` は必ず一致します。それより古い形式（0.1.x の 1、0.2.x の 2、0.3.x の 3、0.4.0 の開発中の 4 と 5、0.4.x の 6、0.5.x の 7、0.6.x の 8、0.7.x の 9）の run は `unsupported`、読めない run は `invalid` として扱い、`unsupported` だけは新しい開始を止めません。
+- **所有者**は run の `(owner_host, owner_session)` で決まります。セッション記録（`.devflow/sessions/<ハッシュ>.json`）は、そのセッションが見ている run か、開始待ちのどちらか一方だけを持ちます。終わった run と `unsupported` の run への紐付けは、次の通常入力（バックグラウンドの処理の終わりの知らせを含む）で外します。status / doctor では外しません。そのため Claude は、run ができたあとの操作に `--run RUN_ID` を付けます。
 - **run を変える操作**は、`--session` に所有者のセッションを渡したときだけ受け付けます（`Command.needs_owner`）。`status`、`doctor`、人間専用の `recover` は所有者を問いません。
 - **開始**は「開始待ちの記録 → run の作成 → 紐付け」の3段階です。run は一時ディレクトリに全部作ってから rename で置くので、途中の状態の run は現れません。途中で止まった場合、次の入力で、作成済みなら紐付けを完了し、未作成なら開始待ちを取り消します。
 - **resume** はフックの中で行います。紐付けを先に書き、その後で所有者の変更・resume の依頼の記録・回答の境界の更新を1回で確定します。
@@ -185,3 +190,99 @@ checkpoint では、開始時からの変更の一覧（`snapshots/NNN.json`）�
 - エージェントの内部（ツールの名前、記録の行の種類、出来事の種類）の許可の一覧を持たない。知らないものは読み飛ばして数え、失敗にするのは壊れているとわかるときだけにする。
 - 新機能は必ず中断・失敗の経路までテストする。
 - 自動化を増やす場合も、Claude Code と各 CLI の利用者の設定や、人間の承認を無効化しない。
+
+## 0.8.0 のホスト連携
+
+単一の plugins/devflow に `.claude-plugin/plugin.json` と `.codex-plugin/plugin.json` を置き、
+版を一致させます。Claude は skills/ と hooks/hooks.json、Codex は codex-skills/ と
+hooks/codex.json を使います。双方とも5操作を明示的に起動し、Codex の
+agents/openai.yaml は policy.allow_implicit_invocation: false です。
+両 marketplace は同じ plugins/devflow を指します。
+
+common/hosts/ はネイティブ入力・会話レコード・ホスト診断を担当します。
+ランナーの全操作とホストを受け取る内部 API は、host の明示を必須にし、既定ホストを設けません。
+引数解析だけで終了する --help / --version はホスト指定を必要としません。
+両ホストの起動コマンドは uv --no-cache run --offline --no-project --no-config --no-python-downloads で共通です。
+Plan の会話組み立ては plan/ に残し、Claude の capture_interview の分割は行いません。
+Codex は短時間だけ既存 CLI の app-server stdio API を使って、実 ID を照合し、
+thread/items/list の全ページから可視の発言を取得します。推論・コマンド出力・子の発言は取り込みません。
+取得結果 `Conversation` は可視レコードと、読み飛ばした種類の件数を返します。
+未知の項目・非テキストブロックは `coverage.unknown_types`、既知の推論・コマンド出力・async配信は
+`coverage.ignored_types` に数えます。APIの件数は取得したセッション全体が対象です。
+面接の前段で所属不明の質問を除く場合も unknown_types に数え、子の質問は ignored_types に数えます。
+独自の常駐サービスや Codex JSONL パーサーは追加しません。
+
+共通イベントは event_id / recorded_at / kind / payload の枠を保ちます。
+payload は host・session_id・agent_scope・origin・operation・outcome・実 tool ID・質問入力・回答を持ち、
+source にネイティブの元 JSON を保存します。内部の AskUserQuestion は意味を表す共通タグです。
+ホストの会話記録に架空の Claude イベントを書きません。
+未確定の回答は outcome=unknown のままにし、元データにない is_error を補いません。
+status の事前入力件数・承認候補・面接取得は、正規化された agent_scope=main を必要とします。
+Codex の JSON 文字列の回答を厳密に読み、question ID ごとの文字列配列を保ちます。
+承認候補は同じホスト・実セッション・親の質問・実行前記録・非事前入力・実回答を必要とします。
+Pre / Post の質問ID・質問文・選択肢も一致する必要があります。共通の question_matches を
+承認候補と Codex 面接取得で使い、Codex は turn も照合します。両ホストとも画面が後から埋める
+answers / annotations は比較から除きます。不整合な結果は承認に使わず、面接取得はエラーにします。
+届いた未回答・失敗・取消・中断・未確認の Post は原文で残し、source の hook_event_index と
+outcome で元イベントへ対応させます。存在しない Post は作りません。
+親子は session ID だけでは分けず、agent_id と実 turn ID も確認します。
+主会話の判定規則はホスト連携に置きます。対応版 Claude のフックでは agent_id が子を表すため、
+agent_id が空なら main、空でなければ subagent とします。
+Codex は空でない agent_id を subagent とし、agent_id がなくルートの入力 turn と照合できれば main、
+照合できなければ unknown です。Codex の通常入力の origin も unknown とし、人間の回答数へ加えません。
+質問の件数は質問ツール1呼び出しを単位とし、質問IDごとの回答配列は本文で保持します。
+会話APIの項目順とフックの記録順を優先して併合し、captured_at は新規イベントでミリ秒まで保存します。
+秒精度の既存イベントや同じミリ秒などで混在順が確定しない場合は source.ordering_ambiguous を示します。
+anchorは次のnative項目の直前にある挿入位置です。同じ位置のフックは記録順を保ち、
+native時刻が単調な場合は、同時刻のnative項目をその左に置きます。
+同じturnのnative時刻が逆転した場合は、そのturnの全フックにordering_ambiguousを付けます。
+この場合も元の記録順を維持します。別turnの時計の逆転だけではフラグを付けません。
+
+Codex の会話APIは1呼び出し30秒、取得は1ページ100項目・最大10,000ページです。
+明示的な --session を持つ plan doctor は初期化・ルート識別・先頭1ページの疎通を調べ、
+面接前の診断に使います。run指定時は(owner_host, owner_session)と呼出元が一致する場合だけ接続します。
+一致しない場合とセッション指定なしでは、固定設定の診断と checked=false / ready=null / 理由を返します。
+セッションなしの診断と全体doctorは制限値の表示だけで、APIへ接続しません。
+成功は全ページ取得や将来の seal を保証しません。終了時の wait / close の失敗は元の取得エラーを上書きしません。
+
+run 形式10では owner_host、escalation.host、イベントの host を照合します。
+別ホストの resume と変更操作は理由を示して止めます。
+セッション形式3のファイル名は sha256(session_id) のまま、上書き・削除の前にホスト衝突を確認します。
+
+| SessionInfo | 新しい開始 | status / doctor | 次の通常入力 |
+| --- | --- | --- | --- |
+| current / run | run の状態に従う | 表示のみ | 完了・unsupported の run なら解除 |
+| current / pending_start | 未適用なら開始を妨げる | 表示のみ | 適用済みなら紐付け、未適用なら破棄 |
+| unsupported / run または pending_start | 妨げない | 形式と推定 host=claude を表示 | 同じホストで空の形式3記録へ置き換えて解除 |
+| invalid | 妨げる | 理由を表示 | フックは exit 1、stdout 空、stderr に理由 |
+
+unsupported は整数の形式1・2かつ基本のセッション ID・ファイル名が一致する記録です。
+未来の番号・bool・識別情報の不一致は invalid です。status で自動変換しません。
+run 形式9は RELEASES[9] = "0.7.x" と表示します。
+
+レビューは preflight → ロックと再確認 → ask_at_limit → packet と PreparedReview の準備・全サイズ検査
+→ artifact の stage → 回数加算 → reserve/save → 同じ入力の送信です。
+準備はファイルを作らず、超過時に .part や予約を残しません。指示の時刻はロック後の準備時に一度固定し、
+実際の制限時間はプロセス起動から測ります。承認のモデル・effort は固定済み設定を reviewer_id で参照します。
+PreparedReview は入力のバイト列、引数、作業場所、固定した設定、事前診断をまとめて実行へ渡します。
+実行側は入力を読み直したり再準備したりしません。設定の重ね合わせも load_workflow_config の一経路です。
+
+レビュー結果の JSON Schema は、Plan・Implement の各 review.schema.json を原本とし、
+両方で `http://json-schema.org/draft-07/schema#` を明示します。
+現在の全制約を表せ、Claude CLI 2.1.319 の検証器にも対応する仕様へ揃えます。
+原本・プロンプト・CLI のスキーマ引数は同じ定義です。Claude での ASCII 化と minify は
+JSON の表現だけを変え、宣言の削除や仕様版の書き換えは行いません。
+回答 JSON の schema_version、必須項目、制約、DevFlow 側の結果検査は変えません。
+Claude の usage / modelUsage は集計専用です。集計情報の不備で回答を失敗させません。
+トップレベルの usage が欠落・オブジェクト以外ならトークン数は unknown です。usage={} は認め、
+その内部項目を検査・集計しません。数えるのは modelUsage の各モデルの4項目だけで、
+各項目がすべて非負整数（boolを除く）でない場合、空のmodelUsageや複数resultの場合も unknown です。
+子の init / result は activity に加えますが主回答の成否には使いません。
+assistantの未知contentブロックもother_eventsへ数えます。既知のtext / thinking / redacted_thinkingは数えず、
+ツール呼び出しの重複判定と回答の成否は変えません。種類名がない・保存不能なものは既存の(unnamed)集計を使います。
+2020-12 固有の機能が必要になった場合は各 CLI の対応を再確認し、仕様変更として検討します。
+未対応のキーワードを削って通す処理や、汎用の仕様変換器は追加しません。
+
+ローカル設定も既存のスナップショット除外規則に従います。context_paths で明示した対象外のパスは、
+設定読込時の専用検査を増やさず、スナップショット取得時の共通エラー
+Requested context file is not in the captured scope で止めます。

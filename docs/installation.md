@@ -46,6 +46,29 @@ Claude Code のセッション内からは、実際の解凍先パスを使い�
 
 人がついていない実行（`claude -p` など）では、確認の画面が出ません。`--allowedTools` などでランナーを許可しておいてください。バックグラウンドのコマンドには、Claude が渡した `timeout` まで（最大 2 時間）の制限がかかります。
 
+許可を設定する場合は、スキルと同じ `uv --no-cache` を含む起動コマンドを指定します。
+たとえば、確認したプラグインの実パスに対する Bash の許可は次の形です。
+`/absolute/path/to/devflow` はインストール済みプラグインのパスへ置き換えてください。
+スキルが使う引用符付きと、手動で使う引用符なしの両方を登録する例です。
+PowerShell を使う場合は、両方の形の同じコマンドに対する `PowerShell(...)` の許可を指定します。
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv --no-cache run --offline --no-project --no-config --no-python-downloads /absolute/path/to/devflow/scripts/devflow.py *)",
+      "Bash(uv --no-cache run --offline --no-project --no-config --no-python-downloads \"/absolute/path/to/devflow/scripts/devflow.py\" *)"
+    ]
+  }
+}
+```
+
+引用符なしの規則だけでは引用符付きの呼び出しが許可されなかった0.7.1の実測を踏まえた例です。
+今回の版で、実際のClaude Codeの許可照合を再検証したものではありません。
+
+ランナーの実操作には、ホストを問わず常に `--host claude` または `--host codex` を渡します。
+セッションなしの status / doctor も同じです。`--help` と `--version` は指定なしで表示できます。
+
 ### Windows
 
 Windows では Git for Windows を入れてください（DevFlow の git と、Implement の既定の `git` モードで使います）。Claude Code の Bash ツールと PowerShell ツールのどちらでも、DevFlow のランナーを使えます。スキルは、どちらのツールでのランナーの呼び出しも事前に許可します。
@@ -148,3 +171,82 @@ Git モードでは、新規作成された正式プランや設定ファイル�
 - [Claude Code plugin の読み込み・版・更新](https://code.claude.com/docs/en/plugins/loading)
 - [Claude Code のツール（Bash の待ち時間とバックグラウンド実行）](https://code.claude.com/docs/en/tools-reference)
 - [uv script metadata](https://docs.astral.sh/uv/guides/scripts/)
+
+## Codex CLI の導入（0.8.0）
+
+対象はローカル Codex CLI 0.166.0 以降です。既存 CLI・Python・uv・各レビュアーの認証を用意し、
+導入先とフックを人間が確認します。同じ配布ルートを登録します。
+
+```text
+codex plugin marketplace add /absolute/path/to/devflow
+codex plugin add devflow@devflow-marketplace
+codex --enable default_mode_request_user_input
+```
+
+CLI の `/hooks` で同梱コマンドを確認して信頼してください。更新で再確認が求められる場合があります。
+`plugin_hooks` が removed と表示されても、0.166.0 では同梱フックの読み込みを実測しました。
+質問機能は既定で無効の実験的機能です。上の起動指定は利用者が明示的に選びます。
+DevFlow が設定ファイルを自動変更することはありません。
+
+`$devflow:plan` / `$devflow:implement PATH` / `$devflow:status` /
+`$devflow:resume RUN_ID` / `$devflow:doctor` の5操作を使います。
+ホストのフックから実セッション ID・プロジェクト・ランナーを渡します。
+`--host codex` が必要で、Claude の変数展開や、継承したセッション ID を推測して使いません。
+フックが使えない場合や質問機能がない場合、面接を開始せず理由を報告します。
+
+uv のキャッシュだけに追加権限を必要としないよう、全入口で `uv --no-cache run --offline ...` を使います。
+この起動方法は Claude と Codex で共通です。
+review / check でネットワークやホームへの書き込みが必要になり、既定権限で実行できない場合があります。
+診断の静的 ready は実行権限・認証を保証しません。必要な処理ごとに Codex 標準の承認を求め、
+利用者が同意したコマンドだけを実行します。昇格は必須条件にせず、設定も自動変更しません。
+長い処理は exec_command の session_id を write_stdin へ渡して完了まで待ち、再実行しません。
+この環境では、親 Codex 内に別の Codex を起動した際の bubblewrap の失敗も観測しています。
+詳細・権限ごとの結果は [成立確認](codex-host-validation.md) を参照してください。
+
+Claude の plan.grill_skill は Skill ツールで呼び出します。Codex はネイティブのスキル一覧から
+指定した同じスキルを選び、その本文を読む標準の方法を使います。別スキルへの代替はしません。
+Codex の探索先はプロジェクトと祖先の .agents/skills、ホームの .agents/skills、CODEX_HOME/skills です。
+プラグインの名前付きスキルは実行時の一覧で確認し、doctor のファイル発見だけで実行済みとはしません。
+
+## Claude レビュアーとローカル設定
+
+Claude Code ホストの最低版は2.1.316、Claude レビュアーの最低版は2.1.319です。
+Claude レビュアーを使う場合は command: ["claude"], model: "opus", effort: "high" を設定できます。
+既定の Codex / OpenCode の一覧は変えません。
+Windows では .cmd / .bat のレビュアーを起動しません。npm の claude.cmd ではなく
+ネイティブ版 Claude を導入してください。設定ファイルの例と優先順位は README を参照してください。
+
+ローカルの切り替えにはプロジェクト直下の devflow.config.local.json を使い、利用者自身で
+.gitignore に /devflow.config.local.json を加えます。POSIX は umask 077 / chmod 600、
+Windows は所有者だけのアクセス権を推奨します。利用者のファイルを自動作成・編集しません。
+
+0.8.0 は run 形式10・セッション形式3です。0.7.x の進行中 run は更新前に終えてください。
+CLI の --host 常時必須化も0.8.0の破壊的変更です。0.7.x用の手動・外部スクリプトの呼び出しは、
+更新と同時に --host claude / --host codex をグローバル引数へ加えます。status / doctor / recover も同じです。
+0.7.xの手動コマンドはそのままでは動きません。省略時に Claude を選ぶ互換動作はありません。--help / --version の表示だけはホスト指定なしで使えます。
+0.7.3へ戻すときはプロセスを止め、更新前の設定・.devflow のバックアップを戻すか、
+.devflow 全体を保管して空から始めます。0.8.0 の記録を0.7.3で続けたり形式番号を直したりしません。
+
+## Codex の会話APIを面接前に確認する
+
+全体の doctor はプロジェクト設定と静的な前提だけを確認します。
+実際のセッションIDを指定した plan doctor は、app-server の初期化、ルートの識別、
+thread/items/list の先頭1ページまでを追加で確認します。モデル呼び出しやログインは行いません。
+
+```text
+uv --no-cache run --offline --no-project --no-config --no-python-downloads "PLUGIN_DIR/scripts/devflow.py" --host codex --project "PROJECT_DIR" --session "ACTUAL_SESSION_ID" plan doctor
+```
+
+実IDはフックが渡した値を使い、推測しません。--runを指定する場合は、そのrunの所有者と
+同じホスト・セッションのときだけAPIに接続します。別の所有者やセッション指定なしの場合は、
+固定済み設定を診断し、conversation_apiはchecked=false、ready=nullと理由を返します。Codex の Plan スキルも、面接の質問より前に
+この診断を実行し、conversation_api.checked / ready が true であることを確認します。
+失敗した場合は理由を表示し、必要ならそのコマンドについて標準承認を求めます。
+先頭ページの成功は、その後の全ページ取得や seal の成功を保証しません。
+セッション指定がなければ checked=false で、APIの制限値を表示するだけです。
+
+会話APIの待ち時間は1呼び出しごとに30秒です。全ページを合計30秒で打ち切る動作はありません。
+可視ユーザー発言のcontentは実測したブロック配列を必要とします。文字列などの未確認の形では、
+取得はCaptureErrorで止まり、推測した変換で続けません。
+seal は1ページ100項目、最大10,000ページを取得します。doctor の conversation_api に制限値と検査範囲を表示します。
+会話・質問の原文を取得できない場合は、要約への置き換えや、欠落した回答の推測で続行しません。

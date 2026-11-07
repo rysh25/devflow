@@ -10,7 +10,7 @@ from ..common.errors import DevFlowError
 from ..common.review import (LIMIT_DECISIONS, REVIEW_BUDGET, after_failed_review, all_approved, ask_at_limit, decide_at_limit,
                              next_reviewer)
 from ..common import summary
-from ..common.reviewers import preflight, recorded_cli_version, review_tokens, run_review
+from ..common.reviewers import preflight, prepare_review, recorded_cli_version, review_tokens, run_review
 from ..common.engine import RunEngine
 from ..common.runs import RUNNER_WAIT, TERMINAL, open_escalation
 from ..common.sessions import approval_candidates
@@ -42,9 +42,9 @@ def _plan_bytes(path: Path, limit: int) -> bytes:
 
 class Engine(RunEngine):
     def __init__(self, project: Path, resources: Path | None = None, lock_wait: float = RUNNER_WAIT,
-                 session: str | None = None):
+                 session: str | None = None, *, host: str):
         from .workflow import WORKFLOW
-        super().__init__(project, WORKFLOW, resources, lock_wait, session)
+        super().__init__(project, WORKFLOW, resources, lock_wait, session, host=host)
 
     def _verify(self, state, source=True):
         super()._verify(state)
@@ -247,19 +247,19 @@ class Engine(RunEngine):
             # _current has just verified the workspace.
             workspace = Path(state["workspace"]["path"])
             packet = self._packet(state,current,workspace,diff_path)
+            prepared = prepare_review(provider, packet, self._run(run_id)/"review-processes"/f"{number:02}",
+                                      self.resources/"review.schema.json", self.resources/"reviewer.md", cwd=workspace,
+                                      probe=probe)
             packet_relative = f"reviews/{number:02}/packet.json"
             self._artifact(state,packet_relative,packet)
             state["attempts"].append({"number":number,"reviewer_id":provider["id"],"snapshot_id":current["snapshot_id"],
                 "snapshot_path":state["candidate"]["path"],
                 "packet_path":packet_relative,"packet_sha256":digest(packet),"status":"dispatched","started_at":now()})
             # Reserved BEFORE dispatch, including unknown-outcome failures.
-            return number, current["snapshot_id"], provider["id"], {
-                "number": number, "packet": packet_relative, "workspace": str(workspace)}
+            return number, current["snapshot_id"], provider["id"], {"prepared": prepared}
 
         def execute(work):
-            return run_review(provider,self._run(run_id)/work["packet"],
-                self._run(run_id)/"review-processes"/f"{work['number']:02}",self.resources/"review.schema.json",
-                self.resources/"reviewer.md",validate_review,probe,cwd=Path(work["workspace"]))
+            return run_review(work["prepared"], validate_review)
 
         def finish(state, reservation, work, result, error):
             if error is None and result["review"]["snapshot_id"] != reservation["target"]:

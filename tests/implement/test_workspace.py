@@ -47,7 +47,7 @@ class WorkspaceFixture(unittest.TestCase):
         self.worktree = self.base / "feature worktree"
         self.git(self.project, "worktree", "add", "--quiet", "-b", "feature", str(self.worktree))
         self.session = "workspace-session"
-        self.engine = Engine(self.project)
+        self.engine = Engine(self.project, host="claude")
 
     def git(self, root, *args):
         result = subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", str(root), *args],
@@ -56,12 +56,12 @@ class WorkspaceFixture(unittest.TestCase):
 
     def prompt(self, text):
         return router.handle_hook({"hook_event_name": "UserPromptSubmit", "cwd": str(self.project),
-                                   "session_id": self.session, "prompt": text}, PLUGIN_ROOT)
+                                   "session_id": self.session, "prompt": text}, PLUGIN_ROOT, host="claude")
 
     def start(self, workspace_value=None):
         self.prompt(f'/devflow:implement "{self.plan}"')
         options = {"workspace": workspace_value} if workspace_value is not None else {}
-        status = router.runner_start(self.project, self.session, "implement", str(self.plan), options)
+        status = router.runner_start(self.project, self.session, "implement", str(self.plan), options, host="claude")
         self.run_id = status["run_id"]
         self.draft = Path(status["draft_dir"])
         return status
@@ -102,7 +102,7 @@ class WorkspaceStartTests(WorkspaceFixture):
         self.prompt(f'/devflow:implement "{self.plan}"')
         out = io.StringIO()
         with redirect_stdout(out), redirect_stderr(io.StringIO()):
-            code = cli.main(["--project", str(self.project), "--session", self.session, "implement", "start",
+            code = cli.main(["--host", "claude", "--project", str(self.project), "--session", self.session, "implement", "start",
                              "--plan", str(self.plan), "--workspace", str(self.worktree)])
         self.assertEqual(code, 0, out.getvalue())
         self.assertTrue(same_path(json.loads(out.getvalue())["workspace"]["path"], self.worktree))
@@ -125,7 +125,7 @@ class WorkspaceStartTests(WorkspaceFixture):
                 self.prompt(f'/devflow:implement "{self.plan}"')
                 with self.assertRaisesRegex(DevFlowError, message):
                     router.runner_start(self.project, self.session, "implement", str(self.plan),
-                                        {"workspace": value})
+                                        {"workspace": value}, host="claude")
                 self.assertFalse(any((self.project / ".devflow" / "runs" / "implement").glob("2*")))
 
     def test_files_mode_accepts_only_the_project(self):
@@ -203,7 +203,7 @@ class RewrittenStateTests(WorkspaceFixture):
     the workspace with the real project, not only with the state."""
 
     def rewrite_workspace(self, value):
-        store = RunStore(self.project, WORKFLOW)
+        store = RunStore(self.project, WORKFLOW, host="claude")
         with store.lock(self.run_id):
             state = store.load(self.run_id)
             state["workspace"] = value
@@ -266,7 +266,7 @@ class DirtyStartTests(WorkspaceFixture):
         # S1: nothing records writes before the start; allow_dirty=false asks the human.
         self.prompt(f'/devflow:implement "{self.plan}"')
         (self.project / "module.py").write_text("VALUE = 5\n", encoding="utf-8")
-        status = router.runner_start(self.project, self.session, "implement", str(self.plan), {})
+        status = router.runner_start(self.project, self.session, "implement", str(self.plan), {}, host="claude")
         self.assertEqual(status["status"], "awaiting_human")
         self.assertEqual(status["escalation"]["detail"]["kind"], "dirty_worktree")
 

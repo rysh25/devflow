@@ -1,0 +1,14 @@
+{
+  "session_id": "probe-session-3",
+  "turn_id": "probe-child-turn",
+  "transcript_path": "/fixture/codex/history.jsonl",
+  "agent_transcript_path": "/fixture/codex/child-history.jsonl",
+  "cwd": "/fixture/project",
+  "hook_event_name": "SubagentStop",
+  "model": "gpt-6.1-sol",
+  "permission_mode": "default",
+  "stop_hook_active": false,
+  "agent_id": "probe-child-agent",
+  "agent_type": "default",
+  "last_assistant_message": "request_user_input can only be used by the root thread"
+}

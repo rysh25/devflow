@@ -11,7 +11,7 @@ from uuid import uuid4
 from ..common.errors import CaptureError, DevFlowError
 from ..common.review import (LIMIT_DECISIONS, REVIEW_BUDGET, after_failed_review, all_approved, ask_at_limit, decide_at_limit,
                              next_reviewer)
-from ..common.reviewers import preflight, recorded_cli_version, review_tokens, run_review
+from ..common.reviewers import preflight, prepare_review, recorded_cli_version, review_tokens, run_review
 from ..common.engine import RunEngine
 from ..common.runs import RUNNER_WAIT, TERMINAL, open_escalation
 from ..common.sessions import approval_candidates
@@ -164,9 +164,9 @@ def summary_source(store, state: dict) -> dict:
 
 class Engine(RunEngine):
     def __init__(self, project: Path, resources: Path | None = None, lock_wait: float = RUNNER_WAIT,
-                 session: str | None = None):
+                 session: str | None = None, *, host: str):
         from .workflow import WORKFLOW
-        super().__init__(project, WORKFLOW, resources, lock_wait, session)
+        super().__init__(project, WORKFLOW, resources, lock_wait, session, host=host)
 
     def _before_dispatch(self, state):
         state["last_error"] = None
@@ -221,7 +221,12 @@ class Engine(RunEngine):
             if decisions["open_questions"]:
                 raise DevFlowError("Resolve initial human questions before sealing the interview.")
             try:
-                interview = capture_interview(state["transcript_marker"], [event["payload"] for event in self._events(state)])
+                payloads = [event["payload"] for event in self._events(state)]
+                if state["owner_host"] == "codex":
+                    from .codex_interview import capture_interview as capture_codex
+                    interview = capture_codex(state["transcript_marker"], payloads, self.project)
+                else:
+                    interview = capture_interview(state["transcript_marker"], payloads)
             except CaptureError as exc:
                 raise DevFlowError(f"Cannot certify complete interview capture: {exc}. Do not replace it with a summary.") from exc
             if interview.get("coverage", {}).get("human_response_count", 0) < 1:
@@ -305,17 +310,16 @@ class Engine(RunEngine):
                 raise DevFlowError("The run changed during the reviewer check; inspect status and retry.")
             number = state["review_count"] + 1
             relative_dir = f"reviews/{number:02d}"
-            packet_path = self._artifact(state, f"{relative_dir}/packet.md", self._packet(state, number, provider))
+            packet = self._packet(state, number, provider)
+            process_dir = self._run(run_id) / "review-processes" / f"{number:02d}"
+            prepared = prepare_review(provider, packet, process_dir, self.resources / "review.schema.json",
+                                      self.resources / "reviewer.md", cwd=self.project, probe=probe)
+            self._artifact(state, f"{relative_dir}/packet.md", packet)
             state["review_count"] = number
-            return number, state["plan_hash"], provider["id"], {"packet": packet_path, "dir": relative_dir,
-                                                                "number": number}
+            return number, state["plan_hash"], provider["id"], {"dir": relative_dir, "prepared": prepared}
 
         def execute(work):
-            # As in implement: the process's input, logs and raw output go to
-            # review-processes/NN; reviews/NN keeps the run's own records.
-            process_dir = self._run(run_id) / "review-processes" / f"{work['number']:02d}"
-            return run_review(provider, work["packet"], process_dir, self.resources / "review.schema.json",
-                              self.resources / "reviewer.md", validate_review, probe, cwd=self.project)
+            return run_review(work["prepared"], validate_review)
 
         return self._dispatch(run_id, "reviewing", "review", prepare, execute,
                               lambda state, reservation, work, result, error:

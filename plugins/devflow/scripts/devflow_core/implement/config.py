@@ -3,9 +3,8 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 from ..common.errors import DevFlowError
-from ..common.storage import read_json
 from ..common.review import validate_limit
-from ..common.settings import validate_reviewers, workflow_overlay
+from ..common.settings import load_workflow_config, validate_reviewers
 from .checks import validate_checks
 
 
@@ -52,11 +51,4 @@ def validate_config(value: dict) -> dict:
 
 
 def load_config(project: Path, workflow) -> dict:
-    value = read_json(workflow.resource("defaults.json"))
-    overlay = workflow_overlay(project, workflow.name)
-    if overlay:
-        # Lists replace completely. Only the snapshot object merges named fields.
-        if "snapshot" in overlay and isinstance(overlay["snapshot"], dict):
-            overlay["snapshot"] = {**value["snapshot"], **overlay["snapshot"]}
-        value.update(overlay)
-    return validate_config(value)
+    return load_workflow_config(project, workflow, validate_config)

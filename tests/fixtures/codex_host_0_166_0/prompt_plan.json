@@ -1,0 +1,10 @@
+{
+  "session_id": "probe-session-1",
+  "turn_id": "probe-turn-1",
+  "transcript_path": "/fixture/codex/history.jsonl",
+  "cwd": "/fixture/project",
+  "hook_event_name": "UserPromptSubmit",
+  "model": "gpt-6.1-sol",
+  "permission_mode": "default",
+  "prompt": "$devflow:plan  Please report the operation marker and delivered hook context. Do not use tools, ask questions, or modify files."
+}

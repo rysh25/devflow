@@ -1,0 +1,32 @@
+{
+  "session_id": "probe-session-3",
+  "turn_id": "probe-child-turn",
+  "agent_id": "probe-child-agent",
+  "agent_type": "default",
+  "transcript_path": "/fixture/codex/history.jsonl",
+  "cwd": "/fixture/project",
+  "hook_event_name": "PreToolUse",
+  "model": "gpt-6.1-sol",
+  "permission_mode": "default",
+  "tool_name": "request_user_input",
+  "tool_input": {
+    "questions": [
+      {
+        "header": "Probe",
+        "id": "child_capability_probe",
+        "question": "Child capability probe",
+        "options": [
+          {
+            "label": "Alpha",
+            "description": "Select Alpha."
+          },
+          {
+            "label": "Beta",
+            "description": "Select Beta."
+          }
+        ]
+      }
+    ]
+  },
+  "tool_use_id": "probe-child-tool"
+}

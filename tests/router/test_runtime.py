@@ -43,17 +43,17 @@ class RuntimeFixture(unittest.TestCase):
 
     # -- helpers ---------------------------------------------------------------------------
     def payload(self, event="UserPromptSubmit", session=None, **fields):
-        return {"hook_event_name": event, "cwd": str(self.project),
+        return {"host": "claude", "hook_event_name": event, "cwd": str(self.project),
                 "session_id": session or self.session, "transcript_path": str(self.transcript), **fields}
 
     def prompt(self, text, session=None):
-        return runtime.handle_hook(self.payload(prompt=text, session=session), PLUGIN)
+        return runtime.handle_hook(self.payload(prompt=text, session=session), PLUGIN, host="claude")
 
     def tool(self, name="Write", session=None, **data):
-        return runtime.handle_hook(self.payload(event="PreToolUse", session=session, tool_name=name, tool_input=data), PLUGIN)
+        return runtime.handle_hook(self.payload(event="PreToolUse", session=session, tool_name=name, tool_input=data), PLUGIN, host="claude")
 
     def record(self, session=None):
-        return sessions.read_record(self.project, session or self.session, WORKFLOWS)
+        return sessions.read_record(self.project, session or self.session, WORKFLOWS, host="claude")
 
     def run_dir(self, flow, run_id):
         return self.project / ".devflow" / "runs" / flow / run_id
@@ -67,15 +67,15 @@ class RuntimeFixture(unittest.TestCase):
     def implement_start(self, session=None):
         session = session or self.session
         self.prompt("/devflow:implement feature.md", session=session)
-        return runtime.runner_start(self.project, session, "implement", "feature.md")["run_id"]
+        return runtime.runner_start(self.project, session, "implement", "feature.md", host="claude")["run_id"]
 
     def engine(self, flow):
-        return WORKFLOWS[flow].engine(self.project)
+        return WORKFLOWS[flow].engine(self.project, host="claude")
 
     def invoke(self, *args):
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
-            code = cli.main(["--project", str(self.project), *args])
+            code = cli.main(["--host", "claude", "--project", str(self.project), *args])
         return code, out.getvalue(), err.getvalue()
 
     def raw_run(self, flow, identifier="20261101T123456Z-123456abcdef", status="interview", **extra):
@@ -90,11 +90,11 @@ class RuntimeFixture(unittest.TestCase):
         # An intentional old-run fixture: the version is always below SCHEMA_VERSION.
         self.raw_run(flow, identifier, status="implementing" if flow == "implement" else "planning",
                      schema_version=version)
-        record = sessions.empty_record(session or self.session)
+        record = sessions.empty_record(session or self.session, host="claude")
         if pending:
             record = dict(record, pending_start={"flow": flow, "run_id": identifier, "args": "x",
                                                  "created_at": "t",
-                                                 "event": make_event({"prompt": f"/devflow:{flow} x"}, "prompt")})
+                                    "event": make_event({"host": "claude", "prompt": f"/devflow:{flow} x"}, "prompt")})
         else:
             record = dict(record, run={"flow": flow, "run_id": identifier})
         sessions.write_record(self.project, record, WORKFLOWS)
@@ -103,7 +103,7 @@ class RuntimeFixture(unittest.TestCase):
     def ask(self, tool_use_id, session=None, **tool_input):
         """PreToolUse of an AskUserQuestion, as Claude sent it."""
         return runtime.handle_hook(self.payload(event="PreToolUse", session=session, tool_name="AskUserQuestion",
-                                                tool_use_id=tool_use_id, tool_input=tool_input), PLUGIN)
+                                                tool_use_id=tool_use_id, tool_input=tool_input), PLUGIN, host="claude")
 
     def assert_not_accepted(self, result, reason=""):
         """A /devflow: command DevFlow did not act on: context for Claude, never an exception."""
@@ -118,8 +118,8 @@ class UnifiedDispatchTests(RuntimeFixture):
     def test_unrelated_hooks_are_inert_and_create_no_workspace(self):
         self.assertIsNone(self.prompt("Explain this code"))
         self.assertIsNone(self.tool("Bash", command="ordinary user tool"))
-        self.assertIsNone(runtime.handle_hook(self.payload(event="Stop"), PLUGIN))
-        self.assertIsNone(runtime.handle_hook({"hook_event_name": "UnknownEvent"}, PLUGIN))
+        self.assertIsNone(runtime.handle_hook(self.payload(event="Stop"), PLUGIN, host="claude"))
+        self.assertIsNone(runtime.handle_hook({"hook_event_name": "UnknownEvent"}, PLUGIN, host="claude"))
         self.assertFalse((self.project / ".devflow").exists())
 
     def test_plan_start_uses_unified_paths_and_preserves_request(self):
@@ -226,9 +226,9 @@ class UnifiedDispatchTests(RuntimeFixture):
         self.raw_run("implement", identifier, "implementing")
         self.assert_not_accepted(self.prompt("/devflow:resume " + identifier), "ambiguous")
         with self.assertRaisesRegex(DevFlowError, "ambiguous"):
-            runtime.status(self.project, None, identifier)
+            runtime.status(self.project, None, identifier, host="claude")
         with self.assertRaises(DevFlowError):
-            runtime.resolve_run(self.project, "20261101T123456Z-aaaaaaaaaaaa", runtime.stores(self.project))
+            runtime.resolve_run(self.project, "20261101T123456Z-aaaaaaaaaaaa", runtime.stores(self.project, host="claude"))
 
     def test_invalid_start_or_resume_does_not_create_workspace(self):
         for prompt in ("/devflow:plan", "/devflow:implement", "/devflow:resume ../bad",
@@ -246,7 +246,7 @@ class UnifiedDispatchTests(RuntimeFixture):
 
     def test_global_status_during_active_run_reports_selected_workflow(self):
         identifier = self.plan_start()
-        value = runtime.status(self.project, self.session, None)
+        value = runtime.status(self.project, self.session, None, host="claude")
         self.assertEqual((value["status"], value["run"], value["owner_matches"], value["pending_start"]),
                          ("bound", {"flow": "plan", "run_id": identifier}, True, None))
         self.assertNotIn("run_status", value)
@@ -254,15 +254,15 @@ class UnifiedDispatchTests(RuntimeFixture):
         self.assertEqual((listed["run_id"], listed["status"], listed["review_count"]), (identifier, "interview", 0))
 
     def test_idle_status_is_nonmutating_and_pending_status_is_explicit(self):
-        value = runtime.status(self.project, self.session, None)
+        value = runtime.status(self.project, self.session, None, host="claude")
         self.assertEqual(value["status"], "idle")
         self.assertFalse((self.project / ".devflow").exists())
         self.prompt("/devflow:implement feature.md")
-        value = runtime.status(self.project, self.session, None)
+        value = runtime.status(self.project, self.session, None, host="claude")
         self.assertEqual(value["status"], "pending_start")
         self.assertEqual(value["pending_start"]["args"], str(self.plan_file))
         self.assertEqual(value["sessions"]["pending_starts"], [])  # Not blocking its own session.
-        other = runtime.status(self.project, "someone-else", None)
+        other = runtime.status(self.project, "someone-else", None, host="claude")
         self.assertEqual(other["sessions"]["pending_starts"][0]["flow"], "implement")
 
     def test_runner_start_cannot_target_an_existing_run(self):
@@ -349,9 +349,9 @@ class ToolCallsAreNeverStopped:
 
     def test_a_session_that_does_not_own_the_run_is_never_stopped(self):
         identifier = self.start()
-        sessions.write_record(self.project, dict(sessions.empty_record("other-session"),
+        sessions.write_record(self.project, dict(sessions.empty_record("other-session", host="claude"),
                                                  run={"flow": self.flow, "run_id": identifier}), WORKFLOWS)
-        self.assertEqual(runtime.status(self.project, "other-session", None)["status"], "stale")
+        self.assertEqual(runtime.status(self.project, "other-session", None, host="claude")["status"], "stale")
         before = self.event_ids(identifier)
         self.assert_nothing_stopped("other-session")
         self.assertIsNone(self.ask("other-question", session="other-session", questions=[{"question": "Q?"}]))
@@ -366,7 +366,7 @@ class ToolCallsAreNeverStopped:
                        "created_at": "2026-11-01T00:00:00+00:00",
                        "event": make_event(self.payload(prompt="/devflow:plan Interrupted request"), "prompt")}
             (self.project / ".devflow").mkdir()
-            sessions.write_record(self.project, dict(sessions.empty_record(self.session), pending_start=pending),
+            sessions.write_record(self.project, dict(sessions.empty_record(self.session, host="claude"), pending_start=pending),
                                   WORKFLOWS)
         self.assertEqual(self.record()["pending_start"]["flow"], self.flow)
         self.assert_nothing_stopped()
@@ -375,7 +375,7 @@ class ToolCallsAreNeverStopped:
 
     def test_a_session_bound_to_an_unsupported_run_is_never_stopped(self):
         identifier = self.bind_to_old_run(flow=self.flow, version=4)  # Old-run fixture: format 4 was never released.
-        self.assertEqual(runtime.status(self.project, self.session, None)["status"], "unsupported")
+        self.assertEqual(runtime.status(self.project, self.session, None, host="claude")["status"], "unsupported")
         before = read_json(self.run_dir(self.flow, identifier) / "state.json")
         self.assert_nothing_stopped()
         self.assertIsNone(self.ask("old-question", questions=[{"question": "Q?"}]))
@@ -383,7 +383,7 @@ class ToolCallsAreNeverStopped:
 
     def test_every_question_of_the_owner_is_recorded_as_an_observation(self):
         identifier = self.start()
-        store = RunStore(self.project, WORKFLOWS[self.flow])
+        store = RunStore(self.project, WORKFLOWS[self.flow], host="claude")
         plain = {"questions": [{"question": "Scope?"}]}
         asked = (("q-plain", plain), ("q-prefilled", dict(plain, answers={"Scope?": "All of it"})),
                  ("q-annotated", dict(plain, annotations={"Scope?": {"notes": "Written by the model"}})),
@@ -416,7 +416,7 @@ class CommandErrorTests(RuntimeFixture):
         for prompt, reason in (("/devflow:plan", "Use /devflow:plan followed by"),
                                ("/devflow:plan request\n/other:skill", "not stacked skills"),
                                ("/devflow:implement", "Use /devflow:implement followed by"),
-                               ("/devflow:implement --plan x", "Supply a plan file"),
+                               ("/devflow:implement --plan x", "standalone --"),
                                ("/devflow:resume ../bad", "")):
             with self.subTest(prompt=prompt):
                 context = self.assert_not_accepted(self.prompt(prompt), reason)
@@ -429,7 +429,7 @@ class CommandErrorTests(RuntimeFixture):
                 self.assert_not_accepted(self.prompt(prompt), "Finish or cancel this session's active workflow")
         self.assertIsNone(self.record("second-session"))
         self.assertEqual(self.record()["run"], {"flow": "plan", "run_id": identifier})
-        self.assertEqual([info.run_id for info in RunStore(self.project, WORKFLOWS["plan"]).scan()[0]], [identifier])
+        self.assertEqual([info.run_id for info in RunStore(self.project, WORKFLOWS["plan"], host="claude").scan()[0]], [identifier])
 
 
 class FrozenConfigurationTests(RuntimeFixture):
@@ -465,9 +465,9 @@ class PendingStartTests(RuntimeFixture):
         self.assertIsNone(self.record())
 
     def test_stop_and_answers_are_not_recorded_while_pending(self):
-        self.assertIsNone(runtime.handle_hook(self.payload(event="Stop"), PLUGIN))
+        self.assertIsNone(runtime.handle_hook(self.payload(event="Stop"), PLUGIN, host="claude"))
         self.assertIsNone(runtime.handle_hook(self.payload(event="PostToolUse", tool_name="AskUserQuestion",
-                                                           tool_use_id="q", tool_input={}, tool_response="A"), PLUGIN))
+                                                           tool_use_id="q", tool_input={}, tool_response="A"), PLUGIN, host="claude"))
         self.assertEqual(self.record()["pending_start"]["flow"], "implement")
         self.assertFalse((self.project / ".devflow" / "runs").exists())
 
@@ -475,10 +475,10 @@ class PendingStartTests(RuntimeFixture):
         other = self.project / "other.md"
         other.write_text("Other plan.\n", encoding="utf-8")
         with self.assertRaisesRegex(DevFlowError, "does not match"):
-            runtime.runner_start(self.project, self.session, "implement", "other.md")
+            runtime.runner_start(self.project, self.session, "implement", "other.md", host="claude")
         with self.assertRaisesRegex(DevFlowError, "explicit /devflow:implement"):
-            runtime.runner_start(self.project, "another-session", "implement", "feature.md")
-        state = runtime.runner_start(self.project, self.session, "implement", "./feature.md")
+            runtime.runner_start(self.project, "another-session", "implement", "feature.md", host="claude")
+        state = runtime.runner_start(self.project, self.session, "implement", "./feature.md", host="claude")
         self.assertEqual(self.record()["run"], {"flow": "implement", "run_id": state["run_id"]})
         first = read_json(self.run_dir("implement", state["run_id"]) / "request.json")
         self.assertEqual(first["event"]["payload"]["prompt"], "/devflow:implement feature.md")
@@ -487,9 +487,9 @@ class PendingStartTests(RuntimeFixture):
 class RunFormatTests(RuntimeFixture):
     def test_valid_old_run_is_listed_as_unsupported_and_does_not_block(self):
         identifier = self.raw_run("plan", status="paused_error")
-        overview = runtime.status(self.project, self.session, None)
+        overview = runtime.status(self.project, self.session, None, host="claude")
         self.assertEqual(overview["runs"][0]["format"], "unsupported")
-        selected = runtime.status(self.project, None, identifier)
+        selected = runtime.status(self.project, None, identifier, host="claude")
         self.assertEqual(selected["format"], "unsupported")
         self.assertIn("0.1.x", selected["message"])
         self.assertEqual(selected["project"], str(self.project))
@@ -505,14 +505,14 @@ class RunFormatTests(RuntimeFixture):
                        dict(good["config"], max_reviews=True)):
             with self.subTest(config=config):
                 atomic_json(path, dict(good, config=config))
-                listed = runtime.status(self.project, "other-session", None)["runs"]
+                listed = runtime.status(self.project, "other-session", None, host="claude")["runs"]
                 self.assertEqual(listed[0]["format"], "invalid")
-                self.assertIn("cannot be read", " ".join(runtime.blocking_warnings(self.project)))
+                self.assertIn("cannot be read", " ".join(runtime.blocking_warnings(self.project, host="claude")))
 
     def test_a_summary_failure_marks_only_that_run_invalid(self):
         identifier = self.plan_start()
         with patch.object(WORKFLOWS["plan"], "summary", side_effect=KeyError("missing")):
-            listed = runtime.status(self.project, "other-session", None)["runs"]
+            listed = runtime.status(self.project, "other-session", None, host="claude")["runs"]
         self.assertEqual((listed[0]["run_id"], listed[0]["format"]), (identifier, "invalid"))
         self.assertIn("Cannot summarize run", listed[0]["error"])
 
@@ -521,23 +521,23 @@ class RunFormatTests(RuntimeFixture):
         identifier = self.raw_run("plan", status="reviewing")
         atomic_json(self.run_dir("plan", identifier) / "transaction.json",
                     {"schema_version": 1, "base_revision": 0, "state": {}, "writes": {}})
-        listed = runtime.status(self.project, self.session, None)["runs"][0]
+        listed = runtime.status(self.project, self.session, None, host="claude")["runs"][0]
         self.assertEqual(listed["format"], "unsupported")
         self.assertNotIn("recovery_required", listed)
-        self.assertNotIn(identifier, " ".join(runtime.blocking_warnings(self.project)))
+        self.assertNotIn(identifier, " ".join(runtime.blocking_warnings(self.project, host="claude")))
         self.plan_start()
         self.assertTrue((self.run_dir("plan", identifier) / "transaction.json").exists())  # Never touched.
 
     def test_runs_from_0_2_are_unsupported_and_never_block(self):
         identifier = self.raw_run("plan", status="reviewing", schema_version=2)
-        info = RunStore(self.project, WORKFLOWS["plan"]).inspect(identifier)
+        info = RunStore(self.project, WORKFLOWS["plan"], host="claude").inspect(identifier)
         self.assertEqual((info.format, info.schema_version), ("unsupported", 2))
-        selected = runtime.status(self.project, None, identifier)
+        selected = runtime.status(self.project, None, identifier, host="claude")
         self.assertEqual(selected["message"], "Started with DevFlow 0.2.x; this version cannot continue it")
         self.assert_not_accepted(self.prompt("/devflow:resume " + identifier),
                                  f"Run {identifier} was started with DevFlow 0.2.x; this version cannot continue it")
         self.plan_start()
-        current = RunStore(self.project, WORKFLOWS["plan"]).inspect(self.record()["run"]["run_id"])
+        current = RunStore(self.project, WORKFLOWS["plan"], host="claude").inspect(self.record()["run"]["run_id"])
         self.assertEqual(current.schema_version, SCHEMA_VERSION)
 
     @staticmethod
@@ -552,12 +552,12 @@ class RunFormatTests(RuntimeFixture):
                     identifier = self.bind_to_old_run(identifier=self.old_id(flow, version), flow=flow,
                                                       version=version)
                     self.assertIsNone(self.tool("Write", file_path=str(self.project / "x.py")))
-                    value = runtime.status(self.project, self.session, None)
+                    value = runtime.status(self.project, self.session, None, host="claude")
                     self.assertEqual((value["status"], value["owner_matches"]), ("unsupported", False))
                     self.assertIn(release, value["message"])
                     self.assertIsNone(self.prompt("hello"))
                     self.assertIsNone(self.record())  # Released by the next prompt.
-                    self.assertFalse(runtime.status(self.project, None, None)["sessions"]["pending_starts"])
+                    self.assertFalse(runtime.status(self.project, None, None, host="claude")["sessions"]["pending_starts"])
                     self.assertTrue(self.run_dir(flow, identifier).exists())  # Never touched.
 
     def test_unreleased_and_last_released_formats_are_unsupported(self):
@@ -569,9 +569,9 @@ class RunFormatTests(RuntimeFixture):
                 with self.subTest(version=version, flow=flow):
                     identifier = self.bind_to_old_run(identifier=self.old_id(flow, version), flow=flow,
                                                       version=version)
-                    info = RunStore(self.project, WORKFLOWS[flow]).inspect(identifier)
+                    info = RunStore(self.project, WORKFLOWS[flow], host="claude").inspect(identifier)
                     self.assertEqual((info.format, info.schema_version), ("unsupported", version))
-                    self.assertEqual(runtime.status(self.project, None, identifier)["message"],
+                    self.assertEqual(runtime.status(self.project, None, identifier, host="claude")["message"],
                                      f"Started with DevFlow {release}; this version cannot continue it")
                     # Resuming it is not accepted, and the binding is released anyway.
                     self.assert_not_accepted(self.prompt("/devflow:resume " + identifier),
@@ -584,7 +584,7 @@ class RunFormatTests(RuntimeFixture):
 
     def test_session_bound_to_a_0_2_run_reports_unsupported_until_released(self):
         identifier = self.bind_to_old_run()
-        value = runtime.status(self.project, self.session, None)
+        value = runtime.status(self.project, self.session, None, host="claude")
         self.assertEqual((value["status"], value["owner_matches"]), ("unsupported", False))
         self.assertEqual(value["message"], f"Run {identifier} was started with DevFlow 0.2.x; "
                                            "this version cannot continue it")
@@ -619,12 +619,12 @@ class RunFormatTests(RuntimeFixture):
                 if version is not None:
                     state["schema_version"] = version
                 atomic_json(path, state)
-                overview = runtime.status(self.project, self.session, None)
+                overview = runtime.status(self.project, self.session, None, host="claude")
                 listed = {item["run_id"]: item for item in overview["runs"]}
                 self.assertEqual(listed[identifier]["format"], "invalid")
                 self.assertIn("error", listed[identifier])
                 with self.assertRaises(DevFlowError):
-                    runtime.status(self.project, None, identifier)
+                    runtime.status(self.project, None, identifier, host="claude")
                 self.assert_not_accepted(self.prompt("/devflow:plan Another request", session="new-session"),
                                          "cannot be read")
                 self.assertIsNone(self.record("new-session"))
@@ -637,7 +637,7 @@ class RunFormatTests(RuntimeFixture):
         # A 0.1.x per-workflow session record; its content is never read.
         atomic_json(old / "plan" / ("a" * 64 + ".json"), {"run_id": "x"})
         (old / "implement").mkdir()
-        self.assertEqual(runtime.status(self.project, self.session, None)["sessions"]["invalid_records"], [])
+        self.assertEqual(runtime.status(self.project, self.session, None, host="claude")["sessions"]["invalid_records"], [])
         self.plan_start()
         self.assertTrue((old / "plan" / ("a" * 64 + ".json")).exists())  # Never read, never removed.
 
@@ -653,10 +653,10 @@ class RunFormatTests(RuntimeFixture):
             self.assert_not_accepted(self.prompt("/devflow:plan Interrupted request"), "simulated stop")
         identifier = self.record()["pending_start"]["run_id"]
         atomic_json(self.run_dir("plan", identifier) / "state.json", {"schema_version": SCHEMA_VERSION, "status": []})
-        overview = runtime.status(self.project, "other-session", None)
+        overview = runtime.status(self.project, "other-session", None, host="claude")
         self.assertEqual(overview["runs"][0]["format"], "invalid")
         self.assertEqual(overview["sessions"]["pending_starts"], [])
-        self.assertIn(f"Run plan/{identifier} cannot be read", " ".join(runtime.blocking_warnings(self.project)))
+        self.assertIn(f"Run plan/{identifier} cannot be read", " ".join(runtime.blocking_warnings(self.project, host="claude")))
         probe, interview, claude, which = UnifiedCliTests.doctor_patches(self)
         with probe, interview, claude, which:
             code, output, _ = self.invoke("doctor")
@@ -669,10 +669,10 @@ class RunFormatTests(RuntimeFixture):
     def test_incomplete_creation_is_listed_but_not_a_run(self):
         leftover = self.project / ".devflow" / "runs" / "plan" / ".creating-20261101T123456Z-123456abcdef"
         leftover.mkdir(parents=True)
-        overview = runtime.status(self.project, self.session, None)
+        overview = runtime.status(self.project, self.session, None, host="claude")
         self.assertEqual(overview["incomplete_creations"], ["plan/" + leftover.name])
         self.assertEqual(overview["runs"], [])
-        self.assertIn("Incomplete run creation", " ".join(runtime.blocking_warnings(self.project)))
+        self.assertIn("Incomplete run creation", " ".join(runtime.blocking_warnings(self.project, host="claude")))
         self.plan_start()
 
 
@@ -699,7 +699,7 @@ class InterruptionTests(RuntimeFixture):
         atomic_json(self.project / "devflow.config.json", {"schema_version": 1, "plan": {"max_reviews": 7}})
         self.assert_not_accepted(self.prompt("/devflow:plan Request with an invalid configuration"), "max_reviews")
         self.assertIsNone(self.record())
-        self.assertEqual(runtime.status(self.project, "other", None)["sessions"]["pending_starts"], [])
+        self.assertEqual(runtime.status(self.project, "other", None, host="claude")["sessions"]["pending_starts"], [])
 
     def test_start_killed_before_creation_is_abandoned_on_the_next_prompt(self):
         # A killed process leaves its pending start behind (no cleanup runs).
@@ -707,7 +707,7 @@ class InterruptionTests(RuntimeFixture):
                    "created_at": "2026-11-01T00:00:00+00:00",
                    "event": make_event(self.payload(prompt="/devflow:plan Interrupted request"), "prompt")}
         (self.project / ".devflow").mkdir()
-        sessions.write_record(self.project, dict(sessions.empty_record(self.session), pending_start=pending), WORKFLOWS)
+        sessions.write_record(self.project, dict(sessions.empty_record(self.session, host="claude"), pending_start=pending), WORKFLOWS)
         self.assert_not_accepted(self.prompt("/devflow:plan Another request", session="other-session"),
                                  "pending plan start")
         self.assertIsNone(self.prompt("Hello again"))
@@ -724,7 +724,7 @@ class InterruptionTests(RuntimeFixture):
         self.prompt("/devflow:implement feature.md")
         with patch.object(sessions, "write_record", side_effect=fail_on_binding):
             with self.assertRaises(OSError):
-                runtime.runner_start(self.project, self.session, "implement", "feature.md")
+                runtime.runner_start(self.project, self.session, "implement", "feature.md", host="claude")
         identifier = self.record()["pending_start"]["run_id"]
         self.prompt("/devflow:resume " + identifier, session="rescue-session")
         self.assertEqual(self.engine("implement").status(identifier)["owner_session"], "rescue-session")
@@ -769,11 +769,11 @@ class InterruptionTests(RuntimeFixture):
 class SessionRecordTests(RuntimeFixture):
     def test_invalid_records_are_listed_and_block_starts(self):
         directory = self.project / ".devflow" / "sessions"
-        good = sessions.empty_record("someone")
+        good = sessions.empty_record("someone", host="claude")
         pending = {"flow": "implement", "run_id": OTHER_ID, "args": "x", "created_at": "t",
-                   "event": make_event({"prompt": "/devflow:implement x"}, "prompt")}
+                   "event": make_event({"host": "claude", "prompt": "/devflow:implement x"}, "prompt")}
         cases = {
-            "version": dict(good, schema_version=1, run={"flow": "plan", "run_id": OTHER_ID}),
+            "version": dict(good, schema_version=True, run={"flow": "plan", "run_id": OTHER_ID}),
             "both": dict(good, run={"flow": "plan", "run_id": OTHER_ID}, pending_start=pending),
             "flow": dict(good, run={"flow": "deploy", "run_id": OTHER_ID}),
             "run_id": dict(good, run={"flow": "plan", "run_id": "../x"}),
@@ -784,24 +784,24 @@ class SessionRecordTests(RuntimeFixture):
             with self.subTest(case=name):
                 path = sessions.session_path(self.project, "someone")
                 atomic_json(path, record)
-                overview = runtime.status(self.project, self.session, None)
+                overview = runtime.status(self.project, self.session, None, host="claude")
                 self.assertEqual(overview["sessions"]["invalid_records"][0]["record"], path.name)
                 self.assert_not_accepted(self.prompt("/devflow:plan New request"), "invalid")
                 path.unlink()
         misplaced = directory / ("0" * 64 + ".json")
         atomic_json(misplaced, good | {"run": {"flow": "plan", "run_id": OTHER_ID}})
-        self.assertIn("does not match", runtime.status(self.project, self.session, None)["sessions"]["invalid_records"][0]["error"])
+        self.assertIn("does not match", runtime.status(self.project, self.session, None, host="claude")["sessions"]["invalid_records"][0]["error"])
 
     def test_record_with_non_string_flow_is_listed_as_invalid(self):
         pending = {"flow": [], "run_id": OTHER_ID, "args": "x", "created_at": "t",
-                   "event": make_event({"prompt": "/devflow:plan x"}, "prompt")}
-        for record in (dict(sessions.empty_record("someone"), run={"flow": [], "run_id": OTHER_ID}),
-                       dict(sessions.empty_record("someone"), run={"flow": {}, "run_id": OTHER_ID}),
-                       dict(sessions.empty_record("someone"), pending_start=pending)):
+                   "event": make_event({"host": "claude", "prompt": "/devflow:plan x"}, "prompt")}
+        for record in (dict(sessions.empty_record("someone", host="claude"), run={"flow": [], "run_id": OTHER_ID}),
+                       dict(sessions.empty_record("someone", host="claude"), run={"flow": {}, "run_id": OTHER_ID}),
+                       dict(sessions.empty_record("someone", host="claude"), pending_start=pending)):
             with self.subTest(record=record):
                 path = sessions.session_path(self.project, "someone")
                 atomic_json(path, record)
-                overview = runtime.status(self.project, self.session, None)
+                overview = runtime.status(self.project, self.session, None, host="claude")
                 self.assertEqual(overview["sessions"]["invalid_records"][0]["record"], path.name)
                 path.unlink()
 
@@ -815,17 +815,17 @@ class SessionRecordTests(RuntimeFixture):
         except (OSError, NotImplementedError):
             self.skipTest("Creating symlinks requires OS permission")
         pending = {"flow": "plan", "run_id": OTHER_ID, "args": "x", "created_at": "t",
-                   "event": make_event({"prompt": "/devflow:plan x"}, "prompt")}
-        sessions.write_record(self.project, dict(sessions.empty_record("someone"), pending_start=pending), WORKFLOWS)
-        overview = runtime.status(self.project, self.session, None)
+                   "event": make_event({"host": "claude", "prompt": "/devflow:plan x"}, "prompt")}
+        sessions.write_record(self.project, dict(sessions.empty_record("someone", host="claude"), pending_start=pending), WORKFLOWS)
+        overview = runtime.status(self.project, self.session, None, host="claude")
         self.assertEqual([item["format"] for item in overview["runs"]], ["invalid"])
         self.assertEqual(overview["sessions"]["pending_starts"], [])
-        runtime.blocking_warnings(self.project)
+        runtime.blocking_warnings(self.project, host="claude")
 
     def test_stale_binding_reports_owner_mismatch(self):
         identifier = self.implement_start()
         self.prompt("/devflow:resume " + identifier, session="other-session")
-        value = runtime.status(self.project, self.session, None)
+        value = runtime.status(self.project, self.session, None, host="claude")
         self.assertEqual((value["status"], value["owner_matches"]), ("stale", False))
         events = len(read_json(self.run_dir("implement", identifier) / "state.json")["event_ids"])
         context = self.prompt("What does the plan say?")["hookSpecificOutput"]["additionalContext"]
@@ -838,8 +838,8 @@ class SessionRecordTests(RuntimeFixture):
         self.assertIsNone(self.ask("stale-q", questions=[{"question": "q?"}]))
         self.assertIsNone(runtime.handle_hook(self.payload(event="PostToolUse", tool_name="AskUserQuestion",
                                                            tool_use_id="stale-q", tool_input={"questions": []},
-                                                           tool_response="Yes"), PLUGIN))
-        self.assertIsNone(runtime.handle_hook(self.payload(event="Stop"), PLUGIN))
+                                                           tool_response="Yes"), PLUGIN, host="claude"))
+        self.assertIsNone(runtime.handle_hook(self.payload(event="Stop"), PLUGIN, host="claude"))
         self.assertEqual(len(read_json(self.run_dir("implement", identifier) / "state.json")["event_ids"]), events)
 
 
@@ -849,7 +849,7 @@ class ProjectResolutionTests(RuntimeFixture):
     def hook_from(self, cwd, environ, event="UserPromptSubmit", **fields):
         payload = self.payload(event=event, **fields)
         payload["cwd"] = str(cwd)
-        return runtime.handle_hook(payload, PLUGIN, environ)
+        return runtime.handle_hook(payload, PLUGIN, environ, host="claude")
 
     def elsewhere(self):
         other = self.base / "another repository"
@@ -904,7 +904,7 @@ class ProjectResolutionTests(RuntimeFixture):
 
         def run_hook(env: dict) -> subprocess.CompletedProcess:
             payload = json.dumps(dict(self.payload(prompt="Hello"), cwd=str(self.project)))
-            return subprocess.run([sys.executable, "-B", str(SCRIPT), "hook"], input=payload, capture_output=True,
+            return subprocess.run([sys.executable, "-B", str(SCRIPT), "--host", "claude", "hook"], input=payload, capture_output=True,
                                   encoding="utf-8", timeout=30, shell=False, env=dict(os.environ, **env))
 
         cases = (("a broken session record", {"CLAUDE_PROJECT_DIR": str(self.project)}, b"{", record.name),
@@ -930,7 +930,7 @@ class ProjectResolutionTests(RuntimeFixture):
         identifier = self.plan_start()
         payload = json.dumps(dict(self.payload(prompt="From a worktree"), cwd=str(self.elsewhere())))
         env = dict(os.environ, CLAUDE_PROJECT_DIR=str(self.project))
-        result = subprocess.run([sys.executable, "-B", str(SCRIPT), "hook"], input=payload, capture_output=True,
+        result = subprocess.run([sys.executable, "-B", str(SCRIPT), "--host", "claude", "hook"], input=payload, capture_output=True,
                                 encoding="utf-8", timeout=30, shell=False, env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("recorded_event_id", json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"])
@@ -939,7 +939,7 @@ class ProjectResolutionTests(RuntimeFixture):
 
 class UnifiedCliTests(RuntimeFixture):
     def process(self, *args, payload=""):
-        return subprocess.run([sys.executable, "-B", str(SCRIPT), "--project", str(self.project), *args],
+        return subprocess.run([sys.executable, "-B", str(SCRIPT), "--host", "claude", "--project", str(self.project), *args],
                               input=payload, capture_output=True, encoding="utf-8", timeout=30, shell=False)
 
     def test_help_version_and_workflow_help_are_text(self):
@@ -985,7 +985,7 @@ class UnifiedCliTests(RuntimeFixture):
             with self.subTest(payload=payload):
                 out, err = io.StringIO(), io.StringIO()
                 with patch.object(sys, "stdin", io.StringIO(payload)), redirect_stdout(out), redirect_stderr(err):
-                    code = cli.main(["hook"])
+                    code = cli.main(["--host", "claude", "hook"])
                 self.assertEqual((code, out.getvalue()), (1, ""))
                 self.assertIn("DevFlow hook failed", err.getvalue())
 
@@ -1080,7 +1080,7 @@ class UnifiedCliTests(RuntimeFixture):
     def test_claude_version_probe_never_authenticates_or_uses_shell(self):
         result = subprocess.CompletedProcess(["claude", "--version"], 0, "2.1.316 (Claude Code)\n", "")
         with patch.object(cli.shutil, "which", return_value="/safe/claude"), \
-             patch.object(cli.subprocess, "run", return_value=result) as execute:
+             patch("devflow_core.common.hosts.diagnostics.subprocess.run", return_value=result) as execute:
             report = cli.claude_version()
         self.assertTrue(report["supported"])
         self.assertEqual(execute.call_args.args[0], ["/safe/claude", "--version"])
@@ -1102,11 +1102,11 @@ class RegistryTests(RuntimeFixture):
                 commands.add_parser("status")
 
         with patch.dict(WORKFLOWS, {"dummy": Dummy()}):
-            self.assertEqual(runtime.public_command("/devflow:dummy go"), ("dummy", "go"))
-            args = cli.parser().parse_args(["dummy", "status"])
+            self.assertEqual(runtime.public_command("/devflow:dummy go", host="claude"), ("dummy", "go"))
+            args = cli.parser().parse_args(["--host", "claude", "dummy", "status"])
             self.assertEqual((args.command, args.action), ("dummy", "status"))
-            self.assertIn("dummy", runtime.stores(self.project))
-            self.assertEqual(runtime.status(self.project, self.session, None)["runs"], [])
+            self.assertIn("dummy", runtime.stores(self.project, host="claude"))
+            self.assertEqual(runtime.status(self.project, self.session, None, host="claude")["runs"], [])
 
 
 if __name__ == "__main__":

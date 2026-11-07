@@ -33,11 +33,11 @@ class PlanHookFixture(unittest.TestCase):
         self.script.write_text("# trusted runner\n", encoding="utf-8")
         self.transcript = base / "transcript.jsonl"
         self.session = "test-session-1"
-        self.store = RunStore(self.project, WORKFLOWS["plan"])
+        self.store = RunStore(self.project, WORKFLOWS["plan"], host="claude")
         self.run_id = None
 
     def hook(self, payload):
-        return router.handle_hook(payload, self.plugin)
+        return router.handle_hook(payload, self.plugin, host="claude")
 
     def payload(self, event="UserPromptSubmit", session=None, **extra):
         return {"hook_event_name": event, "cwd": str(self.project), "session_id": session or self.session,
@@ -53,7 +53,7 @@ class PlanHookFixture(unittest.TestCase):
         return result
 
     def bound_run(self, session=None):
-        record = sessions.read_record(self.project, session or self.session, WORKFLOWS)
+        record = sessions.read_record(self.project, session or self.session, WORKFLOWS, host="claude")
         return record["run"]["run_id"] if record and record["run"] else None
 
     def state(self):
@@ -123,7 +123,7 @@ class DispatchTests(PlanHookFixture):
         ):
             with self.subTest(prompt=prompt):
                 self.assertNotAccepted(self.hook(self.payload(prompt=prompt)), reason)
-        self.assertIsNone(sessions.read_record(self.project, self.session, WORKFLOWS))
+        self.assertIsNone(sessions.read_record(self.project, self.session, WORKFLOWS, host="claude"))
         self.assertEqual(self.store.scan(), ([], []))
 
     def test_similar_command_does_not_trigger(self):

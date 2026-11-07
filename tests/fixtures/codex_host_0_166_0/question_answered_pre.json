@@ -1,0 +1,30 @@
+{
+  "session_id": "probe-session-4",
+  "turn_id": "probe-human-turn",
+  "transcript_path": "/fixture/codex/human-history.jsonl",
+  "cwd": "/fixture/project",
+  "hook_event_name": "PreToolUse",
+  "model": "gpt-6.1-sol",
+  "permission_mode": "default",
+  "tool_name": "request_user_input",
+  "tool_input": {
+    "questions": [
+      {
+        "header": "Probe option",
+        "id": "probe_option",
+        "question": "Which probe option do you choose?",
+        "options": [
+          {
+            "label": "Alpha",
+            "description": "Select Alpha as your probe answer."
+          },
+          {
+            "label": "Beta",
+            "description": "Select Beta as your probe answer."
+          }
+        ]
+      }
+    ]
+  },
+  "tool_use_id": "probe-human-tool"
+}

@@ -1,0 +1,10 @@
+{
+  "session_id": "probe-session-4",
+  "turn_id": "probe-human-turn",
+  "transcript_path": "/fixture/codex/human-history.jsonl",
+  "cwd": "/fixture/project",
+  "hook_event_name": "UserPromptSubmit",
+  "model": "gpt-6.1-sol",
+  "permission_mode": "default",
+  "prompt": "$devflow:plan PROBE_HUMAN_ANSWER: Use the project's configured grilling skill from the registered catalog and load its actual instructions. Conduct one-question interview; every prerequisite is settled. Ask exactly 'Which probe option do you choose?' with Alpha and Beta using native request_user_input, and wait for the UI answer. Do not prefill answers. Do not modify files, spawn agents, or use tools except reading configuration/skill and the question. After the result report the selected answer."
+}
