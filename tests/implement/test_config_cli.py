@@ -40,7 +40,7 @@ class ConfigCliTests(unittest.TestCase):
         config = validate_config(self.config)
         self.assertEqual(config["max_reviews"], 6)
         self.assertEqual([(r["kind"], r["model"], r["effort"]) for r in config["reviewers"]], [
-            ("codex", "gpt-6.1-sol", "xhigh"),
+            ("codex", "gpt-6.1-sol", "high"),
             ("opencode", "opencode-go/deepseek-v4.1-flash", "high")])
         self.assertEqual(config["checks"], [])
 

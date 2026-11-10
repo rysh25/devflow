@@ -355,7 +355,7 @@ class EngineFlowTests(EngineFixture):
         self.assertEqual(final["status"], "completed")
         self.assertEqual(final["review_count"], 2)
         self.assertEqual([r["kind"] for r in self.reviewers], ["codex", "opencode"])
-        self.assertEqual([r["effort"] for r in self.reviewers], ["xhigh", "high"])
+        self.assertEqual([r["effort"] for r in self.reviewers], ["high", "high"])
         self.assertEqual(len(set(final["approvals"].values())), 1)
         self.assertTrue(final["report"]["all_reviewers_approved"])
         self.assertFalse(final["report"]["automatic_commit_push_deploy"])

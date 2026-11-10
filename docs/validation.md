@@ -1,4 +1,4 @@
-# DevFlow 0.8.0 の検証範囲
+# DevFlow 0.8.1 の検証範囲
 
 ## 再実行方法
 
@@ -562,3 +562,13 @@ WindowsのCIでは、模擬レビュアーのsys.stdin.readがCRLFをLFへ変換
 CRLF・LF・CRと日本語を含むパケットで、準備した同じバイト列が届くことを確認するテストにしました。
 Windowsと同じ改行変換をする入力ラッパーでも失敗を再現し、修正後の成功を確認しました。
 Python 3.12のレビュアー関連70テストも成功しています。製品の入力・実行処理は変更していません。
+
+## 0.8.1 の検証（2026-11-10）
+
+0.8.1 は、Codex レビュアーの既定の effort を `xhigh` から `high` に変えただけです（Plan と Implement の `defaults.json`）。
+既定値を確かめるテスト（設定の既定値、Implement の2回のレビューに渡る effort）を新しい値に直しました。
+レビュアーの起動・記録・run の形式の処理は変えていません。
+
+`python tools/test_all.py --quiet` と `python tools/package.py --validate-only` が成功しました。
+Codex に `high` を渡して実際にレビューさせる確認はしていません。`high` は 0.8.0 でも
+設定や起動時の指定で選べた値で、DevFlow は effort をそのまま `model_reasoning_effort` に渡します。

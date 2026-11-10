@@ -10,7 +10,7 @@
       "kind": "codex",
       "command": ["codex"],
       "model": "gpt-6.1-sol",
-      "effort": "xhigh",
+      "effort": "high",
       "timeout_seconds": 1800
     },
     {
