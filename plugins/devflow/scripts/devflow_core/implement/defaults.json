@@ -12,7 +12,7 @@
     "max_packet_bytes": 2000000
   },
   "reviewers": [
-    {"id": "codex", "kind": "codex", "command": ["codex"], "model": "gpt-6.1-sol", "effort": "xhigh", "timeout_seconds": 1800},
+    {"id": "codex", "kind": "codex", "command": ["codex"], "model": "gpt-6.1-sol", "effort": "high", "timeout_seconds": 1800},
     {"id": "opencode", "kind": "opencode", "command": ["opencode"], "model": "opencode-go/deepseek-v4.1-flash", "effort": "high", "timeout_seconds": 1800}
   ],
   "checks": []

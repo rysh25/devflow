@@ -1,4 +1,4 @@
-# DevFlow 0.8.0 — Claude Code / Codex CLI Plugin
+# DevFlow 0.8.1 — Claude Code / Codex CLI Plugin
 
 人間との要件整理から計画作成、実装、独立レビューまでを支援する **両ホストで使える単一のプラグイン** です。インストールするプラグインは `devflow` だけです。
 
@@ -177,7 +177,7 @@ Implement は開始時のプランと作業ツリーを固定し、Claude Code �
 
 | 回 | 既定レビュアー | 既定設定 |
 | --- | --- | --- |
-| 1, 3, 5, … | Codex | `gpt-6.1-sol` / `xhigh` |
+| 1, 3, 5, … | Codex | `gpt-6.1-sol` / `high` |
 | 2, 4, 6, … | OpenCode | `opencode-go/deepseek-v4.1-flash` / `high` |
 
 これらはユーザー指定の設定値です。本配布物のテストで、各アカウントのモデル提供状況・認証・実際のモデル選択まで確認しているわけではありません。未対応時に別モデルへ黙って切り替えません。
@@ -246,7 +246,7 @@ Implement は開始時のプランと作業ツリーを固定し、Claude Code �
 {
   "schema_version": 1,
   "reviewers": [
-    {"id": "codex", "kind": "codex", "command": ["codex"], "model": "gpt-6.1-sol", "effort": "xhigh",
+    {"id": "codex", "kind": "codex", "command": ["codex"], "model": "gpt-6.1-sol", "effort": "high",
      "timeout_seconds": 1800},
     {"id": "opencode", "kind": "opencode", "command": ["opencode"], "model": "opencode-go/deepseek-v4.1-flash",
      "effort": "high", "timeout_seconds": 1800}
@@ -330,6 +330,16 @@ uv --no-cache run --offline --no-project --no-config --no-python-downloads "PLUG
 - push、公開、デプロイ、依存の追加、破壊的移行の前には、人間に確認するようスキルで頼んでいます。
 
 詳しくは [設計](docs/architecture.md)、[信頼の考え方と注意](docs/security.md)、[検証範囲](docs/validation.md) を参照してください。
+
+## 0.8.1 への更新
+
+0.8.0 の run は、そのまま続けられます（run の記録の形式は 10、セッションの記録の形式は 3 のままです）。
+
+変わったこと：
+
+- **Codex レビュアーの既定の effort が `xhigh` から `high` になりました**（Plan と Implement の両方）。モデル（`gpt-6.1-sol`）と制限時間（1800 秒）は変わりません。
+- 新しい既定値を使うのは、0.8.1 で始めた run のうち、設定ファイルで `reviewers` を書かず、起動時に `--reviewer` も指定しないものだけです。設定は run の開始時に固定されるので、0.8.0 で始めた run は resume しても `xhigh` のままです。
+- 今までどおり `xhigh` を使うときは、`devflow.config.json` か `devflow.config.local.json` の `reviewers` に `"effort": "xhigh"` を書くか（[プロジェクト設定](#プロジェクト設定)）、起動時に `--reviewer codex gpt-6.1-sol xhigh` を指定してください。
 
 ## 0.7.3 への更新
 
