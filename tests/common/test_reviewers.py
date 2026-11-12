@@ -25,6 +25,7 @@ MIB = 1024 * 1024
 SENTINEL = "REVIEWER-INSTRUCTIONS-SENTINEL-7f3a"
 REVIEW = {"schema_version": 1, "verdict": "pass", "summary": "問題なし", "findings": [], "questions": []}
 FIXTURE_REVIEW = {**REVIEW, "summary": "fixture pass"}
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 #: The user's own OpenCode settings in the environment: DevFlow passes them on unchanged.
 USER_ENV = {"OPENCODE_CONFIG": "/home/user/opencode.json", "OPENCODE_CONFIG_DIR": "/home/user/.opencode",
             "OPENCODE_CONFIG_CONTENT": '{"model": "x"}', "OPENCODE_PERMISSION": '{"edit": "deny"}',
@@ -87,6 +88,25 @@ class JsonTests(unittest.TestCase):
         for value in ('{"verdict":"pass","verdict":"pass"}', '{"value": NaN}', '```json\n{}\n```', "not json"):
             with self.subTest(value=value), self.assertRaises(ReviewerError):
                 reviewers.json_value(value)
+
+    def test_an_answer_wholly_inside_one_json_or_bare_fence_is_read(self):
+        for text in ('```json\n{"a": 1}\n```', '```\n{"a": 1}\n```', '\n  ```json  \n{"a": 1}\n  ```  \n',
+                     '```json\r\n{"a": 1}\r\n```', '{"a": 1}'):
+            with self.subTest(text=text):
+                self.assertEqual(reviewers.answer_value(text), {"a": 1})
+
+    def test_any_other_answer_shape_still_fails(self):
+        for text, message in (('Here is the review:\n```json\n{}\n```', "Invalid reviewer JSON"),
+                              ('```json\n{}\n```\nThat is all.', "Invalid reviewer JSON"),
+                              ('```json\n{}\n```\n```json\n{}\n```', "Invalid reviewer JSON"),
+                              ('```text\n{}\n```', "Invalid reviewer JSON"),
+                              ('```JSON\n{}\n```', "Invalid reviewer JSON"),
+                              ('```json\n{}', "Invalid reviewer JSON"),
+                              ('```json\n{"a": }\n```', "Invalid reviewer JSON"),
+                              ('```json\n{"a": 1, "a": 2}\n```', "Duplicate JSON key"),
+                              ('```json\n{"a": NaN}\n```', "Invalid JSON constant")):
+            with self.subTest(text=text), self.assertRaisesRegex(ReviewerError, message):
+                reviewers.answer_value(text)
 
     def test_text_bounds(self):
         self.assertEqual(reviewers.text("ok", "summary"), "ok")
@@ -229,10 +249,27 @@ class OpenCodeEventTests(unittest.TestCase):
                 parse_opencode(output)
 
     def test_the_answer_itself_is_strict_json(self):
-        for text in ('{"verdict":"pass","verdict":"pass"}', "```json\n{}\n```"):
+        # Removing a whole-answer fence never relaxes the JSON inside it.
+        for text in ('{"verdict":"pass","verdict":"pass"}', '```json\n{"verdict":"pass","verdict":"pass"}\n```'):
             output = lines(oc("step_start"), oc("text", id="a", text=text), oc("step_finish", reason="stop"))
-            with self.subTest(text=text), self.assertRaises(ReviewerError):
+            with self.subTest(text=text), self.assertRaisesRegex(ReviewerError, "Duplicate JSON key"):
                 parse_opencode(output)
+
+    def test_an_answer_wholly_inside_one_code_fence_is_read(self):
+        output = lines(oc("step_start"), oc("text", id="a", text="```json\n{}\n```"), oc("step_finish", reason="stop"))
+        self.assertEqual(parse_opencode(output)[0], {})
+
+    def test_the_real_fenced_answer_of_opencode_2_2_6(self):
+        """The answer that failed review 4 of a DevFlow 0.8.1 plan run (tests/fixtures/opencode_2_2_6)."""
+        output = (FIXTURES / "opencode_2_2_6" / "fenced-answer.jsonl").read_text(encoding="utf-8")
+        texts = [json.loads(line)["part"]["text"] for line in output.splitlines()
+                 if json.loads(line)["type"] == "text"]
+        self.assertEqual(len(texts), 1)
+        self.assertTrue(texts[0].startswith("```json\n") and texts[0].rstrip().endswith("```"))
+        with self.assertRaisesRegex(ReviewerError, "Invalid reviewer JSON"):
+            reviewers.json_value(texts[0])  # json_value stays strict: the fence alone fails there.
+        value, _ = reviewers.parse_opencode_events(output.split("\n"))
+        self.assertEqual((value["verdict"], len(value["findings"])), ("changes_required", 6))
 
 
 class CommandTests(unittest.TestCase):
@@ -482,6 +519,10 @@ stdin = sys.stdin.buffer.read().decode("utf-8")
 value = {"schema_version": 1, "verdict": "pass", "summary": "fixture pass", "findings": [], "questions": []}
 text = ("not json" if mode == "bad-json" else
         json.dumps({"unexpected": True}) if mode == "not-review" else json.dumps(value))
+if mode == "fenced":
+    text = "```json\n" + text + "\n```"
+elif mode == "fenced-prose":
+    text = "Here is my review.\n```json\n" + text + "\n```"
 if codex:
     Path(args[args.index("--output-last-message") + 1]).write_text(text, encoding="utf-8")
     print(json.dumps({"type": "thread.started", "thread_id": "thread-1"}))
@@ -720,6 +761,10 @@ class ProcessTests(unittest.TestCase):
                 self.assertLess(prompt.index("## Required output schema"), prompt.index(schema))
                 self.assertLess(prompt.index(schema), prompt.index(heading))
                 self.assertTrue(prompt.endswith(heading + "\n" + packet))
+                # The schema follows its heading as plain JSON: no code fence to imitate.
+                schema_heading = "## Required output schema\n"
+                self.assertEqual(prompt.index(schema.rstrip("\n")), prompt.index(schema_heading) + len(schema_heading))
+                self.assertNotIn("```", prompt[prompt.index(schema_heading):prompt.index(heading)])
                 self.assertFalse(any(SENTINEL in arg for arg in self.seen()["args"]))
 
     def test_tool_calls_and_subagents_are_counted_not_refused(self):
@@ -746,6 +791,21 @@ class ProcessTests(unittest.TestCase):
             self.output = self.base / f"not-review {kind}"
             with self.subTest(kind=kind), self.assertRaisesRegex(ReviewerError, "missing or unknown fields"):
                 self.run_fixture(kind, "not-review")
+
+    def test_a_fenced_answer_is_accepted_from_codex_and_opencode(self):
+        for kind in ("codex", "opencode"):
+            self.output = self.base / f"fenced {kind}"
+            with self.subTest(kind=kind):
+                self.assertEqual(self.run_fixture(kind, "fenced")["review"], FIXTURE_REVIEW)
+
+    def test_text_outside_the_fence_still_fails_and_keeps_the_logs(self):
+        for kind in ("codex", "opencode"):
+            self.output = self.base / f"fenced prose {kind}"
+            with self.subTest(kind=kind):
+                with self.assertRaisesRegex(ReviewerError, "Invalid reviewer JSON"):
+                    self.run_fixture(kind, "fenced-prose")
+                for name in ("stdout.jsonl", "stderr.log", "invocation.json"):
+                    self.assertTrue((self.output / name).is_file(), name)
 
     def test_bad_response_retains_raw_logs(self):
         with self.assertRaisesRegex(ReviewerError, "Invalid reviewer JSON"):
