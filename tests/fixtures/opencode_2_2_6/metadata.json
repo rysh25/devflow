@@ -1,0 +1,7 @@
+{
+  "cli_version": "2.2.6",
+  "captured_at": "2026-11-12",
+  "source": "Actual opencode run --format json --standalone output of a DevFlow 0.8.1 Plan review (plan run 20261112T110134Z-ee300aab6448, review 4) whose answer was wrapped in a ```json code fence",
+  "processing": "Only the step_start, text and step_finish lines the parser reads were kept, in order and byte for byte (tool_use lines removed); the session ID was replaced textually with ses_redacted. The lines were not parsed and reserialized. No absolute paths were present in the kept lines.",
+  "expected": "The last step's text is the whole answer inside one ```json fence: a changes_required review with six findings. DevFlow 0.9.0 failed with Invalid reviewer JSON; answer_value reads it."
+}

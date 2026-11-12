@@ -1,6 +1,6 @@
 {
   "name": "devflow",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Planning and implementation with bounded independent reviews.",
   "skills": "./codex-skills/",
   "hooks": "./hooks/codex.json"
