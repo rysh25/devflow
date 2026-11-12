@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-import os
 import json
 from pathlib import Path
 from typing import Any, Mapping
@@ -196,11 +195,6 @@ def binding(project: Path, record: dict | None, stores: Mapping[str, RunStore]) 
     return Binding(record["session_id"], flow, run_id, info.state,
                    (info.state["owner_host"], info.state["owner_session"]) == (record["host"], record["session_id"]),
                    True, info.schema_version)
-
-
-def pending_created(pending: dict, store: RunStore) -> bool:
-    """Whether the pending start's run directory exists (its contents are judged elsewhere)."""
-    return os.path.lexists(store.root / pending["run_id"])
 
 
 def pending_applied(pending: dict, session_id: str, store: RunStore, host: str) -> bool | None:

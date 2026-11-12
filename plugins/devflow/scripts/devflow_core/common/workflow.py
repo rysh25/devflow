@@ -75,6 +75,9 @@ class Workflow:
     extra_start_options: tuple[Option, ...] = ()
     #: Workflow-specific guidance added to hook context.
     guidance: str = ""
+    #: Whether an unfinished run occupies a workspace (at most one unfinished
+    #: run per workspace, checked by the router at creation and resume).
+    occupies_workspace: bool = False
 
     @property
     def resource_dir(self) -> Path:
@@ -106,6 +109,10 @@ class Workflow:
         """Values of ``extra_start_options`` from parsed runner arguments (absent ones are None)."""
         return {option_name(option.flag): getattr(args, option_name(option.flag), None)
                 for option in self.extra_start_options}
+
+    def workspace(self, state: dict) -> str:
+        """The workspace path an unfinished run occupies (only when ``occupies_workspace``)."""
+        raise NotImplementedError
 
     def can_transfer(self, state: dict, session: str) -> str | None:
         """Return a refusal reason, or ``None`` when ownership may move."""

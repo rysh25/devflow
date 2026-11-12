@@ -1,4 +1,4 @@
-# DevFlow 0.8.1 の検証範囲
+# DevFlow 0.9.0 の検証範囲
 
 ## 再実行方法
 
@@ -572,3 +572,35 @@ Python 3.12のレビュアー関連70テストも成功しています。製品�
 `python tools/test_all.py --quiet` と `python tools/package.py --validate-only` が成功しました。
 Codex に `high` を渡して実際にレビューさせる確認はしていません。`high` は 0.8.0 でも
 設定や起動時の指定で選べた値で、DevFlow は effort をそのまま `model_reasoning_effort` に渡します。
+
+## 0.9.0 の検証（2026-11-12）
+
+0.9.0 は、プロジェクト全体で未完了の run を1つに絞る制約をやめ、Plan は何本でも、Implement は実装場所ごとに未完了の run を1つまで持てるようにしました。
+
+自動テストで確かめたこと：
+
+- 別のセッションで、Plan の run を並行して作れること。未完了の Plan がある間に、別のセッションで Implement の run を作れること（元の不具合の経路）。
+- 実際の git worktree で、プロジェクト本体と worktree の Implement を並行できること。同じ実装場所での2本目（絶対パスとプロジェクトからの相対パス）は、run を作る直前に止まること。1本目を取り消すと開始できること。
+- 終わった Implement の run は、同じ実装場所に未完了の run があっても再開できること。未完了の run 同士が同じ実装場所を指す状態（人間が退避して戻した場合）では、再開を受け付けないこと。
+- 読めない Implement の run が、Implement の開始と再開だけを止めること。読めない Plan の run、読めないセッション記録、run ID の形でない名前（`.DS_Store`）、要約だけが失敗した run は止めず、doctor の警告の文言が判定と一致すること。
+- ほかのセッションの開始待ちが開始を止めないこと。`status` の `sessions` が `invalid_records` と `unsupported_records` だけであること。
+- runner の開始の準備（スナップショット）の間、dispatch ロックを持たず、別のセッションの `/devflow:plan` がフックの待ち時間内に受け付けられること。準備中の status / doctor が何も変えないこと。準備中に開始待ちが取り消されると、run も一時ディレクトリも残らないこと。
+- 同じ公開名の Plan の公開が公開ロックで直列になり、後の run が run ID 付きの名前になること。書き出しに失敗した run の名前を、後の run が使わないこと（やり直すと元の名前で公開できる）。残った公開ロックで、何も書かずに止まること。
+
+`python tools/test_all.py --quiet`（905 件）と `python tools/package.py --validate-only` が成功しました。
+
+本物の Claude Code（2.1.322）で、headless の `claude -p --plugin-dir <worktree>/plugins/devflow`（インストール済みの devflow は
+`--settings` で無効）を使い、一時的な git リポジトリで確かめました。どの会話も `.devflow` を持つプロジェクトルートで始め、
+worktree はプロジェクトの外に作って `--workspace` で指定しました。
+
+1. 2つの会話で `/devflow:plan` を送ると、どちらも Plan の run ができ、それぞれの会話に紐付きました。
+2. 別の会話で、プロジェクト本体を実装場所にする `/devflow:implement` と、worktree を実装場所にする `/devflow:implement` を
+   送ると、両方の run ができ、最初の `checkpoint`（`ready_check`）まで進みました。その間、1. の Plan の run は2つとも未完了のままです。
+   3つの会話の開始待ちが同時にあっても、互いに開始を止めませんでした。
+3. さらに別の会話で、2. と同じ worktree を実装場所にした `/devflow:implement` は、runner の `start` で
+   `Another unfinished implement run (…) uses this workspace` となり、run はできませんでした。
+
+確認用の計画には「最初の `checkpoint` の後は `check` と `review` をしない」と書き、外部レビュアーは呼んでいません。
+大きなリポジトリでのスナップショットの所要時間と、実機でのロック待ちは確かめていません（ユニットテストで、準備中に
+dispatch ロックを持たないことを確かめています）。macOS と Windows での実行は CI で確かめます。
+Codex ホストは、実機では確かめていません。変更はホストに依存しない router と Plan の公開だけなので、ユニットテストで確かめています。

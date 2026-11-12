@@ -1002,18 +1002,21 @@ class RecoveryAndIntegrityTests(EngineFixture):
         self.assertEqual(resolved["review_count"], 0)
         self.assertEqual(self.ready()["status"], "ready_review")
 
-    def test_resume_cannot_replace_a_different_active_project_run(self):
+    def test_another_session_can_resume_a_finished_run_beside_an_unfinished_one(self):
+        # This fixture uses files mode, so both runs share the project workspace.
         first = self.start()
         first_id = first["run_id"]
         self.engine.cancel(first_id, self.session, "Finished this attempt; retain audit records.")
         second = self.start()
         self.assertNotEqual(second["run_id"], first_id)
         other_session = "separate-session"
-        self.assertNotAccepted(f"/devflow:resume {first_id}", "unfinished", other_session)
-        self.assertFalse(sessions.session_path(self.project, other_session).exists())
+        # A finished run occupies no workspace, so its resume is not an occupancy conflict.
+        self.hook("UserPromptSubmit", other_session, prompt=f"/devflow:resume {first_id}")
+        self.assertEqual(read_json(sessions.session_path(self.project, other_session))["run"],
+                         {"flow": "implement", "run_id": first_id})
         self.assertEqual(read_json(sessions.session_path(self.project, self.session))["run"],
                          {"flow": "implement", "run_id": second["run_id"]})
-        self.assertEqual(self.engine.status(first_id)["owner_session"], self.session)
+        self.assertEqual(self.engine.status(first_id)["owner_session"], other_session)
         self.assertEqual(self.state()["status"], "implementing")
         self.assertEqual(self.state()["owner_session"], self.session)
 
@@ -1024,8 +1027,10 @@ class RecoveryAndIntegrityTests(EngineFixture):
         # session record moved away by a human); the run itself remains.
         sessions.session_path(self.project, self.session).unlink()
         identity = "another-start-session"
-        self.assertNotAccepted(f'/devflow:implement "{self.plan}"', "unfinished", identity)
-        with self.assertRaises(DevFlowError):
+        # The start prompt is accepted as a pending start; the workspace is checked when the run is created.
+        self.hook("UserPromptSubmit", identity, prompt=f'/devflow:implement "{self.plan}"')
+        self.assertIsNotNone(read_json(sessions.session_path(self.project, identity))["pending_start"])
+        with self.assertRaisesRegex(DevFlowError, f"Another unfinished implement run \\({original_id}\\) uses this workspace"):
             router.runner_start(self.project, identity, "implement", str(self.plan), host="claude")
         self.assertEqual(self.runs(), [original_id])
         self.assertEqual(self.state()["status"], "implementing")

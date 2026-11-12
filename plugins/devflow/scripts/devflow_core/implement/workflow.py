@@ -51,6 +51,7 @@ class ImplementWorkflow(Workflow):
                               "workspace"})
     start_option = "--plan"
     extra_start_options = (Option("--workspace", "text", required=False),)
+    occupies_workspace = True
     guidance = ("DevFlow records and verifies this run. Write runner input files "
                 "to the run's draft directory, preserve pre-existing changes, and use the runner's checks "
                 "as the validation evidence.")
@@ -118,6 +119,10 @@ class ImplementWorkflow(Workflow):
             artifacts["escalations/001.json"] = json_bytes({**escalation, "boundary": 1, "created_at": now()})
             fields.update(status="awaiting_human", escalation=escalation, escalations=["escalations/001.json"])
         return fields, artifacts
+
+    def workspace(self, state: dict) -> str:
+        """The workspace frozen at start (the project or a worktree of its repository)."""
+        return state["workspace"]["path"]
 
     def check_state(self, state: dict) -> None:
         from .workspace import check_frozen

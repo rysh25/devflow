@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import re
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -1061,13 +1062,14 @@ class EngineTests(unittest.TestCase):
                 self.engine.review(self.run_id)
             call.assert_not_called()
 
-    def test_no_second_active_run_and_no_double_seal(self):
+    def test_no_second_active_run_in_a_session_and_no_double_seal(self):
         self.start_interview()
         self.assertNotAccepted(self.hook(self.event(prompt="/devflow:plan a different request")),
                                "plan", "Finish or cancel")
-        self.assertNotAccepted(self.hook(self.event(prompt="/devflow:plan a different request", session="another-session")),
-                               "plan", "unfinished plan run")
-        self.assertEqual([path.name for path in self.run.parent.iterdir()], [self.run_id])
+        # Another session starts its own plan run beside this one.
+        self.hook(self.event(prompt="/devflow:plan a different request", session="another-session"))
+        other = self.bound_run("another-session")
+        self.assertEqual(sorted(path.name for path in self.run.parent.iterdir()), sorted([self.run_id, other]))
         self.assertEqual(self.bound_run(), self.run_id)
         self.seal()
         with self.assertRaises(DevFlowError):
@@ -1166,6 +1168,154 @@ class EngineTests(unittest.TestCase):
         self.assertFalse((self.run / "publication.json").exists())
         for path in directory.iterdir():
             self.assertEqual(path.read_bytes(), b"existing\n")
+
+    def test_parallel_publications_of_one_name_serialize_and_the_later_takes_its_run_suffix(self):
+        first = self.completed("/devflow:plan REVIEW-10")
+        first_id = self.run_id
+        second = self.completed("/devflow:plan REVIEW-10")
+        second_id = self.run_id
+        entered, release = threading.Event(), threading.Event()
+        original = engine_module.write_new
+        first_thread = []
+
+        def paused_export(path, data):
+            # The first publication stops after saving its intent, before writing outside the run.
+            if threading.current_thread() in first_thread and path.is_relative_to(self.project / "docs"):
+                entered.set()
+                self.assertTrue(release.wait(10))
+            return original(path, data)
+
+        results, errors = {}, []
+
+        def publish(run_id):
+            try:
+                results[run_id] = Engine(self.project, host="claude").publish(run_id)
+            except Exception as exc:  # noqa: BLE001 - reported by the assertion below
+                errors.append(exc)
+
+        with patch("devflow_core.plan.engine.write_new", side_effect=paused_export):
+            one = threading.Thread(target=publish, args=(first_id,))
+            first_thread.append(one)
+            one.start()
+            self.assertTrue(entered.wait(10))
+            two = threading.Thread(target=publish, args=(second_id,))
+            two.start()
+            two.join(0.3)
+            self.assertTrue(two.is_alive())  # Waiting for the publication lock.
+            release.set()
+            one.join(10)
+            two.join(10)
+        self.assertEqual(errors, [])
+        self.assertEqual(results[first_id]["publication"]["path"], "docs/plans/REVIEW-10.md")
+        self.assertEqual(results[second_id]["publication"]["path"], f"docs/plans/REVIEW-10-{second_id}.md")
+        for state, result in ((first, results[first_id]), (second, results[second_id])):
+            self.assertEqual((self.project / result["publication"]["path"]).read_bytes(),
+                             Path(state["current_plan"]).read_bytes())
+            self.assertTrue((self.project / result["publication"]["approval_path"]).is_file())
+        self.assertFalse((self.project / ".devflow" / "publish.lock").exists())
+
+    def test_a_failed_publication_keeps_its_name_from_another_run(self):
+        first = self.completed("/devflow:plan REVIEW-10")
+        first_id = self.run_id
+        original = engine_module.write_new
+
+        def fail_export(path, data):
+            if path.suffix == ".md" and path.is_relative_to(self.project / "docs"):
+                raise OSError("Synthetic unavailable filesystem")
+            return original(path, data)
+
+        with patch("devflow_core.plan.engine.write_new", side_effect=fail_export):
+            with self.assertRaisesRegex(DevFlowError, "publication failed"):
+                self.engine.publish(first_id)
+        self.assertEqual(self.engine.status(first_id)["publication"]["path"], "docs/plans/REVIEW-10.md")
+        second = self.completed("/devflow:plan REVIEW-10")
+        second_id = self.run_id
+        later = self.engine.publish(second_id)
+        self.assertEqual(later["publication"]["path"], f"docs/plans/REVIEW-10-{second_id}.md")
+        retried = self.engine.publish(first_id)
+        self.assertEqual(retried["publication"]["status"], "published")
+        self.assertEqual(retried["publication"]["path"], "docs/plans/REVIEW-10.md")
+        for state, result in ((first, retried), (second, later)):
+            self.assertEqual((self.project / result["publication"]["path"]).read_bytes(),
+                             Path(state["current_plan"]).read_bytes())
+            self.assertEqual((self.project / result["publication"]["approval_path"]).read_bytes(),
+                             (Path(state["run_dir"]) / "approval.md").read_bytes())
+
+    def test_a_reservation_holds_a_name_that_differs_only_in_case_where_the_os_folds_case(self):
+        config = self.project / "devflow.config.json"
+        config.write_text(json.dumps({"plan": {"publish": {"filename": "Release"}}}), encoding="utf-8")
+        first = self.completed("/devflow:plan First release plan")
+        first_id = self.run_id
+        original = engine_module.write_new
+
+        def fail_export(path, data):
+            if path.suffix == ".md" and path.is_relative_to(self.project / "docs"):
+                raise OSError("Synthetic unavailable filesystem")
+            return original(path, data)
+
+        with patch("devflow_core.plan.engine.write_new", side_effect=fail_export):
+            with self.assertRaisesRegex(DevFlowError, "publication failed"):
+                self.engine.publish(first_id)
+        config.write_text(json.dumps({"plan": {"publish": {"filename": "release"}}}), encoding="utf-8")
+        second = self.completed("/devflow:plan Second release plan")
+        second_id = self.run_id
+        # Compare paths the way a case-folding file system (Windows) does.
+        with patch.object(engine_module, "path_key", side_effect=lambda path: paths.path_key(path).casefold()):
+            later = self.engine.publish(second_id)
+        self.assertEqual(later["publication"]["path"], f"docs/plans/release-{second_id}.md")
+        retried = self.engine.publish(first_id)
+        self.assertEqual(retried["publication"]["path"], "docs/plans/Release.md")
+        for state, result in ((first, retried), (second, later)):
+            self.assertEqual((self.project / result["publication"]["path"]).read_bytes(),
+                             Path(state["current_plan"]).read_bytes())
+
+    def test_another_runs_malformed_publication_never_blocks_a_healthy_publication(self):
+        for ticket, damaged in (("REVIEW-11", "damaged"), ("REVIEW-12", {"path": 5, "approval_path": ["x"]}),
+                                ("REVIEW-13", {"path": "docs/plans/bad\x00name.md"})):
+            with self.subTest(publication=damaged):
+                self.completed(f"/devflow:plan {ticket}")
+                state_path = self.run / "state.json"
+                atomic_write_json(state_path, dict(read_json(state_path), publication=damaged))
+                before = state_path.read_bytes()
+                healthy = self.completed(f"/devflow:plan {ticket}")
+                result = self.engine.publish(self.run_id)
+                self.assertEqual(result["publication"]["path"], f"docs/plans/{ticket}.md")
+                self.assertEqual((self.project / result["publication"]["path"]).read_bytes(),
+                                 Path(healthy["current_plan"]).read_bytes())
+                self.assertEqual(state_path.read_bytes(), before)  # The damaged run is never touched.
+
+    def test_another_runs_unresolvable_publication_path_never_blocks_a_healthy_publication(self):
+        historic = self.completed("/devflow:plan REVIEW-14")
+        historic_id = self.run_id
+        published = self.engine.publish(historic_id)["publication"]["path"]
+        docs = self.project / "docs"
+        docs.rename(self.project / "docs-moved")
+        try:
+            docs.symlink_to(docs, target_is_directory=True)  # A loop: resolving it fails.
+        except (OSError, NotImplementedError):
+            self.skipTest("Creating symlinks requires OS permission")
+        state_path = self.run.parent / historic_id / "state.json"
+        before = state_path.read_bytes()
+        (self.project / "devflow.config.json").write_text(
+            json.dumps({"plan": {"publish": {"directory": "output/plans"}}}), encoding="utf-8")
+        healthy = self.completed("/devflow:plan REVIEW-14")
+        result = self.engine.publish(self.run_id)
+        self.assertEqual(result["publication"]["path"], "output/plans/REVIEW-14.md")
+        self.assertEqual((self.project / result["publication"]["path"]).read_bytes(),
+                         Path(healthy["current_plan"]).read_bytes())
+        self.assertEqual(state_path.read_bytes(), before)
+        self.assertEqual(self.engine.status(historic_id)["publication"]["path"], published)
+
+    def test_a_left_publication_lock_stops_publication_without_writing(self):
+        self.completed("/devflow:plan REVIEW-10")
+        lock = self.project / ".devflow" / "publish.lock"
+        lock.write_text('{"token": "left by a stopped process"}', encoding="utf-8")
+        engine = Engine(self.project, lock_wait=0.1, host="claude")
+        with self.assertRaisesRegex(DevFlowError, "publish.lock"):
+            engine.publish(self.run_id)
+        self.assertFalse((self.project / "docs").exists())
+        self.assertNotIn("path", self.engine.status(self.run_id)["publication"])
+        self.assertTrue(lock.exists())  # Never removed because of its age.
 
     def test_publish_symlink_directory_rejected(self):
         self.completed()

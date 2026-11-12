@@ -113,7 +113,8 @@ class HostTests(RuntimeFixture):
                 self.assertEqual(path.read_bytes(), before)
                 self.assertEqual(router.status(self.project, self.session, None, host="claude")['status'], 'unsupported')
                 self.assertEqual(path.read_bytes(), before)
-                router.assert_available(self.project, 'another', router.stores(self.project, host="claude"))
+                started = self.plan_start(session=f'another-{pending}')  # An old record never blocks a start.
+                self.engine('plan').cancel(started)
                 with self.assertRaisesRegex(DevFlowError, 'collision'):
                     sessions.write_record(self.project, sessions.empty_record(self.session, 'codex'), WORKFLOWS)
                 self.prompt('next ordinary input')

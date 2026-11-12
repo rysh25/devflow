@@ -75,7 +75,7 @@ def doctor(project: Path, host: str) -> dict:
         reports[name] = {"config": config, "configuration_source": "project_settings", "reviewers": reviewers,
                          "reviewers_ready": all(item["ready"] for item in reviewers), "ready": ready,
                          **{key: value for key, value in extra.items() if key not in {"warnings", "ready"}}}
-    warnings.extend(router.blocking_warnings(project, host))
+    warnings.extend(router.record_warnings(project, host))
     for item in cache.values():
         warnings.extend(item.get("details", {}).get("version_warnings", []))
     version = claude_version() if host == "claude" else codex_version()
