@@ -2,9 +2,11 @@
 
 Hooks are session-scoped: a session without a record is inert and never
 creates files. Hooks never deny a tool or block a prompt; they record human
-events and add context. Starts and resumes enforce one unfinished run per
-project. Ownership is decided by the run's (``owner_host``, ``owner_session``). This module
-never dispatches a model itself.
+events and add context. A session works on one run at a time; across
+sessions, plan runs never block each other, and a workflow that occupies a
+workspace (implement) allows at most one unfinished run per workspace, checked
+when a run is created and when it is resumed. Ownership is decided by the run's
+(``owner_host``, ``owner_session``). This module never dispatches a model itself.
 """
 from __future__ import annotations
 
@@ -15,12 +17,12 @@ from pathlib import Path
 
 from . import __version__
 from .common import notices, sessions
-from .common.paths import hook_project, project_root
+from .common.paths import hook_project, project_root, same_path
 from .common.errors import DevFlowError
 from .common.hosts import question_context, question_tool_name
 from .common.operations import public_command as detect_command
 from .common.startup import parse_start
-from .common.runs import (HOOK_WAIT, RUNNER_WAIT, TERMINAL, RunStore, data_root, ensure_data_root,
+from .common.runs import (HOOK_WAIT, RUN_ID, RUNNER_WAIT, TERMINAL, RunStore, data_root, ensure_data_root,
                           event_bytes, make_event, new_run_id, unsupported_message, validate_run_id)
 from .common.settings import validate_document
 from .common.storage import file_lock, now
@@ -65,42 +67,84 @@ def resolve_run(project: Path, run_id: str, all_stores: dict[str, RunStore]):
     return found[0]
 
 
-def assert_available(project: Path, session: str, all_stores: dict[str, RunStore], selected=None) -> None:
-    """One unfinished run per project; damaged records stop starts."""
-    for flow, store in all_stores.items():
+OCCUPIED_MESSAGE = ("Another unfinished {flow} run ({run_id}) uses this workspace ({path}); "
+                    "resume or cancel it, or start in another worktree")
+UNREADABLE_MESSAGE = ("Run {flow}/{run_id} cannot be read ({error}); its workspace is unknown, so preserve it "
+                      "for human recovery before starting or resuming another {flow} run")
+
+
+def blocks_workspace_check(flow: str, info) -> bool:
+    """An unreadable run of a workspace-occupying workflow: its workspace is unknown.
+
+    An entry whose name is not a run ID is not a run (it cannot be resumed), so it never blocks.
+    """
+    return (WORKFLOWS[flow].occupies_workspace and info.format == "invalid"
+            and RUN_ID.fullmatch(info.run_id) is not None)
+
+
+def assert_workspace_free(all_stores: dict[str, RunStore], flow: str, state: dict, selected=None) -> None:
+    """At most one unfinished run per workspace; nothing for workflows that occupy none.
+
+    Two checks: an unreadable run of a workspace-occupying workflow always stops a
+    start or resume of that kind of run (its workspace is unknown); the
+    occupancy check applies only while ``state`` itself is unfinished, because
+    a finished run occupies no workspace.
+    """
+    workflow = WORKFLOWS[flow]
+    if not workflow.occupies_workspace:
+        return
+    occupying = state["status"] not in TERMINAL  # A new run's fields start unfinished.
+    target = workflow.workspace(state)
+    for other_flow, store in all_stores.items():
+        other = WORKFLOWS[other_flow]
+        if not other.occupies_workspace:
+            continue
         runs, _ = store.scan()
         for info in runs:
-            if selected == (flow, info.run_id) or info.format == "unsupported":
+            if selected == (other_flow, info.run_id) or info.format == "unsupported":
                 continue  # A run from an older format is never continued, so it never blocks.
-            if info.format == "invalid":
-                raise DevFlowError(f"Run {flow}/{info.run_id} cannot be read ({info.error}); "
-                                   "preserve it for human recovery before starting another")
-            if info.format == "current" and info.state["status"] not in TERMINAL:
-                raise DevFlowError(f"Another unfinished {flow} run exists ({info.run_id}); resume or cancel it first")
-    for info in sessions.scan_records(project, WORKFLOWS):
-        if info.format == "unsupported":
-            continue
-        name, record, error = info.name, info.record, info.error
-        if error:
-            raise DevFlowError(f"Session record {name} is invalid ({error}); a human must move it out of "
-                               ".devflow/sessions/ before another start")
-        pending = record["pending_start"]
-        if record["session_id"] == session or not pending:
-            continue
-        if not sessions.pending_created(pending, all_stores[pending["flow"]]):
-            raise DevFlowError(f"Another session has a pending {pending['flow']} start (session record {name}); "
-                               "finish it in that session, or have a human move the record away")
+            if blocks_workspace_check(other_flow, info):
+                raise DevFlowError(UNREADABLE_MESSAGE.format(flow=other_flow, run_id=info.run_id, error=info.error))
+            if (occupying and info.format == "current" and info.state["status"] not in TERMINAL
+                    and _same_workspace(other.workspace(info.state), target)):
+                raise DevFlowError(OCCUPIED_MESSAGE.format(flow=other_flow, run_id=info.run_id, path=target))
+
+
+def _same_workspace(frozen: str, target: str) -> bool:
+    """Whether another run's frozen workspace is the target. A path that can no longer be
+    resolved (a symlink loop raises RuntimeError before Python 3.13) is not the resolved target."""
+    try:
+        return same_path(frozen, target)
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+@contextmanager
+def _prepared(project: Path, pending: dict, all_stores: dict[str, RunStore], options: dict | None):
+    """The workflow fields and start records of a pending start, before any run exists.
+
+    Large start records are written into the scratch directory, which is removed
+    afterwards; ``_commit`` moves them into the run.
+    """
+    workflow = WORKFLOWS[pending["flow"]]
+    with all_stores[pending["flow"]].scratch(pending["run_id"]) as scratch:
+        yield workflow.build_start(project, pending, dict(options or {}), scratch)
+
+
+def _commit(session: str, pending: dict, all_stores: dict[str, RunStore], prepared) -> dict:
+    """Create the prepared run; always called inside ``dispatch_lock``."""
+    fields, artifacts = prepared
+    store = all_stores[pending["flow"]]
+    assert_workspace_free(all_stores, pending["flow"], fields)
+    return store.create(fields, artifacts, run_id=pending["run_id"], owner=session,
+                        first_event=pending["event"], owner_host=store.host)
 
 
 def _create(project: Path, session: str, pending: dict, all_stores: dict[str, RunStore],
             options: dict | None = None) -> dict:
-    workflow = WORKFLOWS[pending["flow"]]
-    store = all_stores[pending["flow"]]
-    # Large start records are written into the scratch directory and moved into the run.
-    with store.scratch(pending["run_id"]) as scratch:
-        fields, artifacts = workflow.build_start(project, pending, dict(options or {}), scratch)
-        return store.create(fields, artifacts, run_id=pending["run_id"], owner=session,
-                            first_event=pending["event"], owner_host=store.host)
+    """Prepare and create in one step, for a start whose records are small (inside the prompt hook)."""
+    with _prepared(project, pending, all_stores, options) as prepared:
+        return _commit(session, pending, all_stores, prepared)
 
 
 def _bound(record: dict, flow: str, run_id: str) -> dict:
@@ -142,7 +186,6 @@ def _start(project: Path, session: str, flow: str, argument: str, payload: dict,
         raise DevFlowError("Finish or cancel this session's active workflow before starting another")
     args = workflow.normalize_args(parse_start(argument).body, project)
     validate_document(project, WORKFLOWS)
-    assert_available(project, session, all_stores)
     pending = {"flow": flow, "run_id": new_run_id(), "args": args, "event": make_event(payload, "prompt"),
                "created_at": now()}
     record = dict(record, run=None, pending_start=pending)
@@ -157,8 +200,8 @@ def _start(project: Path, session: str, flow: str, argument: str, payload: dict,
     try:
         state = _create(project, session, pending, all_stores, {})
     except Exception:
-        # No run exists after a failed creation; drop the pending start so it
-        # cannot block other sessions. A killed process is settled next prompt.
+        # No run exists after a failed creation; drop the pending start, which
+        # no run will apply. A killed process is settled next prompt.
         sessions.write_record(project, dict(record, pending_start=None), WORKFLOWS)
         raise
     sessions.write_record(project, _bound(record, flow, state["run_id"]), WORKFLOWS)
@@ -180,7 +223,7 @@ def _resume(project: Path, session: str, argument: str, payload: dict, record: d
         reason = store.transfer_refusal(state, session)
         if reason:
             raise DevFlowError(reason)
-        assert_available(project, session, all_stores, selected=(flow, run_id))
+        assert_workspace_free(all_stores, flow, state, selected=(flow, run_id))
         # The binding is written first: a stop before the ownership change
         # leaves only a non-owning binding, which asks for /devflow:resume again.
         sessions.write_record(project, _bound(record, flow, run_id), WORKFLOWS)
@@ -195,17 +238,25 @@ def runner_start(project: Path, session: str | None, flow: str, raw: str, option
         raise DevFlowError("start requires the actual current host session ID")
     workflow = WORKFLOWS[flow]
     all_stores = stores(project, host=host)
+    refusal = f"Start only from an explicit /devflow:{flow} command in this session"
     with dispatch_lock(project, RUNNER_WAIT):
         record = sessions.read_record(project, session, WORKFLOWS, host)
         pending = record and record["pending_start"]
         if not pending or pending["flow"] != flow:
-            raise DevFlowError(f"Start only from an explicit /devflow:{flow} command in this session")
+            raise DevFlowError(refusal)
         validate_document(project, WORKFLOWS)
         if workflow.normalize_args(raw, project) != pending["args"]:
             raise DevFlowError(f"The {workflow.start_option} value does not match the user's explicit start command")
-        assert_available(project, session, all_stores)
-        state = _create(project, session, pending, all_stores, options)
-        sessions.write_record(project, _bound(record, flow, state["run_id"]), WORKFLOWS)
+    # Prepared outside the lock: an implementation start captures its baseline
+    # snapshot here, which can take long. The lock is taken again to re-check
+    # the pending start and the workspace before the run is created.
+    with _prepared(project, pending, all_stores, options) as prepared:
+        with dispatch_lock(project, RUNNER_WAIT):
+            record = sessions.read_record(project, session, WORKFLOWS, host)
+            if not record or record["pending_start"] != pending:
+                raise DevFlowError(refusal)
+            state = _commit(session, pending, all_stores, prepared)
+            sessions.write_record(project, _bound(record, flow, state["run_id"]), WORKFLOWS)
     return workflow.engine(project, host=host).status(state["run_id"])
 
 
@@ -358,7 +409,7 @@ def _tool_event(project: Path, event: str, payload: dict, record: dict, all_stor
                                   "Use its exact response and event ID if resolving a human escalation.")
 
 
-def _overview(project: Path, all_stores: dict[str, RunStore], session: str | None = None) -> dict:
+def _overview(project: Path, all_stores: dict[str, RunStore]) -> dict:
     runs, creating = [], []
     for flow, store in all_stores.items():
         infos, leftovers = store.scan()
@@ -372,29 +423,13 @@ def _overview(project: Path, all_stores: dict[str, RunStore], session: str | Non
                 except Exception as exc:  # noqa: BLE001 - one unreadable run must not hide the others
                     item.update(format="invalid", error=f"Cannot summarize run: {type(exc).__name__}: {exc}")
             runs.append(item)
-    blocking, invalid = [], []
-    unsupported = []
+    invalid, unsupported = [], []
     for info in sessions.scan_records(project, WORKFLOWS):
         if info.format == "unsupported":
             unsupported.append({"record": info.name, "host": info.host, "schema_version": info.schema_version})
-            continue
-        name, record, error = info.name, info.record, info.error
-        if error:
-            invalid.append({"record": name, "error": error})
-            continue
-        pending = record["pending_start"]
-        if record["session_id"] == session or not pending:
-            continue
-        try:
-            created = sessions.pending_created(pending, all_stores[pending["flow"]])
-        except (DevFlowError, OSError) as exc:
-            invalid.append({"record": name, "error": str(exc)})
-            continue
-        if not created:
-            blocking.append({"record": name, "flow": pending["flow"], "args": pending["args"],
-                             "created_at": pending["created_at"]})
-    return {"runs": runs, "sessions": {"pending_starts": blocking, "invalid_records": invalid,
-                                      "unsupported_records": unsupported},
+        elif info.error:
+            invalid.append({"record": info.name, "error": info.error})
+    return {"runs": runs, "sessions": {"invalid_records": invalid, "unsupported_records": unsupported},
             "incomplete_creations": creating}
 
 
@@ -417,7 +452,7 @@ def status(project: Path, session: str | None, run_id: str | None, host: str) ->
                 return {"plugin": "devflow", "status": "unsupported", "session_host": info.host,
                         "session_schema_version": info.schema_version, "owner_matches": False,
                         "session_record_error": (None if info.host == host else "Session host collision"),
-                        **_overview(project, all_stores, session)}
+                        **_overview(project, all_stores)}
             record = sessions.read_record(project, session, WORKFLOWS, host)
             current = sessions.binding(project, record, all_stores)
         except DevFlowError as exc:
@@ -430,18 +465,26 @@ def status(project: Path, session: str | None, run_id: str | None, host: str) ->
             "run": record["run"] if current else None, "owner_matches": current.owner if current else None,
             "pending_start": pending and {key: pending[key] for key in ("flow", "run_id", "args", "created_at")},
             "session_record_error": record_error,
-            **_overview(project, all_stores, session)}
+            **_overview(project, all_stores)}
 
 
-def blocking_warnings(project: Path, host: str) -> list[str]:
-    """What would stop a start, for doctor; changes nothing."""
+def record_warnings(project: Path, host: str) -> list[str]:
+    """Records a human may need to look at, for doctor; changes nothing.
+
+    Run warnings come from the same ``RunStore.scan`` records the workspace
+    check reads, so a warning says it blocks exactly when the check would stop.
+    """
     if not data_root(project).exists():
         return []
-    overview = _overview(project, stores(project, host=host))
-    warnings = [f"Pending {item['flow']} start in session record {item['record']} blocks new starts"
-                for item in overview["sessions"]["pending_starts"]]
-    warnings += [f"Invalid session record {item['record']}: {item['error']}" for item in overview["sessions"]["invalid_records"]]
-    warnings += [f"Incomplete run creation {name}; a human may move it away" for name in overview["incomplete_creations"]]
-    warnings += [f"Run {item['flow']}/{item['run_id']} cannot be read and blocks new starts: {item.get('error')}"
-                 for item in overview["runs"] if item["format"] == "invalid"]
+    all_stores = stores(project, host=host)
+    overview = _overview(project, all_stores)
+    warnings = [f"Invalid session record {item['record']}: {item['error']}" for item in overview["sessions"]["invalid_records"]]
+    warnings += [f"Incomplete run creation {name}; if no DevFlow start is still running, a human may move it away"
+                 for name in overview["incomplete_creations"]]
+    for flow, store in all_stores.items():
+        for info in store.scan()[0]:
+            if info.format != "invalid":
+                continue
+            effect = f" and blocks {flow} starts and resumes" if blocks_workspace_check(flow, info) else ""
+            warnings.append(f"Run {flow}/{info.run_id} cannot be read{effect}: {info.error}")
     return warnings

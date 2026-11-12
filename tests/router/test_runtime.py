@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -147,19 +148,26 @@ class UnifiedDispatchTests(RuntimeFixture):
         self.assertEqual(before, after)
         self.assertEqual(self.record()["run"]["run_id"], identifier)
 
-    def test_one_unfinished_workflow_per_project_across_sessions(self):
-        self.plan_start()
-        for command in ("/devflow:plan Another request", "/devflow:implement feature.md"):
-            with self.subTest(command=command):
-                self.assert_not_accepted(self.prompt(command, session="second-human-session"),
-                                         "Another unfinished plan run")
-        self.assertIsNone(self.record("second-human-session"))
+    def test_other_sessions_start_plans_and_implementations_while_a_plan_is_unfinished(self):
+        first = self.plan_start()
+        second = self.plan_start(session="second-plan-session")
+        self.assertNotEqual(second, first)
+        # The original bug's path: an implementation run is created while a plan run is unfinished.
+        implementation = self.implement_start(session="second-implement-session")
+        self.assertEqual(self.engine("plan").status(first)["status"], "interview")
+        self.assertEqual(self.engine("plan").status(second)["status"], "interview")
+        self.assertEqual(self.engine("implement").status(implementation)["status"], "implementing")
+        self.assertEqual(self.record()["run"], {"flow": "plan", "run_id": first})
+        self.assertEqual(self.record("second-plan-session")["run"], {"flow": "plan", "run_id": second})
+        self.assertEqual(self.record("second-implement-session")["run"], {"flow": "implement", "run_id": implementation})
 
-    def test_pending_implementation_is_not_accepted_from_a_different_session(self):
+    def test_another_sessions_pending_start_blocks_nothing(self):
         self.prompt("/devflow:implement feature.md")
-        for command in ("/devflow:plan Another request", "/devflow:implement feature.md"):
-            with self.subTest(command=command):
-                self.assert_not_accepted(self.prompt(command, session="other-session"), "pending implement start")
+        identifier = self.plan_start(session="other-plan-session")
+        self.prompt("/devflow:implement feature.md", session="other-implement-session")
+        self.assertEqual(self.record("other-plan-session")["run"], {"flow": "plan", "run_id": identifier})
+        self.assertEqual(self.record("other-implement-session")["pending_start"]["flow"], "implement")
+        self.assertEqual(self.record()["pending_start"]["flow"], "implement")
 
     def test_new_prompt_can_abandon_pending_implementation_before_plan(self):
         self.prompt("/devflow:implement feature.md")
@@ -261,9 +269,10 @@ class UnifiedDispatchTests(RuntimeFixture):
         value = runtime.status(self.project, self.session, None, host="claude")
         self.assertEqual(value["status"], "pending_start")
         self.assertEqual(value["pending_start"]["args"], str(self.plan_file))
-        self.assertEqual(value["sessions"]["pending_starts"], [])  # Not blocking its own session.
         other = runtime.status(self.project, "someone-else", None, host="claude")
-        self.assertEqual(other["sessions"]["pending_starts"][0]["flow"], "implement")
+        # Another session's pending start blocks nothing, so the overview does not list it.
+        self.assertEqual(set(other["sessions"]), {"invalid_records", "unsupported_records"})
+        self.assertEqual(other["status"], "idle")
 
     def test_runner_start_cannot_target_an_existing_run(self):
         self.prompt("/devflow:implement feature.md")
@@ -423,13 +432,16 @@ class CommandErrorTests(RuntimeFixture):
                 self.assertIn("Check the runner's status before continuing", context)
         self.assertFalse((self.project / ".devflow").exists())
         identifier = self.plan_start()
-        for prompt in ("/devflow:plan Another request", "/devflow:implement feature.md"):
+        for prompt, session in (("/devflow:plan Another request", "second-plan-session"),
+                                ("/devflow:implement feature.md", "second-implement-session")):
             with self.subTest(prompt=prompt):
-                self.assert_not_accepted(self.prompt(prompt, session="second-session"), "Another unfinished plan run")
+                self.assertNotIn("did not accept", json.dumps(self.prompt(prompt, session=session)))
                 self.assert_not_accepted(self.prompt(prompt), "Finish or cancel this session's active workflow")
-        self.assertIsNone(self.record("second-session"))
+        second = self.record("second-plan-session")["run"]["run_id"]
+        self.assertEqual(self.record("second-implement-session")["pending_start"]["flow"], "implement")
         self.assertEqual(self.record()["run"], {"flow": "plan", "run_id": identifier})
-        self.assertEqual([info.run_id for info in RunStore(self.project, WORKFLOWS["plan"], host="claude").scan()[0]], [identifier])
+        self.assertEqual(sorted(info.run_id for info in RunStore(self.project, WORKFLOWS["plan"], host="claude").scan()[0]),
+                         sorted([identifier, second]))
 
 
 class FrozenConfigurationTests(RuntimeFixture):
@@ -507,7 +519,9 @@ class RunFormatTests(RuntimeFixture):
                 atomic_json(path, dict(good, config=config))
                 listed = runtime.status(self.project, "other-session", None, host="claude")["runs"]
                 self.assertEqual(listed[0]["format"], "invalid")
-                self.assertIn("cannot be read", " ".join(runtime.blocking_warnings(self.project, host="claude")))
+                warnings = " ".join(runtime.record_warnings(self.project, host="claude"))
+                self.assertIn(f"Run plan/{identifier} cannot be read:", warnings)
+                self.assertNotIn("blocks", warnings)  # A plan run occupies no workspace.
 
     def test_a_summary_failure_marks_only_that_run_invalid(self):
         identifier = self.plan_start()
@@ -524,7 +538,7 @@ class RunFormatTests(RuntimeFixture):
         listed = runtime.status(self.project, self.session, None, host="claude")["runs"][0]
         self.assertEqual(listed["format"], "unsupported")
         self.assertNotIn("recovery_required", listed)
-        self.assertNotIn(identifier, " ".join(runtime.blocking_warnings(self.project, host="claude")))
+        self.assertNotIn(identifier, " ".join(runtime.record_warnings(self.project, host="claude")))
         self.plan_start()
         self.assertTrue((self.run_dir("plan", identifier) / "transaction.json").exists())  # Never touched.
 
@@ -557,7 +571,6 @@ class RunFormatTests(RuntimeFixture):
                     self.assertIn(release, value["message"])
                     self.assertIsNone(self.prompt("hello"))
                     self.assertIsNone(self.record())  # Released by the next prompt.
-                    self.assertFalse(runtime.status(self.project, None, None, host="claude")["sessions"]["pending_starts"])
                     self.assertTrue(self.run_dir(flow, identifier).exists())  # Never touched.
 
     def test_unreleased_and_last_released_formats_are_unsupported(self):
@@ -599,7 +612,7 @@ class RunFormatTests(RuntimeFixture):
         self.assert_not_accepted(self.prompt("/devflow:resume " + identifier), "0.2.x")
         self.assertIsNone(self.record())
 
-    def test_pending_starts_of_0_2_runs(self):
+    def test_pending_start_records_of_0_2_runs(self):
         self.bind_to_old_run(session="someone-else", pending=True)
         self.plan_start()  # Another session's created 0.2.x start never blocks.
         identifier = self.bind_to_old_run(session="third-session", pending=True, identifier=OTHER_ID)
@@ -607,7 +620,7 @@ class RunFormatTests(RuntimeFixture):
         self.assertIsNone(self.record("third-session"))  # Its own unapplied start is dropped.
         self.assertTrue(self.run_dir("implement", identifier).exists())
 
-    def test_damaged_runs_are_shown_individually_and_block_starts(self):
+    def test_damaged_runs_are_shown_individually(self):
         for index, (version, extra) in enumerate(((None, {}), (True, {}), ("2", {}), (0, {}), (SCHEMA_VERSION + 1, {}),
                                                   (1, {"run_id": OTHER_ID}), (1, {"flow": "implement"}),
                                                   (1, {"flow": None}), (2, {"run_id": OTHER_ID}),
@@ -625,11 +638,12 @@ class RunFormatTests(RuntimeFixture):
                 self.assertIn("error", listed[identifier])
                 with self.assertRaises(DevFlowError):
                     runtime.status(self.project, None, identifier, host="claude")
-                self.assert_not_accepted(self.prompt("/devflow:plan Another request", session="new-session"),
-                                         "cannot be read")
-                self.assertIsNone(self.record("new-session"))
+                # A damaged plan run occupies no workspace, so it never stops a start.
+                started = self.plan_start(session=f"new-session-{index}")
+                self.assertNotEqual(started, identifier)
+                self.engine("plan").cancel(started)
                 path.unlink()
-                path.parent.rmdir()
+                path.parent.rmdir()  # Only the damaged run's own directory.
 
     def test_old_per_workflow_session_directories_do_not_block_starts(self):
         old = self.project / ".devflow" / "sessions"
@@ -655,8 +669,9 @@ class RunFormatTests(RuntimeFixture):
         atomic_json(self.run_dir("plan", identifier) / "state.json", {"schema_version": SCHEMA_VERSION, "status": []})
         overview = runtime.status(self.project, "other-session", None, host="claude")
         self.assertEqual(overview["runs"][0]["format"], "invalid")
-        self.assertEqual(overview["sessions"]["pending_starts"], [])
-        self.assertIn(f"Run plan/{identifier} cannot be read", " ".join(runtime.blocking_warnings(self.project, host="claude")))
+        warnings = " ".join(runtime.record_warnings(self.project, host="claude"))
+        self.assertIn(f"Run plan/{identifier} cannot be read:", warnings)
+        self.assertNotIn("blocks", warnings)
         probe, interview, claude, which = UnifiedCliTests.doctor_patches(self)
         with probe, interview, claude, which:
             code, output, _ = self.invoke("doctor")
@@ -672,7 +687,8 @@ class RunFormatTests(RuntimeFixture):
         overview = runtime.status(self.project, self.session, None, host="claude")
         self.assertEqual(overview["incomplete_creations"], ["plan/" + leftover.name])
         self.assertEqual(overview["runs"], [])
-        self.assertIn("Incomplete run creation", " ".join(runtime.blocking_warnings(self.project, host="claude")))
+        self.assertIn("Incomplete run creation plan/" + leftover.name + "; if no DevFlow start is still running, "
+                      "a human may move it away", " ".join(runtime.record_warnings(self.project, host="claude")))
         self.plan_start()
 
 
@@ -699,7 +715,6 @@ class InterruptionTests(RuntimeFixture):
         atomic_json(self.project / "devflow.config.json", {"schema_version": 1, "plan": {"max_reviews": 7}})
         self.assert_not_accepted(self.prompt("/devflow:plan Request with an invalid configuration"), "max_reviews")
         self.assertIsNone(self.record())
-        self.assertEqual(runtime.status(self.project, "other", None, host="claude")["sessions"]["pending_starts"], [])
 
     def test_start_killed_before_creation_is_abandoned_on_the_next_prompt(self):
         # A killed process leaves its pending start behind (no cleanup runs).
@@ -708,8 +723,9 @@ class InterruptionTests(RuntimeFixture):
                    "event": make_event(self.payload(prompt="/devflow:plan Interrupted request"), "prompt")}
         (self.project / ".devflow").mkdir()
         sessions.write_record(self.project, dict(sessions.empty_record(self.session, host="claude"), pending_start=pending), WORKFLOWS)
-        self.assert_not_accepted(self.prompt("/devflow:plan Another request", session="other-session"),
-                                 "pending plan start")
+        # Another session's pending start blocks nothing.
+        other = self.plan_start(session="other-session")
+        self.assertEqual(self.record("other-session")["run"], {"flow": "plan", "run_id": other})
         self.assertIsNone(self.prompt("Hello again"))
         self.assertIsNone(self.record())
 
@@ -758,16 +774,16 @@ class InterruptionTests(RuntimeFixture):
         self.engine("plan").cancel(finished)
         self.prompt("next")
         active = self.implement_start()
-        self.assert_not_accepted(self.prompt("/devflow:resume " + finished, session="other-session"),
-                                 "unfinished implement")
         self.assert_not_accepted(self.prompt("/devflow:resume " + finished), "Finish or cancel")
-        self.assertEqual(self.engine("plan").status(finished)["owner_session"], self.session)
-        self.assertIsNone(self.record("other-session"))
+        # A plan run occupies no workspace: another session resumes it beside the unfinished implementation.
+        self.assertNotIn("did not accept", json.dumps(self.prompt("/devflow:resume " + finished, session="other-session")))
+        self.assertEqual(self.engine("plan").status(finished)["owner_session"], "other-session")
+        self.assertEqual(self.record("other-session")["run"], {"flow": "plan", "run_id": finished})
         self.assertEqual(self.record()["run"]["run_id"], active)
 
 
 class SessionRecordTests(RuntimeFixture):
-    def test_invalid_records_are_listed_and_block_starts(self):
+    def test_invalid_session_records_are_listed_and_never_block_starts(self):
         directory = self.project / ".devflow" / "sessions"
         good = sessions.empty_record("someone", host="claude")
         pending = {"flow": "implement", "run_id": OTHER_ID, "args": "x", "created_at": "t",
@@ -786,7 +802,8 @@ class SessionRecordTests(RuntimeFixture):
                 atomic_json(path, record)
                 overview = runtime.status(self.project, self.session, None, host="claude")
                 self.assertEqual(overview["sessions"]["invalid_records"][0]["record"], path.name)
-                self.assert_not_accepted(self.prompt("/devflow:plan New request"), "invalid")
+                started = self.plan_start(session=f"starter-{name}")
+                self.engine("plan").cancel(started)
                 path.unlink()
         misplaced = directory / ("0" * 64 + ".json")
         atomic_json(misplaced, good | {"run": {"flow": "plan", "run_id": OTHER_ID}})
@@ -819,8 +836,8 @@ class SessionRecordTests(RuntimeFixture):
         sessions.write_record(self.project, dict(sessions.empty_record("someone", host="claude"), pending_start=pending), WORKFLOWS)
         overview = runtime.status(self.project, self.session, None, host="claude")
         self.assertEqual([item["format"] for item in overview["runs"]], ["invalid"])
-        self.assertEqual(overview["sessions"]["pending_starts"], [])
-        runtime.blocking_warnings(self.project, host="claude")
+        self.assertEqual(overview["sessions"]["invalid_records"], [])
+        runtime.record_warnings(self.project, host="claude")
 
     def test_stale_binding_reports_owner_mismatch(self):
         identifier = self.implement_start()
@@ -1018,7 +1035,7 @@ class UnifiedCliTests(RuntimeFixture):
         self.assertEqual(Path(state["run_dir"]).parent, self.project / ".devflow" / "runs" / "implement")
         self.assertFalse((self.project / ".devflow" / "runs" / "plan").exists())
 
-    def test_cli_start_cannot_cross_unfinished_project_workflow(self):
+    def test_cli_start_requires_this_sessions_pending_start(self):
         self.plan_start()
         code, output, _ = self.invoke("--session", "second-session", "implement", "start", "--plan", str(self.plan_file))
         self.assertEqual(code, 2)
@@ -1070,12 +1087,19 @@ class UnifiedCliTests(RuntimeFixture):
             self.assertEqual(code, 0)
             self.assertFalse(json.loads(output)["ready"])
 
-    def test_doctor_warns_about_what_blocks_starts(self):
-        self.prompt("/devflow:implement feature.md", session="lost-session")
+    def test_doctor_warns_about_unreadable_records(self):
+        self.prompt("/devflow:implement feature.md", session="lost-session")  # A pending start blocks nothing.
+        atomic_json(self.run_dir("implement", OTHER_ID) / "state.json", {"schema_version": SCHEMA_VERSION, "status": []})
+        plan_id = "20261101T123456Z-cccccccccccc"
+        atomic_json(self.run_dir("plan", plan_id) / "state.json", {"schema_version": SCHEMA_VERSION, "status": []})
         probe, interview, claude, which = self.doctor_patches()
         with probe, interview, claude, which:
             code, output, _ = self.invoke("doctor")
-        self.assertIn("Pending implement start", " ".join(json.loads(output)["warnings"]))
+        warnings = json.loads(output)["warnings"]
+        self.assertNotIn("Pending", " ".join(warnings))
+        self.assertTrue(any(item.startswith(f"Run implement/{OTHER_ID} cannot be read and blocks implement starts "
+                                            "and resumes: ") for item in warnings), warnings)
+        self.assertTrue(any(item.startswith(f"Run plan/{plan_id} cannot be read: ") for item in warnings), warnings)
 
     def test_claude_version_probe_never_authenticates_or_uses_shell(self):
         result = subprocess.CompletedProcess(["claude", "--version"], 0, "2.1.316 (Claude Code)\n", "")
@@ -1108,6 +1132,123 @@ class RegistryTests(RuntimeFixture):
             self.assertIn("dummy", runtime.stores(self.project, host="claude"))
             self.assertEqual(runtime.status(self.project, self.session, None, host="claude")["runs"], [])
 
+
+
+class ParallelRunTests(RuntimeFixture):
+    """Plan runs never block each other; an implementation run blocks only its own workspace."""
+
+    def events(self, flow, run_id):
+        return len(read_json(self.run_dir(flow, run_id) / "state.json")["event_ids"])
+
+    def broken_implementation(self, identifier="20261101T123456Z-dddddddddddd"):
+        atomic_json(self.run_dir("implement", identifier) / "state.json", {"schema_version": SCHEMA_VERSION, "status": []})
+        return identifier
+
+    def test_an_unreadable_implementation_run_stops_implementation_but_not_plans(self):
+        unfinished = self.implement_start(session="implementer")
+        broken = self.broken_implementation()
+        self.prompt("/devflow:implement feature.md", session="second-implementer")
+        with self.assertRaisesRegex(DevFlowError, f"Run implement/{broken} cannot be read .*its workspace is unknown"):
+            runtime.runner_start(self.project, "second-implementer", "implement", "feature.md", host="claude")
+        # Even resuming another unfinished implementation run waits for the unreadable one to be preserved.
+        self.assert_not_accepted(self.prompt("/devflow:resume " + unfinished, session="resumer"),
+                                 f"Run implement/{broken} cannot be read")
+        self.assertEqual(self.engine("implement").status(unfinished)["owner_session"], "implementer")
+        self.plan_start(session="planner")
+
+    def test_entries_that_are_not_runs_never_block_and_are_warned_about(self):
+        for flow in ("plan", "implement"):
+            directory = self.project / ".devflow" / "runs" / flow
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / ".DS_Store").write_bytes(b"finder metadata")
+        self.implement_start(session="implementer")
+        self.plan_start(session="planner")
+        warnings = runtime.record_warnings(self.project, host="claude")
+        for flow in ("plan", "implement"):
+            self.assertIn(f"Run {flow}/.DS_Store cannot be read: Not a run directory name", warnings)
+        self.assertNotIn("blocks", " ".join(warnings))
+
+    def test_a_summary_failure_is_shown_by_status_but_is_not_a_doctor_warning(self):
+        identifier = self.implement_start()
+        with patch.object(WORKFLOWS["implement"], "summary", side_effect=KeyError("missing")):
+            listed = runtime.status(self.project, "other-session", None, host="claude")["runs"]
+            self.assertEqual((listed[0]["run_id"], listed[0]["format"]), (identifier, "invalid"))
+            self.assertNotIn(identifier, " ".join(runtime.record_warnings(self.project, host="claude")))
+
+    def test_parallel_plans_record_only_their_own_session_events(self):
+        runs = {session: self.plan_start(session=session) for session in ("planner-a", "planner-b", "planner-c")}
+        self.assertEqual(len(set(runs.values())), 3)
+        before = {session: self.events("plan", run_id) for session, run_id in runs.items()}
+        self.prompt("An answer for the second plan only", session="planner-b")
+        after = {session: self.events("plan", run_id) for session, run_id in runs.items()}
+        self.assertEqual(after, dict(before, **{"planner-b": before["planner-b"] + 1}))
+
+    def blocked_preparation(self):
+        """Start ``implement start`` in a thread and hold it inside its preparation (no lock held)."""
+        entered, release = threading.Event(), threading.Event()
+        original = WORKFLOWS["implement"].build_start
+        result = {}
+
+        def build_start(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(10))
+            return original(*args, **kwargs)
+
+        def start():
+            try:
+                result["status"] = runtime.runner_start(self.project, self.session, "implement", "feature.md",
+                                                        host="claude")
+            except Exception as exc:  # noqa: BLE001 - examined by each test
+                result["error"] = exc
+
+        self.prompt("/devflow:implement feature.md")
+        patcher = patch.object(WORKFLOWS["implement"], "build_start", side_effect=build_start)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        thread = threading.Thread(target=start)
+        thread.start()
+        self.assertTrue(entered.wait(10))
+
+        def finish():
+            release.set()
+            thread.join(10)
+            patcher.stop()
+            return result
+        return finish
+
+    def test_another_sessions_start_is_not_delayed_by_a_preparing_implementation(self):
+        finish = self.blocked_preparation()
+        # /devflow:plan enters _submit and takes dispatch_lock within the patched HOOK_WAIT (0.2 s). An ordinary
+        # prompt of a session without a record, /devflow:status and /devflow:doctor return before _submit and
+        # take no lock, so they could not show that the preparation holds no lock.
+        identifier = self.plan_start(session="planner")
+        self.assertEqual(self.record("planner")["run"], {"flow": "plan", "run_id": identifier})
+        result = finish()
+        self.assertNotIn("error", result)
+        self.assertEqual(self.record()["run"], {"flow": "implement", "run_id": result["status"]["run_id"]})
+
+    def test_status_and_doctor_during_a_preparation_list_it_without_changing_anything(self):
+        finish = self.blocked_preparation()
+        before = sorted((path, path.read_bytes() if path.is_file() else None)
+                        for path in (self.project / ".devflow").rglob("*"))
+        overview = runtime.status(self.project, "other-session", None, host="claude")
+        pending = self.record()["pending_start"]["run_id"]
+        self.assertEqual(overview["incomplete_creations"], [f"implement/.creating-{pending}.start"])
+        self.assertIn(f"Incomplete run creation implement/.creating-{pending}.start; if no DevFlow start is still "
+                      "running, a human may move it away", runtime.record_warnings(self.project, host="claude"))
+        after = sorted((path, path.read_bytes() if path.is_file() else None)
+                       for path in (self.project / ".devflow").rglob("*"))
+        self.assertEqual(after, before)
+        self.assertNotIn("error", finish())
+
+    def test_a_start_abandoned_during_its_preparation_creates_nothing(self):
+        finish = self.blocked_preparation()
+        self.assertIsNone(self.prompt("Never mind, do something else"))  # Drops the pending start.
+        self.assertIsNone(self.record())
+        result = finish()
+        self.assertRegex(str(result["error"]), "Start only from an explicit /devflow:implement command")
+        root = self.project / ".devflow" / "runs" / "implement"
+        self.assertEqual(sorted(path.name for path in root.iterdir()) if root.exists() else [], [])
 
 if __name__ == "__main__":
     unittest.main()

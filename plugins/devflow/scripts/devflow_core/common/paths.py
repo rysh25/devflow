@@ -17,10 +17,15 @@ PROJECT_MARKERS = (".devflow", "devflow.config.json", "devflow.config.local.json
 _MSYS_DRIVE = re.compile(r"/([A-Za-z])(?=/|\Z)")
 
 
+def path_key(path) -> str:
+    """A path as the OS compares it: resolved, and case-folded on Windows."""
+    return os.path.normcase(str(Path(path).resolve()))
+
+
 def same_path(left, right) -> bool:
     """Whether two paths name the same location, compared the way the OS does
     (both resolved; case-folded on Windows)."""
-    return os.path.normcase(str(Path(left).resolve())) == os.path.normcase(str(Path(right).resolve()))
+    return path_key(left) == path_key(right)
 
 
 def project_root(start: Path) -> Path:

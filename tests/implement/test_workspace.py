@@ -14,10 +14,12 @@ import unittest
 from unittest.mock import patch
 
 from devflow_core import cli, router
+from devflow_core.common import sessions
 from devflow_core.common.errors import DevFlowError
 from devflow_core.common.paths import PLUGIN_ROOT, same_path
 from devflow_core.common.runs import RunStore
 from devflow_core.common.storage import atomic_write_json, read_json
+from devflow_core.workflows import WORKFLOWS
 from devflow_core.implement import WORKFLOW, workspace
 from devflow_core.implement.engine import Engine
 
@@ -270,6 +272,114 @@ class DirtyStartTests(WorkspaceFixture):
         self.assertEqual(status["status"], "awaiting_human")
         self.assertEqual(status["escalation"]["detail"]["kind"], "dirty_worktree")
 
+
+
+class ParallelWorkspaceTests(WorkspaceFixture):
+    """At most one unfinished implementation run per workspace; separate worktrees run in parallel."""
+
+    def hook(self, session, text):
+        return router.handle_hook({"hook_event_name": "UserPromptSubmit", "cwd": str(self.project),
+                                   "session_id": session, "prompt": text}, PLUGIN_ROOT, host="claude")
+
+    def start_as(self, session, workspace_value=None):
+        self.hook(session, f'/devflow:implement "{self.plan}"')
+        options = {"workspace": workspace_value} if workspace_value is not None else {}
+        return router.runner_start(self.project, session, "implement", str(self.plan), options, host="claude")
+
+    def runs(self):
+        return sorted(path.name for path in (self.project / ".devflow" / "runs" / "implement").iterdir())
+
+    def record(self, session):
+        return sessions.read_record(self.project, session, WORKFLOWS, host="claude")
+
+    def assert_not_accepted(self, result, reason):
+        context = result["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("did not accept", context)
+        self.assertIn(reason, context)
+
+    def test_the_project_and_a_worktree_run_implementations_in_parallel(self):
+        project_run = self.start_as("project-session")
+        worktree_run = self.start_as("worktree-session", str(self.worktree))
+        self.assertTrue(same_path(project_run["workspace"]["path"], self.project))
+        self.assertTrue(same_path(worktree_run["workspace"]["path"], self.worktree))
+        for status in (project_run, worktree_run):
+            self.assertEqual(self.engine.status(status["run_id"])["status"], "implementing")
+
+    def test_a_second_unfinished_run_in_one_workspace_is_refused_until_the_first_ends(self):
+        first = self.start_as("first-session", str(self.worktree))
+        before = self.runs()
+        for value in (str(self.worktree), "../feature worktree"):
+            with self.subTest(workspace=value):
+                with self.assertRaisesRegex(DevFlowError, f"Another unfinished implement run \\({first['run_id']}\\) "
+                                                          "uses this workspace"):
+                    self.start_as(f"second-session-{len(value)}", value)
+                self.assertEqual(self.runs(), before)
+        self.engine.cancel(first["run_id"], "first-session", "Finished with this attempt.")
+        later = self.start_as("third-session", str(self.worktree))
+        self.assertNotEqual(later["run_id"], first["run_id"])
+
+    def test_a_summary_failure_does_not_stop_a_start_in_another_workspace(self):
+        failing = self.start_as("project-session")["run_id"]
+        original = WORKFLOW.summary
+
+        def summary(state):
+            if state["run_id"] == failing:
+                raise KeyError("missing")
+            return original(state)
+
+        with patch.object(WORKFLOW, "summary", side_effect=summary):
+            listed = {item["run_id"]: item for item in router.status(self.project, None, None, host="claude")["runs"]}
+            self.assertEqual(listed[failing]["format"], "invalid")  # Shown as a display failure.
+            self.start_as("worktree-session", str(self.worktree))  # The check reads the run record, not the summary.
+
+    def test_resume_is_refused_while_another_unfinished_run_holds_the_workspace(self):
+        held = self.start_as("first-session", str(self.worktree))["run_id"]
+        moved = self.base / "preserved run"
+        shutil.move(str(self.project / ".devflow" / "runs" / "implement" / held), str(moved))
+        current = self.start_as("second-session", str(self.worktree))["run_id"]
+        shutil.move(str(moved), str(self.project / ".devflow" / "runs" / "implement" / held))
+        self.assert_not_accepted(self.hook("third-session", f"/devflow:resume {held}"),
+                                 f"Another unfinished implement run ({current}) uses this workspace")
+        self.assertEqual(self.engine.status(held)["owner_session"], "first-session")
+        self.assertIsNone(self.record("third-session"))
+        self.assertEqual(self.record("second-session")["run"], {"flow": "implement", "run_id": current})
+
+    def test_a_finished_run_resumes_beside_an_unfinished_one_in_its_workspace(self):
+        finished = self.start_as("first-session", str(self.worktree))["run_id"]
+        self.engine.cancel(finished, "first-session", "Finished with this attempt.")
+        self.start_as("second-session", str(self.worktree))
+        self.assertNotIn("did not accept", json.dumps(self.hook("third-session", f"/devflow:resume {finished}")))
+        self.assertEqual(self.engine.status(finished)["owner_session"], "third-session")
+
+    def test_another_runs_unresolvable_workspace_does_not_stop_a_start_elsewhere(self):
+        self.start_as("worktree-session", str(self.worktree))
+        self.worktree.rename(self.base / "moved worktree")
+        try:
+            self.worktree.symlink_to(self.worktree, target_is_directory=True)  # A loop: resolving it fails.
+        except (OSError, NotImplementedError):
+            self.skipTest("Creating symlinks requires OS permission")
+        started = self.start_as("project-session")
+        self.assertTrue(same_path(started["workspace"]["path"], self.project))
+        self.assertNotIn("blocks", " ".join(router.record_warnings(self.project, host="claude")))
+
+    def test_an_unreadable_implementation_run_stops_implementation_starts_and_resumes_only(self):
+        finished = self.start_as("first-session", str(self.worktree))["run_id"]
+        self.engine.cancel(finished, "first-session", "Finished with this attempt.")
+        broken = "20261101T123456Z-dddddddddddd"
+        atomic_write_json(self.project / ".devflow" / "runs" / "implement" / broken / "state.json", {"status": []})
+        with self.assertRaisesRegex(DevFlowError, f"Run implement/{broken} cannot be read .*its workspace is unknown"):
+            self.start_as("second-session")
+        self.assert_not_accepted(self.hook("third-session", f"/devflow:resume {finished}"),
+                                 f"Run implement/{broken} cannot be read")
+        self.assertEqual(self.engine.status(finished)["owner_session"], "first-session")
+        self.hook("plan-session", "/devflow:plan A plan beside the unreadable implementation run")
+        plan_run = self.record("plan-session")["run"]
+        self.assertEqual(plan_run["flow"], "plan")
+        # A plan run occupies no workspace, so its resume is not stopped by the unreadable implementation run.
+        plans = WORKFLOWS["plan"].engine(self.project, host="claude")
+        plans.cancel(plan_run["run_id"])
+        self.assertNotIn("did not accept", json.dumps(self.hook("plan-resumer", f"/devflow:resume {plan_run['run_id']}")))
+        self.assertEqual(plans.status(plan_run["run_id"])["owner_session"], "plan-resumer")
 
 if __name__ == "__main__":
     unittest.main()

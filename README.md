@@ -1,4 +1,4 @@
-# DevFlow 0.8.1 — Claude Code / Codex CLI Plugin
+# DevFlow 0.9.0 — Claude Code / Codex CLI Plugin
 
 人間との要件整理から計画作成、実装、独立レビューまでを支援する **両ホストで使える単一のプラグイン** です。インストールするプラグインは `devflow` だけです。
 
@@ -169,7 +169,7 @@ Windows ネイティブと WSL は別環境です。Claude Code を WSL で使�
 /devflow:implement "docs/plans/player movement.md"
 ```
 
-Implement は開始時のプランと作業ツリーを固定し、Claude Code が実装し、設定された検証とコードレビューを実施します。Claude Code は、プロジェクトそのものか、同じリポジトリの別の worktree を実装場所に選べます（プロジェクトの `CLAUDE.md` などに決まりを書いておけます）。実装場所は run の間、固定されます。
+Implement は開始時のプランと作業ツリーを固定し、Claude Code が実装し、設定された検証とコードレビューを実施します。Claude Code は、プロジェクトそのものか、同じリポジトリの別の worktree を実装場所に選べます（プロジェクトの `CLAUDE.md` などに決まりを書いておけます）。実装場所は run の間、固定されます。1つの実装場所で同時に進められる未完了の Implement は1つです。別の worktree を選べば、複数の Implement を並行できます。
 
 既定では、未コミットの既存変更がある場合に一旦止まり、`AskUserQuestion` でその変更を保持したまま続行してよいか確認します。Plan で保存した新しいプランや追加した設定ファイルも、この確認の対象になり得ます。必ず先にコミットしなければならないわけではなく、プラグインが勝手に破棄・コミットすることもありません。既存変更を含む作業ツリーからの開始を事前に許可する場合のみ、`implement.allow_dirty: true` を設定してください。実装差分の基準は、どちらの場合も開始時の実ファイルです。
 
@@ -322,7 +322,11 @@ uv --no-cache run --offline --no-project --no-config --no-python-downloads "PLUG
 ## 制約と安全性
 
 - DevFlow は OS サンドボックスではなく、どのツールも止めません。守りたいことは、Claude Code と各 CLI の権限・サンドボックスの設定で守ってください。
-- 一つのセッションで Plan と Implement を同時に動かしません。同じ作業ツリーの並行編集も避けてください。
+- 1つのセッション（Claude Code / Codex の1つの会話）で進める run は1つです。並行作業は会話を分けて行います。Plan は何本でも並行できます。Implement は実装場所（プロジェクトか worktree）ごとに、未完了の run を1つまで持てます。
+- Implement を並行するときは、別の worktree を実装場所にします。worktree はプロジェクトの外か、`.gitignore` で除外した場所に作ってください。プロジェクトの中にある Git で無視されていない worktree は、プロジェクト本体を実装場所にする Implement のスナップショットを止めます（`Nested repositories require separate implementation runs`）。
+- 並行する会話は、どれも `.devflow` を持つ同じプロジェクトルートで始め、worktree は `--workspace` で指定します。worktree の中で始めた会話は worktree 側の `.devflow` を使うので、ほかの会話の run が見えず、この制約も共有されません。
+- 実装場所はパスで比べます。macOS の大文字小文字を区別しないファイルシステムで、同じ worktree を大文字小文字だけ違うパスで指定すると、別の実装場所とみなされます。いつも同じ書き方で指定してください。
+- 同じ実装場所で Plan の公開と Implement を同時に進めると、公開した計画のファイル（Git で無視されていない場合）が Implement の差分に入ります。同時に進めるなら、Implement は worktree で行ってください。
 - 常駐サービスではありません。Claude Code が終了・停止したら進行も止まり、明示的に再開します。
 - 人間の対話セッションを対象とします。スケジュール実行やエージェント間メッセージを、人間の承認入力として利用する運用はサポートしません。
 - 外部レビュアーには、最初の依頼・表示された面接の質問と回答の原文・決定サマリー・プラン・過去のレビュー（Implement では加えてコードの場所と差分のファイル）が渡ります。レビュアーはプロジェクトのファイルを自分で読み、それをレビュアーのサービスへ送ります。
@@ -330,6 +334,21 @@ uv --no-cache run --offline --no-project --no-config --no-python-downloads "PLUG
 - push、公開、デプロイ、依存の追加、破壊的移行の前には、人間に確認するようスキルで頼んでいます。
 
 詳しくは [設計](docs/architecture.md)、[信頼の考え方と注意](docs/security.md)、[検証範囲](docs/validation.md) を参照してください。
+
+## 0.9.0 への更新
+
+0.8.x の run は、そのまま続けられます（run の記録の形式は 10、セッションの記録の形式は 3 のままです）。
+
+変わったこと：
+
+- **計画と実装を並行できます。** 0.8.x までは、プロジェクト全体で未完了の run を1つしか持てませんでした。0.9.0 では、Plan は何本でも並行でき、Implement は実装場所（プロジェクトか worktree）ごとに未完了の run を1つまで持てます。別の会話で、別の worktree を指定すれば、Implement も並行できます（[制約と安全性](#制約と安全性)）。
+- ほかの会話の開始待ち（`/devflow:implement` を送ったが、まだ run ができていない状態）は、新しい開始を止めなくなりました。
+- 読めない記録で止まるのは、読めない Implement の run があるときの Implement の開始と再開だけです（その run の実装場所が分からないため）。読めない Plan の run、読めないセッション記録、run ID の形でない名前（`.DS_Store` など）は開始を止めず、doctor の警告に出るだけです。
+- `status` の出力から `sessions.pending_starts` がなくなりました。読む外部スクリプトがあれば直してください。doctor の警告は、止めるものにだけ `blocks implement starts and resumes` と書きます。
+- 同じ公開名の Plan が同時に公開しても、`.devflow/publish.lock` で順番に公開し、後の run は run ID 付きの名前になります。公開の途中でプロセスが止まると `publish.lock` が残ります。ほかのロックと同じく、プロセスが止まったことを確かめてから人間が退避してください。
+- Implement の開始は、スナップショットをロックの外で取ってから、ロックの中で確かめ直して run を作ります。大きなリポジトリでも、ほかの会話の入力がロック待ちで失敗しにくくなりました。
+
+0.9.0 から 0.8.x に戻すと、0.9.0 で作った run は読めますが、0.8.x の制約に戻るので、未完了の run が1つでもあると新しい run を始められません。
 
 ## 0.8.1 への更新
 

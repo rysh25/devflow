@@ -9,15 +9,16 @@ import re
 from uuid import uuid4
 
 from ..common.errors import CaptureError, DevFlowError
+from ..common.paths import path_key
 from ..common.review import (LIMIT_DECISIONS, REVIEW_BUDGET, after_failed_review, all_approved, ask_at_limit, decide_at_limit,
                              next_reviewer)
 from ..common.reviewers import preflight, prepare_review, recorded_cli_version, review_tokens, run_review
 from ..common.engine import RunEngine
-from ..common.runs import RUNNER_WAIT, TERMINAL, open_escalation
+from ..common.runs import RUNNER_WAIT, TERMINAL, ensure_data_root, open_escalation
 from ..common.sessions import approval_candidates
 from ..common import summary
-from ..common.storage import (atomic_json, check_json_size, checked_text, digest, json_bytes, no_symlinks, now,
-                              read_json, within, write_new, writable_text)
+from ..common.storage import (atomic_json, check_json_size, checked_text, digest, file_lock, json_bytes, no_symlinks,
+                              now, read_json, within, write_new, writable_text)
 from .config import FILENAME_DEFAULT, publish_name
 from .review import validate_review
 from .transcript import capture_interview
@@ -527,84 +528,90 @@ class Engine(RunEngine):
                 return self.status(run_id)
             publication = dict(state.get("publication", {}))
             try:
-                run = self._run(run_id)
-                source = run / state["current_plan"]
-                no_symlinks(source)
-                data = source.read_bytes()
-                if digest(data) != state["plan_hash"]:
-                    raise DevFlowError("The approved plan bytes changed; publication is forbidden.")
-                if publication.get("path"):
-                    if publication.get("plan_hash") != state["plan_hash"] or "approval.md" not in state["artifacts"]:
-                        raise DevFlowError("A publication intent belongs to a different plan hash.")
-                    target = within(self.project / publication["path"], self.project)
-                else:
-                    directory = within(self.project / state["config"]["publish"]["directory"], self.project)
-                    request = read_json(run / "request.json")["request"]
-                    # A run started before 0.7.3 has no filename and keeps the default rule.
-                    template = state["config"]["publish"].get("filename", FILENAME_DEFAULT)
-                    name = publish_name(template, request, run_id)
-                    # The plan and its approval record take one name; neither file may exist.
-                    for candidate in (name, name + "-" + run_id):
-                        target = within(directory / (candidate + ".md"), self.project)
-                        record = within(directory / (candidate + ".approval.md"), self.project)
-                        if not target.exists() and not record.exists():
-                            break
+                # One publication at a time in the project: choosing a name and writing the files
+                # are serialized (lock order: run, then publish).
+                with file_lock(ensure_data_root(self.project) / "publish.lock", self.store.lock_wait):
+                    run = self._run(run_id)
+                    source = run / state["current_plan"]
+                    no_symlinks(source)
+                    data = source.read_bytes()
+                    if digest(data) != state["plan_hash"]:
+                        raise DevFlowError("The approved plan bytes changed; publication is forbidden.")
+                    if publication.get("path"):
+                        if publication.get("plan_hash") != state["plan_hash"] or "approval.md" not in state["artifacts"]:
+                            raise DevFlowError("A publication intent belongs to a different plan hash.")
+                        target = within(self.project / publication["path"], self.project)
                     else:
-                        raise DevFlowError("Both publication filenames (or their approval records) already exist; "
-                                           "existing files were preserved.")
-                    publication = {"status": "publishing", "path": target.relative_to(self.project).as_posix(),
-                                   "approval_path": record.relative_to(self.project).as_posix(),
-                                   "plan_hash": state["plan_hash"], "intent_at": now()}
+                        directory = within(self.project / state["config"]["publish"]["directory"], self.project)
+                        request = read_json(run / "request.json")["request"]
+                        # A run started before 0.7.3 has no filename and keeps the default rule.
+                        template = state["config"]["publish"].get("filename", FILENAME_DEFAULT)
+                        name = publish_name(template, request, run_id)
+                        # The plan and its approval record take one name; neither file may exist,
+                        # and no other plan run's saved publication intent may hold it.
+                        reserved = self._publication_reservations(run_id)
+                        for candidate in (name, name + "-" + run_id):
+                            target = within(directory / (candidate + ".md"), self.project)
+                            record = within(directory / (candidate + ".approval.md"), self.project)
+                            taken = {path_key(target), path_key(record)} & reserved
+                            if not target.exists() and not record.exists() and not taken:
+                                break
+                        else:
+                            raise DevFlowError("Both publication filenames (or their approval records) already exist; "
+                                               "existing files were preserved.")
+                        publication = {"status": "publishing", "path": target.relative_to(self.project).as_posix(),
+                                       "approval_path": record.relative_to(self.project).as_posix(),
+                                       "plan_hash": state["plan_hash"], "intent_at": now()}
+                        state["publication"] = publication
+                        # The approval record is made once, with the intent, before anything is written
+                        # outside the run; a resumed publication writes the same bytes.
+                        self._artifact(state, "approval.md", self._approval_record(state, publication, acceptance).encode("utf-8"))
+                        # Persist intent before writing outside the run directory.
+                        self._save(state)
+                    no_symlinks(target)
+                    if target.exists():
+                        if not target.is_file() or target.read_bytes() != data:
+                            raise DevFlowError("The publication target differs from the approved plan; it was not overwritten.")
+                    else:
+                        if "publication.json" in state["artifacts"]:
+                            raise DevFlowError("The previously published plan was removed; it was not silently recreated.")
+                        write_new(target, data)
+                    no_symlinks(target)
+                    if target.read_bytes() != data:
+                        raise DevFlowError("The exported plan changed during publication.")
+                    approval_target = within(self.project / publication["approval_path"], self.project)
+                    approval = self.store.record(state, "approval.md")
+                    no_symlinks(approval_target)
+                    if approval_target.exists():
+                        if not approval_target.is_file() or approval_target.read_bytes() != approval:
+                            raise DevFlowError("The approval record target differs from the recorded approval record; "
+                                               "it was not overwritten.")
+                    else:
+                        if "publication.json" in state["artifacts"]:
+                            raise DevFlowError("The previously published approval record was removed; "
+                                               "it was not silently recreated.")
+                        write_new(approval_target, approval)
+                    no_symlinks(approval_target)
+                    if approval_target.read_bytes() != approval:
+                        raise DevFlowError("The exported approval record changed during publication.")
+                    # Whether a receipt exists is decided by the committed records, never by a
+                    # file a stopped save may have left.
+                    if "publication.json" in state["artifacts"]:
+                        receipt = read_json(run / "publication.json")
+                        if (receipt.get("path") != publication["path"] or receipt.get("plan_hash") != state["plan_hash"]
+                                or receipt.get("approval_path") != publication["approval_path"]):
+                            raise DevFlowError("The existing publication receipt does not match this target.")
+                    else:
+                        receipt = {"schema_version": 2, "run_id": run_id, "path": publication["path"],
+                                   "approval_path": publication["approval_path"], "plan_hash": state["plan_hash"],
+                                   # The time written in the approval record.
+                                   "published_at": publication["intent_at"],
+                                   "approval": "reviewers" if reviewed else "human"}
+                        self._artifact(state, "publication.json", json_bytes(receipt))
+                    publication.update(status="published", published_at=receipt["published_at"])
+                    publication.pop("error", None)
                     state["publication"] = publication
-                    # The approval record is made once, with the intent, before anything is written
-                    # outside the run; a resumed publication writes the same bytes.
-                    self._artifact(state, "approval.md", self._approval_record(state, publication, acceptance).encode("utf-8"))
-                    # Persist intent before writing outside the run directory.
                     self._save(state)
-                no_symlinks(target)
-                if target.exists():
-                    if not target.is_file() or target.read_bytes() != data:
-                        raise DevFlowError("The publication target differs from the approved plan; it was not overwritten.")
-                else:
-                    if "publication.json" in state["artifacts"]:
-                        raise DevFlowError("The previously published plan was removed; it was not silently recreated.")
-                    write_new(target, data)
-                no_symlinks(target)
-                if target.read_bytes() != data:
-                    raise DevFlowError("The exported plan changed during publication.")
-                approval_target = within(self.project / publication["approval_path"], self.project)
-                approval = self.store.record(state, "approval.md")
-                no_symlinks(approval_target)
-                if approval_target.exists():
-                    if not approval_target.is_file() or approval_target.read_bytes() != approval:
-                        raise DevFlowError("The approval record target differs from the recorded approval record; "
-                                           "it was not overwritten.")
-                else:
-                    if "publication.json" in state["artifacts"]:
-                        raise DevFlowError("The previously published approval record was removed; "
-                                           "it was not silently recreated.")
-                    write_new(approval_target, approval)
-                no_symlinks(approval_target)
-                if approval_target.read_bytes() != approval:
-                    raise DevFlowError("The exported approval record changed during publication.")
-                # Whether a receipt exists is decided by the committed records, never by a
-                # file a stopped save may have left.
-                if "publication.json" in state["artifacts"]:
-                    receipt = read_json(run / "publication.json")
-                    if (receipt.get("path") != publication["path"] or receipt.get("plan_hash") != state["plan_hash"]
-                            or receipt.get("approval_path") != publication["approval_path"]):
-                        raise DevFlowError("The existing publication receipt does not match this target.")
-                else:
-                    receipt = {"schema_version": 2, "run_id": run_id, "path": publication["path"],
-                               "approval_path": publication["approval_path"], "plan_hash": state["plan_hash"],
-                               # The time written in the approval record.
-                               "published_at": publication["intent_at"],
-                               "approval": "reviewers" if reviewed else "human"}
-                    self._artifact(state, "publication.json", json_bytes(receipt))
-                publication.update(status="published", published_at=receipt["published_at"])
-                publication.pop("error", None)
-                state["publication"] = publication
-                self._save(state)
             except (DevFlowError, OSError, ValueError) as exc:
                 # A state whose save may have failed is never saved again: the
                 # error is recorded on the committed state.
@@ -614,6 +621,31 @@ class Engine(RunEngine):
                 self._save(state)
                 raise DevFlowError(f"Plan reviews completed, but publication failed: {exc}") from exc
         return self.status(run_id)
+
+    def _publication_reservations(self, run_id: str) -> set[str]:
+        """Plan and approval-record paths held by other plan runs' saved publication intents.
+
+        An intent is saved before anything is written, so a run whose writing failed keeps
+        its name for the retry. An unreadable run's intent is not seen; its name is then
+        protected only by the rule that an existing file is never overwritten. Paths are
+        compared the way the OS compares them (``path_key``), so a name that differs only
+        in case is the same file where the file system folds case.
+        A malformed publication value of another run, or a path of it that can no longer be
+        resolved, is skipped like an unreadable run.
+        """
+        taken: set[str] = set()
+        for info in self.store.scan()[0]:
+            publication = info.state.get("publication") if info.format == "current" else None
+            if info.run_id == run_id or not isinstance(publication, dict):
+                continue
+            for key in ("path", "approval_path"):
+                value = publication.get(key)
+                if isinstance(value, str) and value:
+                    try:
+                        taken.add(path_key(self.project / value))
+                    except (OSError, ValueError, RuntimeError):  # RuntimeError: a symlink loop before Python 3.13.
+                        continue
+        return taken
 
     def _approval_record(self, state: dict, publication: dict, acceptance: dict | None) -> str:
         """The approval record published beside the plan (fixed English Markdown)."""

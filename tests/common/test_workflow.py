@@ -5,7 +5,7 @@ import unittest
 
 from devflow_core import cli
 from devflow_core.common.errors import DevFlowError, UsageError
-from devflow_core.common.workflow import OPTION_KINDS, Option
+from devflow_core.common.workflow import OPTION_KINDS, Option, Workflow
 from devflow_core.workflows import WORKFLOWS
 
 
@@ -71,6 +71,20 @@ class StartContractTests(unittest.TestCase):
         self.assertEqual(WORKFLOWS["plan"].start_options(argparse.Namespace()), {})
         with self.assertRaises(UsageError):
             parser.parse_args(["--host", "claude", "implement", "start", "--plan", "plan.md", "--unknown", "x"])
+
+
+
+class WorkspaceOccupancyTests(unittest.TestCase):
+    def test_only_a_workflow_that_declares_it_occupies_a_workspace(self):
+        self.assertFalse(Workflow.occupies_workspace)
+        with self.assertRaises(NotImplementedError):
+            Workflow().workspace({})
+        self.assertEqual({name: workflow.occupies_workspace for name, workflow in WORKFLOWS.items()},
+                         {"plan": False, "implement": True})
+
+    def test_an_implementation_run_occupies_its_frozen_workspace(self):
+        state = {"workspace": {"path": "/frozen/worktree", "git_common_dir": None, "git_dir": None, "identity": None}}
+        self.assertEqual(WORKFLOWS["implement"].workspace(state), "/frozen/worktree")
 
 
 if __name__ == "__main__":
