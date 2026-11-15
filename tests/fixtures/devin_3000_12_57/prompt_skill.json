@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "/probe:ask",
+  "source": "user",
+  "session_id": "glitter-rubidium",
+  "prompt_id": "78996198-7f07-4d9d-9977-dff12775309c"
+}

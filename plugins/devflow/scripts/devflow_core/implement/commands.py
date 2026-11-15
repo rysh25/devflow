@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import shutil
 
-from ..common.hosts import executable_name
+from ..common.hosts import executable_name, host_profile
 
 from .. import __version__
 from ..common.environment import python_errors
@@ -41,7 +41,7 @@ def doctor(engine, args, run_id, session) -> dict:
             "warnings": workflow.doctor(engine.project, config, host=engine.host).get("warnings", [])
                         + [text for item in results for text in item.get("details", {}).get("version_warnings", [])],
             "not_verified": ["CLI authentication and model access", "Actual model used by provider",
-                             "Real Claude Code hook execution", "Native Windows/macOS behavior"],
+                             f"Real {host_profile(engine.host).label} hook execution", "Native Windows/macOS behavior"],
             "note": "Offline help/version probes only. Does not install tools, authenticate, or incur model usage."}
 
 

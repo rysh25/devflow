@@ -2,30 +2,12 @@
 
 ## 新規インストール
 
-1. ZIP を解凍します。`devflow/.claude-plugin/marketplace.json` が存在することを確認します。
-2. **Claude Code 2.1.316 以降**と、同じ環境で起動できる `uv`、互換 Python 3.11 以降、Codex CLI、OpenCode CLI を用意します。必要な認証は各 CLI の通常手順で行います。Windows の `uv` は実行可能な `uv.exe` が必要です。
-3. Plan を使うなら、Claude Code の `Skill` ツールから呼び出せる `grilling` スキルを別途導入します。実際の呼び出し名を `plan.grill_skill` に設定できます。`disable-model-invocation: true` のスキルは利用できません。
-4. 解凍先の `devflow` でターミナルを開きます。
+1. 使うホスト（**Claude Code 2.1.316 以降**、Codex CLI、Devin CLI のどれか）と、同じ環境で起動できる `uv`、互換 Python 3.11 以降、使うレビュアーの CLI（既定は Codex CLI と OpenCode CLI）を用意します。必要な認証は各 CLI の通常手順で行います。Windows の `uv` は実行可能な `uv.exe` が必要です。
+2. Plan を使うなら、ホストから呼び出せる `grilling` スキルを別途導入します。実際の呼び出し名を `plan.grill_skill` に設定できます。Claude Code では `disable-model-invocation: true` のスキルは利用できません。
+3. 使うホストに DevFlow のプラグインを入れます（[プラグインの導入と更新](#プラグインの導入と更新)）。GitHub からでも、ローカルの配布物からでも入れられます。
+4. 対象プロジェクトで `/devflow:doctor`（Codex では `$devflow:doctor`）を実行します。
 
-```text
-claude plugin marketplace add .
-claude plugin install devflow@devflow-marketplace --scope user
-```
-
-marketplace の名前は `devflow-marketplace`、plugin の名前は `devflow` です。インストールするプラグインはこの一つだけです。
-
-`--scope user` はその環境の各プロジェクトで使う場合の指定です。チーム共通の `project` や、このプロジェクトだけの `local` は利用方針に合わせて選択してください。user scope でも別 PC・WSL へ自動インストールされるわけではありません。
-
-Claude Code のセッション内からは、実際の解凍先パスを使います。
-
-```text
-/plugin marketplace add /absolute/path/to/devflow
-/plugin install devflow@devflow-marketplace
-```
-
-パスは例です。実在するパスへ置き換えてください。画面でスコープと導入内容を確認し、反映時期は install summary に従ってください。必要なら `/reload-plugins` または新しいセッションを使用します。
-
-対象プロジェクトで `/devflow:doctor` を実行します。doctor は環境診断であり、アカウントで指定モデルが使えることまで保証するものではありません。doctor はプロジェクトのファイルを書きませんが、設定したレビュアー CLI の `--version` と、使うサブコマンドの `--help` を実行します。確かめた版より新しい CLI や Claude Code では警告を出します（止めません）。
+doctor は環境診断であり、アカウントで指定モデルが使えることまで保証するものではありません。doctor はプロジェクトのファイルを書きませんが、設定したレビュアー CLI の `--version` と、使うサブコマンドの `--help` を実行します。確かめた版より新しい CLI や Claude Code では警告を出します（止めません）。
 
 ### 長い処理の待ち時間（任意）
 
@@ -83,40 +65,125 @@ DevFlow の git は、利用者の git の設定（`core.autocrlf` など）を�
 
 `/devflow:doctor` は現在のプロジェクト設定を診断します。Plan 実行中にランナーから呼ぶ `plan doctor` は、対象の session / run がある場合、その実行に保存された固定設定を診断します。結果の `configuration_source` と `run_id` で対象を確認できます。新しい設定が進行中の実行に適用済みだとは解釈しないでください。
 
-## GitHub から導入する
+## プラグインの導入と更新
 
-ZIP 内の `devflow` ディレクトリの **中身** を GitHub リポジトリのルートへ置きます。直下に `.claude-plugin/marketplace.json` が必要です。
+DevFlow は1つのプラグイン `devflow` で、Claude Code、Codex CLI、Devin CLI に入れられます。入れる元は次の2つです。
+
+- **GitHub**：リポジトリ `rysh25/devflow`。既定のブランチ（`main`）にある、公開した最新の版が入ります。
+- **ローカルの配布物**：配布 ZIP を解凍した `devflow` ディレクトリか、リポジトリのクローン。直下に `.claude-plugin/marketplace.json`（Claude Code 用）と `.agents/plugins/marketplace.json`（Codex 用）があり、プラグイン本体は `plugins/devflow` です。ローカルの配布物は更新元にもなるので、プロジェクトの外の安定した場所に置き、入れた後に削除・移動しないでください。対象プロジェクトの `.devflow/` 作業ディレクトリとは別のものです。
+
+| ホスト | GitHub から入れる | 更新する |
+|---|---|---|
+| Claude Code | `claude plugin marketplace add rysh25/devflow`<br>`claude plugin install devflow@devflow-marketplace --scope user` | `claude plugin marketplace update devflow-marketplace`<br>`claude plugin update devflow@devflow-marketplace` |
+| Codex CLI | `codex plugin marketplace add rysh25/devflow`<br>`codex plugin add devflow@devflow-marketplace` | `codex plugin marketplace upgrade devflow-marketplace` |
+| Devin CLI | `devin plugins install rysh25/devflow#plugins/devflow` | `devin plugins update devflow` |
+| OpenCode | DevFlow のプラグインはありません（レビュアーとして CLI を呼ぶだけです） | CLI の更新は `opencode upgrade` |
+
+marketplace の名前は `devflow-marketplace`、プラグインの名前は `devflow` です。インストールするプラグインはこの一つだけです。どのホストでも、入れ替えた版は、起動し直した新しいセッションから使われます。更新の前に「[更新の前後](#更新の前後)」を確認してください。
+
+### Claude Code に入れる
+
+GitHub から入れる：
 
 ```text
-claude plugin marketplace add OWNER/REPOSITORY
+claude plugin marketplace add rysh25/devflow
 claude plugin install devflow@devflow-marketplace --scope user
 ```
 
-`OWNER/REPOSITORY` はプレースホルダーです。本配布物の作成によって GitHub リポジトリを作成・公開・push することはありません。
+ローカルの配布物から入れる（配布物の `devflow` ディレクトリでターミナルを開きます）：
 
-public は必須ではありません。private も、実行環境の通常の GitHub/Git 認証で読み取れる場合に利用できます。認証情報を plugin、設定、ZIP に埋め込まないでください。組織の marketplace 許可ポリシーも適用されます。
+```text
+claude plugin marketplace add .
+claude plugin install devflow@devflow-marketplace --scope user
+```
 
-## 更新する
+Claude Code のセッション内からは、次のように入れます。ローカルの配布物なら、`rysh25/devflow` の代わりに実際の配布物の絶対パス（例：`/absolute/path/to/devflow`）を使います。
 
-更新の前に、README の「0.9.1 への更新」（それより前の版から上げるときは「0.9.0 への更新」「0.8.1 への更新」「0.8.0 への更新とバージョンを戻す場合」「0.7.3 への更新」「0.7.2 への更新」「0.7.1 への更新」「0.7.0 への更新」「0.6.0 への更新」「0.5.1 への更新」「0.5.0 への更新」「0.4.0 への更新」も）で、その版の注意点を確認してください。版によっては、それまでの run を続けられないことがあります（例：0.6.x で始めた run は 0.7.0 では続けられません）。
+```text
+/plugin marketplace add rysh25/devflow
+/plugin install devflow@devflow-marketplace
+```
 
-### GitHub から導入した場合
+画面でスコープと導入内容を確認し、反映時期は install summary に従ってください。必要なら `/reload-plugins` または新しいセッションを使用します。
+
+`--scope user` はその環境の各プロジェクトで使う場合の指定です。チーム共通の `project` や、このプロジェクトだけの `local` は利用方針に合わせて選択してください。user scope でも別 PC・WSL へ自動インストールされるわけではありません。
+
+更新する（GitHub からでも、ローカルの配布物からでも同じです）：
 
 ```text
 claude plugin marketplace update devflow-marketplace
 claude plugin update devflow@devflow-marketplace
 ```
 
-- 1つ目で、登録したリポジトリから最新の内容を読み込みます。2つ目で、プラグインを新しい版に入れ替えます。`claude plugin update` にはプラグインの名前 `devflow@devflow-marketplace` が必要です。
+- 1つ目で、登録した元（GitHub のリポジトリかローカルの配布物）から最新の内容を読み込みます。2つ目で、プラグインを新しい版に入れ替えます。`claude plugin update` にはプラグインの名前 `devflow@devflow-marketplace` が必要です。
+- ローカルの配布物から入れた場合は、先に登録したディレクトリの中身を新しい配布物の中身に置き換えます。Claude Code はローカルのプラグインも版ごとの場所へ写して使うので、中身を置き換えただけでは入れ替わりません（Claude Code 2.1.325 で確認）。
 - `user` 以外のスコープに入れた場合は、`--scope project` のようにスコープを付けます。
 - 入れ替えた版は、Claude Code を起動し直すか、セッション内で `/reload-plugins` を実行すると使われます。それまでは、起動中のセッションは前の版のまま動きます。
 - `already at the latest version` と表示された場合は、版が変わっていません。DevFlow は `plugin.json` に版を書いているので、版が上がるまで新しい内容は入りません。
 
-### ZIP から導入した場合
+### Codex CLI に入れる
 
-`claude plugin marketplace add .` で登録したディレクトリの中身を、新しい配布物の中身に置き換えます。このプラグインはそのディレクトリから直接読み込まれるので、`claude plugin update` は不要です。Claude Code を起動し直すか、`/reload-plugins` を実行すると反映されます。
+対象はローカル Codex CLI 0.166.0 以降です。GitHub から入れる：
 
-### 更新の後
+```text
+codex plugin marketplace add rysh25/devflow
+codex plugin add devflow@devflow-marketplace
+```
+
+ローカルの配布物から入れる：
+
+```text
+codex plugin marketplace add /absolute/path/to/devflow
+codex plugin add devflow@devflow-marketplace
+```
+
+入れた後に、フックの信頼と質問機能の有効化が要ります（「[Codex CLI の導入（0.8.0）](#codex-cli-の導入080)」）。
+
+更新する：
+
+- **GitHub から入れた場合**：`codex plugin marketplace upgrade devflow-marketplace` を実行します。登録したリポジトリの最新を読み込み、入れたプラグインも新しい版に入れ替わります（codex-cli 0.169.0 で、0.9.0 から 0.9.1 への入れ替わりを確認）。Codex CLI には `plugin update` の操作はありません。
+- **ローカルの配布物から入れた場合**：`marketplace upgrade` は Git の marketplace だけが対象で、ローカルでは `is not configured as a Git marketplace` で終わります。登録したディレクトリの中身を新しい配布物の中身に置き換えてから、`codex plugin add devflow@devflow-marketplace` をもう一度実行すると、新しい版に入れ替わります。
+- 入れ替えた版は新しいセッションで使われます。`/hooks` で、フックの再確認を求められることがあります。
+
+### Devin CLI に入れる
+
+プラグインの管理には Devin へのログイン（`devin auth login`）が要ります。GitHub から入れる：
+
+```text
+devin plugins install rysh25/devflow#plugins/devflow
+```
+
+ローカルの配布物から入れる（プラグイン本体の `plugins/devflow` を指定します）：
+
+```text
+devin plugins install /absolute/path/to/devflow/plugins/devflow
+```
+
+この機械だけに入れるときは `--local` を付けます。入れたら `devin plugins list` で `devflow` が表示されることを確かめます。プロジェクトの信頼とランナーの承認は「[Devin CLI](#devin-cli)」を見てください。
+
+更新する（GitHub からでも、ローカルの配布物からでも同じです）：
+
+```text
+devin plugins update devflow
+```
+
+GitHub から入れた場合は最新の内容を取り直して入れ直し、ローカルの配布物から入れた場合は登録したパスから入れ直します（Devin CLI 3000.12.57 で、ローカルのパスから入れたプラグインの版が上がることを確認）。入れ直しても更新できます。以前に Devin へ 0.9.x を入れていた場合も、0.10.0 以降に更新するか入れ直してください（0.9.x は Devin に対応しておらず、すべてのプロンプトが止まります）。
+
+### OpenCode
+
+DevFlow は OpenCode をレビュアーとして呼ぶだけで、OpenCode に入れる DevFlow のプラグインはありません。OpenCode CLI を OpenCode の手順で入れて認証し、`opencode upgrade` で更新します。Claude Code、Codex CLI、Devin CLI をレビュアーとしてだけ使う場合も、プラグインは要らず、その CLI と認証だけが要ります。
+
+### フォークや private のリポジトリから入れる
+
+自分のリポジトリに置く場合は、ZIP 内の `devflow` ディレクトリの **中身** を GitHub リポジトリのルートへ置き、上のコマンドの `rysh25/devflow` を `OWNER/REPOSITORY` に読み替えます。直下に `.claude-plugin/marketplace.json` と `.agents/plugins/marketplace.json` が必要です。本配布物の作成によって GitHub リポジトリを作成・公開・push することはありません。
+
+public は必須ではありません。private も、実行環境の通常の GitHub/Git 認証で読み取れる場合に利用できます。認証情報を plugin、設定、ZIP に埋め込まないでください。組織の marketplace 許可ポリシーも適用されます。
+
+### 更新の前後
+
+更新の前に、README の「0.10.0 への更新」（それより前の版から上げるときは「0.9.1 への更新」「0.9.0 への更新」「0.8.1 への更新」「0.8.0 への更新とバージョンを戻す場合」「0.7.3 への更新」「0.7.2 への更新」「0.7.1 への更新」「0.7.0 への更新」「0.6.0 への更新」「0.5.1 への更新」「0.5.0 への更新」「0.4.0 への更新」も）で、その版の注意点を確認してください。版によっては、それまでの run を続けられないことがあります（例：0.6.x で始めた run は 0.7.0 では続けられません）。
+
+更新の後：
 
 - 対象プロジェクトで `/devflow:doctor` を実行し、`version` が新しい版になっていることを確認します。
 - 実行中の run がある場合は、レビューやチェックの外部処理が終わってから更新してください。新しい会話で続けるときは `/devflow:resume RUN_ID` を使います。面接の途中の Plan は元の会話でしか続けられないので、面接を終えてから更新してください。
@@ -170,16 +237,17 @@ Git モードでは、新規作成された正式プランや設定ファイル�
 - [Claude Code plugin manifest](https://code.claude.com/docs/en/plugins-reference)
 - [Claude Code plugin の読み込み・版・更新](https://code.claude.com/docs/en/plugins/loading)
 - [Claude Code のツール（Bash の待ち時間とバックグラウンド実行）](https://code.claude.com/docs/en/tools-reference)
+- [Codex CLI のコマンド（`codex plugin`）](https://developers.openai.com/codex/cli/reference)
+- [Devin CLI のプラグイン](https://docs.devin.ai/cli/extensibility/plugins/overview)
 - [uv script metadata](https://docs.astral.sh/uv/guides/scripts/)
 
 ## Codex CLI の導入（0.8.0）
 
 対象はローカル Codex CLI 0.166.0 以降です。既存 CLI・Python・uv・各レビュアーの認証を用意し、
-導入先とフックを人間が確認します。同じ配布ルートを登録します。
+導入先とフックを人間が確認します。プラグインの入れ方と更新は「[Codex CLI に入れる](#codex-cli-に入れる)」にあります。
+入れた後、質問機能を有効にして起動します。
 
 ```text
-codex plugin marketplace add /absolute/path/to/devflow
-codex plugin add devflow@devflow-marketplace
 codex --enable default_mode_request_user_input
 ```
 
@@ -200,6 +268,11 @@ review / check でネットワークやホームへの書き込みが必要に�
 診断の静的 ready は実行権限・認証を保証しません。必要な処理ごとに Codex 標準の承認を求め、
 利用者が同意したコマンドだけを実行します。昇格は必須条件にせず、設定も自動変更しません。
 長い処理は exec_command の session_id を write_stdin へ渡して完了まで待ち、再実行しません。
+Codex の workspace-write のサンドボックスの中では、Codex 自身を起動するランナーの操作が失敗します。
+会話 API の確認（`plan doctor --session`）と面接の確定（`plan seal`）は「Codex conversation API closed before replying」で止まり、
+次のレビュアーが Codex の `review` は、そのレビュアーが `os error 30` で失敗します（codex-cli 0.169.0 で実測。0.9.1 でも同じです）。
+DevFlow は Codex に、これらを実行する前にサンドボックスの外で実行する標準の承認を求めるよう指示しています。
+承認するとその回だけサンドボックスの外で実行され、レビューの回をサンドボックスの失敗で使わずに済みます。
 この環境では、親 Codex 内に別の Codex を起動した際の bubblewrap の失敗も観測しています。
 詳細・権限ごとの結果は [成立確認](codex-host-validation.md) を参照してください。
 
@@ -250,3 +323,76 @@ uv --no-cache run --offline --no-project --no-config --no-python-downloads "PLUG
 取得はCaptureErrorで止まり、推測した変換で続けません。
 seal は1ページ100項目、最大10,000ページを取得します。doctor の conversation_api に制限値と検査範囲を表示します。
 会話・質問の原文を取得できない場合は、要約への置き換えや、欠落した回答の推測で続行しません。
+
+## Devin CLI
+
+0.10.0 から、ローカルの Devin CLI をホストとレビュアーに使えます。確かめたのは Linux / WSL の
+Devin CLI 3000.12.57 です。Devin Desktop、Devin Cloud、ACP のエディター連携、macOS と
+ネイティブの Windows は確かめていません。`uv`、互換 Python 3.11 以降、使うレビュアーの CLI を、
+Devin と同じ環境に用意してください。
+
+### 導入と更新
+
+入れ方と更新は「[Devin CLI に入れる](#devin-cli-に入れる)」にあります。プラグインの `.devin-plugin/plugin.json` は
+`"platforms": ["local"]` なので、ローカルの CLI と Desktop だけに読み込まれ、Devin Cloud には同期されません。
+
+Devin は、プラグインのルートの `hooks.json` を読みます。DevFlow はそこで `UserPromptSubmit` と、
+`ask_user_question` だけの `PreToolUse` / `PostToolUse` を登録します。フックはシェルのコマンド文字列で、
+`--host devin hook` でランナーを起動します。
+
+### 信頼と承認
+
+1. **プロジェクトを信頼する。** 初めてのプロジェクトでは、`devin` をそのプロジェクトで起動し、信頼を選びます。
+   信頼していないプロジェクトでは、Devin をレビュアーにした回が `Refusing to run in an untrusted workspace` で
+   失敗します。DevFlow は `--respect-workspace-trust false` や `--permission-mode` を渡しません。
+2. **ランナーを承認する。** スキルはランナーを事前に許可しません。Devin は許可の規則を文字どおりに照合し、
+   プラグインのパスを展開しないので、ランナーだけを許す規則を配布物に書けないためです。Devin がランナーの
+   コマンドの承認を求めたら、Devin の標準の承認で許可してください。DevFlow は利用者の設定を変えません。
+
+### 確かめる
+
+Devin でプロジェクトを開き、次を送ります。
+
+```text
+/devflow:doctor
+```
+
+`host_diagnostics` に Devin CLI の版、`workflows.plan.interview_skill` に面接スキルの判定が出ます。
+Devin の doctor は静的な確認だけで、会話の API の確認（Codex の `conversation_api`）はありません。
+
+### 面接スキルの場所
+
+`plan.grill_skill` のスキルは、Devin の skill ツールから呼べる必要があります。doctor は、Devin の公開資料と
+`devin skills paths` に載っている次の場所の `<名前>/SKILL.md` を調べます。プロジェクトは根だけを調べ、
+親のディレクトリへはたどりません。Windsurf のグローバルのスキル（`~/.codeium/<チャンネル>/skills`）は、Devin が自分のリリースのチャンネルに合う場所だけを読み、そのチャンネルをオフラインで確かめる方法が公開されていないので、調べません。
+
+| 範囲 | 場所 |
+|---|---|
+| プロジェクト | `.devin/skills`、`.cognition/skills`、`.agents/skills`、`.windsurf/skills`、`.kiro/skills`、取り込みの `.claude/skills`、`.github/skills`、`.codex/skills`、`.codeium/skills` |
+| 利用者 | `~/.config/devin/skills`（Windows は `%APPDATA%\devin\skills`）、`~/.config/cognition/skills`、`~/.agents/skills`、`~/.kiro/skills`、取り込みの `~/.copilot/skills`（`COPILOT_HOME` があればその下）、`~/.codex/skills` |
+
+判定には Devin の frontmatter の項目だけを使います（Claude の `disable-model-invocation` などは使いません）。
+
+- `triggers` に `model` が無い（例 `[user]`）と、モデルが呼べないので使えません。
+- `subagent: true` か、`agent` にプロファイル名があると、サブエージェントで動き、サブエージェントには
+  `ask_user_question` が無いので使えません。`subagent: false` は省略したときと同じです。
+- Devin が読めない frontmatter（`: ` を含む引用符なしの値など）は、Devin が警告なしにスキルを読み込まないので使えません。
+- `triggers` がリストでない、`subagent` が引用符なしの真偽値（`true`・`false`）でない場合は、公開資料の型に合わないので「未確認」と表示します（`"false"`、`0`、`yes` などを読み替えません）。
+- 調べた場所に無いときは「調べた場所には無い」と表示します。プラグインのスキル、Devin Cloud のスキル、
+  設定（取り込みの無効化など）による変更は確かめません。
+
+### フックの終了コード
+
+Devin は、フックのコマンドが終了コード 2 で終わるとプロンプトを止めます（`Prompt blocked`）。DevFlow のランナーは
+hook の失敗を、引数の誤りも含めていつも終了コード 1 で返すので、止まりません。ランナーより前の失敗は防げません。
+存在する `uv` が引数の誤りで 2 を返すと止まります（0.9.1 を Devin に入れたときに実測）。`uv` が見つからないときは
+シェルが 127 を返し、公開資料どおりなら止まりませんが、Devin での動作は確かめていません。`/devflow:doctor` の
+`executables.uv` で `uv` が見つかることを確かめてください。
+
+### Devin をレビュアーにする
+
+`reviewers` に `{"kind": "devin", "command": ["devin"], "model": "swe-2", "effort": "high"}` のように書くか、
+起動時に `--reviewer devin swe-2 high` を指定します。DevFlow は `--model swe-2-high` のように `model` と `effort` を
+`-` でつないで渡します。選べる組み合わせは `devin models list` で確かめてください。レビュアーは run の
+プロジェクト（Implement では実装場所）で `devin --print` として動き、承認が要るツールは Devin 自身が断ります
+（待ち続けません）。

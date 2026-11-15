@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 import shutil
 
-from ..common.hosts import executable_name
+from ..common.hosts import executable_name, host_profile
 
 from ..common.errors import DevFlowError
 from .interview import INTERVIEW_NAME_PATTERN, inspect_interview_skill
@@ -107,7 +107,8 @@ def diagnose(project: Path, workflow, effective_config: dict | None = None, *, h
         "readiness_scope": "Offline prerequisites only; no runtime Skill or provider calls are verified.",
         "checks_not_performed": [
             "CLI authentication, model availability, supported reasoning variants, and billing",
-            "Claude Code hooks, effective skill permissions/overrides, and actual interview skill execution",
+            f"{host_profile(host).label} hooks, effective skill permissions/overrides, and actual interview "
+            "skill execution",
             "Real Windows/macOS CLI execution",
         ],
         "note": "Offline discovery only. Finding a binary does not verify provider readiness.",

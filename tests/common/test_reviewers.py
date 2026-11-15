@@ -760,7 +760,9 @@ class ProcessTests(unittest.TestCase):
                 self.assertLess(prompt.index(SENTINEL), prompt.index("## Required output schema"))
                 self.assertLess(prompt.index("## Required output schema"), prompt.index(schema))
                 self.assertLess(prompt.index(schema), prompt.index(heading))
-                self.assertTrue(prompt.endswith(heading + "\n" + packet))
+                # The packet unchanged, then the answer reminder as the last words, once.
+                self.assertTrue(prompt.endswith(heading + "\n" + packet + "\n\n" + reviewers.ANSWER_REMINDER))
+                self.assertEqual(prompt.count(reviewers.ANSWER_REMINDER), 1)
                 # The schema follows its heading as plain JSON: no code fence to imitate.
                 schema_heading = "## Required output schema\n"
                 self.assertEqual(prompt.index(schema.rstrip("\n")), prompt.index(schema_heading) + len(schema_heading))
@@ -905,7 +907,7 @@ class TokenTests(unittest.TestCase):
         self.assertIsNone(self.tokens("codex", lines({"type": "turn.started"})))
         (self.work / "stdout.jsonl").unlink()
         self.assertIsNone(reviewers.review_tokens(reviewer("codex"), self.work))
-        self.assertIsNone(reviewers.CLI().tokens(self.work / "stdout.jsonl"))
+        self.assertIsNone(reviewers.CLI().tokens(self.work / "stdout.jsonl", self.work))
 
     def test_counts_survive_an_invalid_answer_or_a_timeout_and_never_fail_a_review(self):
         # The turn completed with its usage, then the output stopped (a timeout) or held no valid answer.

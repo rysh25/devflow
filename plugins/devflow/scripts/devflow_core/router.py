@@ -19,7 +19,7 @@ from . import __version__
 from .common import notices, sessions
 from .common.paths import hook_project, project_root, same_path
 from .common.errors import DevFlowError
-from .common.hosts import question_context, question_tool_name
+from .common.hosts import host_profile, question_context, question_tool_name
 from .common.operations import public_command as detect_command
 from .common.startup import parse_start
 from .common.runs import (HOOK_WAIT, RUN_ID, RUNNER_WAIT, TERMINAL, RunStore, data_root, ensure_data_root,
@@ -35,11 +35,15 @@ def public_command(prompt: str, host: str) -> tuple[str | None, str]:
     return detect_command(prompt, host, (*WORKFLOWS, RESUME, "status", "doctor"))
 
 
-def _entry_context(operation: str, session: str, project: Path, plugin_root: Path) -> dict:
-    return notices.context("UserPromptSubmit", "DevFlow Codex entry context: " + json.dumps({
-        "operation": operation, "host": "codex", "session_id": session, "project": str(project),
+def _entry_context(operation: str, host: str, session: str, project: Path, plugin_root: Path) -> dict | None:
+    """What a host that does not expand the plugin's placeholders needs to run an operation."""
+    profile = host_profile(host)
+    if profile.expands_placeholders:
+        return None
+    return notices.context("UserPromptSubmit", f"DevFlow {profile.label} entry context: " + json.dumps({
+        "operation": operation, "host": host, "session_id": session, "project": str(project),
         "runner": str(notices.runner_path(plugin_root)),
-        "global_arguments": ["--host", "codex", "--project", str(project), "--session", session]}, ensure_ascii=False))
+        "global_arguments": ["--host", host, "--project", str(project), "--session", session]}, ensure_ascii=False))
 
 
 def stores(project: Path, wait: float = RUNNER_WAIT, *, host: str) -> dict[str, RunStore]:
@@ -171,11 +175,12 @@ def _context(event: str, flow: str, state: dict, store: RunStore, plugin_root: P
     return notices.context(event, notices.status_context(WORKFLOWS[flow], state, run_dir, plugin_root, event_id))
 
 
-def _inactive_reason(current: sessions.Binding) -> str:
+def _inactive_reason(current: sessions.Binding, host: str) -> str:
     if not current.supported:
         return unsupported_message(current.run_id, current.schema_version) + "; your next prompt releases it."
     return (f"This session no longer owns DevFlow run {current.run_id} (or its resume did not complete). "
-            f"DevFlow does not record this session; send /devflow:resume {current.run_id} to continue the run.")
+            f"DevFlow does not record this session; send {host_profile(host).command_prefix}resume "
+            f"{current.run_id} to continue the run.")
 
 
 def _start(project: Path, session: str, flow: str, argument: str, payload: dict, record: dict,
@@ -192,8 +197,8 @@ def _start(project: Path, session: str, flow: str, argument: str, payload: dict,
     sessions.write_record(project, record, WORKFLOWS)
     if workflow.start_option is not None:
         extra = "".join(f" {option.flag} is optional." for option in workflow.extra_start_options)
-        entry = (_entry_context(flow, session, project, plugin_root)["hookSpecificOutput"]["additionalContext"]
-                 if all_stores[flow].host == "codex" else "")
+        entry = _entry_context(flow, all_stores[flow].host, session, project, plugin_root)
+        entry = entry["hookSpecificOutput"]["additionalContext"] if entry else ""
         return notices.context("UserPromptSubmit", (entry + " " +
             f"DevFlow {flow} start is pending. Run the {flow} start action with {workflow.start_option} naming "
             f"exactly this input.{extra} Runner: {notices.runner_path(plugin_root)}. Pending input: {args}"))
@@ -292,23 +297,22 @@ def handle_hook(payload: dict, plugin_root: Path, environ=None, *, host: str) ->
     if not isinstance(payload, dict):
         raise DevFlowError("Hook input must be a JSON object")
     event = payload.get("hook_event_name")
-    # hooks.json registers these three events only (tools/package.py checks it):
+    # Each host's hook file registers these three events only (tools/package.py checks it):
     # Supported hosts send only these configured events to this hook.
     if event not in {"UserPromptSubmit", "PreToolUse", "PostToolUse"}:
         return None
-    cwd, session = payload.get("cwd"), payload.get("session_id")
-    if not isinstance(cwd, str) or not cwd or not isinstance(session, str) or not sessions.SESSION_ID.fullmatch(session):
-        raise DevFlowError("Hook requires project cwd and a valid host session ID")
-    from .common.hosts import validate_host
-    validate_host(host)
+    session = payload.get("session_id")
+    if not isinstance(session, str) or not sessions.SESSION_ID.fullmatch(session):
+        raise DevFlowError("Hook requires a valid host session ID")
+    profile = host_profile(host)
     payload = dict(payload, host=host, source=payload)
-    project = (hook_project(Path(cwd), os.environ if environ is None else environ) if host == "claude"
-               else project_root(Path(cwd)))
+    project = hook_project(payload.get("cwd"), os.environ if environ is None else environ,
+                           profile.project_variable, from_cwd=profile.project_from_cwd)
     all_stores = stores(project, HOOK_WAIT, host=host)
     if event == "UserPromptSubmit" and isinstance(payload.get("prompt"), str):
         operation = public_command(payload["prompt"], host)[0]
         if operation in {"status", "doctor"}:
-            return _entry_context(operation, session, project, plugin_root) if host == "codex" else None
+            return _entry_context(operation, host, session, project, plugin_root)
     path = sessions.session_path(project, session)
     info = sessions.inspect_record(path, WORKFLOWS) if path.exists() else None
     if info is not None and info.host is not None and info.host != host:
@@ -332,7 +336,7 @@ def handle_hook(payload: dict, plugin_root: Path, environ=None, *, host: str) ->
         except (DevFlowError, OSError, ValueError) as exc:
             if command is not None:
                 return notices.context(event, (
-                    f"DevFlow did not accept /devflow:{command} ({exc}). Check the runner's status before "
+                    f"DevFlow did not accept {host_profile(host).command_prefix}{command} ({exc}). Check the runner's status before "
                     "continuing, and tell the human this reason."))
             return notices.context(event, _unrecorded(record, exc, "this prompt was not recorded as a run event."))
     if info is not None and info.format == "unsupported":
@@ -384,7 +388,7 @@ def _submit(project: Path, session: str, command: str | None, argument: str, pay
             return None
         if not current.owner:
             # A prompt here is ordinary conversation, never a human event of the run.
-            return notices.context(event, _inactive_reason(current))
+            return notices.context(event, _inactive_reason(current, host))
         store = all_stores[current.flow]
         event_id = store.append_event(current.run_id, payload, "prompt")
         return _context(event, current.flow, store.read(current.run_id), store, plugin_root, event_id)

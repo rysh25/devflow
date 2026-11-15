@@ -1,4 +1,4 @@
-# DevFlow 0.9.1 の検証範囲
+# DevFlow 0.10.0 の検証範囲
 
 ## 再実行方法
 
@@ -23,8 +23,9 @@ python tools/package.py --validate-only
 | Claude Code | 2.1.319 |
 | Codex | codex-cli 0.166.0 |
 | OpenCode | 2.2.5 |
+| Devin CLI | 3000.12.57（0.10.0 から） |
 
-GitHub Actions で、Linux / macOS / Windows × Python 3.11 / 3.12 / 3.13 の全テストが通ることを確かめています（2026-11-04）。
+GitHub Actions で、Linux / macOS / Windows × Python 3.11 / 3.12 / 3.13 の全テストが通ることを、2026-11-04 の時点で確かめました。版ごとの CI の結果は各版の節にあります。
 
 ## 自動テストの対象
 
@@ -619,3 +620,110 @@ Codex ホストは、実機では確かめていません。変更はホスト�
 OpenCode に囲まれた答えを返させる実機の確認はしていません（狙って起こせないため）。フックと会話の記録に触れない変更なので、本物の Claude Code での確認もしていません。
 
 `python tools/test_all.py --quiet`（911 件、Python 3.15 と 3.12）と `python tools/package.py --validate-only` が成功しました。
+
+## 0.10.0 の検証（2026-11-15）
+
+DevFlow 0.10.0 は、Devin CLI をホスト（5操作）とレビュアーに加えました。Claude Code のフックのファイルを `hooks/claude.json` に改名しました。
+
+Devin CLI 3000.12.57（Linux / WSL2）で実測し、記録を `tests/fixtures/devin_3000_12_57/` に残しました（パスと名前を伏せ、レビューの記録は構造だけ）。実測した内容と資料は [Devin の調査](devin-host-research.md) にあります。
+
+- フックの入力：`cwd` が無く、`DEVIN_PROJECT_DIR` がプロジェクトを指すこと。`session_id` の形。
+- `ask_user_question`：答えた質問の `PreToolUse` と `PostToolUse`（答えは `tool_response.output` の文章）、2問の質問、取り消しと検査の失敗では `PreToolUse` しか届かないこと、`PostToolUse` の質問入力に `multi_select` が足されること。
+- スキルの許可の規則が文字どおりに照合され、`${PLUGIN_ROOT}` がどこでも展開されないこと。
+- `devin --print --prompt-file … --model … --export …` の `--export` が ATIF-v1.7 であること、信頼していないプロジェクトでは終了コード 1 で止まること。標準出力が答えだけだという最初の記録は誤りで、実際はエージェントの発言をつないだものだった（下の「Devin レビュアーの答えの読み方の修正」）。
+- `devin skills paths` が示すスキルの場所。
+
+自動テストで確かめたこと：
+
+- Devin の回答の読み方：決まった形のときだけ問いごとの選択の配列に直し、読み飛ばし、空、キーの不一致、重複した問い、接頭辞の無い文章、壊れた JSON は `unknown`、`success: false` と `error` は `failed` になること。画面が足す既定値の違いだけでは、Pre と Post の照合を外さないこと。問いの文や `multi_select` が変わると承認候補にならないこと。
+- Devin のフック：`DEVIN_PROJECT_DIR` が無い・相対・存在しないときの理由、`/devflow:` の5操作の入口の文脈、Plan と Implement の開始と再開、ほかのホストの記録との衝突、面接をフックの記録だけで組み立てること。どの hook の失敗（知らないホストや省略形のオプションなどの引数の誤りを含む）でも終了コード 1 で終わること。
+- Devin のレビュアー：偽の CLI で、引数、標準入力を閉じること、答えと動きとトークン数の読み方、`--export` が無いとき、答えが無いとき、信頼していないときの案内、事前確認、起動時のレビュアー指定。
+- Devin の面接スキル：公開資料の場所のそれぞれ、親のディレクトリをたどらないこと、Windows と `COPILOT_HOME`、frontmatter の判定（`triggers`、`subagent`、`agent`、読めない値、リストでない `triggers` と真偽値でない `subagent` を未確認にすること）、公開資料の例。
+- 配布：3つのマニフェストの版、`hooks/claude.json` と `hooks/codex.json` とルートの `hooks.json`、`hooks/` の既定のファイルが無いこと、Devin のフックのコマンドと照合、`devin-skills/` の frontmatter と本文。
+
+`python tools/test_all.py --quiet`（Python 3.15）と `python tools/package.py --validate-only` が成功しました。
+
+0.9.1 に戻す手順（README の「0.10.0 への更新」）を、インストール済みの 0.9.1 のランナーで確かめました。一時的な git リポジトリで、0.10.0 のランナーに、Devin がホストの Plan と Implement の run と、Claude がホストで Devin をレビュアーに固定した Plan と Implement の run を作らせ、すべて取り消しました。
+
+1. 手順4の前は、0.9.1 の Claude の Implement の開始が、Devin がホストの run を読めないとして止まりました（README に書いたとおり）。
+2. 手順4で Devin がホストの run とセッションの記録を移すと、0.9.1 で `doctor`、`status`、取り消した Claude の run の `status` と再開の入口、新しい Implement と Plan の開始が、止まらずに動きました。Codex の `doctor` も同じです。
+
+終わった（レビューを通った）Devin レビュアーの run は、本物のレビューが要るため、この確認では作っていません。
+
+確かめていないこと：
+
+- macOS とネイティブの Windows の Devin CLI、Devin Desktop、Devin Cloud、ACP のエディター連携。
+- 0.10.0 の GitHub Actions（Linux / macOS / Windows × Python 3.11–3.13）。プルリクエストの CI で確かめる。
+- `uv` が見つからないとき（終了コード 127）に Devin がプロンプトを止めないこと。
+
+### Devin レビュアーの答えの読み方の修正（2026-11-15）
+
+0.10.0 の DevFlow のレビュー（Implement の run `20261115T111940Z-0271153ec7e1`、人間が上限で受け入れ）の後の実機確認で、Devin（swe-2-high）のレビューが `Invalid reviewer JSON` で失敗しました。原因と測った結果は [Devin の調査](devin-host-research.md) の「レビュアーの答えの読み方の訂正」にあります。修正は別の修正プランで、新しい Implement の run としてレビューを受けました。
+
+- Devin の答えは、標準出力ではなく、`--export` の記録の最後のエージェントの発言から読みます。記録が無い・読めない・エージェントの発言が無いときは、答えが無いとして失敗にします。
+- 全レビュアー共通の入力の最後（パケットの後）に、答えの形の念押し（`reviewers.ANSWER_REMINDER`）を1回置きます。読み方の規則（答え全体が JSON か、コードブロック1つ）は変えません。
+
+自動テストで確かめたこと：
+
+- 実測の形に合わせた偽の Devin（標準出力は発言をつないだもの、export は発言ごとの段）で、答えを export の最後の発言から読み、標準出力が JSON でなくても通ること。最後の発言に文章が付いていると失敗すること。
+- export が無い、壊れている、深すぎる、`steps` が無い、エージェントの段が無い、`message` が文字列でない、空のときに、答えが無いとして失敗し、元のログが残ること。
+- 実測のフィクスチャ（`joined_stdout.txt` と `joined_export.json`）で、標準出力が発言をつないだもので、export の最後の発言が答えであること。誤った記録に基づいていた `review_stdout.txt` は消しました。
+- Plan と Implement の入力が、パケットをそのまま含み、答えの形の念押しで終わり、それが1回だけ入ること。
+
+実機で確かめたこと（Linux / WSL2、Devin CLI 3000.12.57、swe-2-high）：
+
+- 失敗したレビューと同じ入力で、export の最後の発言が読めた回数：念押しなしで3回中1回（最初の実機のレビューを含む）、念押しありで8回中8回。比べのために、念押しなしで swe-2-max は2回中1回、swe-2-flash-high は2回中2回でした。どれも指摘の無い小さなレビューです。
+- headless の Claude Code（開発中のプラグイン、インストール済みの devflow は無効）で、`--reviewer devin swe-2 high --reviewer codex gpt-6.1-sol high` の Implement の run が completed になりました。Devin のレビューは pass として受け付けられ、ツール呼び出し7回とトークン数が記録されました。このとき Devin の標準出力は「I'll review the diff and the changed files.Let me use the read tools instead.…」で始まっていて、標準出力から読む前の実装なら失敗していました。
+
+確かめていないこと：
+
+- 指摘の多い大きなレビューで、swe-2-high が答えの形を守るか。守らなかった回は、読み違えずに失敗として記録されます。
+
+### 0.10.0 の実機確認（2026-11-15、Linux / WSL2）
+
+Devin CLI 3000.12.57 に `devin plugins install --local` で入れた 0.10.0 と、`claude --plugin-dir` で読み込んだ 0.10.0（インストール済みの devflow は `--settings` で無効）で、git 管理の検証用リポジトリを使って確かめました。人間が Devin と Claude Code の画面で操作し、面接に答えました。Devin のホストのモデルは swe-2-high です。
+
+| 計画の実機確認 | 結果 |
+|---|---|
+| 1. Devin の `/devflow:doctor`、`/devflow:status` | doctor は Devin 3000.12.57 を supported とし、ready でした。status は idle でした |
+| 2. Devin の `/devflow:plan` | completed。面接は Devin の画面の2問で、フックの記録だけから組み立てられ（`hook-records-only`）、2問とも回答として数えられました。Codex → OpenCode → Codex のレビューで両方が同じ版を承認し、公開されました |
+| 3. Devin の `/devflow:implement`（レビュアーは Claude と Codex） | completed。check の後、Claude と Codex の2回とも pass。Devin は `get_output` で完了まで待ちました |
+| 4. Claude Code の run で Devin がレビュー | headless の Claude Code で completed（上の「Devin レビュアーの答えの読み方の修正」） |
+| 5. Claude Code で作ったプランを Devin で実装 | Claude Code の `/devflow:plan`（面接2問、transcript とフックの記録から組み立て）で公開したプランを、Devin の `/devflow:implement --reviewer devin swe-2 high --reviewer codex gpt-6.1-sol high` で実装し、completed。Devin をホストにした run で、Devin（swe-2-high）のレビューも pass として受け付けられました |
+| 6. Claude Code と Codex で Plan → Implement | Claude Code: 5. の `/devflow:plan` と、4. の headless の `/devflow:implement` が、どちらも completed。Codex（codex-cli 0.169.0、`codex plugin marketplace add` でこのリポジトリから入れた 0.10.0）: `/devflow:plan` は completed（面接は Codex の会話 API で3問、3問とも回答として数えられました。レビューの1回目は Codex レビュアーが Codex のサンドボックスの中でファイルを書けず（`os error 30`）失敗し、OpenCode → Codex の2回で両方が承認）。続く `/devflow:implement` も completed（Codex と OpenCode の2回とも pass） |
+| 7. Devin の `/devflow:resume` | 別の Devin の会話から、Devin の implement の run を再開でき、所有者が移りました。Claude Code が持つ Plan の run を Devin から再開しようとすると、フックが「別ホストの再開は対応外」として止め、Devin がそのとおり説明しました |
+
+どの操作でも、フックの失敗（`DevFlow hook failed`）や Devin のプロンプトが止まること（`Prompt blocked`）はありませんでした。改名した `hooks/claude.json` で、Claude Code の面接の記録（`AskUserQuestion` の `PreToolUse` / `PostToolUse`）と開始が動きました。
+
+Claude Code の対話の画面（2026-11-16）：`claude --plugin-dir` で 0.10.0 を読み込み（インストール済みの devflow は `--settings` で無効）、`/devflow:doctor` で 0.10.0 を確かめてから、`/devflow:implement --reviewer devin swe-2 high --reviewer codex gpt-6.1-sol high -- docs/plans/exact-greeting.md` を送りました。run `20261115T161935Z-ce7aba519dd7` は completed で、Devin（9回のツール呼び出し）と Codex（11回）の2回とも pass でした。開始は人間の入力（`origin: human`）として記録されました。2回の `review` は `bash_timeout_ms` の 1900000 ms でバックグラウンドへ移り、Claude は終わりの知らせを受けて次のターンで続けました。権限のモードは `auto` だったので、ランナーの承認の画面は出ませんでした。
+
+Codex で分かったこと：Codex の workspace-write のサンドボックスの中では、ランナーが起こす `codex app-server` が動かず、会話 API の確認（`plan doctor --session`）と面接の確定（`plan seal`）が「Codex conversation API closed before replying」で止まり、Codex レビュアーも上の `os error 30` で失敗しました。0.9.1 でも同じで、`codex sandbox --permission-profile :workspace` で再現します。Codex の標準の承認（今回だけ）でサンドボックスの外で実行すると、どれも動きました。
+
+確かめていないこと：
+
+- macOS とネイティブ Windows での実機確認。
+- Claude Code の対話の画面で、権限のモードが `auto` 以外のときに出るランナーの承認の画面。
+
+### プラグインの導入と更新の確認（2026-11-16、Linux / WSL2）
+
+[プラグインの導入と更新](installation.md#プラグインの導入と更新) に書いた操作を、利用者の設定に触れない別の設定の場所（Claude Code は `CLAUDE_CONFIG_DIR`、Codex は `CODEX_HOME`）で確かめました。Devin はログインが要るため、利用者の環境に試験用のプラグインを `--local` で入れて確かめ、外しました。
+
+| 確かめたこと | 結果 |
+|---|---|
+| Claude Code 2.1.325：GitHub（`rysh25/devflow`）から入れる・更新する | marketplace の登録、`claude plugin install`、`marketplace update`、`claude plugin update` が動き、公開中の 0.9.1 が入りました |
+| Claude Code 2.1.325：ローカルの marketplace の版を上げる | 版ごとの場所（`plugins/cache/<marketplace>/<plugin>/<版>`）に写して使うため、中身を置き換えただけでは前の版のままで、`claude plugin update` で入れ替わりました。以前の「ZIP からなら `claude plugin update` は不要」という記述を直しました |
+| codex-cli 0.169.0：GitHub から入れる・更新する | `codex plugin marketplace add rysh25/devflow` と `codex plugin add` で 0.9.1 が入りました。`--ref` で 0.9.0 を入れてから参照を `main` に変えて `marketplace upgrade` を実行すると、入れたプラグインも 0.9.1 に入れ替わりました |
+| codex-cli 0.169.0：ローカルの marketplace の版を上げる | `marketplace upgrade` は `is not configured as a Git marketplace` で終わり、`codex plugin add` をもう一度実行すると新しい版に入れ替わりました |
+| Devin CLI 3000.12.57：ローカルのパスから入れたプラグインの版を上げる | `devin plugins update <名前>` で新しい版に入れ替わりました |
+
+確かめていないこと：
+
+- Devin で GitHub から入れること（`devin plugins install rysh25/devflow#plugins/devflow`）。0.10.0 が `main` に入るまで、`main` に Devin のマニフェストがないためです。
+- macOS とネイティブ Windows での導入と更新。
+
+### レビューの後の文書の変更（2026-11-16）
+
+0.10.0 の受け入れた run（`20261115T111940Z-0271153ec7e1`）と、Devin レビュアーの修正の run（`20261115T141816Z-2cba32a26e7f`）の後に、次の文書だけを変えました。これらは DevFlow のレビューを受けていません。コードの変更はありません。
+
+- `docs/installation.md` と README：各ホストのプラグインの入れ方と更新の仕方（GitHub からと、ローカルの配布物から）。上の「プラグインの導入と更新の確認」で確かめた内容です。
+- `docs/installation.md` と `plugins/devflow/references/codex-runner.md`：Codex のサンドボックスの中で失敗する操作（`plan doctor --session`、`plan seal`、次のレビュアーが Codex の `review`）を、実行の前に標準の承認でサンドボックスの外で実行するようにという案内。`codex-runner.md` は Codex に渡す指示文なので、Codex の振る舞いが変わります。この指示で Codex が実行の前に承認を求めるかは、実機ではまだ確かめていません。

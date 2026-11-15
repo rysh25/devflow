@@ -1,0 +1,66 @@
+{
+  "hook_event_name": "PostToolUse",
+  "tool_name": "ask_user_question",
+  "tool_input": {
+    "questions": [
+      {
+        "question": "What should greet(name) return?",
+        "header": "Format",
+        "options": [
+          {
+            "label": "Hello, {name}!",
+            "description": "Returns f\"Hello, {name}!\""
+          },
+          {
+            "label": "Hi {name}!",
+            "description": "Returns f\"Hi {name}!\""
+          },
+          {
+            "label": "Hey {name}",
+            "description": "Returns f\"Hey {name}\""
+          }
+        ],
+        "multi_select": false
+      },
+      {
+        "question": "How should greet handle an empty or None name?",
+        "header": "Edge case",
+        "options": [
+          {
+            "label": "Hello, guest!",
+            "description": "Treat falsy names as \"guest\""
+          },
+          {
+            "label": "Raise ValueError",
+            "description": "Raise ValueError on empty/None name"
+          },
+          {
+            "label": "Allow empty",
+            "description": "Return the greeting with empty name"
+          }
+        ],
+        "multi_select": false
+      }
+    ],
+    "answers": {
+      "How should greet handle an empty or None name?": {
+        "selected": [
+          "Hello, guest!"
+        ]
+      },
+      "What should greet(name) return?": {
+        "selected": [
+          "Hello, {name}!"
+        ]
+      }
+    }
+  },
+  "tool_use_id": "call_802aefb4f4050ea7",
+  "tool_response": {
+    "success": true,
+    "output": "User answered your questions:\n{\n  \"What should greet(name) return?\": {\n    \"selected\": [\n      \"Hello, {name}!\"\n    ],\n    \"skipped\": false\n  },\n  \"How should greet handle an empty or None name?\": {\n    \"selected\": [\n      \"Hello, guest!\"\n    ],\n    \"skipped\": false\n  }\n}",
+    "error": null
+  },
+  "session_id": "glitter-rubidium",
+  "prompt_id": "1dfc1534-8c78-4056-a17b-25be9e924e56"
+}

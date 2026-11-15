@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 
 from ..common.errors import UsageError
+from ..common.hosts import host_profile
 from ..common.review import after_failed_review, check_review_budget, check_review_config, review_budget
 from ..common.runs import TERMINAL
 from ..common.storage import json_bytes, now
@@ -14,6 +15,17 @@ from ..common.workflow import Workflow
 from .commands import COMMANDS
 
 STACKED_COMMAND = re.compile(r"(?:\A|\n)\s*/[A-Za-z][A-Za-z0-9_:-]*(?:\s|\Z)")
+
+
+def interview_marker(host: str, payload: dict) -> dict:
+    """Where the interview starts, in the form the host's interview reader needs."""
+    from .transcript import transcript_marker
+    kind = host_profile(host).interview
+    if kind == "transcript":
+        return transcript_marker(payload.get("transcript_path"))
+    if kind == "conversation_api":
+        return {"host": host, "session_id": payload["session_id"], "turn_id": payload.get("turn_id")}
+    return transcript_marker(None)  # Hook records only.
 
 
 class PlanWorkflow(Workflow):
@@ -41,7 +53,6 @@ class PlanWorkflow(Workflow):
                     scratch: Path) -> tuple[dict, dict[str, bytes]]:
         # Plan starts inside the prompt hook and has no extra start options; ``options`` is unused.
         from .config import load_config, validate_config
-        from .transcript import transcript_marker
         payload = pending["event"]["payload"]
         prompt = payload["prompt"]
         # Keep the request byte-exact apart from the command itself.
@@ -55,9 +66,7 @@ class PlanWorkflow(Workflow):
             "status": "interview", "review_count": 0, "review_limit": config["max_reviews"],
             "plan_version": None, "plan_hash": None,
             "current_plan": None, "passes": [], "config": config,
-            "transcript_marker": (transcript_marker(payload.get("transcript_path")) if host == "claude" else
-                                  {"host": "codex", "session_id": payload["session_id"],
-                                   "turn_id": payload.get("turn_id")}),
+            "transcript_marker": interview_marker(host, payload),
             "resolved_escalations": [], "last_error": None, "last_review": None,
             "final_plan_reviewed": False, "escalation": None,
             "publication": {"status": "pending" if config["publish"]["enabled"] else "disabled"},
@@ -76,7 +85,7 @@ class PlanWorkflow(Workflow):
     def can_transfer(self, state: dict, session: str) -> str | None:
         unsealed = "interview.json" not in state["artifacts"]
         if unsealed and state["status"] not in TERMINAL and state["owner_session"] != session:
-            host_name = "Codex" if state["owner_host"] == "codex" else "Claude"
+            host_name = host_profile(state["owner_host"]).label
             return f"An unsealed interview must resume its original {host_name} session so its transcript remains complete."
         return None
 
@@ -128,7 +137,8 @@ class PlanWorkflow(Workflow):
         from ..common.hosts.codex import diagnose_conversation
         inspection = inspect_interview_skill(project, config["grill_skill"], host=host)
         return {"interview_skill": inspection, "ready": inspection["static_ready"],
-                **({"conversation_api": diagnose_conversation(project)} if host == "codex" else {}),
+                **({"conversation_api": diagnose_conversation(project)}
+                   if host_profile(host).interview == "conversation_api" else {}),
                 "warnings": ([] if inspection["static_ready"] else
                              ["Planning interview skill " + inspection["configured_name"] + ": " + inspection["reason"]])
                             + ["Interview skill callability is not runtime-verified; static metadata cannot "

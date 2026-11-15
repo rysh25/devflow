@@ -2,8 +2,9 @@
 
 Every runner error, including a malformed invocation, is one JSON object on
 stdout with exit status 2. ``--help`` and ``--version`` print text. Hook
-failures go to stderr with exit status 1, which Claude Code shows without
-blocking the tool or the prompt.
+failures, including a malformed hook invocation, go to stderr with exit status
+1, which every supported host shows or records without blocking the tool or
+the prompt (exit status 2 blocks on Claude Code and Devin).
 """
 from __future__ import annotations
 
@@ -15,9 +16,9 @@ import sys
 
 from . import __version__, router
 from .common import paths
-from .common.hosts import executable_name
+from .common.hosts import HOSTS, executable_name, host_profile
 from .common.arguments import Parser
-from .common.hosts.diagnostics import MINIMUM_CLAUDE_CODE, claude_version, codex_version
+from .common.hosts.diagnostics import MINIMUM_CLAUDE_CODE, claude_version, codex_version, devin_version
 from .common.environment import python_errors, version_warnings
 from .common.errors import DevFlowError
 from .common.reviewers import preflight
@@ -33,13 +34,13 @@ def parser() -> Parser:
     result.add_argument("--version", action="version", version="devflow " + __version__)
     result.add_argument("--project", type=Path, default=Path.cwd(), help="Project/worktree; global options precede the command")
     result.add_argument("--session", help="Actual host session ID")
-    result.add_argument("--host", choices=("claude", "codex"), required=True,
+    result.add_argument("--host", choices=tuple(HOSTS), required=True,
                         help="The host whose session and records apply; always explicit")
     result.add_argument("--run", help="Existing run ID; required to inspect or act on a particular run")
     commands = result.add_subparsers(dest="command", required=True, parser_class=Parser)
     commands.add_parser("status", help="Overview, or the bound/selected run; changes nothing")
     commands.add_parser("doctor", help="Offline prerequisites for every workflow; never calls a model")
-    commands.add_parser("hook", help="Claude Code hook entry; reads one JSON object from stdin")
+    commands.add_parser("hook", help="Host hook entry; reads one JSON object from stdin")
     for name, workflow in WORKFLOWS.items():
         actions = commands.add_parser(name, help=f"The {name} workflow").add_subparsers(
             dest="action", required=True, parser_class=Parser)
@@ -52,6 +53,34 @@ def emit(value) -> None:
         print(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False))
 
 
+
+
+def host_version(host: str) -> dict:
+    """The host's own offline version probe, chosen from one table."""
+    return {"claude": claude_version, "codex": codex_version, "devin": devin_version}[host]()
+
+
+COMMANDS = ("status", "doctor", "hook", *WORKFLOWS)
+VALUE_OPTIONS = ("--project", "--session", "--host", "--run")  # The global options that take a value.
+
+
+def command_name(arguments: list[str]) -> str | None:
+    """The first known command word, read before parsing.
+
+    Tokens that are not a command (an unknown or abbreviated option's value, for
+    example) are passed over, so a malformed hook invocation is still a hook.
+    """
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        # argparse also accepts a prefix of a long option; any value option it may name takes the next token.
+        if token.startswith("--") and len(token) > 2 and any(option.startswith(token) for option in VALUE_OPTIONS):
+            index += 2
+            continue
+        if token in COMMANDS:
+            return token
+        index += 1
+    return None
 
 
 def doctor(project: Path, host: str) -> dict:
@@ -78,7 +107,7 @@ def doctor(project: Path, host: str) -> dict:
     warnings.extend(router.record_warnings(project, host))
     for item in cache.values():
         warnings.extend(item.get("details", {}).get("version_warnings", []))
-    version = claude_version() if host == "claude" else codex_version()
+    version = host_version(host)
     warnings.extend(version_warnings(host, version["version"]))
     executables = {name: shutil.which(name) for name in ("uv", executable_name(host), "git")}
     errors = python_errors()
@@ -91,7 +120,8 @@ def doctor(project: Path, host: str) -> dict:
                       and all(item["ready"] for item in reports.values())),
             "readiness_scope": "Offline project-settings prerequisites only; use a workflow's doctor with the active session/run to inspect frozen run configuration.",
             "not_verified": ["CLI authentication and model access", "Effective model and reasoning settings",
-                             "Real Claude Code hook and interview skill execution", "Native Windows/macOS execution"],
+                             f"Real {host_profile(host).label} hook and interview skill execution",
+                             "Native Windows/macOS execution"],
             "note": "Offline help/version probes only; no model calls, authentication, installation, or implicit fallback"}
 
 
@@ -106,9 +136,13 @@ def _hook() -> dict | None:
 
 
 def main(argv=None) -> int:
-    command, payload = None, None
+    arguments = sys.argv[1:] if argv is None else list(argv)
+    # Known before parsing, so a malformed hook invocation (for example a host this
+    # runner does not know) also ends with exit status 1 and never blocks the host.
+    command = "hook" if command_name(arguments) == "hook" else None
+    payload = None
     try:
-        args = parser().parse_args(argv)
+        args = parser().parse_args(arguments)
         command = args.command
         host = args.host
         if command == "hook":
@@ -156,7 +190,7 @@ def main(argv=None) -> int:
     except Exception as exc:  # noqa: BLE001 - every failure is reported, never retried
         if command == "hook":
             print("DevFlow hook failed: " + str(exc), file=sys.stderr)
-            # Exit status 2 would make Claude Code block the tool or the prompt.
+            # Exit status 2 would make Claude Code or Devin block the tool or the prompt.
             return 1
         emit({"error": type(exc).__name__, "message": str(exc), "automatic_retry": False})
         return 2

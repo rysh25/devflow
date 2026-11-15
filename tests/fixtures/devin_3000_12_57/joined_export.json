@@ -1,0 +1,90 @@
+{
+  "schema_version": "ATIF-v1.7",
+  "session_id": "probe-session",
+  "agent": {
+    "name": "devin",
+    "version": "3000.12.57",
+    "model_name": "SWE-2 High"
+  },
+  "steps": [
+    {
+      "step_id": 1,
+      "source": "system",
+      "message": ""
+    },
+    {
+      "step_id": 2,
+      "source": "system",
+      "message": ""
+    },
+    {
+      "step_id": 3,
+      "source": "system",
+      "message": ""
+    },
+    {
+      "step_id": 4,
+      "source": "system",
+      "message": ""
+    },
+    {
+      "step_id": 5,
+      "source": "system",
+      "message": ""
+    },
+    {
+      "step_id": 6,
+      "source": "system",
+      "message": ""
+    },
+    {
+      "step_id": 7,
+      "source": "user",
+      "message": ""
+    },
+    {
+      "step_id": 8,
+      "source": "system",
+      "message": ""
+    },
+    {
+      "step_id": 9,
+      "source": "agent",
+      "message": "Looking at the files.",
+      "tool_calls": [
+        {
+          "tool_call_id": "read:0#ceacd79e55964e0ba2aa95357e747c59",
+          "function_name": "read",
+          "arguments": {}
+        }
+      ],
+      "metrics": {
+        "prompt_tokens": 13768,
+        "completion_tokens": 195,
+        "cached_tokens": 11520
+      }
+    },
+    {
+      "step_id": 10,
+      "source": "system",
+      "message": ""
+    },
+    {
+      "step_id": 11,
+      "source": "agent",
+      "message": "{\"lines\": 5}",
+      "tool_calls": [],
+      "metrics": {
+        "prompt_tokens": 14251,
+        "completion_tokens": 39,
+        "cached_tokens": 11072
+      }
+    }
+  ],
+  "final_metrics": {
+    "total_prompt_tokens": 28019,
+    "total_completion_tokens": 234,
+    "total_cached_tokens": 22592,
+    "total_steps": 11
+  }
+}

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from ..common.environment import python_errors
+from ..common.hosts import host_profile
 from ..common.hosts.codex import diagnose_conversation
 from ..common.workflow import Command, Option
 from .config import diagnose
@@ -14,7 +15,7 @@ def doctor(engine, args, run_id, session) -> dict:
     errors = python_errors()
     checks = engine.workflow.doctor(engine.project, report["config"], host=engine.host)
     warnings = checks["warnings"]
-    if engine.host == "codex":
+    if host_profile(engine.host).interview == "conversation_api":
         owner = engine.store.read(run_id) if run_id else None
         if owner and (owner["owner_host"] != engine.host or owner["owner_session"] != session):
             api = {**checks["conversation_api"],

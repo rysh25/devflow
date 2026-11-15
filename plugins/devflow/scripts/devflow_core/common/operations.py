@@ -3,7 +3,8 @@ OPERATIONS = ("plan", "implement", "status", "resume", "doctor")
 
 
 def public_command(prompt: str, host: str, names=OPERATIONS) -> tuple[str | None, str]:
-    prefix = {"claude": "/devflow:", "codex": "$devflow:"}[host]
+    from .hosts import host_profile
+    prefix = host_profile(host).command_prefix
     for name in names:
         command = prefix + name
         if prompt == command:

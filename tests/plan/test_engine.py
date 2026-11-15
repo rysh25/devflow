@@ -976,7 +976,7 @@ class EngineTests(unittest.TestCase):
     def test_unsealed_interview_cannot_move_sessions(self):
         self.start_interview()
         before = (self.run / "state.json").read_bytes()
-        self.assertNotAccepted(self.resume_prompt("other-session"), "resume", "original Claude session")
+        self.assertNotAccepted(self.resume_prompt("other-session"), "resume", "original Claude Code session")
         self.assertEqual((self.run / "state.json").read_bytes(), before)
         self.assertIsNone(self.bound_run("other-session"))
         self.assertEqual(self.bound_run(), self.run_id)

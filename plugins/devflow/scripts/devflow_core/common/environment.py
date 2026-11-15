@@ -35,7 +35,7 @@ def review_timeout_ms(reviewer_seconds: int) -> int:
 #: reported by doctor as a warning, never refused. A reviewer kind without an entry
 #: (a CLI added later) gets no warning.
 CHECKED_VERSIONS = {"claude": ("Claude Code", "2.1.319"), "codex": ("Codex", "0.166.0"),
-                    "opencode": ("OpenCode", "2.2.5")}
+                    "opencode": ("OpenCode", "2.2.5"), "devin": ("Devin CLI", "3000.12.57")}
 
 
 def version_numbers(text: str | None) -> tuple[int, ...] | None:

@@ -567,7 +567,7 @@ class SessionCaptureTests(Fixture):
         self.assertEqual(len(self.stored()["event_ids"]), 1)
 
     def test_hook_configuration_uses_exec_form_and_never_blocks(self):
-        config = json.loads((PACKAGE.parents[2] / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+        config = json.loads((PACKAGE.parents[2] / "hooks" / "claude.json").read_text(encoding="utf-8"))
         self.assertEqual(set(config["hooks"]), {"UserPromptSubmit", "PreToolUse", "PostToolUse"})
         for event, matchers in config["hooks"].items():
             for matcher in matchers:

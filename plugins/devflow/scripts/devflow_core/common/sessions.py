@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .errors import CaptureError, DevFlowError
-from .hosts import HOSTS
+from .hosts import HOSTS, asked_questions
 from .runs import (RUN_ID, SESSION_ID, TERMINAL, RunStore, data_root, validate_event)
 from .storage import atomic_json, no_symlinks, read_json
 
@@ -291,17 +291,17 @@ def question_matches(observation: dict, result: dict) -> bool:
         if not isinstance(value, str) or not value or result.get(field) != value:
             return False
     before, after = observation.get("tool_input"), result.get("tool_input")
-    if not isinstance(before, dict) or not isinstance(after, dict):
+    if not isinstance(before, dict) or not isinstance(after, dict) or observation["host"] not in HOSTS:
         return False
-    # The question screen may add or reshape these fields after PreToolUse.
-    # Compare everything the model wrote about the questions on both hosts.
-    if ({key: value for key, value in before.items() if key not in SCREEN_FILLED_QUESTION_FIELDS}
-            != {key: value for key, value in after.items() if key not in SCREEN_FILLED_QUESTION_FIELDS}):
+    # The question screen may add or reshape the answer fields (and, on Devin, its
+    # defaults) after PreToolUse. Compare everything the model wrote about the questions.
+    host = observation["host"]
+    if asked_questions(host, before) != asked_questions(host, after):
         return False
-    if observation["host"] == "codex":
+    if HOSTS[host].question_scope == "turn":
         turn = observation.get("turn_id")
         return isinstance(turn, str) and bool(turn) and result.get("turn_id") == turn
-    return observation["host"] == "claude"
+    return True
 
 
 def prefilled_question_events(events: list[dict]) -> list[str]:

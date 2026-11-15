@@ -1,0 +1,38 @@
+{
+  "hook_event_name": "PostToolUse",
+  "tool_name": "ask_user_question",
+  "tool_input": {
+    "questions": [
+      {
+        "question": "Pick a fruit",
+        "header": "Fruit",
+        "options": [
+          {
+            "label": "Apple",
+            "description": ""
+          },
+          {
+            "label": "Banana",
+            "description": ""
+          }
+        ],
+        "multi_select": false
+      }
+    ],
+    "answers": {
+      "Pick a fruit": {
+        "selected": [
+          "Apple"
+        ]
+      }
+    }
+  },
+  "tool_use_id": "call_b60d76732ad0bb2c",
+  "tool_response": {
+    "success": true,
+    "output": "User answered your questions:\n{\n  \"Pick a fruit\": {\n    \"selected\": [\n      \"Apple\"\n    ],\n    \"skipped\": false\n  }\n}",
+    "error": null
+  },
+  "session_id": "glitter-rubidium",
+  "prompt_id": "78996198-7f07-4d9d-9977-dff12775309c"
+}

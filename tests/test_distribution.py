@@ -66,11 +66,11 @@ class DistributionTests(unittest.TestCase):
     def test_static_validate_current_bundle(self):
         result = package.validate(ROOT)
         self.assertEqual(result["marketplace"], "devflow-marketplace")
-        self.assertEqual(result["plugins"], {"devflow": "0.9.1"})
+        self.assertEqual(result["plugins"], {"devflow": "0.10.0"})
 
     def test_release_versions_are_consistent(self):
         manifest = json.loads((ROOT / "plugins/devflow/.claude-plugin/plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.9.1")
+        self.assertEqual(manifest["version"], "0.10.0")
         package = ROOT / "plugins/devflow/scripts/devflow_core"
         defining = []
         for source in sorted(package.rglob("*.py")):
@@ -282,11 +282,78 @@ class DistributionTests(unittest.TestCase):
         for name, change, message in cases:
             with self.subTest(case=name):
                 cloned = self.clone()
-                path = cloned / "plugins" / "devflow" / "hooks" / "hooks.json"
+                path = cloned / "plugins" / "devflow" / "hooks" / "claude.json"
                 package.validate(cloned)  # The shipped configuration itself is valid.
                 document = json.loads(path.read_text(encoding="utf-8"))
                 change(document["hooks"])
                 path.write_text(json.dumps(document), encoding="utf-8")
+                with self.assertRaisesRegex(package.PackagingError, message):
+                    package.validate(cloned)
+
+    def test_devin_layout_and_skills_are_checked(self):
+        """Devin: the root hooks.json in the measured form, a local-only manifest, and five
+        human-only skills that pre-approve nothing (Devin expands no plugin path in a
+        permission rule, so any rule would allow more than the runner)."""
+        plugin = Path("plugins") / "devflow"
+
+        def edit_json(relative, change):
+            def apply(root):
+                path = root / plugin / relative
+                document = json.loads(path.read_text(encoding="utf-8"))
+                change(document)
+                path.write_text(json.dumps(document), encoding="utf-8")
+            return apply
+
+        def edit_skill(name, old, new, count=1):
+            def apply(root):
+                path = root / plugin / "devin-skills" / name / "SKILL.md"
+                text = path.read_text(encoding="utf-8")
+                self.assertIn(old, text)
+                path.write_text(text.replace(old, new, count), encoding="utf-8", newline="")
+            return apply
+
+        def add_shared_hook_file(root):
+            shutil.copyfile(root / plugin / "hooks" / "claude.json", root / plugin / "hooks" / "hooks.json")
+
+        prompt = lambda hooks: hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]
+        cases = (
+            ("hooks/hooks.json", add_shared_hook_file, "hooks/hooks.json must not exist"),
+            ("Claude manifest hooks", edit_json(".claude-plugin/plugin.json", lambda d: d.pop("hooks")),
+             "must name ./hooks/claude.json"),
+            ("args", edit_json("hooks.json", lambda d: prompt(d).update(args=["--host", "devin", "hook"])),
+             "one command string without args"),
+            ("another host", edit_json("hooks.json", lambda d: prompt(d).update(
+                command=prompt(d)["command"].replace("--host devin", "--host claude"))), "explicit --host devin"),
+            ("every tool", edit_json("hooks.json", lambda d: d["hooks"]["PreToolUse"][0].update(matcher=".*")),
+             "match only ask_user_question"),
+            ("onFailure", edit_json("hooks.json", lambda d: prompt(d).update(onFailure="block")), "never block"),
+            ("Stop", edit_json("hooks.json", lambda d: d["hooks"].update(Stop=d["hooks"]["UserPromptSubmit"])),
+             "Devin hooks must be exactly"),
+            ("cloud", edit_json(".devin-plugin/plugin.json", lambda d: d.update(platforms=["local", "cloud"])),
+             "platforms"),
+            ("no platforms", edit_json(".devin-plugin/plugin.json", lambda d: d.pop("platforms")), "platforms"),
+            ("version", edit_json(".devin-plugin/plugin.json", lambda d: d.update(version="0.0.1")), "versions"),
+            ("manifest hooks", edit_json(".devin-plugin/plugin.json", lambda d: d.update(hooks="./hooks.json")),
+             "ignores a manifest hooks path"),
+            ("allowed-tools", edit_skill("plan", "triggers: [user]\n", "triggers: [user]\nallowed-tools: [exec]\n"),
+             "must not pre-approve tools"),
+            ("allow exec", edit_skill("plan", "triggers: [user]\n",
+                                      "triggers: [user]\npermissions:\n  allow:\n    - exec\n"),
+             "must not pre-approve tools"),
+            ("allow uv", edit_skill("implement", "triggers: [user]\n",
+                                    'triggers: [user]\npermissions:\n  allow: ["Exec(uv)"]\n'),
+             "must not pre-approve tools"),
+            ("model trigger", edit_skill("status", "triggers: [user]", "triggers: [user, model]"),
+             "invoked by the human only"),
+            ("unreadable frontmatter", edit_skill("doctor", 'description: "Check', "description: Check: x"),
+             "Devin cannot read the frontmatter"),
+            ("Codex wording", edit_skill("resume", "/devflow:resume", "$devflow:resume"), "another host"),
+            ("no question tool", edit_skill("plan", "ask_user_question", "a question", -1), "ask_user_question"),
+        )
+        for name, change, message in cases:
+            with self.subTest(case=name):
+                cloned = self.clone()
+                change(cloned)
                 with self.assertRaisesRegex(package.PackagingError, message):
                     package.validate(cloned)
 
@@ -326,14 +393,14 @@ class DistributionTests(unittest.TestCase):
             # All paths were generated and checked in this test, not untrusted ZIP input.
             archive.extractall(extracted)
         release = extracted / "devflow"
-        self.assertEqual(package.validate(release)["version"], "0.9.1")
+        self.assertEqual(package.validate(release)["version"], "0.10.0")
         independent = self.base / "devflow-only"
         shutil.copytree(release / "plugins" / "devflow", independent)
         self.assertFalse((independent / "shared").exists())
         result = subprocess.run([sys.executable, "-B", str(independent / "scripts" / "devflow.py"), "--version"],
             cwd=self.base, capture_output=True, encoding="utf-8", timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("0.9.1", result.stdout)
+        self.assertIn("0.10.0", result.stdout)
         for flow in ("plan", "implement"):
             with self.subTest(flow=flow):
                 result = subprocess.run([sys.executable, "-B", str(independent / "scripts" / "devflow.py"), flow, "--help"],
