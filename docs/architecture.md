@@ -2,7 +2,7 @@
 
 ## 一つの配布と独立したワークフロー
 
-DevFlow 0.9.1 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
+DevFlow 0.10.0 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
 
 ```mermaid
 flowchart TD
@@ -34,6 +34,8 @@ Python コードは `plugins/devflow/scripts/devflow_core/` の1つのパッケ�
 |---|---|
 | `skills/` | 人間の明示操作を受け、Claude Code へ状態に応じた作業を指示 |
 | `codex-skills/` | Codex の5つの明示操作。共通の起動・待機手順は `references/codex-runner.md` を参照 |
+| `devin-skills/` | Devin の5つの明示操作（`triggers: [user]`）。共通の起動・待機手順は `references/devin-runner.md` を参照 |
+| `hooks/claude.json`、`hooks/codex.json`、`hooks.json` | 各ホストのフック。Devin はプラグインのルートの `hooks.json` だけを読む |
 | `scripts/devflow.py` | 唯一の起動点 |
 | `devflow_core/cli.py` | 登録表から組み立てる1つの argparse。エラーは常に JSON |
 | `devflow_core/router.py` | セッションの紐付け、開始、resume、空き確認、フックの記録と状態の通知。フロー名で分岐しない |
@@ -50,14 +52,14 @@ Python コードは `plugins/devflow/scripts/devflow_core/` の1つのパッケ�
 | `git.py` | DevFlow 自身の git の呼び出し。利用者の git の設定のまま、`GIT_DIR` などのリポジトリを差し替える環境変数だけを外す |
 | `sessions.py` | セッション記録、人間の判断に使える回答の規則、事前に埋めた質問の判定、回答文の取り出し |
 | `notices.py` | フックがホストに渡す状態の通知（run の状態、ランナーの場所、`bash_timeout_ms`） |
-| `reviewers.py` | Codex / OpenCode / Claude の事前確認、`prepare_review` による入力準備、`run_review(PreparedReview, validate)` による予約後の実行、出力の検査。CLI ごとの違いは `CLI` のサブクラスに集める。トークン数の読み取りと、回の CLI の版もここ |
+| `reviewers.py` | Codex / OpenCode / Claude / Devin の事前確認、`prepare_review` による入力準備、`run_review(PreparedReview, validate)` による予約後の実行、出力の検査。CLI ごとの違いは `CLI` のサブクラスに集める。トークン数の読み取りと、回の CLI の版もここ |
 | `summary.py` | レビューの要約：各フローが自分の記録を直した共通の形（`source`）から、データを作る `build` と、決まった英語の短い Markdown を作る `render`。データはすべてを持ち（レビュアーごとの合計 `reviewer_totals` を含む）、Markdown は判断に要るもの（1 回 1 行の表、レビュアーごとの 1 行、失敗、残っている指摘、人間の決定）だけを出す。表のセルには決まった値だけを入れ、自由な文は表の下の一覧に置く。上限の確認で待っている間と run が終わったあとに、`status` と最終レポートに入る |
 | `counts.py` | 前もって知らない名前（出来事の種類、ツールの名前）の、上限付きの数え方 |
 | `settings.py` | 共有・ローカル設定の検査と重ね合わせ、レビュアー設定の共通規則 |
 | `operations.py` | ホスト別の5操作の検出と、生の引数・本文の境界 |
 | `startup.py` | 起動時のレビュアー指定の解析と、最終設定への上書き |
 | `arguments.py` | 終了やヘルプ表示を例外として扱う共通 argparse パーサー |
-| `hosts/` | ホスト別の主会話判定、質問ツール名・実行ファイル名、正規化、スキル探索場所、ネイティブ会話取得と診断。Plan の面接組み立ては含めない |
+| `hosts/` | ホストの表（`Host`：表示名、実行ファイル名、質問ツール名、操作の接頭辞、プロジェクトの環境変数、面接の読み方など）、ホスト別の主会話判定、正規化、スキル探索場所、ネイティブ会話取得と診断。Plan の面接組み立ては含めない |
 | `workflow.py` | 各フローが実装する契約（`Workflow` クラス）と、動作の表（`Command` / `Option`）。CLI の登録、所有者が要る操作（`needs_owner`）、振り分けはこの表から導く。共通層はフロー固有の state の項目を直接読まず、`summary` や `frozen_config` などの契約を通す |
 | `environment.py` | 長い処理に要る Bash の待ち時間（`bash_timeout_ms`）、確かめた CLI の版と `doctor` の警告、MSYS2・Cygwin の Python の検出 |
 | `errors.py`、`storage.py`、`review.py`、`paths.py` | エラーの系統、原子的な保存とロック、回数と承認の判定、インストール先とプロジェクトの根（`project_root`）。`storage.py` の `writable` と `writable_text` は、記録（UTF-8）に書けない文字（対にならないサロゲート）の確かめとエスケープ。使うのはレビュアーの CLI の出力が記録に入る所（答え、ツールと出来事の名前、CLI の出力から作るエラーの文を記録する Plan の `last_error` と `error.json`、Implement の回の `error` と `last_error`、`late/`、トークン数、CLI の版）。ほかから来る文字列（面接の transcript の本文、チェックの出力、公開のエラー、フックの入力、パス）は対象外 |
@@ -150,7 +152,7 @@ checkpoint では、開始時からの変更の一覧（`snapshots/NNN.json`）�
 
 差分のファイルは、開始時から今までのスナップショットの範囲の変更を、Git の unified diff と同じ形で書きます。空のファイルの追加・削除、モードだけの変更、バイナリの変更にも、必ず見出し（`diff --git`、`new file mode`、`old mode` / `new mode`、`Binary files … differ`）を付けます。
 
-レビュアーの CLI ごとの違いは、`reviewers.py` の `CLI` のサブクラス（`Codex`、`OpenCode`、`Claude`）に集めます。サブクラスは、使うサブコマンド、引数、標準入力、答えと動きの読み方を持ちます。事前確認は、引数に含まれるオプション（`--` で始まるもの）が、CLIまたはサブコマンドの `--help` にあることを確かめます。Claude は `claude --help` です。DevFlow が加えるのは、モデルと effort、承認を待たないこと（Codex には `approval_policy="never"` を渡す。OpenCode の `opencode run` は、利用者の設定で確認が要る操作を、自分で断って続ける）、JSON での出力、結果のスキーマ（Codex）、作業ディレクトリと `PWD`、標準入力（Codex にはプロンプトを渡してから閉じ、OpenCode は初めから閉じる）だけです。新しい CLI は、サブクラスを1つ書いて `CLIS` と `settings.REVIEWER_KINDS` に名前を足せば加えられます。トークン数は、サブクラスの `tokens` が CLI の名前のまま、平らな「名前 → 数」で返します（書かなければ unknown）。Codex は `turn.completed` の `usage` がスレッドの累計なので、スレッドごとの最後の値を足します。OpenCode は `step_finish` の `tokens` が1段階分なので、全部を足し、入れ子は `cache.read` のようにつなぎます。トークン数は答えの成否と関係なく、回の出力（`review-processes/NN/stdout.jsonl`）から読み、成功・失敗・回復のどの回の記録にも残します。確かめた版を `environment.CHECKED_VERSIONS` に足すと、それより新しい版で `doctor` が警告します（足さなければ警告しません）。文章で返る答え（Codex の `final-response.json`、OpenCode の最後のステップの文章）は `answer_value` で読みます。答え全体がちょうど1つの ` ```json `（または言語名なし）のコードブロックなら、その中身を厳密な JSON として読み、中身には手を加えません。囲みの外に文章がある答えなど、ほかの形は今までどおり失敗にします。OpenCode には答えの形を強制する選択肢がないためです。プロンプトでは、出力スキーマをコードブロックで囲まずに載せます。
+レビュアーの CLI ごとの違いは、`reviewers.py` の `CLI` のサブクラス（`Codex`、`OpenCode`、`Claude`、`Devin`）に集めます。サブクラスは、使うサブコマンド、引数、標準入力、答えと動きの読み方を持ちます。事前確認は、引数に含まれるオプション（`--` で始まるもの）が、CLIまたはサブコマンドの `--help` にあることを確かめます。Claude は `claude --help` です。DevFlow が加えるのは、モデルと effort、承認を待たないこと（Codex には `approval_policy="never"` を渡す。OpenCode の `opencode run` は、利用者の設定で確認が要る操作を、自分で断って続ける）、JSON での出力、結果のスキーマ（Codex）、作業ディレクトリと `PWD`、標準入力（Codex にはプロンプトを渡してから閉じ、OpenCode と Devin は初めから閉じる）だけです。Devin には入力を `--prompt-file` のファイルで渡し、`--export` の ATIF の記録から動きとトークン数を読みます。新しい CLI は、サブクラスを1つ書いて `CLIS` と `settings.REVIEWER_KINDS` に名前を足せば加えられます。トークン数は、サブクラスの `tokens` が CLI の名前のまま、平らな「名前 → 数」で返します（書かなければ unknown）。Codex は `turn.completed` の `usage` がスレッドの累計なので、スレッドごとの最後の値を足します。OpenCode は `step_finish` の `tokens` が1段階分なので、全部を足し、入れ子は `cache.read` のようにつなぎます。トークン数は答えの成否と関係なく、回の出力（`review-processes/NN/stdout.jsonl`）から読み、成功・失敗・回復のどの回の記録にも残します。確かめた版を `environment.CHECKED_VERSIONS` に足すと、それより新しい版で `doctor` が警告します（足さなければ警告しません）。文章で返る答え（Codex の `final-response.json`、OpenCode の最後のステップの文章）は `answer_value` で読みます。答え全体がちょうど1つの ` ```json `（または言語名なし）のコードブロックなら、その中身を厳密な JSON として読み、中身には手を加えません。囲みの外に文章がある答えなど、ほかの形は今までどおり失敗にします。OpenCode には答えの形を強制する選択肢がないためです。プロンプトでは、出力スキーマをコードブロックで囲まずに載せます。
 
 出力の検査は、壊れているとわかるときだけ失敗にします。
 
@@ -194,7 +196,7 @@ checkpoint では、開始時からの変更の一覧（`snapshots/NNN.json`）�
 ## 0.8.0 のホスト連携
 
 単一の plugins/devflow に `.claude-plugin/plugin.json` と `.codex-plugin/plugin.json` を置き、
-版を一致させます。Claude は skills/ と hooks/hooks.json、Codex は codex-skills/ と
+版を一致させます。Claude は skills/ と hooks/claude.json、Codex は codex-skills/ と
 hooks/codex.json を使います。双方とも5操作を明示的に起動し、Codex の
 agents/openai.yaml は policy.allow_implicit_invocation: false です。
 両 marketplace は同じ plugins/devflow を指します。
@@ -286,3 +288,39 @@ assistantの未知contentブロックもother_eventsへ数えます。既知のt
 ローカル設定も既存のスナップショット除外規則に従います。context_paths で明示した対象外のパスは、
 設定読込時の専用検査を増やさず、スナップショット取得時の共通エラー
 Requested context file is not in the captured scope で止めます。
+
+## 0.10.0 の Devin ホスト
+
+DevFlow 0.10.0 は Devin CLI を3つめのホストに加えます。`.devin-plugin/plugin.json`（`"platforms": ["local"]`）、
+`devin-skills/` の5操作、プラグインのルートの `hooks.json` を使い、`devin plugins install` で入れます。
+Devin はルートの `hooks.json` を読むので、Claude のフックは `hooks/claude.json` に移し、
+`.claude-plugin/plugin.json` の `hooks` で指します。Claude Code と Devin がどちらも自分で読む `hooks/` の既定のファイルは置きません（`tools/package.py` が確かめます）。
+
+ホストごとの違いは `common/hosts/` の `HOSTS` の表（`Host`）に集めます。router、セッション、通知、Plan の面接は
+この表の値だけを読み、ホスト名で分岐しません。新しいホストは、表に1行足し、ネイティブの入力の読み方
+（`canonical_payload`）とスキルの探索場所を書けば加えられます。
+
+| 項目 | Claude Code | Codex | Devin |
+|---|---|---|---|
+| 質問ツール | `AskUserQuestion` | `request_user_input` | `ask_user_question` |
+| 操作の接頭辞 | `/devflow:` | `$devflow:` | `/devflow:` |
+| プロジェクト | `CLAUDE_PROJECT_DIR` か入力の `cwd` | 入力の `cwd` | `DEVIN_PROJECT_DIR`（入力に `cwd` が無い） |
+| スキル本文のパスの展開 | する | しない（入口の文脈で渡す） | しない（入口の文脈で渡す） |
+| 質問の照合 | 主会話 | 主会話と turn | 主会話 |
+| 面接の読み方 | transcript | 会話API | フックの記録だけ |
+
+Devin の回答は `PostToolUse` の `tool_response.output` の文章（`User answered your questions:` に続く JSON）に
+あります。DevFlow は形が厳密に合うときだけ問いごとの選択の配列に直し、合わないときは `outcome=unknown` のまま
+回答として使いません。`success: false` か `error` があるときは `failed` です。取り消しや検査の失敗では
+`PreToolUse` しか届かないので、`PostToolUse` を作りません。Devin は `PostToolUse` の質問入力に既定値
+（問いの `multi_select: false` と選択肢の `description: ""`）を足すので、Pre と Post の照合ではこの2つだけを
+既定値で揃えてから比べます。
+
+Devin の会話の記録（`--export` の ATIF）は面接に読みません。Plan の面接は、フックが記録した質問と回答だけから
+組み立て（Claude の hooks-only と同じ道）、記録の範囲をその理由とともに残します。Devin の面接スキルの判定は、
+Devin の frontmatter（`triggers`、`subagent`、`agent`）を小さな読み手（`plan/interview.py` の
+`devin_frontmatter`）で読みます。配布の検査も同じ読み手を使います。
+
+Devin のスキルは許可の規則を文字どおりに照合し、`${PLUGIN_ROOT}` をどこでも展開しないので、
+`devin-skills/` は `permissions` も `allowed-tools` も持ちません。ランナーの承認は Devin の標準の承認です。
+フックは、失敗しても終了コード 1 で返し、Devin のプロンプトを止めません（2 は止める）。

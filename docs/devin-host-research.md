@@ -17,7 +17,7 @@ Devin のデータディレクトリは `XDG_DATA_HOME` で一時領域へ移し
 
 モデルは無料の `swe-2-flash-medium` を使い、`devin -p`（非対話）で実行した。
 権限は既定（`auto`）のままとした。全ツールを自動承認する `--permission-mode dangerous`
-は、作業していた Claude Code の安全確認で拒否されたため使っていない。
+は、作業していた Claude Code の安全確認で止められたため使っていない。
 
 ## 既存の DevFlow を Devin に入れたときの問題
 
@@ -41,7 +41,7 @@ Devin に入れると5つのスキルとフックが登録される。しかし�
 | JSON スキーマ | 指定する仕組みはない。OpenCode と同じく、指示文と DevFlow 側の厳密な検証で扱う |
 | モデルと effort | `--model` だけを持つ。effort はモデル名の末尾に付く（例: `gpt-6-sol-high`）。選べる effort はモデルごとに違う |
 | 作業ディレクトリ | 起動したディレクトリで動く。DevFlow は既に `cwd=` で起動している |
-| 承認待ち | 承認が要る操作は自動で拒否され、標準エラーに警告が出た。止まらない。`git status` と `git diff` は承認なしで動いた |
+| 承認待ち | 承認が要る操作は自動で断られ、標準エラーに警告が出た。止まらない。`git status` と `git diff` は承認なしで動いた |
 | 活動とトークン数 | `--export <path>` が `ATIF-v1.7` の JSON を書く。ツールの呼び出しと結果、最終回答、`final_metrics` のトークン数を含む。形式は公式に説明されていない |
 | 事前確認 | 使う予定の引数は `devin --help` に載っている |
 
@@ -57,7 +57,7 @@ devin -p --prompt-file <work>/review-input.md --model <model>-<effort> --export 
   迂回できるが、DevFlow は渡さない。人間が先にプロジェクトを信頼し、そうでなければ
   `doctor` かエラーで案内する。
 - 止められても終了コードが 0 になる場合がある。回答の厳密な検証で失敗として扱う。
-- 無料プランでは `swe-2-flash-medium` 以外のモデルが `Upgrade to Pro` で拒否された。
+- 無料プランでは `swe-2-flash-medium` 以外のモデルが `Upgrade to Pro` で使えなかった。
 - `-p` の出力形式、終了コード、export の形式は公式に説明されていない。Devin は既定で
   自動更新するので、版が変わると動きが変わるおそれがある。
 - Devin は既定で `~/.claude` とプロジェクトの `.claude/` のフック・スキル・ルールも読む。
@@ -106,7 +106,7 @@ Devin がこの形で Devin 用のフックとスキルだけを読み、Claude 
 | 明示的な開始 | `/probe:plan alpha beta` と入力すると、`UserPromptSubmit.prompt` にその文字列がそのまま届き、`source: "user"` が付いた |
 | 追加の文脈 | `hookSpecificOutput.additionalContext` がモデルに届いた。Codex と同じく、セッション ID などをこの経路で渡せる |
 | ツール | `PreToolUse` は `tool_name`、`tool_input`、`tool_use_id` を持つ。`PostToolUse` の `tool_response` は `{success, output, error}` |
-| 承認の拒否 | `PreToolUse` と `PermissionRequest` が届き、`PostToolUse` は届かなかった |
+| 承認しなかった場合 | `PreToolUse` と `PermissionRequest` が届き、`PostToolUse` は届かなかった |
 | Stop | `last_assistant_message` でそのターンの最後の発言が取れる |
 | 環境変数 | 起動元の `AI_AGENT` などがそのまま引き継がれた。ホストを環境変数から推測しない |
 
@@ -174,7 +174,7 @@ Codex の最初の対応と同じ制限である。Stop の発言の記録と、
 ### ランナーの起動
 
 exec の `tool_input` は `command`、`timeout`（既定 30000 ms）、`workdir` を持っていた。
-非対話の実行では承認が要るため、ランナーの起動は拒否された。
+非対話の実行では承認が要るため、ランナーは起動できなかった。
 
 人間が Devin の画面で1回承認すると、90秒かかるコマンドが動いた。exec は出力が
 10秒止まった時点でバックグラウンドへ移り、シェル ID を返した。モデルはその ID を
@@ -230,3 +230,26 @@ Codex は隔離した `CODEX_HOME` で、標準の `/hooks` の画面からフ�
 形式が公式に説明されていないので、読めない形のときは既存の規則どおり回答なしとして扱う。
 
 この結果をもとに、`/devflow:plan` で計画を作る。
+
+## 実装時に追加で確かめたこと（2026-11-15、Devin CLI 3000.12.57）
+
+0.10.0 の実装中に、プランが「実装時に確かめる」とした点を実測した。
+
+| 確かめたこと | 結果 | 実装への反映 |
+|---|---|---|
+| 質問の前後の `tool_input` | `PostToolUse` の `tool_input` には、画面が各質問に `multi_select: false` を足し、最上位に `answers` を足す。`PreToolUse` には無い | 質問と回答の照合では、画面が足す回答の項目を除き、`multi_select` が無ければ `false`、選択肢の `description` が無ければ空文字として比べる。ほかの違いは照合しない |
+| スキルの `permissions.allow` | 規則の文字列はそのまま照合された。`Exec(sh ${PLUGIN_ROOT}/...)` は同じ文字列のコマンドだけを通し、`${PLUGIN_ROOT}` はスキルの本文でも、exec の環境でも、規則の中でも展開されなかった。プラグインの実際のパス（キャッシュのパスと元のパスの両方）のコマンドは承認待ちになった | ランナーのパスを含む規則は書けない。`devin-skills/` は `permissions` も `allowed-tools` も書かず、承認は Devin の標準の承認で行う（README に手順を書く） |
+| `--export` の値 | `--export [<PATH>]` は値を省略できる。後ろに位置引数のプロンプトを置くと、パスと区別されずに使い方の誤りになった | レビュアーの引数では `--export PATH` を最後に置く。プロンプトはファイル（`--prompt-file`）で渡す |
+| レビュアーの出力 | 標準出力は最終回答だけだった。`--export` の `steps[].tool_calls[].function_name` にツール名、`final_metrics` に `total_prompt_tokens`・`total_completion_tokens`・`total_cached_tokens` が入った | 活動とトークン数は export から読む。export が無いか読めないときは、活動とトークン数を不明にし、回答は失敗にしない |
+| 信頼していないプロジェクト | `devin -p` は `Refusing to run in an untrusted workspace` で終了コード 1 になった | レビュアーの失敗の文に「Devin でこのプロジェクトを一度信頼する」案内を足す。迂回のフラグは渡さない |
+| `devin skills paths` | 利用者の `~/.config/devin/skills`、`~/.config/cognition/skills`、`~/.agents/skills` と、プロジェクトの `.devin/skills`、`.cognition/skills`、`.agents/skills` を示した | 公開資料の「Where skills live」「Configuration Import」の場所と合わせて、面接スキルの確認の表にする |
+
+公開資料（2026-11-15 に読み直した）は、Claude Code の取り込みとしてプロジェクトの
+`.claude/skills/` だけを挙げ、利用者の `~/.claude/skills/` を挙げていない。そのため
+面接スキルの確認の表に `~/.claude/skills/` は入れない。Codex の取り込みは `~/.codex/skills/`
+で、`CODEX_HOME` は使わないと書かれている。GitHub Copilot の利用者の場所は
+`COPILOT_HOME` で変わる。Windsurf の利用者の場所は `~/.codeium/<channel>/skills/` で、
+`<channel>` は `windsurf`、`windsurf-next`、`windsurf-insiders` の3つが示されている。
+Devin は自分のリリースのチャンネルに合う場所だけを読む（stable は `windsurf`、next は `windsurf-next`、
+insiders は `windsurf-insiders`）。チャンネルの決め方は書かれておらず、オフラインで確かめられないので、
+面接スキルの確認ではこの場所を調べず、調べない場所として示す。

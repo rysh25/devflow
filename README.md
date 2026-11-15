@@ -1,6 +1,6 @@
-# DevFlow 0.9.1 — Claude Code / Codex CLI Plugin
+# DevFlow 0.10.0 — Claude Code / Codex CLI / Devin CLI Plugin
 
-人間との要件整理から計画作成、実装、独立レビューまでを支援する **両ホストで使える単一のプラグイン** です。インストールするプラグインは `devflow` だけです。
+人間との要件整理から計画作成、実装、独立レビューまでを支援する **3つのホスト（Claude Code、Codex CLI、Devin CLI）で使える単一のプラグイン** です。インストールするプラグインは `devflow` だけです。
 
 | コマンド | 入力と役割 |
 | --- | --- |
@@ -28,6 +28,8 @@ Plan / Implement の起動時にレビュアーの種類・モデル・effort �
 /devflow:plan --reviewer claude opus high --reviewer codex gpt-6.1-sol xhigh -- REVIEW-42 を計画して
 $devflow:implement --reviewer claude opus high --reviewer codex gpt-6.1-sol xhigh -- docs/plans/REVIEW-42.md
 ```
+
+Devin をレビュアーにするときは、たとえば `--reviewer devin swe-2 high` と指定します（[プロジェクト設定](#プロジェクト設定)）。
 
 指定しなければ、設定ファイルと既定値の従来の選び方で動きます。
 `--` で始まる起動引数は常にオプションとして解析し、本文の前の単独の `--` が必須です。
@@ -73,9 +75,41 @@ run 形式は10、セッション形式は3です。0.7.x の run（形式9）�
 プロセスをすべて止め、更新前の `.devflow` と共有・ローカル設定のバックアップを戻すか、
 `.devflow` 全体を保管して空の状態から始めてください。形式番号や固定済み設定を書き換えないでください。
 
+## Devin CLI での利用（0.10.0）
+
+Devin CLI（ローカルの端末で動く `devin`）でも、Claude Code と同じ `/devflow:plan`、`/devflow:implement`、
+`/devflow:status`、`/devflow:resume`、`/devflow:doctor` を使えます。導入は次のとおりです（詳しくは
+[導入手順](docs/installation.md#devin-cli)）。
+
+```text
+devin plugins install rysh25/devflow#plugins/devflow
+```
+
+この機械だけに入れるときは `devin plugins install --local ...` も使えます。プラグインは
+`"platforms": ["local"]` で、ローカルの CLI と Desktop だけに読み込まれ、Devin Cloud のセッションには入りません。
+確かめたのは Linux / WSL の Devin CLI 3000.12.57 だけです。Devin Desktop、Devin Cloud、ACP のエディター連携（Zed など）、
+macOS とネイティブの Windows は確かめていません。
+
+- **プロジェクトを信頼する。** 初めてのプロジェクトでは、`devin` をそのプロジェクトで一度起動して信頼してください。
+  DevFlow は信頼や権限の確認を迂回するフラグを渡しません。信頼していないと、Devin をレビュアーにした回は失敗します。
+- **ランナーの承認。** Devin のスキルは、ランナーのコマンドを事前に許可しません。Devin は許可の規則を文字どおりに照合し、
+  プラグインのパスを展開しないため、ランナーだけを許す規則を配布物に書けないからです（[調査](docs/devin-host-research.md#実装時に追加で確かめたこと2026-11-15devin-cli-30001257)）。
+  ランナーを起動するときに Devin が承認を求めたら、Devin の標準の承認で許可してください。DevFlow は利用者の設定を変えません。
+- **面接の記録。** Devin の面接は、フックの記録だけで作ります。人間の回答として数えるのは `ask_user_question` の画面での回答だけで、
+  普通の文章で答えたものは数えません（取り消した質問、飛ばした質問も数えません）。Devin のスキルは、面接の質問を
+  `ask_user_question` で聞くよう頼みます。Devin 自身の説明の文章は記録に入りません。
+- **長い処理。** `review` と `check` は exec で1回だけ実行し、バックグラウンドへ移ったら `get_output` で終わるまで待ちます。
+- **ホストのモデル** は利用者が選びます（例：無料の `swe-2-high`）。DevFlow は決めません。
+- **フックの終了コード。** Devin は、フックが終了コード 2 で終わるとプロンプトを止めます。DevFlow のランナーは、hook の失敗を
+  いつも終了コード 1 で返します（記録だけされ、止まりません）。ランナーより前の失敗は DevFlow では防げません。たとえば `uv` が
+  見つからないとシェルは 127 を返し、公開資料どおりなら止まりませんが、確かめていません。`/devflow:doctor` で `uv` を確かめてください。
+
+あるホストで作ったプランを、別のホストの `/devflow:implement` で実装できます（Implement は Markdown のプランを読むだけです）。
+1つの run を別のホストで再開・復旧することはできません。
+
 ## DevFlow がすること、しないこと
 
-DevFlow は、Claude Code（計画と実装）と外部レビュアー（Codex、OpenCode、Claude Code）の機能を制限しません。どのツールも止めず、フックも失敗したときに止めません。各エージェントは、利用者のそれぞれの設定とモードのまま動きます。
+DevFlow は、ホスト（Claude Code、Codex、Devin：計画と実装）と外部レビュアー（Codex、OpenCode、Claude Code、Devin）の機能を制限しません。どのツールも止めず、フックも失敗したときに止めません。各エージェントは、利用者のそれぞれの設定とモードのまま動きます。
 
 DevFlow がするのは、記録と確認です。
 
@@ -83,7 +117,7 @@ DevFlow がするのは、記録と確認です。
 - レビューの回数（Plan と Implement でそれぞれ、最初は `max_reviews` 回まで。既定 6）と、レビュアーの順番を数える。上限では、人間の承認でレビューを追加するか、やめるか、今の版を受け入れて終えるかを選べる。
 - 両レビュアーが **同じ内容**（Plan はプランのハッシュ、Implement はコードのスナップショット）を承認したときだけ完了（`completed`）とする。上限で人間が受け入れたときは、完了ではなく `accepted` で終える。
 - 上限の確認の前と run が終わったときに、レビューの要約を決まった形で見せる。
-- 人間の判断が要るときは、`AskUserQuestion` の実際の回答だけを判断として記録する。
+- 人間の判断が要るときは、ホストの質問ツール（Claude の `AskUserQuestion`、Codex の `request_user_input`、Devin の `ask_user_question`）の実際の回答だけを判断として記録する。
 
 「計画中はソースを書き換えない」「レビュアーはファイルを書き換えない」「秘密を読まない・外へ出さない」といったことは、スキルとレビュアーへの指示文で頼みます。強制はしません。守りたいことは、Claude Code や各 CLI の権限の設定で守ってください（[信頼の考え方と注意](docs/security.md)）。
 
@@ -100,11 +134,18 @@ claude plugin install devflow@devflow-marketplace --scope user
 
 GitHub に置く場合も公開リポジトリは必須ではありません。認証済みの private リポジトリを marketplace として登録できます。詳細は [インストールと環境設定](docs/installation.md) を参照してください。
 
-更新は、GitHub から導入した場合は次の2つを実行し、Claude Code を起動し直します。ZIP から導入した場合と、更新の前後の注意は [更新する](docs/installation.md#更新する) と「[0.7.3 への更新](#073-への更新)」（それより前の版から上げるときは「[0.7.2 への更新](#072-への更新)」「[0.7.1 への更新](#071-への更新)」「[0.7.0 への更新](#070-への更新)」「[0.6.0 への更新](#060-への更新)」「[0.5.1 への更新](#051-への更新)」「[0.5.0 への更新](#050-への更新)」「[0.4.0 への更新](#040-への更新)」も）を参照してください。
+更新は、GitHub から導入した場合は次の2つを実行し、Claude Code を起動し直します。ZIP から導入した場合と、更新の前後の注意は [更新する](docs/installation.md#更新する) と「[0.10.0 への更新](#0100-への更新)」「[0.7.3 への更新](#073-への更新)」（それより前の版から上げるときは「[0.7.2 への更新](#072-への更新)」「[0.7.1 への更新](#071-への更新)」「[0.7.0 への更新](#070-への更新)」「[0.6.0 への更新](#060-への更新)」「[0.5.1 への更新](#051-への更新)」「[0.5.0 への更新](#050-への更新)」「[0.4.0 への更新](#040-への更新)」も）を参照してください。
 
 ```text
 claude plugin marketplace update devflow-marketplace
 claude plugin update devflow@devflow-marketplace
+```
+
+Codex CLI と Devin CLI への導入と更新は [導入手順](docs/installation.md) を参照してください。Devin では次のとおりです。
+
+```text
+devin plugins install rysh25/devflow#plugins/devflow
+devin plugins update devflow
 ```
 
 ## 必要なもの
@@ -116,11 +157,12 @@ claude plugin update devflow@devflow-marketplace
 | インストール済み Python 3.11 以降 | Python **3.11 固定ではない**。標準ライブラリだけを使用 |
 | Codex CLI | 認証と指定モデルへのアクセスが必要。DevFlow が渡すフラグ（`exec` の `--json`、`--output-schema` など）があれば、版は問わない。doctor で確認 |
 | OpenCode CLI | 認証と指定 provider/model/effort へのアクセスが必要。DevFlow が渡すフラグ（`run` の `--format`、`--standalone` など）があれば、版は問わない |
+| Devin CLI **3000.12.57 以降** | ホストとして使うとき。レビュアーとしては、DevFlow が渡すフラグ（`--print`、`--prompt-file`、`--model`、`--export`）があれば版は問わない。ログインと、指定モデルへのアクセスが必要 |
 | モデルから呼び出せる `grilling` スキル | **Plan のみ必要**。同梱・自動インストールはしない。`plan.grill_skill` で実際のスキル名を指定可能 |
 | 対象プロジェクトの検証環境 | Implement のビルド・テストなど。事前に人間が設定する |
 | Git 2.31 以降 | Implement の既定 `snapshot.mode: "git"` と、worktree での実装で使用。非 Git プロジェクトは明示的に `"files"` に設定 |
 
-DevFlow 0.4.0 は、Claude Code 2.1.317、codex-cli 0.166.0、OpenCode 2.2.5 で確かめました。これより新しい版では、`doctor` が警告を出します（止めません）。確かめ方は [検証範囲](docs/validation.md#版を上げるときの確認) にあります。
+DevFlow 0.4.0 は、Claude Code 2.1.317、codex-cli 0.166.0、OpenCode 2.2.5 で確かめました。Devin CLI は、0.10.0 で 3000.12.57 を確かめました。これより新しい版では、`doctor` が警告を出します（止めません）。確かめ方は [検証範囲](docs/validation.md#版を上げるときの確認) にあります。
 
 実行エントリーポイントには次のインラインメタデータがあります。
 
@@ -240,7 +282,7 @@ Implement は開始時のプランと作業ツリーを固定し、Claude Code �
 
 `publish` の値は、ほかの設定と同じく run の開始時に固定されます。
 
-レビュアーを設定する場合は、最上位の `reviewers` に全員を書きます（配列は全体置換）。2人以上かつ `max_reviews` 以下で、異なる種類（`codex` / `opencode`）を2つ以上含む必要があります。
+レビュアーを設定する場合は、最上位の `reviewers` に全員を書きます（配列は全体置換）。2人以上かつ `max_reviews` 以下で、異なる種類（`codex` / `opencode` / `claude` / `devin`）を2つ以上含む必要があります。
 
 ```json
 {
@@ -257,12 +299,18 @@ Implement は開始時のプランと作業ツリーを固定し、Claude Code �
 | 項目 | 意味 |
 | --- | --- |
 | `id` | 小文字の名前。レビュアーごとに異なる |
-| `kind` | `codex` か `opencode` |
+| `kind` | `codex`、`opencode`、`claude`、`devin` のどれか |
 | `command` | CLI を起動する引数の配列（例：`["codex"]`、`["node", "/path/to/cli.js"]`）。DevFlow はシェルを通さずに起動する |
 | `model`、`effort` | モデルと推論の強さ。DevFlow が引数に組み込むので、`-` で始まらず、空白・`"`・`\`・`#` を含まないもの |
 | `timeout_seconds` | 1回のレビューの制限時間（5〜3600 秒、既定 1800 秒）。DevFlow はレビュアーへの指示に、持ち時間、止める時刻、答えを書き始める目安の時刻（持ち時間の 80% の時点）を書く。時間を過ぎると DevFlow がレビュアーを止め、その回は失敗 |
 
 知らない項目があると、その項目の名前を示すエラーになります。
+
+Devin をレビュアーにする例です。DevFlow は `devin --print --prompt-file <入力> --model <model>-<effort> --export <記録>` で起動し、`model` と `effort` を `-` でつないで渡します（`swe-2` と `high` なら `swe-2-high`）。選べる effort はモデルごとに違うので、`devin models list` で確かめてください。Devin は、プロジェクトを信頼していないとレビューを始めません。
+
+```json
+{"id": "devin", "kind": "devin", "command": ["devin"], "model": "swe-2", "effort": "high", "timeout_seconds": 1800}
+```
 
 `checks: []` は「検証不要」という意味ではありません。変更後のコード版ごとに人間の実確認が必要です。可能な限り自動化するには、[設定例](examples/README.md) を参考に既存テスト・ビルドを登録してください。コマンドは文字列ではなく引数配列で指定します。設定例は依存の導入や実行可能性を保証しません。
 
@@ -294,7 +342,7 @@ Implement は開始時のプランと作業ツリーを固定し、Claude Code �
 | --- | --- | --- |
 | `.devflow/runs/plan/<run-id>/` | 依頼、インタビュー、途中の計画、レビュー、採否、公開記録 | しない |
 | `.devflow/runs/implement/<run-id>/` | 入力プラン、基準コード、差分、検証、レビュー、結果 | しない |
-| `.devflow/sessions/` | Claude セッションと実行の対応 | しない |
+| `.devflow/sessions/` | ホストの会話（セッション）と実行の対応 | しない |
 | `docs/plans/*.md` | 双方のレビューを通過した、またはレビューの上限で人間が受け入れた正式なプラン（保存先は `plan.publish.directory`、名前は `plan.publish.filename` で決まる） | 必要に応じて推奨 |
 | `docs/plans/*.approval.md` | 横のプランの承認の記録（承認したのがレビュアーか人間か、版のハッシュ、run ID、日時など） | プランと同じ |
 | `devflow.config.json` | 共有可能なプロジェクト設定。秘密は書かない | 推奨 |
@@ -308,7 +356,7 @@ run-id は一回の作業を識別する自動生成 ID です。レビューご
 
 `.devflow/.gitignore` は非公開の実行データを無視するために作成します。プロジェクト直下の `.gitignore` を勝手に変更しません。Git で既に追跡済みのファイルは `.gitignore` では追跡解除されません。正式プランを保存しても `git add` / `commit` / `push` は実行しません。
 
-ランナーでは、読み取りも含めて常に `--host claude` または `--host codex` を明示します。`--help` と `--version` はホスト指定なしで表示できます。run を変える操作（`cancel` など）は、run を所有する会話のセッションからだけ使えます。人間が自分の端末からランナーで操作するときは `--session` にそのセッションの ID を渡すか、先に `/devflow:resume RUN_ID` で今の会話へ引き継いでください。`status` と `doctor` は、どこからでも使えます。
+ランナーでは、読み取りも含めて常に `--host claude`、`--host codex`、`--host devin` のどれかを明示します。`--help` と `--version` はホスト指定なしで表示できます。run を変える操作（`cancel` など）は、run を所有する会話のセッションからだけ使えます。人間が自分の端末からランナーで操作するときは `--session` にそのセッションの ID を渡すか、先に `/devflow:resume RUN_ID` で今の会話へ引き継いでください。`status` と `doctor` は、どこからでも使えます。
 
 外部処理（チェック・レビュー）の途中で Claude Code を閉じた場合などは、run が処理中のまま残ります。関係するプロセスが止まったことを確かめてから、人間が自分の端末でランナーの `recover` を実行します。その回は使用済みのままです。`PLUGIN_DIR` はインストールしたプラグインのディレクトリ、`PROJECT_DIR` は対象プロジェクトです。Plan の `--expected-review` には、処理中だったレビューの回（`/devflow:status` の `review_count`）を渡します。
 
@@ -317,12 +365,12 @@ uv --no-cache run --offline --no-project --no-config --no-python-downloads "PLUG
 uv --no-cache run --offline --no-project --no-config --no-python-downloads "PLUGIN_DIR/scripts/devflow.py" --host claude --project "PROJECT_DIR" --run RUN_ID plan recover --expected-review N --confirm-process-stopped
 ```
 
-上の例は Claude の run 用です。Codex の run を復旧するときは `--host codex` を指定します。
+上の例は Claude の run 用です。Codex の run を復旧するときは `--host codex`、Devin の run は `--host devin` を指定します。
 
 ## 制約と安全性
 
 - DevFlow は OS サンドボックスではなく、どのツールも止めません。守りたいことは、Claude Code と各 CLI の権限・サンドボックスの設定で守ってください。
-- 1つのセッション（Claude Code / Codex の1つの会話）で進める run は1つです。並行作業は会話を分けて行います。Plan は何本でも並行できます。Implement は実装場所（プロジェクトか worktree）ごとに、未完了の run を1つまで持てます。
+- 1つのセッション（Claude Code / Codex / Devin の1つの会話）で進める run は1つです。並行作業は会話を分けて行います。Plan は何本でも並行できます。Implement は実装場所（プロジェクトか worktree）ごとに、未完了の run を1つまで持てます。
 - Implement を並行するときは、別の worktree を実装場所にします。worktree はプロジェクトの外か、`.gitignore` で除外した場所に作ってください。プロジェクトの中にある Git で無視されていない worktree は、プロジェクト本体を実装場所にする Implement のスナップショットを止めます（`Nested repositories require separate implementation runs`）。
 - 並行する会話は、どれも `.devflow` を持つ同じプロジェクトルートで始め、worktree は `--workspace` で指定します。worktree の中で始めた会話は worktree 側の `.devflow` を使うので、ほかの会話の run が見えず、この制約も共有されません。
 - 実装場所はパスで比べます。macOS の大文字小文字を区別しないファイルシステムで、同じ worktree を大文字小文字だけ違うパスで指定すると、別の実装場所とみなされます。いつも同じ書き方で指定してください。
@@ -334,6 +382,27 @@ uv --no-cache run --offline --no-project --no-config --no-python-downloads "PLUG
 - push、公開、デプロイ、依存の追加、破壊的移行の前には、人間に確認するようスキルで頼んでいます。
 
 詳しくは [設計](docs/architecture.md)、[信頼の考え方と注意](docs/security.md)、[検証範囲](docs/validation.md) を参照してください。
+
+## 0.10.0 への更新
+
+0.9.x の run は、そのまま続けられます（run の記録の形式は 10、セッションの記録の形式は 3 のままです）。
+
+変わったこと：
+
+- **Devin CLI をホストとレビュアーに加えました**（[Devin CLI での利用](#devin-cli-での利用0100)）。レビュアーの `kind` に `devin` が加わりました。既定のレビュアー（Codex と OpenCode）は変わりません。
+- **Claude Code のフックのファイルの名前が `hooks/claude.json` になりました**（`.claude-plugin/plugin.json` の `hooks` で指定します）。Claude Code と Devin はどちらも `hooks/hooks.json` を必ず読むため、そこにはどのホストのフックも置きません。Claude Code はいつもどおりプラグインを更新し、起動し直せば足ります。Codex は `hooks/codex.json` のままです。
+- ランナーの hook は、引数の誤り（たとえば古いランナーに知らないホストを渡したとき）でも終了コード 1 で終わります。
+
+**0.9.1 に戻すとき。** 0.9.1 は、Devin がホストの run（`owner_host: "devin"`）を「壊れた記録」として扱います。壊れた Implement の run があると、終わっているかに関わらず、ほかの Implement の開始と再開が止まります。また 0.9.1 は `kind: "devin"` のレビュアーを設定の誤りとします。プラグインを戻すだけでは Claude と Codex 側も使えなくなることがあるので、次の順で戻してください。
+
+1. 関係するプロセス（ホスト、ランナー、レビュアー、チェック）がすべて止まっていることを確かめる。
+2. `.devflow/`、`devflow.config.json`、`devflow.config.local.json` を丸ごと控える。
+3. 次の run は 0.9.1 で続けられないので、0.10.0 のうちに終えるか取り消す。
+   - Devin がホストの run
+   - どのホストの run でも、固定された設定（`config.reviewers`）に `kind: "devin"` のレビュアーを含む未完了の run。run は開始時に固定した設定からレビュアーを選ぶので、プロジェクトの設定から Devin を外しても、この run には効きません。
+4. Devin がホストの run とセッションの記録（`owner_host` か `host` が `devin` のもの）を、`.devflow/` の外の保管場所へ移す。
+5. 設定から `kind: "devin"` のレビュアーを外す（または 0.10.0 にする前に控えた設定へ戻す）。
+6. 各ホストで 0.9.1 に戻す。Devin からは DevFlow を外す（0.9.1 を Devin に入れると、すべてのプロンプトが止まります）。
 
 ## 0.9.1 への更新
 
@@ -488,7 +557,7 @@ python tools/package.py
 
 `python` は環境に応じて `python3` などに読み替えてください。ZIP は既存の同名ファイルを上書きせず、固定された順序・タイムスタンプと `SHA256SUMS` を含みます。
 
-変更を配るときは、版を上げます。Claude Code は版が同じだと、GitHub から導入した利用者のプラグインを更新しません。版は `plugins/devflow/.claude-plugin/plugin.json` と `plugins/devflow/scripts/devflow_core/__init__.py` の2か所に書き、版を固定しているテスト（`tests/test_distribution.py`、`tests/router/test_entrypoint.py`）の期待値も合わせて直します。
+変更を配るときは、版を上げます。Claude Code は版が同じだと、GitHub から導入した利用者のプラグインを更新しません。版は3つのマニフェスト（`plugins/devflow/.claude-plugin/plugin.json`、`.codex-plugin/plugin.json`、`.devin-plugin/plugin.json`）と `plugins/devflow/scripts/devflow_core/__init__.py` に書き、版を固定しているテスト（`tests/test_distribution.py`、`tests/router/test_entrypoint.py`）の期待値も合わせて直します。
 
 `tools/package.py` は静的検証です。Claude Code 本体によるプラグイン検証・hooks 実行・認証済みモデル呼び出しとは異なります。GitHub Actions で Linux / macOS / Windows × Python 3.11 / 3.12 / 3.13 のテストを実行します。
 
@@ -498,5 +567,9 @@ python tools/package.py
 - [Claude Code：Skills](https://code.claude.com/docs/en/skills)
 - [Claude Code：Hooks](https://code.claude.com/docs/en/hooks)
 - [Claude Code：ツールの説明（Bash の待ち時間とバックグラウンド実行）](https://code.claude.com/docs/en/tools-reference)
+- [Devin CLI：Plugins](https://docs.devin.ai/cli/extensibility/plugins/overview)
+- [Devin CLI：Skills](https://docs.devin.ai/cli/extensibility/skills/overview)
+- [Devin CLI：Hooks](https://docs.devin.ai/cli/extensibility/hooks/overview)
+- [Devin CLI：Permissions](https://docs.devin.ai/cli/reference/permissions)
 - [uv：Python スクリプトの実行](https://docs.astral.sh/uv/guides/scripts/)
 - [uv：Python バージョンの選択](https://docs.astral.sh/uv/concepts/python-versions/)

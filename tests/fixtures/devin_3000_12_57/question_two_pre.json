@@ -1,0 +1,47 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "ask_user_question",
+  "tool_input": {
+    "questions": [
+      {
+        "header": "Format",
+        "options": [
+          {
+            "description": "Returns f\"Hello, {name}!\"",
+            "label": "Hello, {name}!"
+          },
+          {
+            "description": "Returns f\"Hi {name}!\"",
+            "label": "Hi {name}!"
+          },
+          {
+            "description": "Returns f\"Hey {name}\"",
+            "label": "Hey {name}"
+          }
+        ],
+        "question": "What should greet(name) return?"
+      },
+      {
+        "header": "Edge case",
+        "options": [
+          {
+            "description": "Treat falsy names as \"guest\"",
+            "label": "Hello, guest!"
+          },
+          {
+            "description": "Raise ValueError on empty/None name",
+            "label": "Raise ValueError"
+          },
+          {
+            "description": "Return the greeting with empty name",
+            "label": "Allow empty"
+          }
+        ],
+        "question": "How should greet handle an empty or None name?"
+      }
+    ]
+  },
+  "tool_use_id": "call_802aefb4f4050ea7",
+  "session_id": "glitter-rubidium",
+  "prompt_id": "1dfc1534-8c78-4056-a17b-25be9e924e56"
+}

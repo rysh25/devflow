@@ -39,25 +39,30 @@ def project_root(start: Path) -> Path:
     return current
 
 
-def hook_project(cwd: Path, environ) -> Path:
+def hook_project(cwd: str | None, environ, variable: str | None, *, from_cwd: bool = True) -> Path:
     """The project a hook acts for.
 
-    Claude Code sets ``CLAUDE_PROJECT_DIR`` to the directory where the session
-    started; it stays fixed after a ``cd`` or a move into a worktree, so the
-    hook keeps finding the run that session works on. When it is unset or empty,
-    the project is found from the hook's ``cwd`` (older behaviour). A non-empty
-    value that is not an absolute existing directory is an error.
+    ``variable`` is the host's environment variable naming the project (the
+    host table's ``project_variable``). Claude Code sets ``CLAUDE_PROJECT_DIR``
+    to the directory where the session started; it stays fixed after a ``cd``
+    or a move into a worktree, so the hook keeps finding the run that session
+    works on. Devin sets ``DEVIN_PROJECT_DIR`` to the project root and sends no
+    ``cwd``. When the variable is unset or empty and ``from_cwd`` allows it, the
+    project is found from the hook's ``cwd``. A non-empty value that is not an
+    absolute existing directory is an error.
     """
-    value = environ.get("CLAUDE_PROJECT_DIR") if environ is not None else None
+    value = environ.get(variable) if variable and environ is not None else None
     if not value:
+        if not from_cwd or not isinstance(cwd, str) or not cwd:
+            raise DevFlowError(f"Hook requires {variable or 'its cwd'} to name the project")
         return project_root(Path(cwd))
     if os.name == "nt":
         value = msys_path(value)
     start = Path(value)
     if not start.is_absolute():
-        raise DevFlowError("CLAUDE_PROJECT_DIR must be an absolute directory")
+        raise DevFlowError(f"{variable} must be an absolute directory")
     if not start.is_dir():
-        raise DevFlowError("CLAUDE_PROJECT_DIR does not name an existing directory")
+        raise DevFlowError(f"{variable} does not name an existing directory")
     return project_root(start)
 
 

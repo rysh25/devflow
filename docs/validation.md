@@ -1,4 +1,4 @@
-# DevFlow 0.9.1 の検証範囲
+# DevFlow 0.10.0 の検証範囲
 
 ## 再実行方法
 
@@ -23,8 +23,9 @@ python tools/package.py --validate-only
 | Claude Code | 2.1.319 |
 | Codex | codex-cli 0.166.0 |
 | OpenCode | 2.2.5 |
+| Devin CLI | 3000.12.57（0.10.0 から） |
 
-GitHub Actions で、Linux / macOS / Windows × Python 3.11 / 3.12 / 3.13 の全テストが通ることを確かめています（2026-11-04）。
+GitHub Actions で、Linux / macOS / Windows × Python 3.11 / 3.12 / 3.13 の全テストが通ることを、2026-11-04 の時点で確かめました。版ごとの CI の結果は各版の節にあります。
 
 ## 自動テストの対象
 
@@ -619,3 +620,38 @@ Codex ホストは、実機では確かめていません。変更はホスト�
 OpenCode に囲まれた答えを返させる実機の確認はしていません（狙って起こせないため）。フックと会話の記録に触れない変更なので、本物の Claude Code での確認もしていません。
 
 `python tools/test_all.py --quiet`（911 件、Python 3.15 と 3.12）と `python tools/package.py --validate-only` が成功しました。
+
+## 0.10.0 の検証（2026-11-15）
+
+DevFlow 0.10.0 は、Devin CLI をホスト（5操作）とレビュアーに加えました。Claude Code のフックのファイルを `hooks/claude.json` に改名しました。
+
+Devin CLI 3000.12.57（Linux / WSL2）で実測し、記録を `tests/fixtures/devin_3000_12_57/` に残しました（パスと名前を伏せ、レビューの記録は構造だけ）。実測した内容と資料は [Devin の調査](devin-host-research.md) にあります。
+
+- フックの入力：`cwd` が無く、`DEVIN_PROJECT_DIR` がプロジェクトを指すこと。`session_id` の形。
+- `ask_user_question`：答えた質問の `PreToolUse` と `PostToolUse`（答えは `tool_response.output` の文章）、2問の質問、取り消しと検査の失敗では `PreToolUse` しか届かないこと、`PostToolUse` の質問入力に `multi_select` が足されること。
+- スキルの許可の規則が文字どおりに照合され、`${PLUGIN_ROOT}` がどこでも展開されないこと。
+- `devin --print --prompt-file … --model … --export …` の標準出力が答えだけであること、`--export` が ATIF-v1.7 であること、信頼していないプロジェクトでは終了コード 1 で止まること。
+- `devin skills paths` が示すスキルの場所。
+
+自動テストで確かめたこと：
+
+- Devin の回答の読み方：決まった形のときだけ問いごとの選択の配列に直し、読み飛ばし、空、キーの不一致、重複した問い、接頭辞の無い文章、壊れた JSON は `unknown`、`success: false` と `error` は `failed` になること。画面が足す既定値の違いだけでは、Pre と Post の照合を外さないこと。問いの文や `multi_select` が変わると承認候補にならないこと。
+- Devin のフック：`DEVIN_PROJECT_DIR` が無い・相対・存在しないときの理由、`/devflow:` の5操作の入口の文脈、Plan と Implement の開始と再開、ほかのホストの記録との衝突、面接をフックの記録だけで組み立てること。どの hook の失敗（知らないホストや省略形のオプションなどの引数の誤りを含む）でも終了コード 1 で終わること。
+- Devin のレビュアー：偽の CLI で、引数、標準入力を閉じること、答えと動きとトークン数の読み方、`--export` が無いとき、答えが無いとき、信頼していないときの案内、事前確認、起動時のレビュアー指定。
+- Devin の面接スキル：公開資料の場所のそれぞれ、親のディレクトリをたどらないこと、Windows と `COPILOT_HOME`、frontmatter の判定（`triggers`、`subagent`、`agent`、読めない値、リストでない `triggers` と真偽値でない `subagent` を未確認にすること）、公開資料の例。
+- 配布：3つのマニフェストの版、`hooks/claude.json` と `hooks/codex.json` とルートの `hooks.json`、`hooks/` の既定のファイルが無いこと、Devin のフックのコマンドと照合、`devin-skills/` の frontmatter と本文。
+
+`python tools/test_all.py --quiet`（Python 3.15）と `python tools/package.py --validate-only` が成功しました。
+
+0.9.1 に戻す手順（README の「0.10.0 への更新」）を、インストール済みの 0.9.1 のランナーで確かめました。一時的な git リポジトリで、0.10.0 のランナーに、Devin がホストの Plan と Implement の run と、Claude がホストで Devin をレビュアーに固定した Plan と Implement の run を作らせ、すべて取り消しました。
+
+1. 手順4の前は、0.9.1 の Claude の Implement の開始が、Devin がホストの run を読めないとして止まりました（README に書いたとおり）。
+2. 手順4で Devin がホストの run とセッションの記録を移すと、0.9.1 で `doctor`、`status`、取り消した Claude の run の `status` と再開の入口、新しい Implement と Plan の開始が、止まらずに動きました。Codex の `doctor` も同じです。
+
+終わった（レビューを通った）Devin レビュアーの run は、本物のレビューが要るため、この確認では作っていません。
+
+確かめていないこと：
+
+- macOS とネイティブの Windows の Devin CLI、Devin Desktop、Devin Cloud、ACP のエディター連携。
+- 0.10.0 の GitHub Actions（Linux / macOS / Windows × Python 3.11–3.13）。プルリクエストの CI で確かめる。
+- `uv` が見つからないとき（終了コード 127）に Devin がプロンプトを止めないこと。

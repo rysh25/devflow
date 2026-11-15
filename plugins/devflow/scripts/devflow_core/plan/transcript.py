@@ -246,13 +246,15 @@ def _unanswered_content(value: Any) -> str:
     return _json(value)
 
 
-def capture_interview(marker: dict, events: list[dict]) -> dict:
+def capture_interview(marker: dict, events: list[dict], *, host: str = "claude") -> dict:
     """Return visible messages with explicit provenance.
 
     ``events`` are the original hook input objects recorded since activation.
     UserPromptSubmit is authoritative for raw prompts (including the original
     slash command). PostToolUse can preserve structured AskUserQuestion answers
-    more faithfully than Claude's human-readable tool-result rendering.
+    more faithfully than Claude's human-readable tool-result rendering. A host
+    whose interview is read from the hook records only (``host``, e.g. Devin)
+    has no transcript, and the coverage names that host.
     """
     if not isinstance(events, list) or any(not isinstance(e, dict) for e in events):
         raise CaptureError("Hook events must be a list of objects")
@@ -610,7 +612,8 @@ def capture_interview(marker: dict, events: list[dict]) -> dict:
                 prompt["origin_unknown"] = True
         return _hooks_only(marker, events, [p for p in prompts if p["event_index"] not in automated_events],
                            post_questions, questions, segment.bytes_read, scan, unhooked,
-                           _NO_TRANSCRIPT if missing else _UNPLACED)
+                           (_HOOKS_ONLY_HOSTS[host][0] if host in _HOOKS_ONLY_HOSTS else
+                            _NO_TRANSCRIPT if missing else _UNPLACED), host=host)
     if unused:
         first = unused[0]
         messages.insert(0, {"role": "user", "content": first["text"], "source": {
@@ -700,10 +703,28 @@ _UNPLACED = "The transcript's form did not let every human prompt be placed; "
 _NO_TRANSCRIPT = ("There was no Claude Code transcript; messages Claude Code sent as prompts (such as task "
                   "notifications) cannot be told from the human's, so the prompts after the request are kept "
                   "with an unknown origin; ")
+_CLAUDE_HOOKS_ONLY = (
+    "Claude's messages other than its AskUserQuestion questions are not included; human "
+    "texts and questions without a hook record are kept at the end, in transcript order; a text counts "
+    "as a response only when Claude Code marked it human, a prompt whose origin is unknown is not "
+    "counted, and a question without its PreToolUse record is kept as unverified and not counted; an "
+    "answer the hook gives in a form this version does not read is taken from the transcript.")
+#: Hosts whose interview is read from the hook records only: why, and what that leaves out.
+_HOOKS_ONLY_HOSTS = {
+    "devin": (
+        "Devin's conversation record is not read; the interview is built from the hook records alone. "
+        "Prompts Devin sends itself cannot be told from the human's, so the prompts after the request are "
+        "kept with an unknown origin; ",
+        "Devin's messages other than its ask_user_question questions are not included; a prompt whose "
+        "origin is unknown is not counted, and a question without its PreToolUse record is kept as "
+        "unverified and not counted; an answer in a form this version does not read, a skipped question "
+        "and a cancelled question (which has no PostToolUse record) are not answers."),
+}
 
 
 def _hooks_only(marker: dict, events: list[dict], prompts: list[dict], post_questions: list[tuple[int, dict]],
-                questions: dict[str, dict], captured_bytes: int, scan: dict, unhooked: list[dict], why: str) -> dict:
+                questions: dict[str, dict], captured_bytes: int, scan: dict, unhooked: list[dict], why: str,
+                *, host: str = "claude") -> dict:
     """The interview from the hook records, in their order.
 
     Used when the transcript's form does not let every human prompt be placed,
@@ -759,7 +780,8 @@ def _hooks_only(marker: dict, events: list[dict], prompts: list[dict], post_ques
         tool_id = _name(item.get("tool_use_id"))
         hooked.add(tool_id)
         source = {"origin": "PostToolUse", "hook_event_index": index, "tool_use_id": tool_id}
-        content = _read_answer(item["tool_response"])
+        # An answer the host adapter could not read (outcome unknown) is never taken from the native result.
+        content = None if item.get("outcome") == "unknown" else _read_answer(item["tool_response"])
         if content is not None:
             answer = {"content": content, "source": {
                 **source, "encoding": "string" if isinstance(item["tool_response"], str) else "json-values"}}
@@ -797,9 +819,5 @@ def _hooks_only(marker: dict, events: list[dict], prompts: list[dict], post_ques
         "hook-records-only", marker, captured_bytes, scan, messages, answered=counts["answered"],
         unanswered=counts["unanswered"], prefilled=counts["prefilled"], user_responses=responses + marked,
         unhooked=len(unhooked), unverified=counts["unverified"],
-        reason=why + "Claude's messages other than its AskUserQuestion questions are not included; human "
-               "texts and questions without a hook record are kept at the end, in transcript order; a text counts "
-               "as a response only when Claude Code marked it human, a prompt whose origin is unknown is not "
-               "counted, and a question without its PreToolUse record is kept as unverified and not counted; an "
-               "answer the hook gives in a form this version does not read is taken from the transcript.",
+        reason=why + (_HOOKS_ONLY_HOSTS[host][1] if host in _HOOKS_ONLY_HOSTS else _CLAUDE_HOOKS_ONLY),
         excluded=("assistant-messages",))}

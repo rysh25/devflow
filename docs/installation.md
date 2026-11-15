@@ -3,7 +3,7 @@
 ## 新規インストール
 
 1. ZIP を解凍します。`devflow/.claude-plugin/marketplace.json` が存在することを確認します。
-2. **Claude Code 2.1.316 以降**と、同じ環境で起動できる `uv`、互換 Python 3.11 以降、Codex CLI、OpenCode CLI を用意します。必要な認証は各 CLI の通常手順で行います。Windows の `uv` は実行可能な `uv.exe` が必要です。
+2. **Claude Code 2.1.316 以降**と、同じ環境で起動できる `uv`、互換 Python 3.11 以降、Codex CLI、OpenCode CLI を用意します（Devin CLI を使う場合は「[Devin CLI](#devin-cli)」）。必要な認証は各 CLI の通常手順で行います。Windows の `uv` は実行可能な `uv.exe` が必要です。
 3. Plan を使うなら、Claude Code の `Skill` ツールから呼び出せる `grilling` スキルを別途導入します。実際の呼び出し名を `plan.grill_skill` に設定できます。`disable-model-invocation: true` のスキルは利用できません。
 4. 解凍先の `devflow` でターミナルを開きます。
 
@@ -98,7 +98,7 @@ public は必須ではありません。private も、実行環境の通常の G
 
 ## 更新する
 
-更新の前に、README の「0.9.1 への更新」（それより前の版から上げるときは「0.9.0 への更新」「0.8.1 への更新」「0.8.0 への更新とバージョンを戻す場合」「0.7.3 への更新」「0.7.2 への更新」「0.7.1 への更新」「0.7.0 への更新」「0.6.0 への更新」「0.5.1 への更新」「0.5.0 への更新」「0.4.0 への更新」も）で、その版の注意点を確認してください。版によっては、それまでの run を続けられないことがあります（例：0.6.x で始めた run は 0.7.0 では続けられません）。
+更新の前に、README の「0.10.0 への更新」（それより前の版から上げるときは「0.9.1 への更新」「0.9.0 への更新」「0.8.1 への更新」「0.8.0 への更新とバージョンを戻す場合」「0.7.3 への更新」「0.7.2 への更新」「0.7.1 への更新」「0.7.0 への更新」「0.6.0 への更新」「0.5.1 への更新」「0.5.0 への更新」「0.4.0 への更新」も）で、その版の注意点を確認してください。版によっては、それまでの run を続けられないことがあります（例：0.6.x で始めた run は 0.7.0 では続けられません）。
 
 ### GitHub から導入した場合
 
@@ -250,3 +250,83 @@ uv --no-cache run --offline --no-project --no-config --no-python-downloads "PLUG
 取得はCaptureErrorで止まり、推測した変換で続けません。
 seal は1ページ100項目、最大10,000ページを取得します。doctor の conversation_api に制限値と検査範囲を表示します。
 会話・質問の原文を取得できない場合は、要約への置き換えや、欠落した回答の推測で続行しません。
+
+## Devin CLI
+
+0.10.0 から、ローカルの Devin CLI をホストとレビュアーに使えます。確かめたのは Linux / WSL の
+Devin CLI 3000.12.57 です。Devin Desktop、Devin Cloud、ACP のエディター連携、macOS と
+ネイティブの Windows は確かめていません。`uv`、互換 Python 3.11 以降、使うレビュアーの CLI を、
+Devin と同じ環境に用意してください。
+
+### 導入と更新
+
+```text
+devin plugins install rysh25/devflow#plugins/devflow
+```
+
+この機械だけに入れるときは `--local` を付けます。プラグインの `.devin-plugin/plugin.json` は
+`"platforms": ["local"]` なので、ローカルの CLI と Desktop だけに読み込まれ、Devin Cloud には同期されません。
+入れたら `devin plugins list` で `devflow` が表示されることを確かめます。更新は
+`devin plugins update devflow` か、入れ直しで行います。以前に Devin へ 0.9.x を入れていた場合も、
+0.10.0 に更新するか入れ直してください（0.9.x は Devin に対応しておらず、すべてのプロンプトが止まります）。
+
+Devin は、プラグインのルートの `hooks.json` を読みます。DevFlow はそこで `UserPromptSubmit` と、
+`ask_user_question` だけの `PreToolUse` / `PostToolUse` を登録します。フックはシェルのコマンド文字列で、
+`--host devin hook` でランナーを起動します。
+
+### 信頼と承認
+
+1. **プロジェクトを信頼する。** 初めてのプロジェクトでは、`devin` をそのプロジェクトで起動し、信頼を選びます。
+   信頼していないプロジェクトでは、Devin をレビュアーにした回が `Refusing to run in an untrusted workspace` で
+   失敗します。DevFlow は `--respect-workspace-trust false` や `--permission-mode` を渡しません。
+2. **ランナーを承認する。** スキルはランナーを事前に許可しません。Devin は許可の規則を文字どおりに照合し、
+   プラグインのパスを展開しないので、ランナーだけを許す規則を配布物に書けないためです。Devin がランナーの
+   コマンドの承認を求めたら、Devin の標準の承認で許可してください。DevFlow は利用者の設定を変えません。
+
+### 確かめる
+
+Devin でプロジェクトを開き、次を送ります。
+
+```text
+/devflow:doctor
+```
+
+`host_diagnostics` に Devin CLI の版、`workflows.plan.interview_skill` に面接スキルの判定が出ます。
+Devin の doctor は静的な確認だけで、会話の API の確認（Codex の `conversation_api`）はありません。
+
+### 面接スキルの場所
+
+`plan.grill_skill` のスキルは、Devin の skill ツールから呼べる必要があります。doctor は、Devin の公開資料と
+`devin skills paths` に載っている次の場所の `<名前>/SKILL.md` を調べます。プロジェクトは根だけを調べ、
+親のディレクトリへはたどりません。Windsurf のグローバルのスキル（`~/.codeium/<チャンネル>/skills`）は、Devin が自分のリリースのチャンネルに合う場所だけを読み、そのチャンネルをオフラインで確かめる方法が公開されていないので、調べません。
+
+| 範囲 | 場所 |
+|---|---|
+| プロジェクト | `.devin/skills`、`.cognition/skills`、`.agents/skills`、`.windsurf/skills`、`.kiro/skills`、取り込みの `.claude/skills`、`.github/skills`、`.codex/skills`、`.codeium/skills` |
+| 利用者 | `~/.config/devin/skills`（Windows は `%APPDATA%\devin\skills`）、`~/.config/cognition/skills`、`~/.agents/skills`、`~/.kiro/skills`、取り込みの `~/.copilot/skills`（`COPILOT_HOME` があればその下）、`~/.codex/skills` |
+
+判定には Devin の frontmatter の項目だけを使います（Claude の `disable-model-invocation` などは使いません）。
+
+- `triggers` に `model` が無い（例 `[user]`）と、モデルが呼べないので使えません。
+- `subagent: true` か、`agent` にプロファイル名があると、サブエージェントで動き、サブエージェントには
+  `ask_user_question` が無いので使えません。`subagent: false` は省略したときと同じです。
+- Devin が読めない frontmatter（`: ` を含む引用符なしの値など）は、Devin が警告なしにスキルを読み込まないので使えません。
+- `triggers` がリストでない、`subagent` が引用符なしの真偽値（`true`・`false`）でない場合は、公開資料の型に合わないので「未確認」と表示します（`"false"`、`0`、`yes` などを読み替えません）。
+- 調べた場所に無いときは「調べた場所には無い」と表示します。プラグインのスキル、Devin Cloud のスキル、
+  設定（取り込みの無効化など）による変更は確かめません。
+
+### フックの終了コード
+
+Devin は、フックのコマンドが終了コード 2 で終わるとプロンプトを止めます（`Prompt blocked`）。DevFlow のランナーは
+hook の失敗を、引数の誤りも含めていつも終了コード 1 で返すので、止まりません。ランナーより前の失敗は防げません。
+存在する `uv` が引数の誤りで 2 を返すと止まります（0.9.1 を Devin に入れたときに実測）。`uv` が見つからないときは
+シェルが 127 を返し、公開資料どおりなら止まりませんが、Devin での動作は確かめていません。`/devflow:doctor` の
+`executables.uv` で `uv` が見つかることを確かめてください。
+
+### Devin をレビュアーにする
+
+`reviewers` に `{"kind": "devin", "command": ["devin"], "model": "swe-2", "effort": "high"}` のように書くか、
+起動時に `--reviewer devin swe-2 high` を指定します。DevFlow は `--model swe-2-high` のように `model` と `effort` を
+`-` でつないで渡します。選べる組み合わせは `devin models list` で確かめてください。レビュアーは run の
+プロジェクト（Implement では実装場所）で `devin --print` として動き、承認が要るツールは Devin 自身が断ります
+（待ち続けません）。

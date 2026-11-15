@@ -9,6 +9,26 @@ import json
 from pathlib import Path
 
 
+#: How each host that does not expand the plugin's placeholders runs the runner.
+HOST_INSTRUCTIONS = {
+    "codex": ("Pass --host codex --project PROJECT --session SESSION from this context. "
+              "Run long review/check calls with exec_command and poll its returned session_id "
+              "with write_stdin until completion; never replay the command. Use standard Codex "
+              "approval only when required and approved by the human. "),
+    "devin": ("Pass --host devin --project PROJECT --session SESSION from this context. "
+              "Run long review/check calls once with exec, passing bash_timeout_ms as its timeout; when "
+              "it moves to the background, pass its returned shell ID to get_output (with a timeout) until "
+              "the command completes; never rerun the command. Use standard Devin approval only when "
+              "required and approved by the human. "),
+}
+#: How each host waits for a long review or check.
+WAIT_INSTRUCTIONS = {
+    "claude": ("For review and check, pass bash_timeout_ms as the Bash timeout, unchanged; "
+               "if it is larger than the tool's foreground maximum, run the call in the background "
+               "with that timeout. Wait for its completion notice before the next action. "),
+}
+
+
 def context(event: str, message: str) -> dict:
     return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": message}}
 
@@ -24,15 +44,8 @@ def status_context(workflow, state: dict, run_dir: Path, plugin_root: Path, even
               **workflow.context_fields(state, run_dir), "bash_timeout_ms": workflow.bash_timeouts(state)}
     if event_id:
         fields["recorded_event_id"] = event_id
-    host_instructions = ("Pass --host codex --project PROJECT --session SESSION from this context. "
-                         "Run long review/check calls with exec_command and poll its returned session_id "
-                         "with write_stdin until completion; never replay the command. Use standard Codex "
-                         "approval only when required and approved by the human. "
-                         if state["owner_host"] == "codex" else "")
-    wait_instructions = ("For review and check, pass bash_timeout_ms as the Bash timeout, unchanged; "
-                         "if it is larger than the tool's foreground maximum, run the call in the background "
-                         "with that timeout. Wait for its completion notice before the next action. "
-                         if state["owner_host"] == "claude" else "")
+    host_instructions = HOST_INSTRUCTIONS.get(state["owner_host"], "")
+    wait_instructions = WAIT_INSTRUCTIONS.get(state["owner_host"], "")
     return (host_instructions + f"DevFlow {workflow.name} is active. {workflow.guidance} "
             "Use the runner path below for DevFlow actions. DevFlow does not limit any other tool; "
             "your host settings and permission mode apply. " + wait_instructions +

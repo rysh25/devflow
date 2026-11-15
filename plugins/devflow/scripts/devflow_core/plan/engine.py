@@ -9,6 +9,7 @@ import re
 from uuid import uuid4
 
 from ..common.errors import CaptureError, DevFlowError
+from ..common.hosts import host_profile
 from ..common.paths import path_key
 from ..common.review import (LIMIT_DECISIONS, REVIEW_BUDGET, after_failed_review, all_approved, ask_at_limit, decide_at_limit,
                              next_reviewer)
@@ -223,11 +224,12 @@ class Engine(RunEngine):
                 raise DevFlowError("Resolve initial human questions before sealing the interview.")
             try:
                 payloads = [event["payload"] for event in self._events(state)]
-                if state["owner_host"] == "codex":
+                kind = host_profile(state["owner_host"]).interview
+                if kind == "conversation_api":
                     from .codex_interview import capture_interview as capture_codex
                     interview = capture_codex(state["transcript_marker"], payloads, self.project)
-                else:
-                    interview = capture_interview(state["transcript_marker"], payloads)
+                else:  # Claude's transcript with the hook records, or the hook records only.
+                    interview = capture_interview(state["transcript_marker"], payloads, host=state["owner_host"])
             except CaptureError as exc:
                 raise DevFlowError(f"Cannot certify complete interview capture: {exc}. Do not replace it with a summary.") from exc
             if interview.get("coverage", {}).get("human_response_count", 0) < 1:

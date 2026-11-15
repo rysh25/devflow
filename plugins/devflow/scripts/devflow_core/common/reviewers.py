@@ -5,10 +5,11 @@ there: with the user's settings and the project's own settings and instruction
 files (``AGENTS.md`` and the like), which the user trusts as part of the
 project. It reads what it needs with its own tools. DevFlow adds only what it
 needs to start the CLI and read its answer: the model and effort, no waiting for
-approvals (Codex gets ``approval_policy="never"``; ``opencode run`` itself
-declines what the user's settings would ask about), JSON events, the output
-schema (Codex), the working directory, and the standard input: Codex reads the
-prompt from it, then it is closed; OpenCode's is closed from the start. The
+approvals (Codex gets ``approval_policy="never"``; ``opencode run`` and
+``devin -p`` themselves decline what the user's settings would ask about), JSON
+events (Devin: a session export file), the output schema (Codex), the working
+directory, and the standard input: Codex reads the prompt from it, then it is
+closed; OpenCode's and Devin's are closed from the start. The
 reviewer instructions ask it to treat every file as data, so a file cannot
 change its verdict or this contract.
 
@@ -498,10 +499,14 @@ class CLI:
         """The answer as strict JSON, and what the run did; ``output`` is the stdout log."""
         raise NotImplementedError
 
-    def tokens(self, output: Path) -> dict[str, int] | None:
-        """The token counts in the stdout log, under the CLI's own names (flat), or
-        None when the output reports none or the CLI is not taught to read them."""
+    def tokens(self, output: Path, work_dir: Path) -> dict[str, int] | None:
+        """The token counts the run reported (in the stdout log, or a file the CLI wrote in
+        ``work_dir``), under the CLI's own names (flat), or None when the run reports
+        none or the CLI is not taught to read them."""
         return None
+
+    #: Added to the error when the CLI exits with a failure, for a cause the human can fix.
+    failure_hint = ""
 
 
 class Codex(CLI):
@@ -526,7 +531,7 @@ class Codex(CLI):
             raise ReviewerError("Codex finished without an answer")
         return answer_value(final), activity
 
-    def tokens(self, output):
+    def tokens(self, output, work_dir):
         """``turn.completed`` carries its thread's running total (``codex exec --json``
         reports the thread's total token usage), so the last one of each thread
         counts, and only threads are added together. An event without a thread
@@ -558,7 +563,7 @@ class OpenCode(CLI):
     def answer(self, output, work_dir):
         return parse_opencode_events(_lines(output))
 
-    def tokens(self, output):
+    def tokens(self, output, work_dir):
         """Each ``step_finish`` reports one step's tokens; every step of every session is added."""
         totals: dict[str, int] = {}
         for event in _events(_lines(output), Activity()):
@@ -594,7 +599,7 @@ class Claude(CLI):
     def answer(self, output, work_dir):
         return parse_claude_events(_raw_lines(output))
 
-    def tokens(self, output):
+    def tokens(self, output, work_dir):
         # Measured on 2.1.319: modelUsage includes child work absent from usage.
         # usage is required only as an object (possibly empty); its numeric
         # members are not a source. All four fields are required in each model.
@@ -616,8 +621,67 @@ class Claude(CLI):
         return totals
 
 
+DEVIN_TOKEN_FIELDS = ("total_prompt_tokens", "total_completion_tokens", "total_cached_tokens")
+
+
+def _devin_export(work_dir: Path) -> dict | None:
+    """The ``--export`` record (ATIF-v1.7 on 3000.12.57), or None when it is missing or unreadable."""
+    try:
+        value = json_value(_read_text(Path(work_dir) / "export.json", None))
+    except (ReviewerError, RecursionError):  # Optional telemetry never fails the answer.
+        return None
+    return value if isinstance(value, dict) else None
+
+
+class Devin(CLI):
+    """``devin -p``: the prompt from a file and a closed standard input (a prompt on standard
+    input is an error); standard output is only the final answer. Tool calls and token counts
+    come from the session record ``--export`` writes. Tools that would need approval are
+    declined by ``-p`` itself, without waiting."""
+
+    command = ("devin",)
+    failure_hint = ("; if Devin refused an untrusted workspace, start devin in this project once and trust it "
+                    "(DevFlow never skips the trust check)")
+
+    def flags(self):
+        return ["--print", "--prompt-file", "--model", "--export"]
+
+    def arguments(self, model, effort, work_dir, cwd, schema_path, *, schema=None):
+        # --export takes an optional path, so it stays last with its path.
+        return ["--print", "--prompt-file", str(work_dir / "review-input.md"), "--model", f"{model}-{effort}",
+                "--export", str(work_dir / "export.json")]
+
+    def answer(self, output, work_dir):
+        final = _read_text(output, None)
+        if not final.strip():
+            raise ReviewerError("Devin finished without an answer")
+        activity = Activity()
+        record = _devin_export(work_dir)
+        steps = record.get("steps") if record else None
+        if isinstance(steps, list):
+            for step in steps:
+                calls = step.get("tool_calls") if isinstance(step, dict) else None
+                for call in calls if isinstance(calls, list) else ():
+                    # Only the measured ATIF shape counts; other entries are ignored, not counted.
+                    if isinstance(call, dict) and isinstance(call.get("function_name"), str):
+                        activity.tool(call["function_name"])
+        else:
+            activity.other("(no readable export)")
+        return answer_value(final), activity.value()
+
+    def tokens(self, output, work_dir):
+        record = _devin_export(work_dir)
+        metrics = record.get("final_metrics") if record else None
+        if not isinstance(metrics, dict):
+            return None
+        # The three measured counts, under their own names; any other shape is ignored.
+        totals = {name: metrics[name] for name in DEVIN_TOKEN_FIELDS
+                  if type(metrics.get(name)) is int and metrics[name] >= 0}
+        return dict(sorted(totals.items())) or None
+
+
 #: The reviewer CLIs by kind, including their standard command prefixes.
-CLIS = {"codex": Codex(), "opencode": OpenCode(), "claude": Claude()}
+CLIS = {"codex": Codex(), "opencode": OpenCode(), "claude": Claude(), "devin": Devin()}
 
 #: What every reviewer is asked, whatever the workflow: added after its instructions.
 RULES = Path(__file__).with_name("reviewer-rules.md")
@@ -631,7 +695,7 @@ def review_tokens(config: dict, work_dir: Path) -> dict[str, int] | None:
     try:
         if output.is_symlink() or not output.is_file():
             return None
-        tokens = CLIS[config["kind"]].tokens(output)
+        tokens = CLIS[config["kind"]].tokens(output, Path(work_dir))
         # The counts go into a record: one that cannot be written (a sum past Python's
         # integer-to-text limit, say) is unknown, never a failed save.
         json_bytes(tokens)
@@ -749,6 +813,6 @@ def run_review(prepared: PreparedReview, validate: Callable[[Any], dict]) -> dic
     code, _ = _capture(argv, cwd=cwd, env=env, timeout=timeout,
                        data=cli.stdin(prepared.prompt.decode("utf-8")), log_dir=work_dir)
     if code:
-        raise ReviewerError(f"{kind} exited with {code}; inspect stderr.log (no automatic retry)")
+        raise ReviewerError(f"{kind} exited with {code}; inspect stderr.log (no automatic retry){cli.failure_hint}")
     value, activity = cli.answer(work_dir / "stdout.jsonl", work_dir)
     return {"review": validate(value), "activity": activity}

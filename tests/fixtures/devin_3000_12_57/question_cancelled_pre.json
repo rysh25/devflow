@@ -1,0 +1,25 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "ask_user_question",
+  "tool_input": {
+    "questions": [
+      {
+        "header": "Fruit",
+        "options": [
+          {
+            "description": "An apple",
+            "label": "Apple"
+          },
+          {
+            "description": "A banana",
+            "label": "Banana"
+          }
+        ],
+        "question": "Pick a fruit"
+      }
+    ]
+  },
+  "tool_use_id": "call_ad534d2adac7add2",
+  "session_id": "glitter-rubidium",
+  "prompt_id": "f1a1f94a-b52e-4f4a-9d5d-8bb62969c36b"
+}

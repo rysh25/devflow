@@ -1,0 +1,39 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv --no-cache run --offline --no-project --no-config --no-python-downloads \"${PLUGIN_ROOT}/scripts/devflow.py\" --host devin hook",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^ask_user_question$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv --no-cache run --offline --no-project --no-config --no-python-downloads \"${PLUGIN_ROOT}/scripts/devflow.py\" --host devin hook",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^ask_user_question$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv --no-cache run --offline --no-project --no-config --no-python-downloads \"${PLUGIN_ROOT}/scripts/devflow.py\" --host devin hook",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

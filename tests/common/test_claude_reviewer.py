@@ -61,11 +61,11 @@ class ClaudeTests(unittest.TestCase):
                         result = {**self.result, field: value}
                         self.assertEqual(self.parse(self.init, result)[0], self.result["structured_output"])
                         output.write_text(json.dumps(result), encoding="utf-8")
-                        self.assertIsNone(reviewers.Claude().tokens(output))
+                        self.assertIsNone(reviewers.Claude().tokens(output, output.parent))
                 result = {key: value for key, value in self.result.items() if key != field}
                 self.assertEqual(self.parse(self.init, result)[0], self.result["structured_output"])
                 output.write_text(json.dumps(result), encoding="utf-8")
-                self.assertIsNone(reviewers.Claude().tokens(output))
+                self.assertIsNone(reviewers.Claude().tokens(output, output.parent))
 
     def test_child_result_and_init_are_counted_without_affecting_main_answer(self):
         child = {**self.result, "session_id": "child", "parent_tool_use_id": "child-tool", "is_error": True}
@@ -132,7 +132,7 @@ class ClaudeTests(unittest.TestCase):
             output.write_bytes(self.raw)
             cli = reviewers.Claude()
             native = next(iter(self.result["modelUsage"].values()))
-            self.assertEqual(cli.tokens(output), {"input_tokens": native["inputTokens"],
+            self.assertEqual(cli.tokens(output, output.parent), {"input_tokens": native["inputTokens"],
                 "output_tokens": native["outputTokens"], "cache_creation_input_tokens": native["cacheCreationInputTokens"],
                 "cache_read_input_tokens": native["cacheReadInputTokens"]})
             for field in ("inputTokens", "outputTokens", "cacheCreationInputTokens", "cacheReadInputTokens"):
@@ -140,22 +140,22 @@ class ClaudeTests(unittest.TestCase):
                     value = copy.deepcopy(self.result)
                     next(iter(value["modelUsage"].values()))[field] = invalid
                     output.write_text(json.dumps(value))
-                    self.assertIsNone(cli.tokens(output))
+                    self.assertIsNone(cli.tokens(output, output.parent))
             output.write_bytes(self.raw + self.raw)
-            self.assertIsNone(cli.tokens(output))
+            self.assertIsNone(cli.tokens(output, output.parent))
 
     def test_usage_object_is_metadata_and_model_usage_is_the_only_numeric_source(self):
         with tempfile.TemporaryDirectory() as folder:
             output = Path(folder) / 'stdout.jsonl'
             output.write_bytes(self.raw)
-            expected = reviewers.Claude().tokens(output)
+            expected = reviewers.Claude().tokens(output, output.parent)
             self.assertIsNotNone(expected)
             for usage in ({}, {'input_tokens':1}, {'input_tokens':-1, 'output_tokens':'unused'}):
                 with self.subTest(usage=usage):
                     result = {**self.result, 'usage':usage}
                     self.assertEqual(self.parse(result)[0], self.result['structured_output'])
                     output.write_text(json.dumps(result), encoding='utf-8')
-                    self.assertEqual(reviewers.Claude().tokens(output), expected)
+                    self.assertEqual(reviewers.Claude().tokens(output, output.parent), expected)
 
     def test_schema_is_minified_ascii_and_limited_separately_from_stdin(self):
         with tempfile.TemporaryDirectory() as folder:

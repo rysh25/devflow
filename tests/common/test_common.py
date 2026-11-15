@@ -449,7 +449,7 @@ class EnvironmentTests(unittest.TestCase):
 
     def test_versions_newer_than_the_checked_ones_are_warned_about(self):
         from devflow_core.common.environment import CHECKED_VERSIONS, version_warnings
-        self.assertEqual(set(CHECKED_VERSIONS), {"claude", "codex", "opencode"})
+        self.assertEqual(set(CHECKED_VERSIONS), {"claude", "codex", "opencode", "devin"})
         self.assertEqual(version_warnings("codex", "codex-cli 0.166.0"), [])
         self.assertEqual(version_warnings("codex", "codex-cli 0.150.2"), [])
         self.assertEqual(version_warnings("opencode", "opencode v2.2.5"), [])

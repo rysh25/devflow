@@ -9,7 +9,7 @@ from .errors import DevFlowError
 from .storage import no_symlinks, read_json
 
 
-REVIEWER_KINDS = frozenset({"codex", "opencode", "claude"})
+REVIEWER_KINDS = frozenset({"codex", "opencode", "claude", "devin"})
 REVIEWER_FIELDS = frozenset({"id", "kind", "command", "model", "effort", "timeout_seconds"})
 REVIEWER_REQUIRED = REVIEWER_FIELDS
 CONFIG_FILES = ("devflow.config.json", "devflow.config.local.json")

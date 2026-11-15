@@ -1,0 +1,15 @@
+{
+  "hook_event_name": "PostToolUse",
+  "tool_name": "read",
+  "tool_input": {
+    "file_path": "/work/project/a.txt"
+  },
+  "tool_use_id": "call_875d0b07a42c5150",
+  "tool_response": {
+    "success": true,
+    "output": "<file-view ...>\n  1|hi\n</file-view>",
+    "error": null
+  },
+  "session_id": "glitter-rubidium",
+  "prompt_id": "d678c5bf-4288-4d37-86ef-8efcd905cd45"
+}

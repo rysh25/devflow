@@ -905,7 +905,7 @@ class TokenTests(unittest.TestCase):
         self.assertIsNone(self.tokens("codex", lines({"type": "turn.started"})))
         (self.work / "stdout.jsonl").unlink()
         self.assertIsNone(reviewers.review_tokens(reviewer("codex"), self.work))
-        self.assertIsNone(reviewers.CLI().tokens(self.work / "stdout.jsonl"))
+        self.assertIsNone(reviewers.CLI().tokens(self.work / "stdout.jsonl", self.work))
 
     def test_counts_survive_an_invalid_answer_or_a_timeout_and_never_fail_a_review(self):
         # The turn completed with its usage, then the output stopped (a timeout) or held no valid answer.

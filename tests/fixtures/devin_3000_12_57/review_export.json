@@ -1,0 +1,96 @@
+{
+  "schema_version": "ATIF-v1.7",
+  "session_id": "kind-spider",
+  "agent": {
+    "name": "devin",
+    "version": "3000.12.57",
+    "model_name": "SWE-2 Flash Medium"
+  },
+  "steps": [
+    {
+      "step_id": 1,
+      "source": "system",
+      "message": ""
+    },
+    {
+      "step_id": 2,
+      "source": "system",
+      "message": ""
+    },
+    {
+      "step_id": 3,
+      "source": "system",
+      "message": ""
+    },
+    {
+      "step_id": 4,
+      "source": "system",
+      "message": ""
+    },
+    {
+      "step_id": 5,
+      "source": "user",
+      "message": ""
+    },
+    {
+      "step_id": 6,
+      "source": "system",
+      "message": ""
+    },
+    {
+      "step_id": 7,
+      "source": "agent",
+      "message": "",
+      "tool_calls": [
+        {
+          "tool_call_id": "call_b7415076639b4f9d",
+          "function_name": "read",
+          "arguments": {}
+        },
+        {
+          "tool_call_id": "call_afe082c0532d269b",
+          "function_name": "grep",
+          "arguments": {}
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "call_b7415076639b4f9d",
+            "content": ""
+          },
+          {
+            "source_call_id": "call_afe082c0532d269b",
+            "content": ""
+          }
+        ]
+      },
+      "metrics": {
+        "prompt_tokens": 13575,
+        "completion_tokens": 92
+      }
+    },
+    {
+      "step_id": 8,
+      "source": "system",
+      "message": ""
+    },
+    {
+      "step_id": 9,
+      "source": "agent",
+      "message": "{\"verdict\": \"pass\", \"title_found\": true}",
+      "tool_calls": [],
+      "metrics": {
+        "prompt_tokens": 15519,
+        "completion_tokens": 28,
+        "cached_tokens": 11520
+      }
+    }
+  ],
+  "final_metrics": {
+    "total_prompt_tokens": 29094,
+    "total_completion_tokens": 120,
+    "total_cached_tokens": 11520,
+    "total_steps": 9
+  }
+}

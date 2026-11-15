@@ -144,7 +144,7 @@ class CliTests(unittest.TestCase):
         code, out, err = self.cli("hook", stdin=json.dumps(self.payload(session="new-session", prompt=prompt)))
         # The prompt goes through with a context message; it is never blocked.
         self.assertEqual((code, err), (0, ""))
-        self.assertNotAccepted(out, "resume", "original Claude session")
+        self.assertNotAccepted(out, "resume", "original Claude Code session")
         self.assertIsNone(sessions.read_record(self.project, "new-session", WORKFLOWS, host="claude"))
         code, out, err = self.cli("--session", "cli-session", "plan", "status")
         self.assertEqual(json.loads(out)["owner_session"], "cli-session")

@@ -136,7 +136,12 @@ def _validate_files(files: dict[str, bytes]) -> dict:
     _require('# /// script' in metadata and 'requires-python = ">=3.11"' in metadata,
              "Runner needs a Python minimum, not an exact interpreter pin")
     _require('dependencies = []' in metadata, "Runner must not download Python packages")
-    hooks = document(plugin + "/hooks/hooks.json").get("hooks")
+    # Claude Code and Devin both load hooks/hooks.json by themselves, so no host's hooks live there.
+    _require(plugin + "/hooks/hooks.json" not in files,
+             "hooks/hooks.json must not exist: Claude uses hooks/claude.json, Codex hooks/codex.json, Devin hooks.json")
+    _require(manifests["devflow"].get("hooks") == "./hooks/claude.json",
+             "The Claude manifest must name ./hooks/claude.json as its hooks")
+    hooks = document(plugin + "/hooks/claude.json").get("hooks")
     _require(isinstance(hooks, dict), "Missing unified hook map")
     # Hooks only record and add context: they never block, and the tool hooks
     # run only for AskUserQuestion (so other tool calls start no process).
@@ -218,6 +223,7 @@ def _validate_files(files: dict[str, bytes]) -> dict:
     entry = catalog["plugins"][0]
     _require(isinstance(entry, dict) and entry.get("name") == "devflow" and entry.get("source") ==
              {"source": "local", "path": "./plugins/devflow"}, "Codex marketplace must point inside the same plugin")
+    _validate_devin(files, plugin, manifests["devflow"]["version"], set(hooks), operations)
     _validate_package(files)
     for path, data in files.items():
         if path.endswith(".py"):
@@ -225,6 +231,86 @@ def _validate_files(files: dict[str, bytes]) -> dict:
         elif path.endswith(".json"):
             _json(data, path)
     return {"marketplace": marketplace["name"], "version": manifests["devflow"]["version"], "plugins": {name: manifests[name]["version"] for name in PLUGINS}, "source_files": len(files), "source_bytes": sum(map(len, files.values()))}
+
+
+DEVIN_HOOK_COMMAND = ('uv --no-cache run --offline --no-project --no-config --no-python-downloads '
+                      '"${PLUGIN_ROOT}/scripts/devflow.py" --host devin hook')
+
+
+def _devin_frontmatter(text: str, path: str) -> dict:
+    """The Devin skill frontmatter, read by the same function the interview-skill check uses."""
+    sys.dont_write_bytecode = True
+    scripts = str(ROOT / "plugins" / "devflow" / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    from devflow_core.plan.interview import devin_frontmatter
+    from devflow_core.common.errors import DevFlowError
+    _require(text.startswith("---\n") and "\n---" in text[4:], f"Missing skill frontmatter: {path}")
+    try:
+        return devin_frontmatter(text[4:text.index("\n---", 4)])
+    except DevFlowError as exc:
+        raise PackagingError(f"Devin cannot read the frontmatter of {path}: {exc}") from exc
+
+
+def _validate_devin(files: dict[str, bytes], plugin: str, version: str, events: set, operations: set) -> None:
+    def document(name):
+        _require(name in files, f"Missing package file: {name}")
+        value = _json(files[name], name)
+        _require(isinstance(value, dict), f"Expected JSON object: {name}")
+        return value
+    manifest = document(plugin + "/.devin-plugin/plugin.json")
+    _require(manifest.get("name") == "devflow" and manifest.get("version") == version,
+             "Host manifest versions/names differ")
+    _require(isinstance(manifest.get("description"), str) and manifest["description"].strip(),
+             "Devin manifest needs a description")
+    _require(manifest.get("skills") == "./devin-skills/", "Devin skills must be ./devin-skills/ inside the plugin")
+    # Only the local CLI is supported: the plugin must not sync to Devin Cloud sessions.
+    _require(manifest.get("platforms") == ["local"], 'Devin manifest platforms must be ["local"]')
+    _require("hooks" not in manifest, "Devin ignores a manifest hooks path; its hooks are the plugin root hooks.json")
+    devin_hooks = document(plugin + "/hooks.json").get("hooks")
+    _require(isinstance(devin_hooks, dict) and set(devin_hooks) == events,
+             "Devin hooks must be exactly UserPromptSubmit, PreToolUse and PostToolUse")
+    for event, matchers in devin_hooks.items():
+        _require(isinstance(matchers, list) and len(matchers) == 1 and isinstance(matchers[0], dict),
+                 f"Invalid Devin hook matcher: {event}")
+        matcher = matchers[0]
+        _require(matcher.get("matcher") == (None if event == "UserPromptSubmit" else "^ask_user_question$"),
+                 f"Devin {event} must match only ask_user_question")
+        commands = matcher.get("hooks")
+        _require(isinstance(commands, list) and len(commands) == 1 and isinstance(commands[0], dict),
+                 "Invalid Devin hook command list")
+        hook = commands[0]
+        # Devin runs the command string with a shell and ignores args.
+        _require("args" not in hook, "Devin hooks must be one command string without args")
+        _require(hook.get("type") == "command" and hook.get("command") == DEVIN_HOOK_COMMAND,
+                 "Devin hooks must invoke the bundled runner with explicit --host devin")
+        _require(hook.get("onFailure") != "block", "Devin hooks must never block on failure")
+    prefix = plugin + "/devin-skills/"
+    skills = [path for path in files if path.startswith(prefix) and path.endswith("/SKILL.md")]
+    _require(set(skills) == {prefix + name + "/SKILL.md" for name in operations},
+             "Devin must ship exactly five manual skills")
+    contract_path = plugin + "/references/devin-runner.md"
+    _require(contract_path in files, "Missing shared Devin runner contract")
+    contract = files[contract_path].decode("utf-8")
+    _require("--host devin" in contract and "uv --no-cache run" in contract and "get_output" in contract,
+             "Devin runner contract bypasses the host-aware runner")
+    for path in skills:
+        text = files[path].decode("utf-8")
+        fields = _devin_frontmatter(text, path)
+        name = Path(path).parent.name
+        _require(fields.get("name") == name, f"Skill name/directory mismatch: {path}")
+        _require(isinstance(fields.get("description"), str) and fields["description"].strip(),
+                 f"Skill description missing: {path}")
+        _require(fields.get("triggers") == ["user"], f"Devin skill must be invoked by the human only: {path}")
+        # Devin matches permission rules literally and expands no plugin path in them, so a rule for the
+        # runner alone cannot be written; any rule here would allow more than the runner.
+        _require("allowed-tools" not in fields and "permissions" not in fields,
+                 f"Devin skills must not pre-approve tools: {path}")
+        _require("references/devin-runner.md" in text, f"Devin skill must reference the runner contract: {path}")
+        _require("$devflow:" not in text and "conversation_api.checked" not in text,
+                 f"Devin skill uses another host's instructions: {path}")
+    _require("ask_user_question" in files[prefix + "plan/SKILL.md"].decode("utf-8"),
+             "Devin plan skill must ask interview questions with ask_user_question")
 
 
 def _module_name(path: str) -> str:

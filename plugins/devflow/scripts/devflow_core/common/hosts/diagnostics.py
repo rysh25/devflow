@@ -6,6 +6,8 @@ from ..environment import version_numbers
 
 MINIMUM_CLAUDE_CODE = "2.1.316"
 MINIMUM_CODEX = "0.166.0"
+#: The Devin CLI version whose hooks, question results and skills were measured.
+MINIMUM_DEVIN = "3000.12.57"
 
 
 def claude_version() -> dict:
@@ -50,3 +52,22 @@ def codex_version():
     report["feature_note"] = ("Under development and disabled by default in checked Codex 0.166.0; "
                               "explicit activation and real question/answer verification are required")
     return report
+
+
+def devin_version() -> dict:
+    executable = shutil.which("devin")
+    report = {"minimum_version": MINIMUM_DEVIN, "path": executable, "version": None, "supported": False,
+              "reason": "Devin CLI executable not found", "runtime_verified": False}
+    if executable:
+        try:
+            result = subprocess.run([executable, "--version"], stdin=subprocess.DEVNULL, capture_output=True,
+                                    text=True, encoding="utf-8", errors="replace", timeout=10, shell=False)
+            found = version_numbers(result.stdout[:8192])
+            report.update(version=".".join(map(str, found)) if found else None,
+                          supported=result.returncode == 0 and bool(found) and found >= version_numbers(MINIMUM_DEVIN),
+                          reason=("Plugin hooks, workspace trust and ask_user_question need runtime verification; "
+                                  "trust this project in Devin once before using DevFlow"))
+        except (OSError, subprocess.SubprocessError) as exc:
+            report["reason"] = str(exc)
+    return report
+
