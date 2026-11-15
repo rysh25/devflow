@@ -309,7 +309,7 @@ class DistributionTests(unittest.TestCase):
                 path = root / plugin / "devin-skills" / name / "SKILL.md"
                 text = path.read_text(encoding="utf-8")
                 self.assertIn(old, text)
-                path.write_text(text.replace(old, new, count), encoding="utf-8")
+                path.write_text(text.replace(old, new, count), encoding="utf-8", newline="")
             return apply
 
         def add_shared_hook_file(root):
