@@ -1,7 +1,8 @@
 """Devin as a reviewer CLI and Devin's interview-skill metadata, offline.
 
 The reviewer runs as a fake local process that answers like Devin CLI
-3000.12.57 (stdout holds only the final answer; --export writes ATIF-v1.7).
+3000.12.57: standard output joins every agent message without a separator, and
+--export writes an ATIF-v1.7 record whose last agent message is the answer.
 """
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "devin_3000_12_57"
 REVIEW = {"schema_version": 1, "verdict": "pass", "summary": "ok", "findings": [], "questions": []}
 
 FAKE_DEVIN = r'''
-import json, shutil, sys
+import json, sys
 from pathlib import Path
 args = sys.argv[1:]
 mode = args.pop(0)
@@ -40,11 +41,15 @@ stdin = sys.stdin.read() if not sys.stdin.closed else ""
 values = dict(zip(args[1::2], args[2::2])) if args[0] == "--print" else {}
 work = Path(values["--prompt-file"]).parent
 (work / "seen.json").write_text(json.dumps({"argv": args, "stdin": stdin}))
-fixtures = Path(sys.argv[0]).parent
+record = json.loads((Path(sys.argv[0]).parent / "review_export.json").read_text())
+answer = json.dumps(%s)
+final = {"pass": answer, "prose": "Analysis of the diff.\n\n" + answer, "empty": ""}.get(mode, answer)
+agents = [step for step in record["steps"] if step["source"] == "agent"]
+agents[0]["message"] = "Reading the diff."
+agents[-1]["message"] = final
 if mode != "no-export":
-    shutil.copyfile(fixtures / "review_export.json", values["--export"])
-if mode != "empty":
-    print(json.dumps(%s))
+    Path(values["--export"]).write_text(json.dumps(record))
+print("".join(step["message"] for step in agents))
 ''' % json.dumps(REVIEW)
 
 
@@ -74,6 +79,14 @@ class DevinReviewerTests(unittest.TestCase):
                                             cwd=self.project, probe=reviewers.preflight(config))
         return reviewers.run_review(prepared, lambda value: value), config
 
+    def answer(self, export_text):
+        """Devin.answer on a written export; standard output is never read."""
+        self.work.mkdir(exist_ok=True)
+        output = self.work / "stdout.jsonl"
+        output.write_text("not the answer", encoding="utf-8")
+        (self.work / "export.json").write_text(export_text, encoding="utf-8")
+        return reviewers.CLIS["devin"].answer(output, self.work)
+
     def test_arguments_pass_the_prompt_file_model_effort_and_export(self):
         cli = reviewers.CLIS["devin"]
         self.assertEqual(cli.command, ("devin",))
@@ -83,9 +96,11 @@ class DevinReviewerTests(unittest.TestCase):
         self.assertIsNone(cli.stdin("prompt"))
         self.assertEqual(cli.flags(), ["--print", "--prompt-file", "--model", "--export"])
 
-    def test_a_review_reads_the_answer_from_stdout_and_activity_and_tokens_from_the_export(self):
+    def test_a_review_reads_the_answer_activity_and_tokens_from_the_export(self):
         result, config = self.run_review()
         self.assertEqual(result["review"], REVIEW)
+        # Standard output joined the messages, so it is not JSON; the answer still reads.
+        self.assertTrue((self.work / "stdout.jsonl").read_text().startswith("Reading the diff.{"))
         self.assertEqual(result["activity"]["tool_calls"], {"grep": 1, "read": 1})
         seen = json.loads((self.work / "seen.json").read_text())
         self.assertEqual(seen["stdin"], "")
@@ -93,50 +108,56 @@ class DevinReviewerTests(unittest.TestCase):
         self.assertEqual(reviewers.review_tokens(config, self.work),
                          {"total_cached_tokens": 11520, "total_completion_tokens": 120, "total_prompt_tokens": 29094})
 
-    def test_the_measured_stdout_is_the_answer_alone(self):
-        self.assertEqual(json.loads((FIXTURES / "review_stdout.txt").read_text()),
-                         {"verdict": "pass", "title_found": True})
+    def test_the_measured_stdout_joins_the_agent_messages_and_the_export_keeps_the_last_one(self):
+        record = json.loads((FIXTURES / "joined_export.json").read_text(encoding="utf-8"))
+        messages = [step["message"] for step in record["steps"] if step["source"] == "agent"]
+        stdout = (FIXTURES / "joined_stdout.txt").read_text(encoding="utf-8").rstrip("\n")
+        self.assertEqual(stdout, "".join(messages))
+        self.assertGreater(len(messages), 1)
+        with self.assertRaises(ValueError):
+            json.loads(stdout)
+        self.assertEqual(reviewers.answer_value(reviewers._devin_answer(record)), {"lines": 5})
+
+    def test_an_answer_with_text_around_the_json_still_fails(self):
+        with self.assertRaisesRegex(ReviewerError, "JSON"):
+            self.run_review("prose")
+        self.assertTrue((self.work / "export.json").is_file())  # The original record stays for inspection.
 
     def test_unknown_export_shapes_are_ignored_not_counted(self):
-        self.work.mkdir()
-        output = self.work / "stdout.jsonl"
-        output.write_text(json.dumps(REVIEW), encoding="utf-8")
-        (self.work / "export.json").write_text(json.dumps({
-            "steps": [{"tool_calls": [None, 7, {}, {"function_name": 3}, {"function_name": "read"}]}, "odd"],
+        review, activity = self.answer(json.dumps({
+            "steps": [{"tool_calls": [None, 7, {}, {"function_name": 3}, {"function_name": "read"}]}, "odd",
+                      {"source": "agent", "message": json.dumps(REVIEW)}],
             "final_metrics": {"total_prompt_tokens": {"unexpected": 5}, "total_completion_tokens": -1,
-                              "total_cached_tokens": True, "other_tokens": 9}}), encoding="utf-8")
-        cli = reviewers.CLIS["devin"]
-        review, activity = cli.answer(output, self.work)
+                              "total_cached_tokens": True, "other_tokens": 9}}))
         self.assertEqual(review, REVIEW)
         self.assertEqual((activity["tool_call_count"], activity["tool_calls"]), (1, {"read": 1}))
+        cli, output = reviewers.CLIS["devin"], self.work / "stdout.jsonl"
         self.assertIsNone(cli.tokens(output, self.work))
         (self.work / "export.json").write_text(json.dumps({"final_metrics": {
             "total_prompt_tokens": 10, "total_completion_tokens": {"x": 1}}}), encoding="utf-8")
         self.assertEqual(cli.tokens(output, self.work), {"total_prompt_tokens": 10})
 
-    def test_a_deeply_nested_export_is_unreadable_but_keeps_the_answer(self):
-        self.work.mkdir()
-        output = self.work / "stdout.jsonl"
-        output.write_text(json.dumps(REVIEW), encoding="utf-8")
-        (self.work / "export.json").write_text('{"steps": [], "x": ' + "[" * 100000 + "]" * 100000 + "}",
-                                               encoding="utf-8")
-        cli = reviewers.CLIS["devin"]
-        review, activity = cli.answer(output, self.work)
-        self.assertEqual(review, REVIEW)
-        self.assertEqual(activity["other_events"], {"(no readable export)": 1})
-        self.assertIsNone(cli.tokens(output, self.work))
+    def test_without_a_readable_final_agent_message_there_is_no_answer(self):
+        cases = {
+            "broken": "{not json",
+            "too deep": '{"steps": [], "x": ' + "[" * 100000 + "]" * 100000 + "}",
+            "no steps": json.dumps({"final_metrics": {}}),
+            "no agent step": json.dumps({"steps": [{"source": "user", "message": json.dumps(REVIEW)}]}),
+            "message not a string": json.dumps({"steps": [{"source": "agent", "message": REVIEW}]}),
+            "empty message": json.dumps({"steps": [{"source": "agent", "message": json.dumps(REVIEW)},
+                                                   {"source": "agent", "message": " "}]}),
+        }
+        for name, text in cases.items():
+            with self.subTest(name), self.assertRaisesRegex(ReviewerError, "no readable final agent message"):
+                self.answer(text)
 
-    def test_a_missing_export_leaves_activity_and_tokens_unknown_but_keeps_the_answer(self):
-        result, config = self.run_review("no-export")
-        self.assertEqual(result["review"], REVIEW)
-        self.assertEqual(result["activity"]["tool_call_count"], 0)
-        self.assertEqual(result["activity"]["other_events"], {"(no readable export)": 1})
-        self.assertIsNone(reviewers.review_tokens(config, self.work))
-
-    def test_an_empty_answer_fails_and_an_untrusted_workspace_says_how_to_fix_it(self):
-        with self.assertRaisesRegex(ReviewerError, "Devin finished without an answer"):
-            self.run_review("empty")
-        self.work = self.base / "attempt 2"
+    def test_a_missing_export_or_empty_answer_fails_and_an_untrusted_workspace_says_how_to_fix_it(self):
+        for mode in ("no-export", "empty"):
+            self.work = self.base / f"attempt {mode}"
+            with self.subTest(mode), self.assertRaisesRegex(ReviewerError, "Devin finished without an answer"):
+                self.run_review(mode)
+            self.assertTrue((self.work / "stdout.jsonl").is_file())
+        self.work = self.base / "attempt untrusted"
         with self.assertRaisesRegex(ReviewerError, "trust it"):
             self.run_review("untrusted")
 

@@ -1,7 +1,7 @@
 {
   "cli": "devin 3000.12.57 (Linux, WSL2)",
   "captured": "2026-11-15",
-  "source": "Hook stdin recorded by a probe plugin's hooks.json (UserPromptSubmit, PreToolUse, PostToolUse) and one `devin -p --prompt-file --model --export` run",
+  "source": "Hook stdin recorded by a probe plugin's hooks.json (UserPromptSubmit, PreToolUse, PostToolUse) and one `devin -p --prompt-file --model --export` run; a second `devin -p --verbosity 0 --export` probe for the joined output",
   "sanitized": "Paths replaced with /work/... and /home/user; export messages, system prompts, reasoning and file contents removed; tool calls and metrics kept",
   "files": {
     "prompt_skill.json": "UserPromptSubmit for a plugin skill command",
@@ -9,8 +9,9 @@
     "question_cancelled_pre.json": "ask_user_question cancelled by the human (no PostToolUse)",
     "question_two_pre.json / question_two_post.json": "two questions answered in one call",
     "subagent_tool_post.json": "a tool call made by a background subagent: same session_id and prompt_id, no field telling it apart",
-    "review_stdout.txt / review_export.json": "reviewer run: stdout holds only the final answer; export is ATIF-v1.7",
     "question_invalid_pre.json": "ask_user_question whose input failed Devin's tool validation (options without descriptions): no PostToolUse",
-    "(synthesized in tests)": "A skipped answer (skipped: true) was not captured; tests derive it from question_answered_post.json"
+    "(synthesized in tests)": "A skipped answer (skipped: true) was not captured; tests derive it from question_answered_post.json",
+    "review_export.json": "reviewer run (structure only): ATIF-v1.7; the final agent message is the answer",
+    "joined_stdout.txt / joined_export.json": "`devin -p` asked to say a sentence, read a file, then answer in JSON: standard output joins every agent message without a separator; the export keeps each agent message, and the last one is the answer (captured 2026-11-15 while fixing the reviewer)"
   }
 }

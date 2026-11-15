@@ -760,7 +760,9 @@ class ProcessTests(unittest.TestCase):
                 self.assertLess(prompt.index(SENTINEL), prompt.index("## Required output schema"))
                 self.assertLess(prompt.index("## Required output schema"), prompt.index(schema))
                 self.assertLess(prompt.index(schema), prompt.index(heading))
-                self.assertTrue(prompt.endswith(heading + "\n" + packet))
+                # The packet unchanged, then the answer reminder as the last words, once.
+                self.assertTrue(prompt.endswith(heading + "\n" + packet + "\n\n" + reviewers.ANSWER_REMINDER))
+                self.assertEqual(prompt.count(reviewers.ANSWER_REMINDER), 1)
                 # The schema follows its heading as plain JSON: no code fence to imitate.
                 schema_heading = "## Required output schema\n"
                 self.assertEqual(prompt.index(schema.rstrip("\n")), prompt.index(schema_heading) + len(schema_heading))

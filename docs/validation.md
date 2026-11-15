@@ -630,7 +630,7 @@ Devin CLI 3000.12.57（Linux / WSL2）で実測し、記録を `tests/fixtures/d
 - フックの入力：`cwd` が無く、`DEVIN_PROJECT_DIR` がプロジェクトを指すこと。`session_id` の形。
 - `ask_user_question`：答えた質問の `PreToolUse` と `PostToolUse`（答えは `tool_response.output` の文章）、2問の質問、取り消しと検査の失敗では `PreToolUse` しか届かないこと、`PostToolUse` の質問入力に `multi_select` が足されること。
 - スキルの許可の規則が文字どおりに照合され、`${PLUGIN_ROOT}` がどこでも展開されないこと。
-- `devin --print --prompt-file … --model … --export …` の標準出力が答えだけであること、`--export` が ATIF-v1.7 であること、信頼していないプロジェクトでは終了コード 1 で止まること。
+- `devin --print --prompt-file … --model … --export …` の `--export` が ATIF-v1.7 であること、信頼していないプロジェクトでは終了コード 1 で止まること。標準出力が答えだけだという最初の記録は誤りで、実際はエージェントの発言をつないだものだった（下の「Devin レビュアーの答えの読み方の修正」）。
 - `devin skills paths` が示すスキルの場所。
 
 自動テストで確かめたこと：
@@ -655,3 +655,26 @@ Devin CLI 3000.12.57（Linux / WSL2）で実測し、記録を `tests/fixtures/d
 - macOS とネイティブの Windows の Devin CLI、Devin Desktop、Devin Cloud、ACP のエディター連携。
 - 0.10.0 の GitHub Actions（Linux / macOS / Windows × Python 3.11–3.13）。プルリクエストの CI で確かめる。
 - `uv` が見つからないとき（終了コード 127）に Devin がプロンプトを止めないこと。
+
+### Devin レビュアーの答えの読み方の修正（2026-11-15）
+
+0.10.0 の DevFlow のレビュー（Implement の run `20261115T111940Z-0271153ec7e1`、人間が上限で受け入れ）の後の実機確認で、Devin（swe-2-high）のレビューが `Invalid reviewer JSON` で失敗しました。原因と測った結果は [Devin の調査](devin-host-research.md) の「レビュアーの答えの読み方の訂正」にあります。修正は別の修正プランで、新しい Implement の run としてレビューを受けました。
+
+- Devin の答えは、標準出力ではなく、`--export` の記録の最後のエージェントの発言から読みます。記録が無い・読めない・エージェントの発言が無いときは、答えが無いとして失敗にします。
+- 全レビュアー共通の入力の最後（パケットの後）に、答えの形の念押し（`reviewers.ANSWER_REMINDER`）を1回置きます。読み方の規則（答え全体が JSON か、コードブロック1つ）は変えません。
+
+自動テストで確かめたこと：
+
+- 実測の形に合わせた偽の Devin（標準出力は発言をつないだもの、export は発言ごとの段）で、答えを export の最後の発言から読み、標準出力が JSON でなくても通ること。最後の発言に文章が付いていると失敗すること。
+- export が無い、壊れている、深すぎる、`steps` が無い、エージェントの段が無い、`message` が文字列でない、空のときに、答えが無いとして失敗し、元のログが残ること。
+- 実測のフィクスチャ（`joined_stdout.txt` と `joined_export.json`）で、標準出力が発言をつないだもので、export の最後の発言が答えであること。誤った記録に基づいていた `review_stdout.txt` は消しました。
+- Plan と Implement の入力が、パケットをそのまま含み、答えの形の念押しで終わり、それが1回だけ入ること。
+
+実機で確かめたこと（Linux / WSL2、Devin CLI 3000.12.57、swe-2-high）：
+
+- 失敗したレビューと同じ入力で、export の最後の発言が読めた回数：念押しなしで3回中1回（最初の実機のレビューを含む）、念押しありで8回中8回。比べのために、念押しなしで swe-2-max は2回中1回、swe-2-flash-high は2回中2回でした。どれも指摘の無い小さなレビューです。
+- headless の Claude Code（開発中のプラグイン、インストール済みの devflow は無効）で、`--reviewer devin swe-2 high --reviewer codex gpt-6.1-sol high` の Implement の run が completed になりました。Devin のレビューは pass として受け付けられ、ツール呼び出し7回とトークン数が記録されました。このとき Devin の標準出力は「I'll review the diff and the changed files.Let me use the read tools instead.…」で始まっていて、標準出力から読む前の実装なら失敗していました。
+
+確かめていないこと：
+
+- 指摘の多い大きなレビューで、swe-2-high が答えの形を守るか。守らなかった回は、読み違えずに失敗として記録されます。

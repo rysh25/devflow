@@ -306,7 +306,7 @@ Implement は開始時のプランと作業ツリーを固定し、Claude Code �
 
 知らない項目があると、その項目の名前を示すエラーになります。
 
-Devin をレビュアーにする例です。DevFlow は `devin --print --prompt-file <入力> --model <model>-<effort> --export <記録>` で起動し、`model` と `effort` を `-` でつないで渡します（`swe-2` と `high` なら `swe-2-high`）。選べる effort はモデルごとに違うので、`devin models list` で確かめてください。Devin は、プロジェクトを信頼していないとレビューを始めません。
+Devin をレビュアーにする例です。DevFlow は `devin --print --prompt-file <入力> --model <model>-<effort> --export <記録>` で起動し、`model` と `effort` を `-` でつないで渡します（`swe-2` と `high` なら `swe-2-high`）。選べる effort はモデルごとに違うので、`devin models list` で確かめてください。Devin は、プロジェクトを信頼していないとレビューを始めません。答えは、Devin が `--export` に書く記録の最後の発言から読みます。Devin には答えの形を強制する機能が無いので、モデルが JSON の前後に文章を付けると、その回は失敗になります（DevFlow は文章から JSON を拾いません）。
 
 ```json
 {"id": "devin", "kind": "devin", "command": ["devin"], "model": "swe-2", "effort": "high", "timeout_seconds": 1800}

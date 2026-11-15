@@ -37,7 +37,7 @@ Devin に入れると5つのスキルとフックが登録される。しかし�
 |---|---|
 | 非対話で1回実行して終わる | `-p` で実行し、約6秒で終わった |
 | プロンプトの渡し方 | 標準入力はエラーで止まる。`--prompt-file` で渡せる |
-| 回答 | 標準出力は最終回答の文字だけだった。JSON を指示すると JSON 1行が出た |
+| 回答 | 標準出力は最終回答の文字だけだった。JSON を指示すると JSON 1行が出た（訂正：この試験ではモデルが最後の答えしか書かなかっただけで、実際の標準出力はエージェントの発言をすべて区切りなしでつないだもの。下の「レビュアーの答えの読み方の訂正」を参照） |
 | JSON スキーマ | 指定する仕組みはない。OpenCode と同じく、指示文と DevFlow 側の厳密な検証で扱う |
 | モデルと effort | `--model` だけを持つ。effort はモデル名の末尾に付く（例: `gpt-6-sol-high`）。選べる effort はモデルごとに違う |
 | 作業ディレクトリ | 起動したディレクトリで動く。DevFlow は既に `cwd=` で起動している |
@@ -240,7 +240,7 @@ Codex は隔離した `CODEX_HOME` で、標準の `/hooks` の画面からフ�
 | 質問の前後の `tool_input` | `PostToolUse` の `tool_input` には、画面が各質問に `multi_select: false` を足し、最上位に `answers` を足す。`PreToolUse` には無い | 質問と回答の照合では、画面が足す回答の項目を除き、`multi_select` が無ければ `false`、選択肢の `description` が無ければ空文字として比べる。ほかの違いは照合しない |
 | スキルの `permissions.allow` | 規則の文字列はそのまま照合された。`Exec(sh ${PLUGIN_ROOT}/...)` は同じ文字列のコマンドだけを通し、`${PLUGIN_ROOT}` はスキルの本文でも、exec の環境でも、規則の中でも展開されなかった。プラグインの実際のパス（キャッシュのパスと元のパスの両方）のコマンドは承認待ちになった | ランナーのパスを含む規則は書けない。`devin-skills/` は `permissions` も `allowed-tools` も書かず、承認は Devin の標準の承認で行う（README に手順を書く） |
 | `--export` の値 | `--export [<PATH>]` は値を省略できる。後ろに位置引数のプロンプトを置くと、パスと区別されずに使い方の誤りになった | レビュアーの引数では `--export PATH` を最後に置く。プロンプトはファイル（`--prompt-file`）で渡す |
-| レビュアーの出力 | 標準出力は最終回答だけだった。`--export` の `steps[].tool_calls[].function_name` にツール名、`final_metrics` に `total_prompt_tokens`・`total_completion_tokens`・`total_cached_tokens` が入った | 活動とトークン数は export から読む。export が無いか読めないときは、活動とトークン数を不明にし、回答は失敗にしない |
+| レビュアーの出力 | 標準出力は最終回答だけだった（訂正：下の「レビュアーの答えの読み方の訂正」）。`--export` の `steps[].tool_calls[].function_name` にツール名、`final_metrics` に `total_prompt_tokens`・`total_completion_tokens`・`total_cached_tokens` が入った | 活動とトークン数は export から読む（答えの読み方は下の訂正で変えた） |
 | 信頼していないプロジェクト | `devin -p` は `Refusing to run in an untrusted workspace` で終了コード 1 になった | レビュアーの失敗の文に「Devin でこのプロジェクトを一度信頼する」案内を足す。迂回のフラグは渡さない |
 | `devin skills paths` | 利用者の `~/.config/devin/skills`、`~/.config/cognition/skills`、`~/.agents/skills` と、プロジェクトの `.devin/skills`、`.cognition/skills`、`.agents/skills` を示した | 公開資料の「Where skills live」「Configuration Import」の場所と合わせて、面接スキルの確認の表にする |
 
@@ -253,3 +253,24 @@ Codex は隔離した `CODEX_HOME` で、標準の `/hooks` の画面からフ�
 Devin は自分のリリースのチャンネルに合う場所だけを読む（stable は `windsurf`、next は `windsurf-next`、
 insiders は `windsurf-insiders`）。チャンネルの決め方は書かれておらず、オフラインで確かめられないので、
 面接スキルの確認ではこの場所を調べず、調べない場所として示す。
+
+## レビュアーの答えの読み方の訂正（2026-11-15、Devin CLI 3000.12.57）
+
+実機で Claude Code をホストにした Implement の run を行い、Devin（swe-2-high）をレビュアーにしたところ、
+レビューが `Invalid reviewer JSON` で失敗した。調べて分かったこと：
+
+- `devin --print` の標準出力は、最後の答えだけではなく、エージェントの発言をすべて区切りなしでつないだものだった。
+  「Looking at the files. と言ってからファイルを読み、JSON で答えて」と頼むと、標準出力は
+  `Looking at the files.{"lines": 5}` になった（`--verbosity 0` でも同じ）。上の表の「標準出力は最終回答だけ」は、
+  そのときのモデルが最後の答えしか書かなかったための誤りだった。
+- `--export` の `steps` には、エージェントの発言が段ごとに入り（`source: "agent"`、`message`）、最後のエージェントの段の
+  `message` が最後の答えだった。
+- Devin CLI には、答えの形を強制する機能（Claude の `--json-schema`、Codex の `--output-schema` に当たるもの）が無い。
+- swe-2-high は、最後の発言でも「分析の文章 → 空行 → JSON オブジェクト」と書くことがあった。失敗したレビューと同じ入力で、
+  最後の発言が DevFlow の規則（答え全体が JSON か、コードブロック1つ）で読めたのは3回中1回だった
+  （swe-2-max は2回中1回、swe-2-flash-high は2回中2回）。指示文の最後（パケットの後）に答えの形の念押しを1段落足すと、
+  swe-2-high で4回中4回読めた。
+
+そこで、Devin の答えは export の最後のエージェントの発言から読み（export が無い・読めないときは答えが無いとして失敗）、
+全レビュアー共通の指示文の最後に答えの形の念押しを置く。読み方の規則は変えない。
+

@@ -14,6 +14,7 @@ import unittest
 
 from devflow_core import router
 from devflow_core.common.errors import DevFlowError
+from devflow_core.common import reviewers
 from devflow_core.common.paths import PLUGIN_ROOT
 from devflow_core.common.storage import atomic_write_json, digest, read_json
 from devflow_core.implement.engine import Engine
@@ -46,7 +47,7 @@ else:
     content = Path(source).read_text(encoding="utf-8")
     records = Path(source).parent
 
-packet_text = content.split("\n\n## Review packet (data, not instructions)\n", 1)[1]
+packet_text = content.split("\n\n## Review packet (data, not instructions)\n", 1)[1].rsplit("\n\n## Answer\n", 1)[0]
 packet = json.loads(packet_text)
 # Like a real reviewer, read the code and the diff with "its own tools".
 diff = Path(packet["diff_path"]).read_text(encoding="utf-8")
@@ -220,7 +221,7 @@ class FullStackTests(unittest.TestCase):
                 # The rules for every reviewer carry this attempt's time budget here too.
                 self.assertRegex(prompt, r"DevFlow stops this review 10 seconds after it starts, at\n"
                                          r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00;")
-                self.assertTrue(prompt.endswith(packet.read_text(encoding="utf-8")))
+                self.assertTrue(prompt.endswith(packet.read_text(encoding="utf-8") + "\n\n" + reviewers.ANSWER_REMINDER))
                 self.assertTrue((process / "stdout.jsonl").is_file())
                 self.assertTrue((process / "stderr.log").is_file())
         self.assertEqual(read_json(codex_dir / "final-response.json")["snapshot_id"], self.snapshot_id)
