@@ -678,3 +678,26 @@ Devin CLI 3000.12.57（Linux / WSL2）で実測し、記録を `tests/fixtures/d
 確かめていないこと：
 
 - 指摘の多い大きなレビューで、swe-2-high が答えの形を守るか。守らなかった回は、読み違えずに失敗として記録されます。
+
+### 0.10.0 の実機確認（2026-11-15、Linux / WSL2）
+
+Devin CLI 3000.12.57 に `devin plugins install --local` で入れた 0.10.0 と、`claude --plugin-dir` で読み込んだ 0.10.0（インストール済みの devflow は `--settings` で無効）で、git 管理の検証用リポジトリを使って確かめました。人間が Devin と Claude Code の画面で操作し、面接に答えました。Devin のホストのモデルは swe-2-high です。
+
+| 計画の実機確認 | 結果 |
+|---|---|
+| 1. Devin の `/devflow:doctor`、`/devflow:status` | doctor は Devin 3000.12.57 を supported とし、ready でした。status は idle でした |
+| 2. Devin の `/devflow:plan` | completed。面接は Devin の画面の2問で、フックの記録だけから組み立てられ（`hook-records-only`）、2問とも回答として数えられました。Codex → OpenCode → Codex のレビューで両方が同じ版を承認し、公開されました |
+| 3. Devin の `/devflow:implement`（レビュアーは Claude と Codex） | completed。check の後、Claude と Codex の2回とも pass。Devin は `get_output` で完了まで待ちました |
+| 4. Claude Code の run で Devin がレビュー | headless の Claude Code で completed（上の「Devin レビュアーの答えの読み方の修正」） |
+| 5. Claude Code で作ったプランを Devin で実装 | Claude Code の `/devflow:plan`（面接2問、transcript とフックの記録から組み立て）で公開したプランを、Devin の `/devflow:implement --reviewer devin swe-2 high --reviewer codex gpt-6.1-sol high` で実装し、completed。Devin をホストにした run で、Devin（swe-2-high）のレビューも pass として受け付けられました |
+| 6. Claude Code と Codex で Plan → Implement | Claude Code: 5. の `/devflow:plan` と、4. の headless の `/devflow:implement` が、どちらも completed。Codex（codex-cli 0.169.0、`codex plugin marketplace add` でこのリポジトリから入れた 0.10.0）: `/devflow:plan` は completed（面接は Codex の会話 API で3問、3問とも回答として数えられました。レビューの1回目は Codex レビュアーが Codex のサンドボックスの中でファイルを書けず（`os error 30`）失敗し、OpenCode → Codex の2回で両方が承認）。続く `/devflow:implement` も completed（Codex と OpenCode の2回とも pass） |
+| 7. Devin の `/devflow:resume` | 別の Devin の会話から、Devin の implement の run を再開でき、所有者が移りました。Claude Code が持つ Plan の run を Devin から再開しようとすると、フックが「別ホストの再開は対応外」として止め、Devin がそのとおり説明しました |
+
+どの操作でも、フックの失敗（`DevFlow hook failed`）や Devin のプロンプトが止まること（`Prompt blocked`）はありませんでした。改名した `hooks/claude.json` で、Claude Code の面接の記録（`AskUserQuestion` の `PreToolUse` / `PostToolUse`）と開始が動きました。
+
+Codex で分かったこと：Codex の workspace-write のサンドボックスの中では、ランナーが起こす `codex app-server` が動かず、会話 API の確認（`plan doctor --session`）と面接の確定（`plan seal`）が「Codex conversation API closed before replying」で止まり、Codex レビュアーも上の `os error 30` で失敗しました。0.9.1 でも同じで、`codex sandbox --permission-profile :workspace` で再現します。Codex の標準の承認（今回だけ）でサンドボックスの外で実行すると、どれも動きました。
+
+確かめていないこと：
+
+- macOS とネイティブ Windows での実機確認。
+- Claude Code の Implement を、headless ではなく対話の画面で 0.10.0 を読み込んで通すこと。
