@@ -701,3 +701,20 @@ Codex で分かったこと：Codex の workspace-write のサンドボックス
 
 - macOS とネイティブ Windows での実機確認。
 - Claude Code の Implement を、headless ではなく対話の画面で 0.10.0 を読み込んで通すこと。
+
+### プラグインの導入と更新の確認（2026-11-16、Linux / WSL2）
+
+[プラグインの導入と更新](installation.md#プラグインの導入と更新) に書いた操作を、利用者の設定に触れない別の設定の場所（Claude Code は `CLAUDE_CONFIG_DIR`、Codex は `CODEX_HOME`）で確かめました。Devin はログインが要るため、利用者の環境に試験用のプラグインを `--local` で入れて確かめ、外しました。
+
+| 確かめたこと | 結果 |
+|---|---|
+| Claude Code 2.1.325：GitHub（`rysh25/devflow`）から入れる・更新する | marketplace の登録、`claude plugin install`、`marketplace update`、`claude plugin update` が動き、公開中の 0.9.1 が入りました |
+| Claude Code 2.1.325：ローカルの marketplace の版を上げる | 版ごとの場所（`plugins/cache/<marketplace>/<plugin>/<版>`）に写して使うため、中身を置き換えただけでは前の版のままで、`claude plugin update` で入れ替わりました。以前の「ZIP からなら `claude plugin update` は不要」という記述を直しました |
+| codex-cli 0.169.0：GitHub から入れる・更新する | `codex plugin marketplace add rysh25/devflow` と `codex plugin add` で 0.9.1 が入りました。`--ref` で 0.9.0 を入れてから参照を `main` に変えて `marketplace upgrade` を実行すると、入れたプラグインも 0.9.1 に入れ替わりました |
+| codex-cli 0.169.0：ローカルの marketplace の版を上げる | `marketplace upgrade` は `is not configured as a Git marketplace` で終わり、`codex plugin add` をもう一度実行すると新しい版に入れ替わりました |
+| Devin CLI 3000.12.57：ローカルのパスから入れたプラグインの版を上げる | `devin plugins update <名前>` で新しい版に入れ替わりました |
+
+確かめていないこと：
+
+- Devin で GitHub から入れること（`devin plugins install rysh25/devflow#plugins/devflow`）。0.10.0 が `main` に入るまで、`main` に Devin のマニフェストがないためです。
+- macOS とネイティブ Windows での導入と更新。

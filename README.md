@@ -123,7 +123,16 @@ DevFlow がするのは、記録と確認です。
 
 ## インストール
 
-ZIP を解凍し、`.claude-plugin/marketplace.json` がある `devflow` ディレクトリへ移動して、ターミナルで実行します。
+DevFlow のプラグイン `devflow` を、使うホスト（Claude Code、Codex CLI、Devin CLI）に入れます。入れる元は GitHub のリポジトリ `rysh25/devflow` か、ローカルの配布物（配布 ZIP を解凍した `devflow` ディレクトリ、またはクローン）です。OpenCode はレビュアーとして CLI を呼ぶだけなので、プラグインはありません。
+
+| ホスト | GitHub から入れる | 更新する |
+|---|---|---|
+| Claude Code | `claude plugin marketplace add rysh25/devflow`<br>`claude plugin install devflow@devflow-marketplace --scope user` | `claude plugin marketplace update devflow-marketplace`<br>`claude plugin update devflow@devflow-marketplace` |
+| Codex CLI | `codex plugin marketplace add rysh25/devflow`<br>`codex plugin add devflow@devflow-marketplace` | `codex plugin marketplace upgrade devflow-marketplace` |
+| Devin CLI | `devin plugins install rysh25/devflow#plugins/devflow` | `devin plugins update devflow` |
+| OpenCode | DevFlow のプラグインはありません | CLI の更新は `opencode upgrade` |
+
+ローカルの配布物から入れるときは、`rysh25/devflow` の代わりに配布物のパスを指定します（Devin ではその中の `plugins/devflow`）。たとえば Claude Code では、配布物の `devflow` ディレクトリで次を実行します。
 
 ```text
 claude plugin marketplace add .
@@ -132,21 +141,7 @@ claude plugin install devflow@devflow-marketplace --scope user
 
 この `devflow` は配布物のディレクトリです。対象プロジェクトの `.devflow/` 作業ディレクトリとは異なります。配布物はプロジェクト外の安定した場所に置いて構いません。ローカル marketplace の更新元になるため、インストール直後に削除・移動しないでください。
 
-GitHub に置く場合も公開リポジトリは必須ではありません。認証済みの private リポジトリを marketplace として登録できます。詳細は [インストールと環境設定](docs/installation.md) を参照してください。
-
-更新は、GitHub から導入した場合は次の2つを実行し、Claude Code を起動し直します。ZIP から導入した場合と、更新の前後の注意は [更新する](docs/installation.md#更新する) と「[0.10.0 への更新](#0100-への更新)」「[0.7.3 への更新](#073-への更新)」（それより前の版から上げるときは「[0.7.2 への更新](#072-への更新)」「[0.7.1 への更新](#071-への更新)」「[0.7.0 への更新](#070-への更新)」「[0.6.0 への更新](#060-への更新)」「[0.5.1 への更新](#051-への更新)」「[0.5.0 への更新](#050-への更新)」「[0.4.0 への更新](#040-への更新)」も）を参照してください。
-
-```text
-claude plugin marketplace update devflow-marketplace
-claude plugin update devflow@devflow-marketplace
-```
-
-Codex CLI と Devin CLI への導入と更新は [導入手順](docs/installation.md) を参照してください。Devin では次のとおりです。
-
-```text
-devin plugins install rysh25/devflow#plugins/devflow
-devin plugins update devflow
-```
+ローカルの配布物から入れた場合の更新（中身を置き換えてから更新の操作をします。Codex では `codex plugin add` をもう一度実行します）、フォークや private のリポジトリから入れる方法、更新の前後の注意は [プラグインの導入と更新](docs/installation.md#プラグインの導入と更新) を参照してください。更新の前には、「[0.10.0 への更新](#0100-への更新)」（それより前の版から上げるときは「[0.7.3 への更新](#073-への更新)」「[0.7.2 への更新](#072-への更新)」「[0.7.1 への更新](#071-への更新)」「[0.7.0 への更新](#070-への更新)」「[0.6.0 への更新](#060-への更新)」「[0.5.1 への更新](#051-への更新)」「[0.5.0 への更新](#050-への更新)」「[0.4.0 への更新](#040-への更新)」も）で、その版の注意点を確認してください。入れ替えた版は、ホストを起動し直した新しいセッションから使われます。
 
 ## 必要なもの
 
