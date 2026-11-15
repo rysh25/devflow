@@ -268,6 +268,11 @@ review / check でネットワークやホームへの書き込みが必要に�
 診断の静的 ready は実行権限・認証を保証しません。必要な処理ごとに Codex 標準の承認を求め、
 利用者が同意したコマンドだけを実行します。昇格は必須条件にせず、設定も自動変更しません。
 長い処理は exec_command の session_id を write_stdin へ渡して完了まで待ち、再実行しません。
+Codex の workspace-write のサンドボックスの中では、Codex 自身を起動するランナーの操作が失敗します。
+会話 API の確認（`plan doctor --session`）と面接の確定（`plan seal`）は「Codex conversation API closed before replying」で止まり、
+次のレビュアーが Codex の `review` は、そのレビュアーが `os error 30` で失敗します（codex-cli 0.169.0 で実測。0.9.1 でも同じです）。
+DevFlow は Codex に、これらを実行する前にサンドボックスの外で実行する標準の承認を求めるよう指示しています。
+承認するとその回だけサンドボックスの外で実行され、レビューの回をサンドボックスの失敗で使わずに済みます。
 この環境では、親 Codex 内に別の Codex を起動した際の bubblewrap の失敗も観測しています。
 詳細・権限ごとの結果は [成立確認](codex-host-validation.md) を参照してください。
 

@@ -718,3 +718,10 @@ Codex で分かったこと：Codex の workspace-write のサンドボックス
 
 - Devin で GitHub から入れること（`devin plugins install rysh25/devflow#plugins/devflow`）。0.10.0 が `main` に入るまで、`main` に Devin のマニフェストがないためです。
 - macOS とネイティブ Windows での導入と更新。
+
+### レビューの後の文書の変更（2026-11-16）
+
+0.10.0 の受け入れた run（`20261115T111940Z-0271153ec7e1`）と、Devin レビュアーの修正の run（`20261115T141816Z-2cba32a26e7f`）の後に、次の文書だけを変えました。これらは DevFlow のレビューを受けていません。コードの変更はありません。
+
+- `docs/installation.md` と README：各ホストのプラグインの入れ方と更新の仕方（GitHub からと、ローカルの配布物から）。上の「プラグインの導入と更新の確認」で確かめた内容です。
+- `docs/installation.md` と `plugins/devflow/references/codex-runner.md`：Codex のサンドボックスの中で失敗する操作（`plan doctor --session`、`plan seal`、次のレビュアーが Codex の `review`）を、実行の前に標準の承認でサンドボックスの外で実行するようにという案内。`codex-runner.md` は Codex に渡す指示文なので、Codex の振る舞いが変わります。この指示で Codex が実行の前に承認を求めるかは、実機ではまだ確かめていません。
