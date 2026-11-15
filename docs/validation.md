@@ -695,12 +695,14 @@ Devin CLI 3000.12.57 に `devin plugins install --local` で入れた 0.10.0 と
 
 どの操作でも、フックの失敗（`DevFlow hook failed`）や Devin のプロンプトが止まること（`Prompt blocked`）はありませんでした。改名した `hooks/claude.json` で、Claude Code の面接の記録（`AskUserQuestion` の `PreToolUse` / `PostToolUse`）と開始が動きました。
 
+Claude Code の対話の画面（2026-11-16）：`claude --plugin-dir` で 0.10.0 を読み込み（インストール済みの devflow は `--settings` で無効）、`/devflow:doctor` で 0.10.0 を確かめてから、`/devflow:implement --reviewer devin swe-2 high --reviewer codex gpt-6.1-sol high -- docs/plans/exact-greeting.md` を送りました。run `20261115T161935Z-ce7aba519dd7` は completed で、Devin（9回のツール呼び出し）と Codex（11回）の2回とも pass でした。開始は人間の入力（`origin: human`）として記録されました。2回の `review` は `bash_timeout_ms` の 1900000 ms でバックグラウンドへ移り、Claude は終わりの知らせを受けて次のターンで続けました。権限のモードは `auto` だったので、ランナーの承認の画面は出ませんでした。
+
 Codex で分かったこと：Codex の workspace-write のサンドボックスの中では、ランナーが起こす `codex app-server` が動かず、会話 API の確認（`plan doctor --session`）と面接の確定（`plan seal`）が「Codex conversation API closed before replying」で止まり、Codex レビュアーも上の `os error 30` で失敗しました。0.9.1 でも同じで、`codex sandbox --permission-profile :workspace` で再現します。Codex の標準の承認（今回だけ）でサンドボックスの外で実行すると、どれも動きました。
 
 確かめていないこと：
 
 - macOS とネイティブ Windows での実機確認。
-- Claude Code の Implement を、headless ではなく対話の画面で 0.10.0 を読み込んで通すこと。
+- Claude Code の対話の画面で、権限のモードが `auto` 以外のときに出るランナーの承認の画面。
 
 ### プラグインの導入と更新の確認（2026-11-16、Linux / WSL2）
 
