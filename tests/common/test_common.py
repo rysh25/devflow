@@ -210,12 +210,13 @@ class SharedReviewTests(unittest.TestCase):
     def setUp(self):
         self.reviewers = [{"id": "codex"}, {"id": "opencode"}]
 
-    def test_hard_limit_and_no_boolean_integer_coercion(self):
-        for value in (None, True, 1, 7, 6.0, "6"):
+    def test_limit_range_and_no_boolean_integer_coercion(self):
+        for value in (None, True, 0, 100, 6.0, "6"):
             with self.subTest(value=value):
-                with self.assertRaises(DevFlowError):
+                with self.assertRaisesRegex(DevFlowError, "from 1 to 99"):
                     validate_limit(value)
-        self.assertEqual(validate_limit(6), 6)
+        for value in (1, 6, 99):
+            self.assertEqual(validate_limit(value), value)
 
     def test_alternating_schedule_stays_within_the_limit(self):
         self.assertEqual([next_reviewer(self.reviewers, used, 6)["id"] for used in range(6)],
@@ -230,6 +231,10 @@ class SharedReviewTests(unittest.TestCase):
             with self.subTest(limit=limit):
                 with self.assertRaises(DevFlowError):
                     next_reviewer(self.reviewers, 0, limit)
+
+    def test_a_single_reviewer_reviews_every_attempt(self):
+        self.assertEqual([next_reviewer([{"id": "codex"}], used, 3)["id"] for used in range(3)], ["codex"] * 3)
+        self.assertTrue(all_approved([{"id": "codex"}], {"codex": "A"}, "A"))
 
     def test_same_digest_required_from_every_reviewer(self):
         self.assertFalse(all_approved(self.reviewers, {"codex": "A"}, "A"))
@@ -273,6 +278,17 @@ class SharedSettingsTests(unittest.TestCase):
         plan["reviewers"][0]["id"] = "changed"
         self.assertEqual(implement["reviewers"][0]["id"], "synthetic")
         self.assertEqual(WORKFLOWS["plan"].load_config(self.project)["reviewers"][0]["id"], "synthetic")
+
+    def test_each_flow_sets_its_own_review_count_from_1_to_99(self):
+        atomic_json(self.path, {"schema_version": 1, "max_reviews": 6,
+                                "plan": {"max_reviews": 3}, "implement": {"max_reviews": 50}})
+        self.assertEqual(WORKFLOWS["plan"].load_config(self.project)["max_reviews"], 3)
+        self.assertEqual(WORKFLOWS["implement"].load_config(self.project)["max_reviews"], 50)
+        for value in (0, 100):
+            with self.subTest(value=value):
+                atomic_json(self.path, {"schema_version": 1, "implement": {"max_reviews": value}})
+                with self.assertRaisesRegex(DevFlowError, "from 1 to 99"):
+                    WORKFLOWS["implement"].load_config(self.project)
 
     def test_unknown_top_level_and_schema_versions_fail(self):
         names = ("plan", "implement")
@@ -353,6 +369,30 @@ class ReviewLimitTests(unittest.TestCase):
         state = self.state(limit=96)
         self.assertEqual(self.ask(state, 96)[0], True)
         self.assertEqual(state["status"], "ready")  # 96 + 2 = 98 still fits: asked.
+
+    def test_a_single_reviewer_adds_one_review_per_round(self):
+        state = self.state(limit=1, reviewers=("codex",))
+        state["config"]["max_reviews"] = 1
+        reached, asked = self.ask(state, 1)
+        self.assertEqual(asked[0][1][0], limit_question("v1", used=1, limit=1, approved="none", grant=1, new_limit=2, order="codex"))
+        decide_at_limit(state, "continue", "ready")
+        self.assertEqual(state["review_limit"], 2)
+        check_review_budget(state, 1)
+        # 98 + 1 = 99 still fits; at 99 one more round would pass the ceiling.
+        state = self.state(limit=98, reviewers=("codex",))
+        self.assertEqual(self.ask(state, 98)[0], True)
+        self.assertEqual(state["status"], "ready")
+        decide_at_limit(state, "continue", "ready")
+        self.assertEqual(state["review_limit"], 99)
+        self.assertEqual(self.ask(state, 99), (True, []))
+        self.assertEqual(state["status"], "exhausted")
+
+    def test_a_max_reviews_of_99_ends_at_the_limit_without_a_question(self):
+        state = self.state(limit=99)
+        state["config"]["max_reviews"] = 99
+        check_review_budget(state, 99)
+        self.assertEqual(self.ask(state, 99), (True, []))
+        self.assertEqual(state["status"], "exhausted")
 
     def test_answers(self):
         state = self.state()

@@ -95,10 +95,10 @@ class CliTests(unittest.TestCase):
         self.assertFalse((self.project / ".devflow").exists())
 
     def test_invalid_config_reports_json(self):
-        (self.project / "devflow.config.json").write_text('{"max_reviews":7}', encoding="utf-8")
+        (self.project / "devflow.config.json").write_text('{"max_reviews":100}', encoding="utf-8")
         code, out, err = self.cli("plan", "doctor")
         self.assertEqual(code, 2)
-        self.assertIn("hard ceiling", self.assertJsonError(out))
+        self.assertIn("from 1 to 99", self.assertJsonError(out))
 
     def test_unrelated_hook_is_inert(self):
         code, out, err = self.cli("hook", stdin=json.dumps(self.payload(prompt="Ordinary unrelated conversation")))

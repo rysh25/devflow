@@ -987,9 +987,9 @@ class EngineTests(unittest.TestCase):
         with self.assertRaisesRegex(DevFlowError, "Resolve initial human questions"):
             self.engine.seal(self.run_id, decisions)
 
-    def test_maximum_seven_is_rejected_before_run_creation(self):
-        (self.project / "devflow.config.json").write_text('{"max_reviews":7}', encoding="utf-8")
-        self.assertNotAccepted(self.hook(self.event(prompt="/devflow:plan A request")), "plan", "hard ceiling")
+    def test_maximum_one_hundred_is_rejected_before_run_creation(self):
+        (self.project / "devflow.config.json").write_text('{"max_reviews":100}', encoding="utf-8")
+        self.assertNotAccepted(self.hook(self.event(prompt="/devflow:plan A request")), "plan", "from 1 to 99")
         self.assertIsNone(self.bound_run())
         self.assertEqual(list((self.project / ".devflow" / "runs" / "plan").glob("*")), [])
 
@@ -1120,7 +1120,7 @@ class EngineTests(unittest.TestCase):
     def test_publish_before_second_approval_is_not_published(self):
         self.ready()
         self.submit(review_value())
-        with self.assertRaisesRegex(DevFlowError, "both reviewers"):
+        with self.assertRaisesRegex(DevFlowError, "every reviewer"):
             self.engine.publish(self.run_id)
         self.assertFalse((self.project / "docs").exists())
         self.assertEqual(self.engine.status(self.run_id)["review_count"], 1)
@@ -1132,7 +1132,7 @@ class EngineTests(unittest.TestCase):
         self.reflect(self.submit(review_value("changes_required")))
         self.ask_at_limit()
         self.assertEqual(self.at_limit("stop")["status"], "exhausted")
-        with self.assertRaisesRegex(DevFlowError, "both reviewers"):
+        with self.assertRaisesRegex(DevFlowError, "every reviewer"):
             self.engine.publish(self.run_id)
         self.assertFalse((self.project / "docs").exists())
 

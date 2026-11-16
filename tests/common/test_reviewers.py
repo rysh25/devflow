@@ -405,15 +405,16 @@ class ReviewerSettingsTests(unittest.TestCase):
                 self.assertRejected(reviewer(timeout_seconds=timeout), "timeout_seconds")
 
     def test_reviewer_count_against_max_reviews(self):
-        for count, accepted in ((1, False), (2, True), (3, True), (6, True), (7, False)):
+        for count, accepted in ((0, False), (1, True), (2, True), (6, True), (7, False)):
             with self.subTest(count=count):
                 if accepted:
                     self.assertEqual(len(settings.validate_reviewers(self.reviewers(count), 6)), count)
                 else:
-                    with self.assertRaisesRegex(DevFlowError, "two reviewers up to max_reviews"):
+                    with self.assertRaisesRegex(DevFlowError, "one reviewer up to max_reviews"):
                         settings.validate_reviewers(self.reviewers(count), 6)
         with self.assertRaises(DevFlowError):
             settings.validate_reviewers(self.reviewers(3), 2)
+        self.assertEqual(len(settings.validate_reviewers(self.reviewers(1), 1)), 1)
         with self.assertRaises(DevFlowError):
             settings.validate_reviewers({"codex": reviewer()}, 6)
 
@@ -422,10 +423,12 @@ class ReviewerSettingsTests(unittest.TestCase):
         with self.assertRaisesRegex(DevFlowError, "unique"):
             settings.validate_reviewers(entries, 6)
 
-    def test_at_least_two_kinds_required(self):
-        for kind in ("codex", "opencode"):
-            with self.subTest(kind=kind), self.assertRaisesRegex(DevFlowError, "two different reviewer kinds"):
-                settings.validate_reviewers(self.reviewers(3, (kind,)), 6)
+    def test_any_kinds_are_accepted(self):
+        for kind in ("codex", "opencode", "claude", "devin"):
+            with self.subTest(kind=kind):
+                self.assertEqual(settings.validate_reviewers(self.reviewers(3, (kind,)), 6),
+                                 self.reviewers(3, (kind,)))
+                self.assertEqual(len(settings.validate_reviewers(self.reviewers(1, (kind,)), 6)), 1)
         entries = self.reviewers(3, ("codex", "codex", "opencode"))
         result = settings.validate_reviewers(entries, 6)
         self.assertEqual(result, entries)

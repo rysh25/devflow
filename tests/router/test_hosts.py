@@ -203,6 +203,25 @@ class HostTests(RuntimeFixture):
         atomic_json(self.project/'devflow.config.local.json', {'plan':{'max_reviews':2}})
         self.assertEqual(read_json(folder/'config.json'), config)
 
+    def test_max_reviews_option_freezes_the_limit_and_one_reviewer(self):
+        self.prompt('/devflow:plan --max-reviews 2 --reviewer codex m high -- 依頼')
+        run = self.record()['run']['run_id']
+        folder = self.run_dir('plan', run)
+        config = read_json(folder/'config.json')
+        self.assertEqual((config['max_reviews'], [r['id'] for r in config['reviewers']]), (2, ['codex']))
+        self.assertEqual(read_json(folder/'state.json')['review_limit'], 2)
+        self.assertEqual(read_json(folder/'request.json')['request'], '依頼')
+        # Later settings changes do not touch the frozen limit.
+        atomic_json(self.project/'devflow.config.local.json', {'plan':{'max_reviews':5}})
+        self.assertEqual(read_json(folder/'config.json'), config)
+
+    def test_implement_max_reviews_option_is_frozen_at_start(self):
+        self.prompt('/devflow:implement --max-reviews 3 --reviewer claude opus high -- feature.md')
+        result=router.runner_start(self.project,self.session,'implement','feature.md', host="claude")
+        self.assertEqual((result['config']['max_reviews'], [r['id'] for r in result['config']['reviewers']]),
+                         (3, ['claude']))
+        self.assertEqual(result['review_limit'], 3)
+
     def test_missing_host_fails_before_any_hook_or_mutation(self):
         for args in (['hook'], ['status'], ['doctor'], ['plan','status'], ['implement','doctor'],
                      ['--session','s','status'], ['plan','cancel']):
@@ -240,7 +259,10 @@ class HostTests(RuntimeFixture):
     def test_syntax_error_never_leaves_pending_or_run(self):
         for prompt in ('/devflow:plan --reviwer claude opus high -- request',
                        '/devflow:implement --rev claude opus high -- feature.md',
-                       '/devflow:implement --reviewer claude "opus" high -- feature.md'):
+                       '/devflow:implement --reviewer claude "opus" high -- feature.md',
+                       '/devflow:plan --max-reviews 0 -- request',
+                       '/devflow:implement --max-reviews 100 -- feature.md',
+                       '/devflow:implement --max-reviews 2 --max-reviews 3 -- feature.md'):
             context=self.prompt(prompt)['hookSpecificOutput']['additionalContext']
             self.assertIn('did not accept',context)
             self.assertFalse((self.project/'.devflow').exists())

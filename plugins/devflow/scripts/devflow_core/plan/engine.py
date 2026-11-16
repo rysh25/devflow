@@ -524,7 +524,7 @@ class Engine(RunEngine):
             accepted = (state["status"] == "accepted" and acceptance is not None
                         and acceptance["version"] == state["plan_hash"])
             if not (reviewed or accepted):
-                raise DevFlowError("Only the identical plan approved by both reviewers, or the plan the human "
+                raise DevFlowError("Only the identical plan approved by every reviewer, or the plan the human "
                                    "accepted at the review limit, can be published.")
             if not state["config"]["publish"]["enabled"]:
                 return self.status(run_id)

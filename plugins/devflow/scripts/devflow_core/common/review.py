@@ -5,8 +5,8 @@ from typing import Callable, Collection
 from .errors import DevFlowError, ReviewerError
 from .runs import TERMINAL
 
-HARD_MAX_REVIEWS = 6  # The ceiling of the configured max_reviews (the initial limit).
-# One run's total: review records use two-digit numbers (reviews/NN).
+# The ceiling of both the configured max_reviews (the initial limit) and one
+# run's total: review records use two-digit numbers (reviews/NN).
 TOTAL_REVIEW_CEILING = 99
 # The kind of the human question opened at the review limit (escalation detail).
 REVIEW_BUDGET = "review_budget"
@@ -26,8 +26,8 @@ FIELD_NAME_CHARS = 64
 
 
 def validate_limit(value: int) -> int:
-    if type(value) is not int or not 2 <= value <= HARD_MAX_REVIEWS:
-        raise DevFlowError("max_reviews must be an integer from 2 to 6; six is a hard ceiling")
+    if type(value) is not int or not 1 <= value <= TOTAL_REVIEW_CEILING:
+        raise DevFlowError(f"max_reviews must be an integer from 1 to {TOTAL_REVIEW_CEILING}")
     return value
 
 

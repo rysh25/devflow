@@ -1,7 +1,7 @@
 ---
 name: implement
-description: Implement an explicitly selected Markdown plan, run approved project checks, and alternate independent Codex and OpenCode reviews up to max_reviews attempts, which only the human can raise at the limit. Use only when the user invokes /devflow:implement with a plan file.
-argument-hint: "[--reviewer AGENT MODEL EFFORT ... --] <plan-file>"
+description: Implement an explicitly selected Markdown plan, run approved project checks, and review with each configured reviewer in turn up to max_reviews attempts, which only the human can raise at the limit. Use only when the user invokes /devflow:implement with a plan file.
+argument-hint: "[--max-reviews N] [--reviewer AGENT MODEL EFFORT ...] -- <plan-file>"
 disable-model-invocation: true
 allowed-tools: Bash(uv --no-cache run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *) PowerShell(uv --no-cache run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *)
 ---
@@ -44,4 +44,4 @@ DevFlow records and verifies; it does not limit tools. It assumes you follow the
 
 Use AskUserQuestion without prefilled answers when a human decision is necessary. Never schedule this skill or invoke it from another agent's message. A UserPromptSubmit event alone is not proof of a human origin. Keep automated messages out of a decision-waiting session. Records live under the project's `.devflow/runs/implement/RUN_ID`; do not edit them or other runs. The plan workflow is not a prerequisite.
 
-Startup reviewer arguments replace the complete reviewer list for this run. Without them the effective project settings apply unchanged. The hook parses options; never invent or replay the start event. Plan handoff commands do not inherit these arguments.
+Startup `--reviewer` arguments replace the complete reviewer list for this run, and `--max-reviews N` (1 to 99, at least the number of reviewers) sets its initial review limit. Without them the effective project settings apply unchanged. The hook parses options; never invent or replay the start event. Plan handoff commands do not inherit these arguments.

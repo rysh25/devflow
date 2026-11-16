@@ -17,7 +17,7 @@ from unittest.mock import patch
 from devflow_core.common import reviewers
 from devflow_core.common.errors import ReviewerError
 from devflow_core.common.hosts.skills import DEVIN_PROJECT_SKILLS, devin_user_skill_roots
-from devflow_core.common.startup import override_reviewers, parse_start
+from devflow_core.common.startup import apply_startup, parse_start
 from devflow_core.plan.interview import devin_frontmatter, inspect_interview_skill
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "devin_3000_12_57"
@@ -173,7 +173,7 @@ class DevinReviewerTests(unittest.TestCase):
             {"id": "opencode", "kind": "opencode", "command": ["opencode"], "model": "m", "effort": "high",
              "timeout_seconds": 1800}]}
         startup = parse_start("--reviewer devin swe-2 high --reviewer codex gpt-6.1-sol high -- feature.md")
-        result = override_reviewers(config, startup)
+        result = apply_startup(config, startup)
         self.assertEqual([(r["id"], r["command"], r["model"]) for r in result["reviewers"]],
                          [("devin", ["devin"], "swe-2"), ("codex", ["codex"], "gpt-6.1-sol")])
 
