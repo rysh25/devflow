@@ -1,4 +1,4 @@
-"""Native CLI reviewers for every workflow: one bounded run, no retries.
+"""Native CLI reviewers for every workflow: one bounded run per attempt.
 
 A reviewer runs in the directory under review exactly as the user's CLI runs
 there: with the user's settings and the project's own settings and instruction
@@ -12,6 +12,12 @@ directory, and the standard input: Codex reads the prompt from it, then it is
 closed; OpenCode's and Devin's are closed from the start. The
 reviewer instructions ask it to treat every file as data, so a file cannot
 change its verdict or this contract.
+
+An attempt is never retried as a review. The one exception is the answer's
+shape alone: when the answer cannot be read as strict JSON, a CLI that can
+continue its session is asked once — inside the same session and within the
+attempt's own time limit — to send the same review again. That is the same
+attempt, not a new review, and it happens at most once.
 
 The answer is checked strictly: it is refused, never rewritten, when it is not
 strict JSON or holds text a record cannot hold (an unpaired surrogate). The
@@ -36,12 +42,13 @@ import re
 from pathlib import Path
 import shutil
 import subprocess
+import time
 from string import Template
 from typing import Any, Callable
 
 from .counts import tally
 from .environment import PROBE_SECONDS, version_numbers, version_warnings
-from .errors import DevFlowError, ReviewerError
+from .errors import AnswerFormatError, DevFlowError, ReviewerError
 from .process import run_bounded
 from .settings import validate_reviewer
 from .storage import json_bytes, read_json, writable
@@ -91,10 +98,15 @@ def answer_value(text: str) -> Any:
 
     An answer that is entirely one ```json (or ```) code fence is read from inside the
     fence; the JSON itself is never changed. Anything else, including text outside the
-    fence, is read as it is, so it fails exactly as before.
+    fence, is read as it is, and its refusal is ``AnswerFormatError``: the one error a
+    CLI that can continue its session may be asked to answer once more. ``json_value``
+    itself is unchanged, so other records (Devin's ``export.json``) fail as before.
     """
     match = FENCED_ANSWER.fullmatch(text)
-    return json_value(match.group(1) if match else text)
+    try:
+        return json_value(match.group(1) if match else text)
+    except ReviewerError as exc:
+        raise AnswerFormatError(str(exc)) from exc
 
 
 def text(value: Any, label: str, limit: int = 32768) -> str:
@@ -505,6 +517,15 @@ class CLI:
         none or the CLI is not taught to read them."""
         return None
 
+    def follow_up_arguments(self, model: str, effort: str, previous_dir: Path,
+                            work_dir: Path) -> list[str] | None:
+        """The arguments after the user's command prefix that continue the session whose records are in
+        ``previous_dir``, with the prompt in ``work_dir/review-input.md`` and the CLI's records written to
+        ``work_dir``; None when this CLI cannot continue a session (the default) or its session is unknown.
+        ``answer`` and ``tokens`` are then called with ``work_dir``: they read what the follow-up turn
+        recorded (the first turn's records stay in ``previous_dir``)."""
+        return None
+
     #: Added to the error when the CLI exits with a failure, for a cause the human can fix.
     failure_hint = ""
 
@@ -623,6 +644,9 @@ class Claude(CLI):
 
 DEVIN_TOKEN_FIELDS = ("total_prompt_tokens", "total_completion_tokens", "total_cached_tokens")
 
+#: A session id ``--resume`` can carry without being mistaken for an option.
+_DEVIN_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
 
 def _devin_export(work_dir: Path) -> dict | None:
     """The ``--export`` record (ATIF-v1.7 on 3000.12.57), or None when it is missing or unreadable
@@ -662,12 +686,24 @@ class Devin(CLI):
                     "(DevFlow never skips the trust check)")
 
     def flags(self):
-        return ["--print", "--prompt-file", "--model", "--export"]
+        return ["--print", "--prompt-file", "--resume", "--model", "--export"]
 
     def arguments(self, model, effort, work_dir, cwd, schema_path, *, schema=None):
         # --export takes an optional path, so it stays last with its path.
         return ["--print", "--prompt-file", str(work_dir / "review-input.md"), "--model", f"{model}-{effort}",
                 "--export", str(work_dir / "export.json")]
+
+    def follow_up_arguments(self, model, effort, previous_dir, work_dir):
+        record = _devin_export(previous_dir)
+        session = record.get("session_id") if record else None
+        # The shape check keeps an id that starts with "-" from being read as an option;
+        # it also matches the measured form (for example ``silky-kicker``).
+        if not isinstance(session, str) or not _DEVIN_SESSION_ID.fullmatch(session) or not writable(session):
+            return None
+        # The continued export holds the whole conversation with cumulative
+        # ``final_metrics``, so ``answer`` and ``tokens`` read ``work_dir`` as usual.
+        return ["--print", "--prompt-file", str(work_dir / "review-input.md"), "--resume", session,
+                "--model", f"{model}-{effort}", "--export", str(work_dir / "export.json")]
 
     def answer(self, output, work_dir):
         record = _devin_export(work_dir)
@@ -698,6 +734,9 @@ CLIS = {"codex": Codex(), "opencode": OpenCode(), "claude": Claude(), "devin": D
 #: What every reviewer is asked, whatever the workflow: added after its instructions.
 RULES = Path(__file__).with_name("reviewer-rules.md")
 
+#: The one follow-up request sent inside the same session when the answer is not strict JSON.
+FOLLOW_UP = Path(__file__).with_name("answer-follow-up.md")
+
 #: The last words of every reviewer's input, after the packet. Some models put their analysis
 #: before the JSON when the output instructions are far above a long packet; CLIs without an
 #: output schema option (OpenCode, Devin) rely on this alone.
@@ -708,18 +747,26 @@ ANSWER_REMINDER = ("## Answer\n\nYour final message is the review: only the JSON
 def review_tokens(config: dict, work_dir: Path) -> dict[str, int] | None:
     """The token counts one review attempt's CLI printed, whether or not its answer was
     valid; None when there is no output, it reports none, or it cannot be read.
-    Reading them never fails a review."""
-    output = Path(work_dir) / "stdout.jsonl"
-    try:
-        if output.is_symlink() or not output.is_file():
-            return None
-        tokens = CLIS[config["kind"]].tokens(output, Path(work_dir))
-        # The counts go into a record: one that cannot be written (a sum past Python's
-        # integer-to-text limit, say) is unknown, never a failed save.
-        json_bytes(tokens)
-        return tokens
-    except (DevFlowError, OSError, KeyError, TypeError, ValueError, RecursionError):
-        return None
+    Reading them never fails a review. The counts come from the attempt's last turn:
+    an answer follow-up's records, or the first turn's when those cannot be read."""
+    work_dir = Path(work_dir)
+    # The follow-up's records first, then the first turn's; every filesystem probe stays
+    # inside the protected read, so an unreadable directory means unknown counts, never
+    # a failed save.
+    for directory in (work_dir / "follow-up", work_dir):
+        try:
+            output = directory / "stdout.jsonl"
+            if output.is_symlink() or not output.is_file():
+                continue
+            tokens = CLIS[config["kind"]].tokens(output, directory)
+            # The counts go into a record: one that cannot be written (a sum past Python's
+            # integer-to-text limit, say) is unknown, never a failed save.
+            json_bytes(tokens)
+        except (DevFlowError, OSError, KeyError, TypeError, ValueError, RecursionError):
+            continue
+        if tokens is not None:
+            return tokens
+    return None
 
 
 def recorded_cli_version(work_dir: Path) -> str | None:
@@ -798,12 +845,64 @@ def _check_argv_length(argv, *, windows: bool | None = None) -> None:
         raise ReviewerError("Reviewer argv exceeds the Windows 32,767 UTF-16 unit limit")
 
 
+def _answer_follow_up(prepared: PreparedReview, work_dir: Path, argv: list[str], env: dict,
+                      deadline: float, first: AnswerFormatError,
+                      validate: Callable[[Any], dict]) -> tuple[dict, dict]:
+    """Ask the reviewer once, inside the same session, to send the same review as strict JSON.
+
+    Reached only when the first answer was refused as ``AnswerFormatError``. When the
+    CLI cannot continue its session or the attempt's time limit is already spent, the
+    first refusal stands. Otherwise the follow-up runs in ``<work_dir>/follow-up/``
+    with the remaining time, and its answer is validated like any other. Every failure
+    after the follow-up is decided shares one error: that a follow-up ran, the first
+    refusal, this failure's cause, and where the records are.
+    """
+    kind, prefix, model, effort, _ = _config(prepared.config)
+    cwd, probe, cli = prepared.cwd, prepared.probe, CLIS[kind]
+    follow_dir = work_dir / "follow-up"
+    follow_argv = cli.follow_up_arguments(model, effort, work_dir, follow_dir)
+    if follow_argv is None or deadline - time.monotonic() <= 0:
+        raise first
+    try:
+        if follow_dir.is_symlink() or follow_dir.exists():
+            raise ReviewerError("This answer follow-up already ran; never replay a previous attempt")
+        follow_dir.mkdir()
+        request = _read_text(FOLLOW_UP, 262144)
+        _write_new(follow_dir / "review-input.md", request)
+        _write_new(follow_dir / "invocation.json", json.dumps(
+                   {**probe, "cwd": str(cwd.resolve()), "prefix_arg_count": len(prefix) - 1,
+                    "timeout_seconds": deadline - time.monotonic(),
+                    "packet_sha256": hashlib.sha256(prepared.packet).hexdigest(),
+                    "prepared_at": prepared.prepared_at, "follow_up": True,
+                    "shell": False, "settings": "the user's own CLI settings"},
+                   ensure_ascii=False, indent=2) + "\n")
+        follow = argv[:len(prefix)] + follow_argv
+        _check_argv_length(follow)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReviewerError("The attempt's time limit left no time for the answer follow-up")
+        code, _ = _capture(follow, cwd=cwd, env=env, timeout=remaining, data=cli.stdin(request),
+                           log_dir=follow_dir)
+        if code:
+            raise ReviewerError(f"{kind} exited with {code} on the answer follow-up{cli.failure_hint}")
+        value, activity = cli.answer(follow_dir / "stdout.jsonl", follow_dir)
+        return validate(value), activity
+    except Exception as exc:
+        raise ReviewerError(
+            f"The answer follow-up failed: the reviewer was asked once to send the same review again, "
+            f"as only JSON, in the same session after its first answer was refused ({first}); "
+            f"the follow-up failed ({exc}); its records are in {follow_dir}") from exc
+
+
 def run_review(prepared: PreparedReview, validate: Callable[[Any], dict]) -> dict:
     """Execute the exact prepared attempt after its caller has reserved it.
 
-    Returns ``{"review": ..., "activity": ...}``. The caller runs ``preflight``,
+    Returns ``{"review": ..., "activity": ...}``; the activity always holds
+    ``answer_follow_ups`` (0 or 1). The caller runs ``preflight``,
     prepares the input, then reserves the attempt before calling this function. Errors and timeouts are
-    never retried. Preparation fixes instructions, rules, schema, data and their
+    never retried; only an answer that is not strict JSON may be asked for again, once, inside the
+    same session and within the attempt's own time limit — the same attempt, not a new review.
+    Preparation fixes instructions, rules, schema, data and their
     times once; the times are a guide, and what stops the
     reviewer is the time ``run_bounded`` measures. Requested model/effort are recorded, not claimed as
     provider attestation.
@@ -829,9 +928,14 @@ def run_review(prepared: PreparedReview, validate: Callable[[Any], dict]) -> dic
                "prepared_at": prepared.prepared_at,
                "shell": False, "settings": "the user's own CLI settings"},
               ensure_ascii=False, indent=2) + "\n")
+    deadline = time.monotonic() + timeout
     code, _ = _capture(argv, cwd=cwd, env=env, timeout=timeout,
                        data=cli.stdin(prepared.prompt.decode("utf-8")), log_dir=work_dir)
     if code:
         raise ReviewerError(f"{kind} exited with {code}; inspect stderr.log (no automatic retry){cli.failure_hint}")
-    value, activity = cli.answer(work_dir / "stdout.jsonl", work_dir)
-    return {"review": validate(value), "activity": activity}
+    try:
+        value, activity = cli.answer(work_dir / "stdout.jsonl", work_dir)
+    except AnswerFormatError as first:
+        review, activity = _answer_follow_up(prepared, work_dir, argv, env, deadline, first, validate)
+        return {"review": review, "activity": {**activity, "answer_follow_ups": 1}}
+    return {"review": validate(value), "activity": {**activity, "answer_follow_ups": 0}}

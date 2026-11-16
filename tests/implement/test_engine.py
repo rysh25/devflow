@@ -406,6 +406,31 @@ class EngineFlowTests(EngineFixture):
         self.assertEqual(second["previous_reviews"][0]["review"]["verdict"], "pass")
         self.assertEqual(second["snapshot_id"], first["snapshot_id"])
 
+    def test_an_answer_follow_up_count_reaches_the_attempt_record_and_status(self):
+        self.start()
+        self.ready()
+        respond = self.reviewer.side_effect
+        def reasked(prepared, validate):
+            result = respond(prepared, validate)
+            return {**result, "activity": {**result["activity"], "answer_follow_ups": 1}}
+        self.reviewer.side_effect = reasked
+        reviewed = self.review()
+        self.assertEqual(reviewed["reviews"][0]["answer_follow_ups"], 1)
+        self.assertEqual(self.state()["attempts"][0]["activity"]["answer_follow_ups"], 1)
+
+    def test_a_follow_up_failure_message_reaches_the_attempt_record_and_status(self):
+        self.start()
+        self.ready()
+        message = ("The answer follow-up failed: the reviewer was asked once to send the same review "
+                   "again, as only JSON, in the same session after its first answer was refused "
+                   "(Invalid reviewer JSON); the follow-up failed (Invalid reviewer JSON); "
+                   "its records are in /run/review-processes/01/follow-up")
+        self.reviewer.side_effect = ReviewerError(message)
+        self.review()
+        state = self.state()
+        self.assertEqual(state["attempts"][-1]["error"], message)
+        self.assertEqual(state["last_error"], message)
+
     def test_code_change_invalidates_prior_approval_and_requires_fresh_checks(self):
         self.start()
         self.ready()

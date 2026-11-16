@@ -313,6 +313,27 @@ class EngineTests(unittest.TestCase):
                                                 "verdict": "pass", "plan_hash": initial["plan_hash"], **ACTIVITY}])
         self.assertEqual(read_json(self.run / "reviews" / "01" / "review.json")["activity"], ACTIVITY)
 
+    def test_an_answer_follow_up_count_reaches_the_review_record_and_status(self):
+        initial = self.ready()
+        activity = {**ACTIVITY, "answer_follow_ups": 1}
+        with patch(RUN_REVIEW, side_effect=lambda prepared, validate: {
+                "review": validate(review_value()), "activity": dict(activity)}):
+            reviewed = self.engine.review(self.run_id)
+        self.assertEqual(reviewed["reviews"][0],
+                         {"number": 1, "reviewer_id": "codex", "status": "succeeded", "verdict": "pass",
+                          "plan_hash": initial["plan_hash"], **activity})
+        self.assertEqual(read_json(self.run / "reviews" / "01" / "review.json")["activity"]["answer_follow_ups"], 1)
+
+    def test_a_follow_up_failure_message_reaches_the_error_record_and_status(self):
+        self.ready()
+        message = ("The answer follow-up failed: the reviewer was asked once to send the same review "
+                   "again, as only JSON, in the same session after its first answer was refused "
+                   "(Invalid reviewer JSON); the follow-up failed (Invalid reviewer JSON); "
+                   "its records are in /run/review-processes/01/follow-up")
+        failed = self.submit_with_output(None, error=ReviewerError(message))
+        self.assertEqual(read_json(self.run / "reviews" / "01" / "error.json")["message"], message)
+        self.assertEqual(failed["last_error"]["message"], message)
+
     def test_a_later_packet_carries_each_earlier_review_in_full(self):
         """As in implement: the next reviewer sees each earlier round's findings and
         evidence, not only how they were dispositioned."""

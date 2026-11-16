@@ -13,5 +13,9 @@ class ReviewerError(DevFlowError):
     """An external reviewer could not produce a trustworthy result."""
 
 
+class AnswerFormatError(ReviewerError):
+    """The reviewer's answer text is not strict JSON: a shape error, not a failed review."""
+
+
 class CaptureError(DevFlowError):
     """The interview record cannot be captured faithfully."""

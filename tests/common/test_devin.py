@@ -23,15 +23,22 @@ from devflow_core.plan.interview import devin_frontmatter, inspect_interview_ski
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "devin_3000_12_57"
 REVIEW = {"schema_version": 1, "verdict": "pass", "summary": "ok", "findings": [], "questions": []}
 
+
+def accept(value):
+    """A workflow's schema check: exactly the review keys."""
+    if not isinstance(value, dict) or set(value) != set(REVIEW):
+        raise ReviewerError("Review has missing or unknown fields")
+    return value
+
 FAKE_DEVIN = r'''
-import json, sys
+import json, sys, time
 from pathlib import Path
 args = sys.argv[1:]
 mode = args.pop(0)
 if args == ["--version"]:
     print("devin 3000.12.57 (96542e930752)"); sys.exit(0)
 if args == ["--help"]:
-    flags = ["--print", "--prompt-file", "--model", "--export"]
+    flags = ["--print", "--prompt-file", "--resume", "--model", "--export"]
     if mode == "old":
         flags.remove("--export")
     print("Usage: devin [OPTIONS]\n" + "\n".join("  " + f for f in flags)); sys.exit(0)
@@ -40,10 +47,27 @@ if mode == "untrusted":
 stdin = sys.stdin.read() if not sys.stdin.closed else ""
 values = dict(zip(args[1::2], args[2::2])) if args[0] == "--print" else {}
 work = Path(values["--prompt-file"]).parent
+resume = "--resume" in values
+base = Path(sys.argv[0]).parent
+with open(base / "calls.jsonl", "a", encoding="utf-8") as log:
+    log.write(json.dumps({"mode": mode, "resume": resume, "argv": args}) + "\n")
 (work / "seen.json").write_text(json.dumps({"argv": args, "stdin": stdin}))
-record = json.loads((Path(sys.argv[0]).parent / "review_export.json").read_text())
+record = json.loads((base / ("follow_export.json" if resume else "review_export.json")).read_text())
 answer = json.dumps(%s)
-final = {"pass": answer, "prose": "Analysis of the diff.\n\n" + answer, "empty": ""}.get(mode, answer)
+prose = "Analysis of the diff.\n\n" + answer
+texts = {"pass": answer, "empty": "", "prose": prose, "tidy": prose, "slow": prose,
+         "exit-error": prose, "odd": prose, "not-review": json.dumps({"unexpected": True}),
+         "no-session": prose,
+         "prose-resume": "Analysis again.\n\n" + answer, "odd-resume": json.dumps({"unexpected": True})}
+if mode == "no-session":
+    record.pop("session_id", None)
+if resume and mode == "slow":
+    time.sleep(30)
+if mode == "fail" and not resume:
+    print("fixture failure", file=sys.stderr); sys.exit(7)
+if resume and mode == "exit-error":
+    print("follow-up fixture failure", file=sys.stderr); sys.exit(7)
+final = texts.get(mode + ("-resume" if resume else ""), answer)
 agents = [step for step in record["steps"] if step["source"] == "agent"]
 agents[0]["message"] = "Reading the diff."
 agents[-1]["message"] = final
@@ -63,21 +87,43 @@ class DevinReviewerTests(unittest.TestCase):
         self.fake = self.base / "fake devin.py"
         self.fake.write_text(FAKE_DEVIN, encoding="utf-8")
         (self.base / "review_export.json").write_bytes((FIXTURES / "review_export.json").read_bytes())
+        follow = json.loads((FIXTURES / "review_export.json").read_bytes())
+        # The continued session's export: the whole conversation and cumulative metrics.
+        follow["final_metrics"] = {"total_prompt_tokens": 58188, "total_completion_tokens": 240,
+                                   "total_cached_tokens": 23040, "total_steps": 11}
+        follow["steps"] += [{"source": "user", "message": "Send the same review again."},
+                            {"source": "agent", "message": "", "tool_calls": [{"function_name": "read"}]}]
+        (self.base / "follow_export.json").write_text(json.dumps(follow), encoding="utf-8")
         self.schema = self.base / "schema.json"
         self.schema.write_text("{}", encoding="utf-8")
         self.instructions = self.base / "instructions.md"
         self.instructions.write_text("# Review\n", encoding="utf-8")
         self.work = self.base / "attempt 1"
 
-    def config(self, mode="pass"):
+    def config(self, mode="pass", **changes):
         return {"id": "devin", "kind": "devin", "command": [sys.executable, str(self.fake), mode],
-                "model": "swe-2", "effort": "high", "timeout_seconds": 30}
+                "model": "swe-2", "effort": "high", "timeout_seconds": 30, **changes}
 
-    def run_review(self, mode="pass"):
-        config = self.config(mode)
-        prepared = reviewers.prepare_review(config, b"packet", self.work, self.schema, self.instructions,
-                                            cwd=self.project, probe=reviewers.preflight(config))
-        return reviewers.run_review(prepared, lambda value: value), config
+    def prepare(self, config):
+        return reviewers.prepare_review(config, b"packet", self.work, self.schema, self.instructions,
+                                        cwd=self.project, probe=reviewers.preflight(config))
+
+    def run_review(self, mode="pass", validate=lambda value: value, **changes):
+        config = self.config(mode, **changes)
+        return reviewers.run_review(self.prepare(config), validate), config
+
+    def calls(self):
+        """Each fake devin process DevFlow launched, in order."""
+        path = self.base / "calls.jsonl"
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] \
+            if path.exists() else []
+
+    def assert_follow_up_failed(self, message, cause):
+        """The shared failure shape: the follow-up, the first refusal, this cause, the records."""
+        self.assertIn("follow-up", message)
+        self.assertIn("Invalid reviewer JSON", message)  # the first answer's refusal
+        self.assertIn(cause, message)
+        self.assertIn(str(self.work / "follow-up"), message)
 
     def answer(self, export_text):
         """Devin.answer on a written export; standard output is never read."""
@@ -94,7 +140,7 @@ class DevinReviewerTests(unittest.TestCase):
                          ["--print", "--prompt-file", str(Path("/w") / "review-input.md"), "--model", "swe-2-high",
                           "--export", str(Path("/w") / "export.json")])
         self.assertIsNone(cli.stdin("prompt"))
-        self.assertEqual(cli.flags(), ["--print", "--prompt-file", "--model", "--export"])
+        self.assertEqual(cli.flags(), ["--print", "--prompt-file", "--resume", "--model", "--export"])
 
     def test_a_review_reads_the_answer_activity_and_tokens_from_the_export(self):
         result, config = self.run_review()
@@ -118,10 +164,191 @@ class DevinReviewerTests(unittest.TestCase):
             json.loads(stdout)
         self.assertEqual(reviewers.answer_value(reviewers._devin_answer(record)), {"lines": 5})
 
-    def test_an_answer_with_text_around_the_json_still_fails(self):
-        with self.assertRaisesRegex(ReviewerError, "JSON"):
+    def test_a_follow_up_answer_with_text_around_the_json_still_fails(self):
+        with self.assertRaisesRegex(ReviewerError, "follow-up") as caught:
             self.run_review("prose")
+        self.assert_follow_up_failed(str(caught.exception), "Invalid reviewer JSON")
         self.assertTrue((self.work / "export.json").is_file())  # The original record stays for inspection.
+        self.assertEqual(len(self.calls()), 2)
+
+    def test_a_prose_answer_is_sent_back_once_in_the_same_session(self):
+        result, config = self.run_review("tidy")
+        self.assertEqual(result["review"], REVIEW)
+        self.assertEqual(result["activity"]["answer_follow_ups"], 1)
+        first, second = self.calls()
+        self.assertFalse(first["resume"])
+        self.assertTrue(second["resume"])
+        argv = second["argv"]
+        self.assertEqual(argv[argv.index("--resume") + 1], "kind-spider")
+        self.assertEqual(argv[-2:], ["--export", str(self.work / "follow-up" / "export.json")])
+        follow = self.work / "follow-up"
+        for name in ("review-input.md", "invocation.json", "stdout.jsonl", "stderr.log", "export.json"):
+            self.assertTrue((follow / name).is_file(), name)
+        self.assertEqual((follow / "review-input.md").read_text(encoding="utf-8"),
+                         reviewers.FOLLOW_UP.read_text(encoding="utf-8"))
+        meta = json.loads((follow / "invocation.json").read_text(encoding="utf-8"))
+        first_meta = json.loads((self.work / "invocation.json").read_text(encoding="utf-8"))
+        self.assertEqual(set(meta), set(first_meta) | {"follow_up"})
+        self.assertTrue(meta["follow_up"])
+        self.assertGreater(meta["timeout_seconds"], 0)
+        self.assertLessEqual(meta["timeout_seconds"], first_meta["timeout_seconds"])
+        # The first turn's export keeps its refused answer; the follow-up's export gives the
+        # cumulative token counts and the whole conversation's tool calls.
+        record = json.loads((self.work / "export.json").read_text(encoding="utf-8"))
+        self.assertIn("Analysis of the diff.", record["steps"][-1]["message"])
+        self.assertEqual(result["activity"]["tool_calls"], {"grep": 1, "read": 2})
+        self.assertEqual(reviewers.review_tokens(config, self.work),
+                         {"total_cached_tokens": 23040, "total_completion_tokens": 240,
+                          "total_prompt_tokens": 58188})
+
+    def test_the_follow_up_gets_only_the_time_left(self):
+        config = self.config("tidy")
+        prepared = self.prepare(config)
+        timeouts = []
+        capture = reviewers._capture
+        with patch.object(reviewers, "_capture",
+                          side_effect=lambda argv, **kw: (timeouts.append(kw["timeout"]), capture(argv, **kw))[1]):
+            reviewers.run_review(prepared, lambda value: value)
+        self.assertEqual(timeouts[0], 30)
+        self.assertEqual(len(timeouts), 2)
+        self.assertGreater(timeouts[1], 25)
+        self.assertLessEqual(timeouts[1], 30)
+
+    def test_a_clean_first_answer_never_follows_up(self):
+        result, _ = self.run_review()
+        self.assertEqual(result["activity"]["answer_follow_ups"], 0)
+        self.assertFalse((self.work / "follow-up").exists())
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_follow_up_arguments_continue_the_recorded_session(self):
+        cli = reviewers.CLIS["devin"]
+        self.work.mkdir(exist_ok=True)
+        (self.work / "export.json").write_bytes((FIXTURES / "review_export.json").read_bytes())
+        self.assertEqual(cli.follow_up_arguments("swe-2", "high", self.work, self.work / "follow-up"),
+                         ["--print", "--prompt-file", str(self.work / "follow-up" / "review-input.md"),
+                          "--resume", "kind-spider", "--model", "swe-2-high",
+                          "--export", str(self.work / "follow-up" / "export.json")])
+        for record in ({}, {"session_id": 7}, {"session_id": ""}, {"session_id": "-looks-like-an-option"},
+                       {"session_id": "has space"}, {"session_id": "odd?chars"}):
+            with self.subTest(record=record):
+                (self.work / "export.json").write_text(json.dumps(record), encoding="utf-8")
+                self.assertIsNone(cli.follow_up_arguments("m", "h", self.work, self.work / "follow-up"))
+        for kind in ("codex", "opencode", "claude"):
+            with self.subTest(kind=kind):
+                self.assertIsNone(reviewers.CLIS[kind].follow_up_arguments("m", "h", self.work, self.work / "f"))
+
+    def test_an_unreadable_session_id_keeps_the_first_error(self):
+        self.work = self.base / "attempt no-session"
+        with self.assertRaisesRegex(ReviewerError, "Invalid reviewer JSON") as caught:
+            self.run_review("no-session")
+        self.assertNotIn("follow-up", str(caught.exception))
+        self.assertFalse((self.work / "follow-up").exists())
+
+    def test_failures_that_are_not_the_answers_shape_never_follow_up(self):
+        for mode, pattern in (("fail", "exited with 7"), ("no-export", "without an answer"),
+                              ("empty", "without an answer")):
+            self.work = self.base / f"attempt {mode}"
+            with self.subTest(mode), self.assertRaisesRegex(ReviewerError, pattern):
+                self.run_review(mode)
+            self.assertFalse((self.work / "follow-up").exists())
+        self.assertEqual(len(self.calls()), 3)
+        # Valid JSON that fails the workflow's schema check is not a shape error either.
+        self.work = self.base / "attempt not-review"
+        with self.assertRaisesRegex(ReviewerError, "missing or unknown fields"):
+            self.run_review("not-review", accept)
+        self.assertFalse((self.work / "follow-up").exists())
+        self.assertEqual(len(self.calls()), 4)
+
+    def test_a_follow_up_that_exits_or_times_out_fails_in_the_shared_shape(self):
+        validate = reviewers.validate_reviewer
+        with patch.object(reviewers, "validate_reviewer", lambda c: validate({**c, "timeout_seconds": 5})):
+            for mode, cause in (("exit-error", "exited with 7"), ("slow", "timed out")):
+                self.work = self.base / f"attempt {mode}"
+                with self.subTest(mode), self.assertRaisesRegex(ReviewerError, "follow-up") as caught:
+                    self.run_review(mode, timeout_seconds=0.5 if mode == "slow" else 30)
+                self.assert_follow_up_failed(str(caught.exception), cause)
+        self.assertEqual(len(self.calls()), 4)  # Two launches each; never a second follow-up.
+
+    def test_a_follow_up_answer_that_breaks_the_schema_fails_the_same_way(self):
+        with self.assertRaisesRegex(ReviewerError, "follow-up") as caught:
+            self.run_review("odd", accept)
+        self.assert_follow_up_failed(str(caught.exception), "missing or unknown fields")
+        self.assertEqual(len(self.calls()), 2)
+
+    def test_no_time_left_keeps_the_first_error(self):
+        real, shifted = reviewers.time.monotonic, {"on": False}
+        devin, answer = reviewers.CLIS["devin"], reviewers.CLIS["devin"].answer
+
+        def expire_after_first(output, work_dir):
+            try:
+                return answer(output, work_dir)
+            finally:
+                if Path(work_dir).name != "follow-up":
+                    shifted["on"] = True
+
+        with patch.object(reviewers.time, "monotonic", side_effect=lambda: real() + (100 if shifted["on"] else 0)), \
+                patch.object(devin, "answer", side_effect=expire_after_first), \
+                self.assertRaisesRegex(ReviewerError, "Invalid reviewer JSON") as caught:
+            self.run_review("tidy")
+        self.assertNotIn("follow-up", str(caught.exception))
+        self.assertFalse((self.work / "follow-up").exists())
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_time_spent_preparing_the_follow_up_fails_in_the_shared_shape(self):
+        real, shifted = reviewers.time.monotonic, {"on": False}
+        read = reviewers._read_text
+
+        def expire_on_request(path, limit):
+            if Path(path).name == "answer-follow-up.md":
+                shifted["on"] = True
+            return read(path, limit)
+
+        with patch.object(reviewers.time, "monotonic", side_effect=lambda: real() + (100 if shifted["on"] else 0)), \
+                patch.object(reviewers, "_read_text", side_effect=expire_on_request), \
+                self.assertRaisesRegex(ReviewerError, "follow-up") as caught:
+            self.run_review("tidy")
+        self.assert_follow_up_failed(str(caught.exception), "time limit")
+        self.assertEqual(len(self.calls()), 1)  # The follow-up turn never launched.
+        self.assertTrue((self.work / "follow-up" / "invocation.json").is_file())
+        self.assertFalse((self.work / "follow-up" / "stdout.jsonl").exists())
+
+    def test_an_existing_or_linked_follow_up_dir_is_refused_in_the_shared_shape(self):
+        self.work = self.base / "attempt existing"
+        (self.work / "follow-up").mkdir(parents=True)
+        with self.assertRaisesRegex(ReviewerError, "follow-up") as caught:
+            self.run_review("tidy")
+        self.assert_follow_up_failed(str(caught.exception), "already ran")
+        self.assertEqual(len(self.calls()), 1)
+
+    @unittest.skipIf(os.name == "nt", "Creating symlinks needs extra rights on Windows")
+    def test_a_symlinked_follow_up_dir_is_refused_the_same_way(self):
+        (self.base / "elsewhere").mkdir()
+        self.work.mkdir()
+        (self.work / "follow-up").symlink_to(self.base / "elsewhere", target_is_directory=True)
+        with self.assertRaisesRegex(ReviewerError, "follow-up"):
+            self.run_review("tidy")
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_tokens_fall_back_to_the_first_turn_when_the_follow_up_has_none(self):
+        config = self.config("tidy")
+        (self.work / "follow-up").mkdir(parents=True)
+        (self.work / "follow-up" / "stdout.jsonl").write_text("x", encoding="utf-8")
+        (self.work / "stdout.jsonl").write_text("x", encoding="utf-8")
+        (self.work / "export.json").write_text(json.dumps({"final_metrics": {"total_prompt_tokens": 10}}))
+        # The follow-up's output exists but its export cannot be read: the first turn's count stands.
+        self.assertEqual(reviewers.review_tokens(config, self.work), {"total_prompt_tokens": 10})
+
+    @unittest.skipIf(os.name == "nt", "Directory permission bits differ on Windows")
+    def test_an_unreadable_follow_up_dir_falls_back_to_the_first_turn(self):
+        config = self.config("tidy")
+        follow = self.work / "follow-up"
+        follow.mkdir(parents=True)
+        (follow / "stdout.jsonl").write_text("x", encoding="utf-8")
+        (self.work / "stdout.jsonl").write_text("x", encoding="utf-8")
+        (self.work / "export.json").write_text(json.dumps({"final_metrics": {"total_prompt_tokens": 10}}))
+        follow.chmod(0)
+        self.addCleanup(follow.chmod, 0o700)
+        self.assertEqual(reviewers.review_tokens(config, self.work), {"total_prompt_tokens": 10})
 
     def test_unknown_export_shapes_are_ignored_not_counted(self):
         review, activity = self.answer(json.dumps({

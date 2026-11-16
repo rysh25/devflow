@@ -274,3 +274,25 @@ insiders は `windsurf-insiders`）。チャンネルの決め方は書かれて
 そこで、Devin の答えは export の最後のエージェントの発言から読み（export が無い・読めないときは答えが無いとして失敗）、
 全レビュアー共通の指示文の最後に答えの形の念押しを置く。読み方の規則は変えない。
 
+
+## 同じ会話の続け方の実測（2026-11-17、Devin CLI 3000.12.57）
+
+レビュアーの答えが JSON の前後に文章を付ける失敗（上の訂正）への対策として、同じ会話を非対話で
+続けられるかを確かめた。`devin --print` には出力スキーマの機能が無い（`devin --help` と公式資料で確認）
+ため、出し直しは会話の続きとして送る。
+
+```text
+devin --print --prompt-file p1.md --model swe-2-medium --export e1.json          # session_id: silky-kicker
+devin --print --prompt-file p2.md -r silky-kicker --model swe-2-medium --export e2.json
+```
+
+- `-r`（`--resume`）に1回目の export の `session_id` を渡すと、新しいセッションではなく同じ会話が続く
+  （`e2.json` の `session_id` は同じ `silky-kicker` だった）。
+- `e2.json` の `steps` には会話の全部が入る（1回目の入力と答え、2回目の入力と答え）。
+  最後の agent の発言が新しい答えだった。
+- `final_metrics` は会話の累計だった（`total_prompt_tokens` は 13,760 → 27,596）。
+- `--model` は続きでも同じ形で渡す（変えられるかは確かめていない。DevFlow は同じ値を渡す）。
+
+この結果、Devin の出し直しは「`--resume` に1回目の `session_id` を渡し、同じモデルと effort で
+`--export` を別のファイルに向ける」形で実装した。トークン数は2回目の export の累計値をそのまま
+使い、ツールの呼び出しも会話全体の数になる。

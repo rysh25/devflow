@@ -1,4 +1,4 @@
-# DevFlow 0.11.0 の検証範囲
+# DevFlow 0.12.0 の検証範囲
 
 ## 再実行方法
 
@@ -828,3 +828,60 @@ run は `completed` で終わりました（レビュー 2 回、どちらも pa
 
 - フロー別の回数：`{"schema_version": 1, "plan": {"max_reviews": 3}, "implement": {"max_reviews": 4}}` で、`plan doctor` と `implement doctor` の `max_reviews` がそれぞれ 3 と 4 になった。`implement.max_reviews` を 100 にすると、`devflow.config.json: max_reviews must be an integer from 1 to 99` で止まった。
 - 古い版に戻すとき：0.11.0 で作った Plan の run を、0.10.1 のランナーの `plan status` で開いた。`max_reviews` 1 の run は `max_reviews must be an integer from 2 to 6; six is a hard ceiling` で開けず、レビュアー1人で `max_reviews` 2 の run は開けた（README の「0.11.0 への更新とバージョンを戻す場合」のとおり）。
+## 0.12.0 の検証（2026-11-17）
+
+0.12.0 は、レビュアーの答えが厳密な JSON として読めないときだけ、同じ会話の続きを1回だけ起動して
+同じレビューを JSON だけで送り直してもらう、出し直しを加えました（今は Devin のみ。新しいレビューではなく、
+回数は1回分のまま）。自動テストと配布物の検査は、ローカル設定 `devflow.config.local.json` を一時的に
+プロジェクトの外へ退避した状態で通しました（0.11.0 の検証と同じ理由：配布物の検査はそれを秘密として拒むため）。
+
+### 本物の Devin CLI での出し直し（確認 A）
+
+作業ツリーの `devflow_core.common.reviewers` を直接呼び、本物の Devin CLI 3000.12.57（swe-2-high）を
+レビュアーにしました。指示文は「最後の発言の先頭に `Here is my review.` と1文書いてから JSON を書く」ことを
+頼むもので、記録は `/tmp/devflow-acceptance-a/attempt` に置きました（レビュアーの起動先は信頼済みの
+プロジェクト。プロジェクトの外の一時ディレクトリは untrusted workspace で起動を断られました）。
+
+- 1回目の答えは `Here is my review.` + 空行 + JSON で、`Invalid reviewer JSON` 相当の形の誤りになった。
+- 出し直しが1回だけ起きた：`follow-up/` に `review-input.md`・`invocation.json`（`follow_up: true`、
+  残り時間だけの `timeout_seconds`）・`stdout.jsonl`・`stderr.log`・`export.json` ができ、
+  `session_id` は1回目と同じ（`cobalt-berry`）だった。1回目の `export.json` はそのまま残った。
+- 出し直しの答えは JSON だけで、検証を通った。`answer_follow_ups` は 1。
+- トークン数は出し直しの `export.json` の会話累計から読まれた
+  （`total_prompt_tokens` 14,206 → 28,710、`total_steps` 9 → 11）。
+
+### 古い版での読み取り（0.11.0）
+
+0.12.0 で作った形の run 記録（試行の活動に `answer_follow_ups: 1`、`review-processes/NN/follow-up/` あり）を
+別ディレクトリの複製として用意し、インストール済み 0.11.0 のランナーで読みました。
+
+- `implement status`・`implement doctor`：`answer_follow_ups` を含む活動がそのまま表示され、doctor は ready。
+- `plan status`・`plan report`：同じく読め、report は全文を生成した
+  （report は成果物のハッシュを照合するため、複製では記録に合わせてハッシュも更新して確かめた）。
+- 0.11.0 に戻しても 0.12.0 の run を読める（README の「0.12.0 への更新とバージョンを戻す場合」のとおり）。
+  ただし 0.11.0 のトークン数は1回目の `stdout.jsonl` だけを読む。
+
+### 本物の DevFlow の Plan での出し直し（確認 B）
+
+人間が別の Devin 会話で `/devflow:plan --reviewer devin swe-2 high --max-reviews 1` で始めた本物の
+Plan の run（`20261116T213831Z-9178faffe4a2`、面接・seal・plan は通常どおり）で、レビューだけを
+作業ツリーのランナー（0.12.0）で実行しました。
+
+- レビュー1（`review-processes/01/`）の1回目の答えは、また JSON の前に文章が付いていた
+  （"I've completed verification of the plan…"）。
+- 出し直しが同じ会話（`cypress-tick`）で1回だけ起き、`review-processes/01/follow-up/` に記録ができた。
+- 出し直しの答えは JSON だけで検証を通り、レビューは `changes_required`（low 1件）として記録された。
+  `reviews` と `review.json` の活動に `answer_follow_ups: 1` が出た。
+- トークン数は出し直しの export の会話累計（`total_prompt_tokens` 578,170 → 629,408）。
+
+答えが最初から正しい形の回も、同じ本物の run で得ました。人間がレビュー上限を延ばし
+（続ける、と記録された人間の決定）、revise された plan v001 へのレビュー2を同じく作業ツリーの
+ランナーで実行しました：
+
+- 1回目の答えがそのまま厳密な JSON で、出し直しは起きなかった。
+- `reviews` と `review.json` の活動に `answer_follow_ups: 0` が出た。
+- `review-processes/02/` には `follow-up/` が無く、1回目の記録だけが残った。
+
+あわせて、確認 A と同じ直接呼び出しでも JSON のみの答えを確認しています：
+出し直しは起きず、`answer_follow_ups` は 0、`follow-up/` は作られませんでした
+（本物の Devin CLI 3000.12.57、swe-2-high）。

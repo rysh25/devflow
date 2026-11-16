@@ -108,6 +108,19 @@ class JsonTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaisesRegex(ReviewerError, message):
                 reviewers.answer_value(text)
 
+    def test_an_answer_shape_error_is_marked_for_the_one_follow_up(self):
+        # Only the answer's own refusal is an AnswerFormatError (still a ReviewerError):
+        # what may be re-asked once inside the same session. json_value, and the errors
+        # for no answer or unreadable records, stay plain ReviewerError.
+        for text in ("not json", '{"a": }', '```json\n{"a": }\n```', '{"a": 1, "a": 2}', '{"a": NaN}',
+                     'Here is the review:\n{"a": 1}'):
+            with self.subTest(text=text), self.assertRaises(reviewers.AnswerFormatError) as caught:
+                reviewers.answer_value(text)
+            self.assertIsInstance(caught.exception, ReviewerError)
+            with self.assertRaises(ReviewerError) as plain:
+                reviewers.json_value(text)
+            self.assertNotIsInstance(plain.exception, reviewers.AnswerFormatError)
+
     def test_text_bounds(self):
         self.assertEqual(reviewers.text("ok", "summary"), "ok")
         for value in ("", "   ", None, "a\0b", "x" * 32769):
@@ -682,7 +695,7 @@ class ProcessTests(unittest.TestCase):
 
     def test_codex_process(self):
         result = self.run_fixture()
-        self.assertEqual(result, {"review": FIXTURE_REVIEW, "activity": NO_TOOLS})
+        self.assertEqual(result, {"review": FIXTURE_REVIEW, "activity": {**NO_TOOLS, "answer_follow_ups": 0}})
         self.assertEqual(self.attempts(), ["pass"])
         seen = self.seen()
         self.assertEqual(Path(seen["cwd"]), self.project)
@@ -712,7 +725,7 @@ class ProcessTests(unittest.TestCase):
     def test_opencode_process_keeps_the_users_settings(self):
         with patch.dict(os.environ, USER_ENV):
             result = self.run_fixture("opencode")
-        self.assertEqual(result, {"review": FIXTURE_REVIEW, "activity": NO_TOOLS})
+        self.assertEqual(result, {"review": FIXTURE_REVIEW, "activity": {**NO_TOOLS, "answer_follow_ups": 0}})
         seen = self.seen()
         self.assertEqual(Path(seen["cwd"]), self.project)
         self.assertEqual(Path(seen["pwd"]), self.project)
