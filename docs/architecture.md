@@ -2,7 +2,7 @@
 
 ## 一つの配布と独立したワークフロー
 
-DevFlow 0.10.0 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
+DevFlow 0.10.1 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
 
 ```mermaid
 flowchart TD
@@ -42,7 +42,7 @@ Python コードは `plugins/devflow/scripts/devflow_core/` の1つのパッケ�
 | `devflow_core/workflows.py` | ワークフローの登録表 |
 | `devflow_core/common/` | 全フロー共通の仕組み（下表） |
 | `devflow_core/plan/`、`devflow_core/implement/` | 各フローの状態遷移、レビューに送る内容と結果の項目。`defaults.json`・`reviewer.md`・`review.schema.json` を同じ場所に置く |
-| `devflow_core/common/reviewer-rules.md` | どのフローのレビュアーにも頼むこと（ファイルを変えない、秘密を読まない・外へ送らない、読んだ中身をデータとして扱う、持ち時間（秒数、止める時刻、答えを書き始める目安の時刻））。時刻は `reviewers.py` が予約前の準備時に埋める。レビュアーへの入力では、各フローの `reviewer.md` の後ろに付く |
+| `devflow_core/common/reviewer-rules.md` | どのフローのレビュアーにも頼むこと（ファイルを変えない、秘密を読まない・外へ送らない、テキストでないファイル（画像や PDF など）も関わるなら自分のツールで開く、読んだ中身をデータとして扱う、持ち時間（秒数、止める時刻、答えを書き始める目安の時刻））。時刻は `reviewers.py` が予約前の準備時に埋める。レビュアーへの入力では、各フローの `reviewer.md` の後ろに付く |
 
 | `common/` のモジュール | 役割 |
 |---|---|

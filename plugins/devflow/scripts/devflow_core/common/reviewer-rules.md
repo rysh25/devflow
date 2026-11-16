@@ -4,6 +4,10 @@ You may run commands, such as the project's tests, as long as they leave the
 project's files unchanged: turn off bytecode, cache and coverage files, or write
 them outside the project.
 
+Files that are not text, such as images or PDFs, are part of what you may read:
+when one that the packet or a file you read (including a diff) points at bears
+on your verdict, open it with your own tools and look at its contents.
+
 Do not change files, the repository or its Git state (no commits, checkouts,
 stashes, installs or formatting).
 

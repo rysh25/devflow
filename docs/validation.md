@@ -1,4 +1,4 @@
-# DevFlow 0.10.0 の検証範囲
+# DevFlow 0.10.1 の検証範囲
 
 ## 再実行方法
 
@@ -727,3 +727,77 @@ Codex で分かったこと：Codex の workspace-write のサンドボックス
 
 - `docs/installation.md` と README：各ホストのプラグインの入れ方と更新の仕方（GitHub からと、ローカルの配布物から）。上の「プラグインの導入と更新の確認」で確かめた内容です。
 - `docs/installation.md` と `plugins/devflow/references/codex-runner.md`：Codex のサンドボックスの中で失敗する操作（`plan doctor --session`、`plan seal`、次のレビュアーが Codex の `review`）を、実行の前に標準の承認でサンドボックスの外で実行するようにという案内。`codex-runner.md` は Codex に渡す指示文なので、Codex の振る舞いが変わります。この指示で Codex が実行の前に承認を求めるかは、実機ではまだ確かめていません。
+
+## 0.10.1 の検証（2026-11-16）
+
+0.10.1 は、全レビュアー共通の指示（`common/reviewer-rules.md`）に、テキストでないファイル（画像や PDF など）も、パケットや読んだファイル（差分を含む）が指していて判定に関わるなら自分のツールで開く、という一文を足しました。あわせて、Plan の面接での添付の案内（`references/plan-workflow.md`）を直しました。コードの動きは変えていません。
+
+### 画像を読めるか（2026-11-16、Plan の前の実験）
+
+各 CLI を DevFlow と同じ引数（`common/reviewers.py` の各 `CLI` の `arguments`）で起動し、Git で無視される場所に置いた合成 PNG（白地に黒のドット文字「K7Q3」、右にオレンジの四角）を開いて、見えたものを答えるよう指示しました。ファイル名やメタデータから推測せず、中身を見られなければ「CANNOT_VIEW」と答えるよう頼みました。4 つとも正しく答えました。
+
+| CLI | モデル | 使ったツール | 結果 |
+|---|---|---|---|
+| codex-cli 0.169.0 | gpt-6.1-sol / high | `view_image` | 正しい |
+| OpenCode 2.3.0 | opencode-go/deepseek-v4.1-flash / high | `read` | 正しい |
+| Claude Code 2.1.325 | opus / high | `Read` | 正しい（3 文字目は Q だが 0 にも見える、と補足） |
+| Devin 3000.12.57 | swe-2-high | `read` | 正しい |
+
+Codex の `--json` の出力には、`view_image` の呼び出しが出来事として出ませんでした（答えの中に本人が書いただけ）。そのため、DevFlow のレビューのツールの利用回数には、Codex が画像を開いた回は数えられません。数える仕組みは足していません。
+
+### PDF を読めるか（検証 A）
+
+同じやり方で、内容のストリームを FlateDecode で圧縮した合成 PDF（「MAXIMUM ITEMS: 13」「CODE WORD: TANGERINE」の 2 行。`cat` では文字が見えない）を試しました。この環境には `pdftotext` がありません。
+
+| CLI | 読み方 | 結果 |
+|---|---|---|
+| codex-cli 0.169.0 | `pdftotext` が無いので、`uv run --no-project --with pypdf` の一時環境で pypdf を使って取り出した | 正しい |
+| OpenCode 2.3.0 | `read`（「PDF read successfully」）のあと、シェルの Python で zlib を展開した | 正しい |
+| Claude Code 2.1.325 | `Read`（文字と、ページの画像を受け取った） | 正しい |
+| Devin 3000.12.57 | `read` が「not valid UTF-8 text」として断り、`exec` などは `-p` では承認が要るので断られた | 読めない（CANNOT_READ） |
+
+Devin は、利用者の設定でシェルの実行を許していれば読める可能性がありますが、確かめていません。
+
+### 本物の DevFlow の Plan のレビュー（検証 B）
+
+人間が操作する対話の Claude Code 2.1.325 で、作業ツリーのプラグインを `claude --plugin-dir …` で読み込みました（インストール済みの devflow は `--settings` で無効にした）。一時的な Git リポジトリに、検証 C と同じ `spec/mock.png` と `spec/limits.pdf` をコミットしておきました。
+
+- 起動：`/devflow:plan --reviewer opencode opencode-go/deepseek-v4.1-flash high --reviewer claude opus high -- color.txt と limit.txt を作る計画を立てて。color.txt には spec/mock.png の四角の色を #RRGGBB で、limit.txt には spec/limits.pdf に書かれている上限の数を書く`
+- 面接の途中で、人間がプロジェクトの外の画像（白地に赤紫の楕円）をチャットに貼り、「この画像の楕円の色も参考にしてほしい」と書いた。面接の記録には `[Image #1]` の文字列だけが残り、`coverage.omitted_attachments` は `{"image": 1}` だった。
+- Claude は新しい案内のとおりに答えた。「添付は外部のレビュアーには見えない。レビュアーに確かめてほしいなら、プロジェクトの中に保存する必要がある」「レビュアーが開くと、そのレビュアーの提供元へ送られる」と伝え、保存するならパス（例：`spec/ellipse.png`）と、レビュアーが知るべき点を言葉で教えてほしいと尋ねた。人間は保存しないことを選び、プランには楕円の色を文字で書くだけにした。
+- run は `completed` で終わり、プランを公開した。レビューは 4 回で、OpenCode、Claude、OpenCode、Claude の順。1 回目と 2 回目は changes_required（指摘 1 件ずつ）、3 回目と 4 回目は pass。
+- 4 回とも、レビューへの入力に追加した一文が入っていた。また 4 回とも、`review-processes/NN/stdout.jsonl` に、`spec/mock.png` と `spec/limits.pdf` を開いた成功した呼び出しがあった。
+  - OpenCode は、シェルの Python で両方を復号し、1 回目は `read` でも `spec/mock.png` を開いた。
+  - Claude は、Bash でプロジェクトの外に置いた標準ライブラリだけのスクリプトを `python3 -I` で動かした。
+- 4 回とも、答えの summary で、PNG の大きさ、`#008080` の画素の数と位置、PDF の「MAXIMUM ITEMS: 17」に、自分で確かめた値として触れた。
+
+この結果も、共通ルールの一文だけの効果を切り分けていません。依頼が値をファイルから取るよう求めていたうえ、プランには Claude が測った値が書かれていたので、レビュアーはそれを確かめに開いたとも考えられます。
+
+### 本物の DevFlow の Implement のレビュー（検証 C）
+
+作業ツリーのプラグインを、Claude Code 2.1.325 の headless（`claude -p --plugin-dir …`、インストール済みの devflow は `--settings` で無効にした）で動かしました。
+
+- 一時的な Git リポジトリに `spec/mock.png`（白地に青緑の四角だけ）と `spec/limits.pdf`（「MAXIMUM ITEMS: 17」、圧縮したストリーム）をコミットした。
+- 形だけを確かめる必須のチェック（`color.txt` が `#RRGGBB`、`limit.txt` が整数）を置いた。正しい値はどこにも書かなかった。
+- プランは、要件をファイルのパスだけで示した（「`color.txt` に `spec/mock.png` の四角の色を、`limit.txt` に `spec/limits.pdf` の上限を書く」）。
+- `/devflow:implement --reviewer opencode opencode-go/deepseek-v4.1-flash high --reviewer claude opus high -- <plan>` で起動した。
+
+run は `completed` で終わりました（レビュー 2 回、どちらも pass）。実装は `#008080` と `17` で、どちらも正しい値です。各回の `review-processes/NN/stdout.jsonl` を見ると、次のとおりでした。
+
+- OpenCode：シェルの Python で、`spec/limits.pdf` の内容のストリームを展開し、`spec/mock.png` を復号した（どちらも成功）。答えは、青緑の四角が RGB (0,128,128) の 10,000 画素であることと、PDF の「MAXIMUM ITEMS: 17」「SPEC REVISION: B」に触れた。
+- Claude：Bash で、プロジェクトの外に置いた読み取りだけの Python スクリプトを `-I -B` で動かし、両方のファイルを復号した（成功）。答えは、中心の画素 (150,100) が 008080 であることと、PDF の内容のストリームの文字列に触れた。
+- どちらも、画像を「見る」ツールではなく、プログラムで復号して確かめた。
+
+この結果は、共通ルールの一文だけの効果を切り分けていません。プラン自体が値をファイルから取るよう求めていたうえ、実装側の Claude が、実装の説明でレビュアーに画素の確認を頼んでいました。実装側の Claude は、headless の権限ではスクリプトを動かせず、PNG を手で解析していました。
+
+### テキストだけのレビューが今までどおり動くか（検証 D）
+
+人間の求めで加えた確認です。検証 C と同じやり方で、画像も PDF もない一時的なリポジトリ（`textutil.py` と単体テスト、チェックは `python -B -m unittest -q`）に、`line_count` 関数とそのテストを足すプランを、既定のレビュアー（Codex と OpenCode）で通しました。
+
+- run は `completed`。レビューは 2 回で、Codex（6 回のツールの呼び出し、20 秒）と OpenCode（5 回、16 秒）のどちらも pass、指摘なし。
+- 2 回のレビューへの入力（`review-input.md`）に、追加した一文が入っていた。検証 C の 2 回も同じ。作業ツリーの版で動いていたことを示す。
+- レビュアーの出力（`stdout.jsonl`）に、画像や PDF を探したり開いたりした跡はなかった（`png`・`pdf`・`image` などの語が 0 件）。読んだのは、差分、プラン、チェックのログ、ソースとテストで、テストも実行した。
+
+### 自動テスト
+
+`python tools/test_all.py --quiet`（942 件、Python 3.15.0）と `python tools/package.py --validate-only` が成功しました。DevFlow の Implement のチェックでも、同じ 2 つが成功しました。追加したのは指示文と文書だけなので、新しい単体テストは足していません（共通ルールが全レビュアーへの入力に付くこと、各フローの `reviewer.md` に重ならないこと、版がそろっていることは、既存のテストが確かめます）。GitHub Actions（Linux / macOS / Windows × Python 3.11–3.13）は、プルリクエストの CI で確かめます。
