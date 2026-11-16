@@ -10,7 +10,7 @@ from ..common.review import after_failed_review, check_review_budget, check_revi
 from ..common.runs import TERMINAL
 from ..common.storage import json_bytes, now
 from ..common.operations import public_command
-from ..common.startup import override_reviewers, parse_start
+from ..common.startup import apply_startup, parse_start
 from ..common.workflow import Workflow
 from .commands import COMMANDS
 
@@ -61,7 +61,7 @@ class PlanWorkflow(Workflow):
             raise UsageError("Codex Plan requires the actual start turn ID from its hook; do not guess")
         startup = parse_start(public_command(prompt, host)[1])
         request = startup.body
-        config = validate_config(override_reviewers(load_config(project, self), startup))
+        config = validate_config(apply_startup(load_config(project, self), startup))
         fields = {
             "status": "interview", "review_count": 0, "review_limit": config["max_reviews"],
             "plan_version": None, "plan_hash": None,

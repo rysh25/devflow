@@ -11,7 +11,7 @@ from ..common.review import after_failed_review, check_review_budget, check_revi
 from ..common.runs import TERMINAL
 from ..common.sessions import prefilled_question_events
 from ..common.operations import public_command
-from ..common.startup import override_reviewers, parse_start
+from ..common.startup import apply_startup, parse_start
 from ..common.storage import check_json_size, digest, json_bytes, no_symlinks, now
 from ..common.workflow import Option, Workflow
 from .commands import COMMANDS
@@ -75,7 +75,7 @@ class ImplementWorkflow(Workflow):
         no_symlinks(plan)
         payload = pending["event"]["payload"]
         startup = parse_start(public_command(payload["prompt"], payload["host"])[1])
-        config = validate_config(override_reviewers(load_config(project, self), startup))
+        config = validate_config(apply_startup(load_config(project, self), startup))
         if plan.suffix.lower() not in {".md", ".markdown"}:
             raise DevFlowError("The input plan must be a UTF-8 Markdown file")
         # The workspace is decided once, before anything is created, and frozen.

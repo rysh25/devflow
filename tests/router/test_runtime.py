@@ -712,7 +712,7 @@ class InterruptionTests(RuntimeFixture):
         self.assertEqual(self.record()["run"], {"flow": "plan", "run_id": pending["run_id"]})
 
     def test_failed_in_hook_creation_clears_its_pending_start(self):
-        atomic_json(self.project / "devflow.config.json", {"schema_version": 1, "plan": {"max_reviews": 7}})
+        atomic_json(self.project / "devflow.config.json", {"schema_version": 1, "plan": {"max_reviews": 100}})
         self.assert_not_accepted(self.prompt("/devflow:plan Request with an invalid configuration"), "max_reviews")
         self.assertIsNone(self.record())
 

@@ -50,21 +50,23 @@ class ConfigCliTests(unittest.TestCase):
         self.assertNotEqual(config, self.config)
 
     def test_unknown_fields_and_boolean_schema_rejected(self):
-        for field, value in (("schema_version", True), ("max_reviews", True), ("max_reviews", 7), ("unexpected", 1)):
+        for field, value in (("schema_version", True), ("max_reviews", True), ("max_reviews", 0), ("max_reviews", 100), ("unexpected", 1)):
             config = {**self.config, field: value}
             with self.subTest(field=field, value=value):
                 with self.assertRaises(DevFlowError):
                     validate_config(config)
 
-    def test_two_or_more_reviewers_of_different_kinds_required(self):
+    def test_one_or_more_reviewers_of_any_kinds_up_to_max_reviews(self):
         config = copy.deepcopy(self.config)
         config["reviewers"][1]["kind"] = "codex"
-        with self.assertRaisesRegex(DevFlowError, "different reviewer kinds"):
-            validate_config(config)
+        self.assertEqual([r["kind"] for r in validate_config(config)["reviewers"]], ["codex", "codex"])
         config["reviewers"] = config["reviewers"][:1]
-        with self.assertRaises(DevFlowError):
+        config["max_reviews"] = 1
+        self.assertEqual([r["id"] for r in validate_config(config)["reviewers"]], ["codex"])
+        config["reviewers"] = []
+        with self.assertRaisesRegex(DevFlowError, "one reviewer up to max_reviews"):
             validate_config(config)
-        # A third reviewer is allowed, up to max_reviews, with at least two kinds.
+        # A third reviewer is allowed, up to max_reviews.
         three = copy.deepcopy(self.config)
         three["reviewers"].append(dict(three["reviewers"][0], id="codex-second"))
         self.assertEqual([r["id"] for r in validate_config(three)["reviewers"]], ["codex", "opencode", "codex-second"])
@@ -164,7 +166,7 @@ class ConfigCliTests(unittest.TestCase):
         self.assertIn("Unknown devflow.config.json keys", output)
 
     def test_workflow_review_budget_stays_bounded_when_inherited(self):
-        atomic_write_json(self.project / "devflow.config.json", {"schema_version": 1, "max_reviews": 7})
+        atomic_write_json(self.project / "devflow.config.json", {"schema_version": 1, "max_reviews": 100})
         with self.assertRaises(DevFlowError):
             load_config(self.project, WORKFLOW)
 

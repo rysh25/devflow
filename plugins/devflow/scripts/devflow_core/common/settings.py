@@ -83,16 +83,14 @@ def validate_reviewers(reviewers: object, max_reviews: int) -> list:
     Reviewer settings are trusted human configuration. DevFlow checks only what
     it needs to start each CLI and read its answer, never how the user runs it.
     """
-    if not isinstance(reviewers, list) or len(reviewers) < 2 or len(reviewers) > max_reviews:
-        raise DevFlowError("Configure from two reviewers up to max_reviews; every reviewer must be able to approve")
+    if not isinstance(reviewers, list) or not reviewers or len(reviewers) > max_reviews:
+        raise DevFlowError("Configure from one reviewer up to max_reviews; every reviewer must be able to approve")
     seen = set()
     for reviewer in reviewers:
         validate_reviewer(reviewer)
         if reviewer["id"] in seen:
             raise DevFlowError("Reviewer IDs must be unique lowercase names")
         seen.add(reviewer["id"])
-    if len({reviewer["kind"] for reviewer in reviewers}) < 2:
-        raise DevFlowError("Reviews need at least two different reviewer kinds for independence")
     return copy.deepcopy(reviewers)
 
 

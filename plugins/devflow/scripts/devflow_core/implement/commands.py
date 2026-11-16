@@ -18,13 +18,13 @@ def doctor(engine, args, run_id, session) -> dict:
     config = engine.read_frozen_config(run_id) if run_id else workflow.load_config(engine.project)
     source = "frozen_run" if run_id else "project_settings"
     if not run_id and session:
-        from ..common.startup import parse_start, override_reviewers
+        from ..common.startup import apply_startup, parse_start
         from ..common.operations import public_command
         from .config import validate_config
         pending = getattr(args, "pending_start", None)
         if pending and pending["flow"] == workflow.name:
             prompt = pending["event"]["payload"]["prompt"]
-            config = validate_config(override_reviewers(config, parse_start(public_command(prompt, engine.host)[1])))
+            config = validate_config(apply_startup(config, parse_start(public_command(prompt, engine.host)[1])))
             source = "pending_start"
     results = []
     for provider in config["reviewers"]:
