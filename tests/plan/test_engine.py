@@ -55,7 +55,7 @@ def raise_unwritable(kind):
 UNWRITABLE = {"answer": "Reviewer answer contains text that cannot be saved (an unpaired surrogate)",
               "codex turn failure": "Codex reported that the review turn failed: boom \\ud800",
               "opencode error": "OpenCode reported an error: boom \\ud800",
-              "duplicate key": "Duplicate JSON key: \\ud800"}
+              "duplicate key": "Duplicate JSON key: \"\\ud800\""}
 
 
 def unwritable_activity():
@@ -326,9 +326,10 @@ class EngineTests(unittest.TestCase):
 
     def test_a_follow_up_failure_message_reaches_the_error_record_and_status(self):
         self.ready()
-        message = ("The answer follow-up failed: the reviewer was asked once to send the same review "
-                   "again, as only JSON, in the same session after its first answer was refused "
-                   "(Invalid reviewer JSON); the follow-up failed (Invalid reviewer JSON); "
+        message = ("The answer follow-up failed: the reviewer was asked once, in the same session, to send "
+                   "its review again with the refusal's reason and the required output schema after its "
+                   "first answer was refused (Invalid reviewer JSON); "
+                   "the follow-up failed (Invalid reviewer JSON); "
                    "its records are in /run/review-processes/01/follow-up")
         failed = self.submit_with_output(None, error=ReviewerError(message))
         self.assertEqual(read_json(self.run / "reviews" / "01" / "error.json")["message"], message)

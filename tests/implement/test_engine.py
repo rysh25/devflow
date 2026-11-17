@@ -28,7 +28,6 @@ from devflow_core.common.storage import atomic_write_json, digest, json_bytes, r
 from devflow_core.implement import checks as checks_module
 from devflow_core.implement import engine as engine_module
 from devflow_core.implement.engine import Engine
-from devflow_core.implement.review import validate_review
 from devflow_core.workflows import WORKFLOWS
 from devflow_core.common.review import REVIEW_LIMIT_REASON
 from tests.common.test_common import limit_question
@@ -169,7 +168,6 @@ class EngineFixture(unittest.TestCase):
         self.assertEqual(Path(cwd), Path(packet["workspace"]["path"]))
         self.assertTrue(json.loads(prepared.schema))
         self.assertIn(WORKFLOWS["implement"].resource("reviewer.md").read_text().rstrip(), prepared.prompt.decode("utf-8"))
-        self.assertIs(validate, validate_review)
         self.assertEqual(probe, {"available": True, "offline_probe": True})
         review = {"schema_version": 1, "snapshot_id": packet["snapshot_id"], "verdict": self.response_kind,
                   "summary": "Independent offline test review.", "findings": [], "questions": []}
@@ -421,9 +419,10 @@ class EngineFlowTests(EngineFixture):
     def test_a_follow_up_failure_message_reaches_the_attempt_record_and_status(self):
         self.start()
         self.ready()
-        message = ("The answer follow-up failed: the reviewer was asked once to send the same review "
-                   "again, as only JSON, in the same session after its first answer was refused "
-                   "(Invalid reviewer JSON); the follow-up failed (Invalid reviewer JSON); "
+        message = ("The answer follow-up failed: the reviewer was asked once, in the same session, to send "
+                   "its review again with the refusal's reason and the required output schema after its "
+                   "first answer was refused (Invalid reviewer JSON); "
+                   "the follow-up failed (Invalid reviewer JSON); "
                    "its records are in /run/review-processes/01/follow-up")
         self.reviewer.side_effect = ReviewerError(message)
         self.review()
@@ -598,11 +597,16 @@ class EngineFlowTests(EngineFixture):
         self.start()
         self.ready()
 
+        expected = self.state()["candidate"]["snapshot_id"]
         self.alter = lambda review: review.update(snapshot_id="different-snapshot")
         result = self.review()
         self.assertEqual(result["status"], "paused_error")
         self.assertEqual(result["approvals"], {})
         self.assertEqual(result["review_count"], 1)
+        # The snapshot check lives in the answer checks now: its message is the
+        # attempt's error (the fake reviewer cannot be asked again).
+        self.assertEqual(result["attempts"][0]["error"],
+                         f"snapshot_id must be the snapshot under review: {expected}")
         self.resume()
 
         self.alter = lambda review: review.update(unexpected="not allowed")

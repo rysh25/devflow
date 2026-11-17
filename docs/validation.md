@@ -1,4 +1,4 @@
-# DevFlow 0.12.0 の検証範囲
+# DevFlow 0.12.1 の検証範囲
 
 ## 再実行方法
 
@@ -885,3 +885,45 @@ Plan の run（`20261116T213831Z-9178faffe4a2`、面接・seal・plan は通常�
 あわせて、確認 A と同じ直接呼び出しでも JSON のみの答えを確認しています：
 出し直しは起きず、`answer_follow_ups` は 0、`follow-up/` は作られませんでした
 （本物の Devin CLI 3000.12.57、swe-2-high）。
+
+## 0.12.1 の検証（2026-11-17）
+
+0.12.1 は、答えの点検（厳密な JSON として読むことと、ワークフローの点検）で断られた答えを、同じ会話で
+1回だけ出し直してもらうように広げました。出し直しの依頼は1つの雛形になり、断られた理由と
+スキーマの全文を添えます。自動テスト（978 件）と配布物の検査は、ローカル設定
+`devflow.config.local.json` を一時的にプロジェクトの外へ退避した状態で通しました（0.12.0 の検証と
+同じ理由：配布物の検査はそれを秘密として拒むため）。
+
+### 本物の Devin CLI での出し直し（確認 A）
+
+作業ツリーの `devflow_core.common.reviewers` を直接呼び、本物の Devin CLI 3000.13.4（swe-2-high）を
+レビュアーにしました（確かめた版 3000.12.57 より新しい。preflight の警告どおり、DevFlow は新しい版を
+止めません）。0.12.0 の確認 A と同じく、レビュアーの起動先は信頼済みのプロジェクト、記録は
+プロジェクトの外（`/tmp/devflow-verify-a/01`）に置きました。
+
+- 1回目はスキーマの無い短い依頼を `Devin.arguments` と同じ形（`--print --prompt-file … --model
+  swe-2-high --export …/export.json`）で送り、答えは `{"verdict":"pass","findings":[],"questions":[]}`
+  だけでした（自動要約のあとの状態をまねた形。スキーマとフィールド名は依頼に含めていません）。
+- plan の `validate_review` を `checked_review` に通すと
+  `Review has missing or unknown fields (missing: "schema_version", "summary"; unknown: none)` で断られ、
+  `reviewers._answer_follow_up` が出し直しを1回だけ起動しました。
+- `follow-up/review-input.md` には、断られた理由の全文とスキーマの全文が入っていました。
+  `session_id` は1回目と同じ（`stump-hollyhock`）でした。
+- 出し直しの答えは `schema_version`（1）と `summary` を持ち、plan の `validate_review` を通りました
+  （`{"schema_version":1,"verdict":"pass","summary":"…","findings":[],"questions":[]}`）。
+- 実際の run で失敗した答えと同じ形（スキーマとフィールド名を持たない、要約のあとの状態をまねた
+  会話）の答えが、同じ会話の1回の出し直しで直ることを、本物の Devin 3000.13.4 で確かめました。
+  要約された本物の会話を再開しての確認はしていません。
+
+### 古い版での読み取り（0.12.0）
+
+run の記録の形は 0.12.0 と同じです（`answer_follow_ups` と `follow-up/` は 0.12.0 で入ったもので、
+0.12.1 は記録の形を変えません）。0.12.0 で作った Plan の run（`20261116T213831Z-9178faffe4a2`）の
+複製を別ディレクトリのプロジェクトに置き、`review-processes/01` を確認 A で 0.12.1 が作った記録
+（点検で断られて出し直した `follow-up/` を含む）に差し替え、複製の `state["project"]` だけを
+複製先に合わせて、コミット 040cb55（0.12.0）の worktree のランナーで読みました。
+
+- `plan status`：run・レビュー・活動の `answer_follow_ups: 1` がそのまま読めました。
+- `plan doctor`：凍結した設定を読み、通常どおりの診断を返しました。
+- `plan report`：全文のレポート（`review_summary_markdown` を含む）を生成しました。
+- 0.12.0 に戻しても 0.12.1 の run を読めます（README の「0.12.1 への更新」のとおり）。

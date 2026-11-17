@@ -24,76 +24,81 @@ class ValidationTests(unittest.TestCase):
         # The shape of a real OpenCode reply: a finding with an added field.
         value = {**PASS, "verdict": "changes_required", "findings": [{**FINDING, "consequence": "Breaks X"}]}
         with self.assertRaises(ReviewerError) as caught:
-            validate_review(value)
+            validate_review(value, "snapshot-abc123")
         self.assertEqual(str(caught.exception), FIELD_ERROR)
 
     def test_missing_review_field_is_named(self):
         value = {key: item for key, item in PASS.items() if key != "questions"}
         with self.assertRaisesRegex(ReviewerError, r'^Review has missing or unknown fields \(missing: "questions"; unknown: none\)$'):
-            validate_review(value)
+            validate_review(value, "snapshot-abc123")
 
     def test_pass_and_no_mutation(self):
         value = copy.deepcopy(PASS)
-        self.assertEqual(validate_review(value), PASS)
+        self.assertEqual(validate_review(value, "snapshot-abc123"), PASS)
         self.assertEqual(value, PASS)
 
     def test_snapshot_is_required(self):
         value = {k: v for k, v in PASS.items() if k != "snapshot_id"}
         with self.assertRaises(ReviewerError):
-            validate_review(value)
+            validate_review(value, "snapshot-abc123")
 
     def test_unknown_fields(self):
         with self.assertRaises(ReviewerError):
-            validate_review({**PASS, "execute": "rm -rf ."})
+            validate_review({**PASS, "execute": "rm -rf ."}, "snapshot-abc123")
 
     def test_boolean_version_rejected(self):
         with self.assertRaises(ReviewerError):
-            validate_review({**PASS, "schema_version": True})
+            validate_review({**PASS, "schema_version": True}, "snapshot-abc123")
 
     def test_bad_snapshot_identifiers(self):
         for snapshot in (None, "", "abc/../../x", "a b"):
             with self.subTest(snapshot=snapshot), self.assertRaises(ReviewerError):
-                validate_review({**PASS, "snapshot_id": snapshot})
+                validate_review({**PASS, "snapshot_id": snapshot}, "snapshot-abc123")
+
+    def test_a_different_snapshot_is_refused_with_the_expected_one(self):
+        with self.assertRaisesRegex(
+                ReviewerError, r"^snapshot_id must be the snapshot under review: snapshot-abc123$"):
+            validate_review({**PASS, "snapshot_id": "snapshot-other"}, "snapshot-abc123")
 
     def test_pass_cannot_hide_findings_or_questions(self):
         for change in ({"findings": [FINDING]}, {"questions": ["What scope?"]}):
             with self.subTest(change=change), self.assertRaises(ReviewerError):
-                validate_review({**PASS, **change})
+                validate_review({**PASS, **change}, "snapshot-abc123")
 
     def test_changes_need_findings(self):
         with self.assertRaises(ReviewerError):
-            validate_review({**PASS, "verdict": "changes_required"})
-        validate_review({**PASS, "verdict": "changes_required", "findings": [FINDING]})
+            validate_review({**PASS, "verdict": "changes_required"}, "snapshot-abc123")
+        validate_review({**PASS, "verdict": "changes_required", "findings": [FINDING]}, "snapshot-abc123")
 
     def test_human_required_needs_question(self):
         with self.assertRaises(ReviewerError):
-            validate_review({**PASS, "verdict": "human_required"})
-        validate_review({**PASS, "verdict": "human_required", "questions": ["Which public API?"]})
+            validate_review({**PASS, "verdict": "human_required"}, "snapshot-abc123")
+        validate_review({**PASS, "verdict": "human_required", "questions": ["Which public API?"]}, "snapshot-abc123")
 
     def test_human_flag_cannot_be_automatic(self):
         with self.assertRaises(ReviewerError):
             validate_review({**PASS, "verdict": "changes_required",
-                             "findings": [{**FINDING, "requires_human": True}]})
+                             "findings": [{**FINDING, "requires_human": True}]}, "snapshot-abc123")
 
     def test_duplicate_finding_id(self):
         with self.assertRaises(ReviewerError):
-            validate_review({**PASS, "verdict": "changes_required", "findings": [FINDING, FINDING]})
+            validate_review({**PASS, "verdict": "changes_required", "findings": [FINDING, FINDING]}, "snapshot-abc123")
 
     def test_invalid_line_ranges(self):
         for start, end in ((-1, 0), (0, 1), (5, 2), (True, 2), (1, "2")):
             with self.subTest(start=start, end=end), self.assertRaises(ReviewerError):
                 validate_review({**PASS, "verdict": "changes_required",
-                                 "findings": [{**FINDING, "line_start": start, "line_end": end}]})
+                                 "findings": [{**FINDING, "line_start": start, "line_end": end}]}, "snapshot-abc123")
 
     def test_cross_cutting_finding(self):
         validate_review({**PASS, "verdict": "changes_required",
-                         "findings": [{**FINDING, "file": "*", "line_start": 0, "line_end": 0}]})
+                         "findings": [{**FINDING, "file": "*", "line_start": 0, "line_end": 0}]}, "snapshot-abc123")
 
     def test_paths_must_be_relative(self):
         for path in ("/tmp/a", "../a", "C:\\secret", "src/../secret", "src\\a"):
             with self.subTest(path=path), self.assertRaises(ReviewerError):
                 validate_review({**PASS, "verdict": "changes_required",
-                                 "findings": [{**FINDING, "file": path}]})
+                                 "findings": [{**FINDING, "file": path}]}, "snapshot-abc123")
 
 
 if __name__ == "__main__":

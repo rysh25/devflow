@@ -14,7 +14,7 @@ FINDING_KEYS = {"id", "severity", "category", "file", "line_start", "line_end",
                 "evidence", "recommendation", "requires_human"}
 
 
-def validate_review(value: Any) -> dict:
+def validate_review(value: Any, snapshot_id: str) -> dict:
     """Validate exact fields and invariants. Never repair or salvage model JSON."""
     check_fields(value, REVIEW_KEYS, "Review")
     if type(value["schema_version"]) is not int or value["schema_version"] != 1:
@@ -22,6 +22,8 @@ def validate_review(value: Any) -> dict:
     text(value["snapshot_id"], "snapshot_id", 128)
     if not re.fullmatch(r"[A-Za-z0-9._:-]+", value["snapshot_id"]):
         raise ReviewerError("snapshot_id must be a plain identifier")
+    if value["snapshot_id"] != snapshot_id:
+        raise ReviewerError(f"snapshot_id must be the snapshot under review: {snapshot_id}")
     text(value["summary"], "summary")
     findings, questions = value["findings"], value["questions"]
     if not isinstance(findings, list) or len(findings) > 128:
