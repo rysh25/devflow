@@ -256,14 +256,13 @@ class Engine(RunEngine):
                 "snapshot_path":state["candidate"]["path"],
                 "packet_path":packet_relative,"packet_sha256":digest(packet),"status":"dispatched","started_at":now()})
             # Reserved BEFORE dispatch, including unknown-outcome failures.
-            return number, current["snapshot_id"], provider["id"], {"prepared": prepared}
+            return number, current["snapshot_id"], provider["id"], {"prepared": prepared,
+                                                                   "snapshot_id": current["snapshot_id"]}
 
         def execute(work):
-            return run_review(work["prepared"], validate_review)
+            return run_review(work["prepared"], lambda value: validate_review(value, work["snapshot_id"]))
 
         def finish(state, reservation, work, result, error):
-            if error is None and result["review"]["snapshot_id"] != reservation["target"]:
-                error = DevFlowError("Reviewer response is for a different snapshot")
             self._finish_review(state, reservation, provider, result, error)
 
         return self._dispatch(run_id, "reviewing", "review", prepare, execute, finish)

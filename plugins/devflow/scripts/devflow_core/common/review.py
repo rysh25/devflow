@@ -1,8 +1,7 @@
 """Shared budget, approval and verdict mechanics; domain policy remains in each flow."""
-import json
 from typing import Callable, Collection
 
-from .errors import DevFlowError, ReviewerError
+from .errors import DevFlowError, ReviewerError, shown_name
 from .runs import TERMINAL
 
 # The ceiling of both the configured max_reviews (the initial limit) and one
@@ -22,7 +21,6 @@ LIMIT_DECISIONS = ("continue", "stop", "accept")
 # Field names in a rejected response come from the model: show a bounded,
 # escaped, deterministic selection.
 SHOWN_FIELD_NAMES = 8
-FIELD_NAME_CHARS = 64
 
 
 def validate_limit(value: int) -> int:
@@ -98,9 +96,7 @@ VERDICTS = ("pass", "changes_required", "human_required")
 def _field_names(names: list[str]) -> str:
     if not names:
         return "none"
-    # ensure_ascii escapes control and bidirectional characters, so a name
-    # cannot disguise the message; the cut applies before escaping.
-    shown = [json.dumps(name[:FIELD_NAME_CHARS]) for name in names[:SHOWN_FIELD_NAMES]]
+    shown = [shown_name(name) for name in names[:SHOWN_FIELD_NAMES]]
     if len(names) > SHOWN_FIELD_NAMES:
         shown.append(f"and {len(names) - SHOWN_FIELD_NAMES} more")
     return ", ".join(shown)

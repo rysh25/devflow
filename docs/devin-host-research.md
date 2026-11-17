@@ -296,3 +296,22 @@ devin --print --prompt-file p2.md -r silky-kicker --model swe-2-medium --export 
 この結果、Devin の出し直しは「`--resume` に1回目の `session_id` を渡し、同じモデルと effort で
 `--export` を別のファイルに向ける」形で実装した。トークン数は2回目の export の累計値をそのまま
 使い、ツールの呼び出しも会話全体の数になる。
+
+## 長い会話の自動要約（2026-11-17、Devin CLI 3000.12.57）
+
+別プロジェクトの DevFlow 0.12.0 の plan run（`20261117T021453Z-3d163c10bec6`）のレビューで、Devin が会話の
+途中を自動で要約した実例を確認した。そのレビューの `export.json` では、17 ステップのうちステップ 6 が
+「You are continuing work from a previous conversation thread. Below is a summary of the previous
+conversation thread: …」で始まっていた。そのレビューの入力（`review-input.md`）は 109 KB で、
+ほかのレビュー（28〜67 KB）のおよそ倍だった。
+
+要約には「答えは JSON 1つ」「verdict は pass / changes_required / human_required」「ID は一意」などの
+決まりが言い換えで残っていたが、スキーマそのものと、`schema_version`・`summary` というフィールド名は
+残っていなかった。その会話の最後の agent の発言は `{"verdict":"pass","findings":[],"questions":[]}`
+だけで、JSON としては正しいため 0.12.0 の出し直しは動かず、ワークフローの点検
+（`missing: "schema_version", "summary"`）で失敗した。
+
+要約のあとの会話では、0.12.0 の「the JSON object that the required output schema describes」とだけ
+書く出し直しの文面では、何を返せばよいかレビュアーには分からない。0.12.1 では、出し直しの依頼を
+1つの雛形にし、断られた理由とスキーマの全文を差し込むようにした。1回の起動ごとに渡せる設定の中に、
+自動要約そのものを止める方法は見つかっていない。

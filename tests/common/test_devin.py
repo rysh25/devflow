@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from devflow_core.common import reviewers
 from devflow_core.common.errors import ReviewerError
+from devflow_core.common.review import check_fields, check_verdict
 from devflow_core.common.hosts.skills import DEVIN_PROJECT_SKILLS, devin_user_skill_roots
 from devflow_core.common.startup import apply_startup, parse_start
 from devflow_core.plan.interview import devin_frontmatter, inspect_interview_skill
@@ -28,6 +29,13 @@ def accept(value):
     """A workflow's schema check: exactly the review keys."""
     if not isinstance(value, dict) or set(value) != set(REVIEW):
         raise ReviewerError("Review has missing or unknown fields")
+    return value
+
+
+def strict(value):
+    """A workflow's checks: the exact review keys, then the cross-field verdict rules."""
+    check_fields(value, set(REVIEW), "Review")
+    check_verdict(value["verdict"], value["findings"], value["questions"])
     return value
 
 FAKE_DEVIN = r'''
@@ -58,7 +66,12 @@ prose = "Analysis of the diff.\n\n" + answer
 texts = {"pass": answer, "empty": "", "prose": prose, "tidy": prose, "slow": prose,
          "exit-error": prose, "odd": prose, "not-review": json.dumps({"unexpected": True}),
          "no-session": prose,
-         "prose-resume": "Analysis again.\n\n" + answer, "odd-resume": json.dumps({"unexpected": True})}
+         "missing-fields": json.dumps({"verdict": "pass", "findings": [], "questions": []}),
+         "contradict": json.dumps({**json.loads(answer),
+                                   "findings": [{"id": "F1", "requires_human": False}]}),
+         "duplicate": '{"\\ud800": 1, "\\ud800": 2}',
+         "prose-resume": "Analysis again.\n\n" + answer, "odd-resume": json.dumps({"unexpected": True}),
+         "still-bad": json.dumps({"unexpected": True}), "still-bad-resume": json.dumps({"unexpected": True})}
 if mode == "no-session":
     record.pop("session_id", None)
 if resume and mode == "slow":
@@ -95,7 +108,8 @@ class DevinReviewerTests(unittest.TestCase):
                             {"source": "agent", "message": "", "tool_calls": [{"function_name": "read"}]}]
         (self.base / "follow_export.json").write_text(json.dumps(follow), encoding="utf-8")
         self.schema = self.base / "schema.json"
-        self.schema.write_text("{}", encoding="utf-8")
+        # A "$" inside the schema stays literal in a filled follow-up request.
+        self.schema.write_text('{"$schema": "urn:test-schema", "type": "object"}', encoding="utf-8")
         self.instructions = self.base / "instructions.md"
         self.instructions.write_text("# Review\n", encoding="utf-8")
         self.work = self.base / "attempt 1"
@@ -118,10 +132,10 @@ class DevinReviewerTests(unittest.TestCase):
         return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] \
             if path.exists() else []
 
-    def assert_follow_up_failed(self, message, cause):
+    def assert_follow_up_failed(self, message, cause, first="Invalid reviewer JSON"):
         """The shared failure shape: the follow-up, the first refusal, this cause, the records."""
         self.assertIn("follow-up", message)
-        self.assertIn("Invalid reviewer JSON", message)  # the first answer's refusal
+        self.assertIn(first, message)  # the first answer's refusal
         self.assertIn(cause, message)
         self.assertIn(str(self.work / "follow-up"), message)
 
@@ -184,8 +198,15 @@ class DevinReviewerTests(unittest.TestCase):
         follow = self.work / "follow-up"
         for name in ("review-input.md", "invocation.json", "stdout.jsonl", "stderr.log", "export.json"):
             self.assertTrue((follow / name).is_file(), name)
-        self.assertEqual((follow / "review-input.md").read_text(encoding="utf-8"),
-                         reviewers.FOLLOW_UP.read_text(encoding="utf-8"))
+        # The request is the one template filled once: the first refusal's reason
+        # and the whole schema (a "$" inside the schema stays literal).
+        with self.assertRaises(ReviewerError) as first:
+            reviewers.answer_value("Analysis of the diff.\n\n" + json.dumps(REVIEW))
+        request = reviewers._fill(reviewers.FOLLOW_UP.read_text(encoding="utf-8"),
+                                  "the answer follow-up request",
+                                  reason=str(first.exception), schema=self.schema.read_text(encoding="utf-8"))
+        self.assertEqual((follow / "review-input.md").read_text(encoding="utf-8"), request)
+        self.assertIn('"$schema": "urn:test-schema"', request)
         meta = json.loads((follow / "invocation.json").read_text(encoding="utf-8"))
         first_meta = json.loads((self.work / "invocation.json").read_text(encoding="utf-8"))
         self.assertEqual(set(meta), set(first_meta) | {"follow_up"})
@@ -244,7 +265,7 @@ class DevinReviewerTests(unittest.TestCase):
         self.assertNotIn("follow-up", str(caught.exception))
         self.assertFalse((self.work / "follow-up").exists())
 
-    def test_failures_that_are_not_the_answers_shape_never_follow_up(self):
+    def test_failures_that_are_not_the_answers_checks_never_follow_up(self):
         for mode, pattern in (("fail", "exited with 7"), ("no-export", "without an answer"),
                               ("empty", "without an answer")):
             self.work = self.base / f"attempt {mode}"
@@ -252,12 +273,72 @@ class DevinReviewerTests(unittest.TestCase):
                 self.run_review(mode)
             self.assertFalse((self.work / "follow-up").exists())
         self.assertEqual(len(self.calls()), 3)
-        # Valid JSON that fails the workflow's schema check is not a shape error either.
-        self.work = self.base / "attempt not-review"
-        with self.assertRaisesRegex(ReviewerError, "missing or unknown fields"):
-            self.run_review("not-review", accept)
-        self.assertFalse((self.work / "follow-up").exists())
-        self.assertEqual(len(self.calls()), 4)
+
+    def test_an_answer_the_workflows_checks_refuse_is_sent_back_once(self):
+        # Valid JSON that the workflow's schema check refuses is re-asked once too.
+        result, _ = self.run_review("not-review", accept)
+        self.assertEqual(result["review"], REVIEW)
+        self.assertEqual(result["activity"]["answer_follow_ups"], 1)
+        first, second = self.calls()
+        self.assertFalse(first["resume"])
+        self.assertTrue(second["resume"])
+        argv = second["argv"]
+        self.assertEqual(argv[argv.index("--resume") + 1], "kind-spider")
+        request = (self.work / "follow-up" / "review-input.md").read_text(encoding="utf-8")
+        self.assertIn("Review has missing or unknown fields", request)
+        self.assertIn(self.schema.read_text(encoding="utf-8"), request)
+        # The first turn's export keeps its refused answer.
+        record = json.loads((self.work / "export.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["steps"][-1]["message"], json.dumps({"unexpected": True}))
+
+    def test_a_missing_fields_answer_is_sent_back_with_the_reason_and_the_schema(self):
+        # The badjob2 answer: strict JSON, refused by the field check.
+        result, _ = self.run_review("missing-fields", strict)
+        self.assertEqual(result["review"], REVIEW)
+        self.assertEqual(result["activity"]["answer_follow_ups"], 1)
+        request = (self.work / "follow-up" / "review-input.md").read_text(encoding="utf-8")
+        self.assertIn('missing: "schema_version", "summary"', request)
+        self.assertIn(self.schema.read_text(encoding="utf-8"), request)
+        argv = self.calls()[1]["argv"]
+        self.assertEqual(argv[argv.index("--resume") + 1], "kind-spider")
+
+    def test_a_verdict_the_checks_refuse_is_sent_back_once(self):
+        # pass with findings: a cross-field refusal, not a missing field.
+        result, _ = self.run_review("contradict", strict)
+        self.assertEqual(result["review"], REVIEW)
+        self.assertEqual(result["activity"]["answer_follow_ups"], 1)
+        request = (self.work / "follow-up" / "review-input.md").read_text(encoding="utf-8")
+        self.assertIn("A pass cannot contain findings or questions", request)
+
+    def test_a_duplicate_key_answer_is_sent_back_with_the_escaped_reason(self):
+        result, _ = self.run_review("duplicate", strict)
+        self.assertEqual(result["review"], REVIEW)
+        self.assertEqual(result["activity"]["answer_follow_ups"], 1)
+        request = (self.work / "follow-up" / "review-input.md").read_text(encoding="utf-8")
+        self.assertIn('Duplicate JSON key: "\\ud800"', request)
+        self.assertTrue(request.isascii())
+        self.assertIn(self.schema.read_text(encoding="utf-8"), request)
+
+    def test_a_follow_up_answer_the_checks_refuse_fails_in_the_shared_shape(self):
+        with self.assertRaisesRegex(ReviewerError, "follow-up") as caught:
+            self.run_review("still-bad", accept)
+        self.assert_follow_up_failed(str(caught.exception), "missing or unknown fields",
+                                     first="missing or unknown fields")
+        self.assertEqual(len(self.calls()), 2)
+
+    def test_a_template_the_fill_cannot_complete_fails_in_the_shared_shape(self):
+        read = reviewers._read_text
+
+        def unfillable(path, limit):
+            if Path(path).name == "answer-follow-up.md":
+                return "A template with $unknown and $reason and $schema."
+            return read(path, limit)
+
+        with patch.object(reviewers, "_read_text", side_effect=unfillable), \
+                self.assertRaisesRegex(ReviewerError, "follow-up") as caught:
+            self.run_review("tidy")
+        self.assert_follow_up_failed(str(caught.exception), "Cannot fill the answer follow-up request")
+        self.assertEqual(len(self.calls()), 1)  # The follow-up turn never launched.
 
     def test_a_follow_up_that_exits_or_times_out_fails_in_the_shared_shape(self):
         validate = reviewers.validate_reviewer

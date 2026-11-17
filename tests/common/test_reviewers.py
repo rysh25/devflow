@@ -108,18 +108,33 @@ class JsonTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaisesRegex(ReviewerError, message):
                 reviewers.answer_value(text)
 
-    def test_an_answer_shape_error_is_marked_for_the_one_follow_up(self):
-        # Only the answer's own refusal is an AnswerFormatError (still a ReviewerError):
+    def test_a_refused_answer_is_marked_for_the_one_follow_up(self):
+        # Only the answer's own refusal is an AnswerRefusedError (still a ReviewerError):
         # what may be re-asked once inside the same session. json_value, and the errors
         # for no answer or unreadable records, stay plain ReviewerError.
         for text in ("not json", '{"a": }', '```json\n{"a": }\n```', '{"a": 1, "a": 2}', '{"a": NaN}',
                      'Here is the review:\n{"a": 1}'):
-            with self.subTest(text=text), self.assertRaises(reviewers.AnswerFormatError) as caught:
+            with self.subTest(text=text), self.assertRaises(reviewers.AnswerRefusedError) as caught:
                 reviewers.answer_value(text)
             self.assertIsInstance(caught.exception, ReviewerError)
             with self.assertRaises(ReviewerError) as plain:
                 reviewers.json_value(text)
-            self.assertNotIsInstance(plain.exception, reviewers.AnswerFormatError)
+            self.assertNotIsInstance(plain.exception, reviewers.AnswerRefusedError)
+
+    def test_a_workflow_check_refusal_is_marked_the_same_way(self):
+        # checked_review marks the workflow's own refusal the same way, with the same
+        # message; an AnswerRefusedError passes through, and anything else rises as is.
+        self.assertIs(reviewers.checked_review(accept, REVIEW), REVIEW)
+        for value in ({"unexpected": True}, "not a dict"):
+            with self.subTest(value=value), self.assertRaises(reviewers.AnswerRefusedError) as caught:
+                reviewers.checked_review(accept, value)
+            self.assertIsInstance(caught.exception, ReviewerError)
+            self.assertIn("Review has missing or unknown fields", str(caught.exception))
+        with self.assertRaises(reviewers.AnswerRefusedError):
+            reviewers.checked_review(lambda value: (_ for _ in ()).throw(
+                reviewers.AnswerRefusedError("own refusal")), {})
+        with self.assertRaisesRegex(ValueError, "not a reviewer error"):
+            reviewers.checked_review(lambda value: (_ for _ in ()).throw(ValueError("not a reviewer error")), {})
 
     def test_text_bounds(self):
         self.assertEqual(reviewers.text("ok", "summary"), "ok")
@@ -805,10 +820,13 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(self.meta()["cli_version"], probe["cli_version"])
 
     def test_workflow_validator_is_applied(self):
+        # Codex and OpenCode cannot continue a session: the refusal stands as is,
+        # with no follow-up records (a refused answer may only be re-asked where one exists).
         for kind in ("codex", "opencode"):
             self.output = self.base / f"not-review {kind}"
             with self.subTest(kind=kind), self.assertRaisesRegex(ReviewerError, "missing or unknown fields"):
                 self.run_fixture(kind, "not-review")
+            self.assertFalse((self.output / "follow-up").exists())
 
     def test_a_fenced_answer_is_accepted_from_codex_and_opencode(self):
         for kind in ("codex", "opencode"):
@@ -989,11 +1007,21 @@ class UnwritableTextTests(unittest.TestCase):
             with self.assertRaisesRegex(ReviewerError, "cannot be saved"):
                 reviewers.CLIS["codex"].answer(work / "stdout.jsonl", work)
 
-    def test_a_duplicate_key_message_holding_such_text_is_an_error_a_record_can_hold_once_escaped(self):
-        with self.assertRaisesRegex(ReviewerError, "Duplicate JSON key") as caught:
-            reviewers.json_value('{"\\ud800": 1, "\\ud800": 2}')
-        self.assertFalse(storage.writable(str(caught.exception)))
-        self.assertTrue(storage.writable(storage.writable_text(str(caught.exception))))
+    def test_a_duplicate_key_message_shows_the_name_escaped_and_cut(self):
+        # The model-chosen name is shown the one way check_fields shows field
+        # names: quoted, ASCII-escaped and cut to 64 characters, so the message
+        # fits a record and a request unchanged.
+        cases = (
+            ('{"\\ud800": 1, "\\ud800": 2}', 'Duplicate JSON key: "\\ud800"'),
+            ('{"a\\nb": 1, "a\\nb": 2}', 'Duplicate JSON key: "a\\nb"'),
+            ('{"' + "x" * 70 + '": 1, "' + "x" * 70 + '": 2}',
+             'Duplicate JSON key: "' + "x" * 64 + '"'),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text[:40]), self.assertRaises(ReviewerError) as caught:
+                reviewers.json_value(text)
+            self.assertEqual(str(caught.exception), expected)
+            self.assertTrue(storage.writable(str(caught.exception)))
 
     def test_names_a_record_cannot_hold_are_counted_as_unnamed(self):
         activity = parse_codex(codex(item("item.completed", "\ud800tool", "t1"), {"type": "\udfffkind"}, answer_item()))

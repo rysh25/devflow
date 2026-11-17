@@ -13,11 +13,13 @@ closed; OpenCode's and Devin's are closed from the start. The
 reviewer instructions ask it to treat every file as data, so a file cannot
 change its verdict or this contract.
 
-An attempt is never retried as a review. The one exception is the answer's
-shape alone: when the answer cannot be read as strict JSON, a CLI that can
-continue its session is asked once — inside the same session and within the
-attempt's own time limit — to send the same review again. That is the same
-attempt, not a new review, and it happens at most once.
+An attempt is never retried as a review. The one exception is a refused
+answer: when the answer checks — reading the answer as strict JSON, then the
+workflow's checks — refuse it, a CLI that can continue its session is asked
+once — inside the same session and within the attempt's own time limit — to
+send the review again, told the refusal's reason and the required output
+schema. That is the same attempt, not a new review, and it happens at most
+once.
 
 The answer is checked strictly: it is refused, never rewritten, when it is not
 strict JSON or holds text a record cannot hold (an unpaired surrogate). The
@@ -48,7 +50,7 @@ from typing import Any, Callable
 
 from .counts import tally
 from .environment import PROBE_SECONDS, version_numbers, version_warnings
-from .errors import AnswerFormatError, DevFlowError, ReviewerError
+from .errors import AnswerRefusedError, DevFlowError, ReviewerError, shown_name
 from .process import run_bounded
 from .settings import validate_reviewer
 from .storage import json_bytes, read_json, writable
@@ -68,7 +70,7 @@ def json_value(text: str) -> Any:
         result = {}
         for key, value in items:
             if key in result:
-                raise ReviewerError(f"Duplicate JSON key: {key}")
+                raise ReviewerError(f"Duplicate JSON key: {shown_name(key)}")
             result[key] = value
         return result
 
@@ -98,7 +100,7 @@ def answer_value(text: str) -> Any:
 
     An answer that is entirely one ```json (or ```) code fence is read from inside the
     fence; the JSON itself is never changed. Anything else, including text outside the
-    fence, is read as it is, and its refusal is ``AnswerFormatError``: the one error a
+    fence, is read as it is, and its refusal is ``AnswerRefusedError``: the one error a
     CLI that can continue its session may be asked to answer once more. ``json_value``
     itself is unchanged, so other records (Devin's ``export.json``) fail as before.
     """
@@ -106,7 +108,19 @@ def answer_value(text: str) -> Any:
     try:
         return json_value(match.group(1) if match else text)
     except ReviewerError as exc:
-        raise AnswerFormatError(str(exc)) from exc
+        raise AnswerRefusedError(str(exc)) from exc
+
+
+def checked_review(validate: Callable[[Any], dict], value: Any) -> dict:
+    """The workflow's checks on one answer; their refusal is an AnswerRefusedError
+    with the same message, the one error a CLI that can continue its session may be
+    asked to answer once more."""
+    try:
+        return validate(value)
+    except AnswerRefusedError:
+        raise
+    except ReviewerError as exc:
+        raise AnswerRefusedError(str(exc)) from exc
 
 
 def text(value: Any, label: str, limit: int = 32768) -> str:
@@ -734,7 +748,8 @@ CLIS = {"codex": Codex(), "opencode": OpenCode(), "claude": Claude(), "devin": D
 #: What every reviewer is asked, whatever the workflow: added after its instructions.
 RULES = Path(__file__).with_name("reviewer-rules.md")
 
-#: The one follow-up request sent inside the same session when the answer is not strict JSON.
+#: The one follow-up request sent inside the same session when the answer checks refuse
+#: the answer: a template filled with the refusal's reason and the required output schema.
 FOLLOW_UP = Path(__file__).with_name("answer-follow-up.md")
 
 #: The last words of every reviewer's input, after the packet. Some models put their analysis
@@ -784,15 +799,20 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _fill(text: str, what: str, **values: str) -> str:
+    """One ``string.Template`` fill; a placeholder it cannot fill is a ReviewerError."""
+    try:
+        return Template(text).substitute(**values)
+    except (KeyError, ValueError) as exc:
+        raise ReviewerError(f"Cannot fill {what}: {exc}") from exc
+
+
 def fill_rules(text: str, timeout: float, started: datetime) -> str:
     """The rules for every reviewer with this attempt's time budget filled in."""
     def stamp(seconds: float) -> str:
         return (started + timedelta(seconds=seconds)).isoformat(timespec="seconds")
-    try:
-        return Template(text).substitute(timeout_seconds=f"{timeout:g}", stop_at=stamp(timeout),
-                                         answer_by=stamp(timeout * ANSWER_SHARE))
-    except (KeyError, ValueError) as exc:
-        raise ReviewerError(f"Cannot fill the rules for every reviewer: {exc}") from exc
+    return _fill(text, "the rules for every reviewer", timeout_seconds=f"{timeout:g}",
+                 stop_at=stamp(timeout), answer_by=stamp(timeout * ANSWER_SHARE))
 
 
 @dataclass(frozen=True)
@@ -846,14 +866,15 @@ def _check_argv_length(argv, *, windows: bool | None = None) -> None:
 
 
 def _answer_follow_up(prepared: PreparedReview, work_dir: Path, argv: list[str], env: dict,
-                      deadline: float, first: AnswerFormatError,
+                      deadline: float, first: AnswerRefusedError,
                       validate: Callable[[Any], dict]) -> tuple[dict, dict]:
-    """Ask the reviewer once, inside the same session, to send the same review as strict JSON.
+    """Ask the reviewer once, inside the same session, to send the review again.
 
-    Reached only when the first answer was refused as ``AnswerFormatError``. When the
+    Reached only when the first answer was refused as ``AnswerRefusedError``. When the
     CLI cannot continue its session or the attempt's time limit is already spent, the
     first refusal stands. Otherwise the follow-up runs in ``<work_dir>/follow-up/``
-    with the remaining time, and its answer is validated like any other. Every failure
+    with the remaining time and a request filled with the refusal's reason and the
+    required output schema, and its answer is validated like any other. Every failure
     after the follow-up is decided shares one error: that a follow-up ran, the first
     refusal, this failure's cause, and where the records are.
     """
@@ -867,7 +888,8 @@ def _answer_follow_up(prepared: PreparedReview, work_dir: Path, argv: list[str],
         if follow_dir.is_symlink() or follow_dir.exists():
             raise ReviewerError("This answer follow-up already ran; never replay a previous attempt")
         follow_dir.mkdir()
-        request = _read_text(FOLLOW_UP, 262144)
+        request = _fill(_read_text(FOLLOW_UP, 262144), "the answer follow-up request",
+                        reason=str(first), schema=prepared.schema.decode("utf-8"))
         _write_new(follow_dir / "review-input.md", request)
         _write_new(follow_dir / "invocation.json", json.dumps(
                    {**probe, "cwd": str(cwd.resolve()), "prefix_arg_count": len(prefix) - 1,
@@ -889,9 +911,10 @@ def _answer_follow_up(prepared: PreparedReview, work_dir: Path, argv: list[str],
         return validate(value), activity
     except Exception as exc:
         raise ReviewerError(
-            f"The answer follow-up failed: the reviewer was asked once to send the same review again, "
-            f"as only JSON, in the same session after its first answer was refused ({first}); "
-            f"the follow-up failed ({exc}); its records are in {follow_dir}") from exc
+            f"The answer follow-up failed: the reviewer was asked once, in the same session, to send "
+            f"its review again with the refusal's reason and the required output schema after its "
+            f"first answer was refused ({first}); the follow-up failed ({exc}); "
+            f"its records are in {follow_dir}") from exc
 
 
 def run_review(prepared: PreparedReview, validate: Callable[[Any], dict]) -> dict:
@@ -900,7 +923,7 @@ def run_review(prepared: PreparedReview, validate: Callable[[Any], dict]) -> dic
     Returns ``{"review": ..., "activity": ...}``; the activity always holds
     ``answer_follow_ups`` (0 or 1). The caller runs ``preflight``,
     prepares the input, then reserves the attempt before calling this function. Errors and timeouts are
-    never retried; only an answer that is not strict JSON may be asked for again, once, inside the
+    never retried; only an answer the checks refuse may be asked for again, once, inside the
     same session and within the attempt's own time limit — the same attempt, not a new review.
     Preparation fixes instructions, rules, schema, data and their
     times once; the times are a guide, and what stops the
@@ -935,7 +958,8 @@ def run_review(prepared: PreparedReview, validate: Callable[[Any], dict]) -> dic
         raise ReviewerError(f"{kind} exited with {code}; inspect stderr.log (no automatic retry){cli.failure_hint}")
     try:
         value, activity = cli.answer(work_dir / "stdout.jsonl", work_dir)
-    except AnswerFormatError as first:
+        review = checked_review(validate, value)
+    except AnswerRefusedError as first:
         review, activity = _answer_follow_up(prepared, work_dir, argv, env, deadline, first, validate)
         return {"review": review, "activity": {**activity, "answer_follow_ups": 1}}
-    return {"review": validate(value), "activity": {**activity, "answer_follow_ups": 0}}
+    return {"review": review, "activity": {**activity, "answer_follow_ups": 0}}
