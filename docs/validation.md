@@ -927,3 +927,30 @@ run の記録の形は 0.12.0 と同じです（`answer_follow_ups` と `follow-
 - `plan doctor`：凍結した設定を読み、通常どおりの診断を返しました。
 - `plan report`：全文のレポート（`review_summary_markdown` を含む）を生成しました。
 - 0.12.0 に戻しても 0.12.1 の run を読めます（README の「0.12.1 への更新」のとおり）。
+
+## 配布物の検査とローカル設定（2026-11-17）
+
+リポジトリ直下に Git で無視されたローカル設定 `devflow.config.local.json` があると、配布物の検査
+（`tools/package.py`）がそれを秘密として拒み、`python tools/test_all.py --quiet` の
+`tests/test_distribution.py` 35 件と `python tools/package.py --validate-only`・`python
+tools/package.py` が止まっていました（0.11.0・0.12.0・0.12.1 の検証では、その回避として
+プロジェクトの外の worktree や一時的な退避で通していました）。
+
+`tools/package.py` に、`SHA256SUMS` と同じくパッケージの根からのパスで読み飛ばす定数 `SKIP_FILES`
+（`{"SHA256SUMS", "devflow.config.local.json"}`）を足し、`_collect()` の読み飛ばしをその照合に
+変えました。直下のこの名前と完全一致するファイルだけを読み飛ばすので、`.gitignore` の
+`/devflow.config.local.json` と同じ範囲です。入れ子の場所にあるものと、大文字小文字が違う名前、
+`.env`・`*.pem` などは今までどおり作成を止め、収集した結果にローカル設定が混じっていた場合も
+最後の検査（`_validate_files()`）で作成を止めます。
+
+`tests/test_distribution.py` に `test_root_local_configuration_is_skipped` を1件足し、直下に
+ローカル設定を置いた複製で、収集した一覧・作成した ZIP・`SHA256SUMS` のどれにもそれが入らないことと、
+その複製が検査を通ることを確かめます。
+
+直下に `devflow.config.local.json` を置いた状態と、退避した状態（CI と同じ）の両方で確かめました：
+
+- 置いた状態：`python tools/test_all.py --quiet` が 979 件すべて成功、`python tools/package.py
+  --validate-only` と `python tools/package.py --output …` が成功。作った ZIP の項目にも
+  `SHA256SUMS` にも `devflow.config.local.json` はありませんでした。
+- 置かない状態：`python tools/test_all.py --quiet` が 979 件すべて成功、`python tools/package.py
+  --validate-only` が成功。
