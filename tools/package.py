@@ -28,6 +28,9 @@ COMMON_RESOURCES = ("reviewer-rules.md", "answer-follow-up.md")
 COORDINATORS = ("router", "cli", "workflows")
 SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv", "node_modules", "dist", ".devflow"}
 SKIP_SUFFIXES = {".pyc", ".pyo", ".zip", ".log", ".tmp"}
+# Files skipped by their path from the package root: the generated checksum list and
+# the Git-ignored local settings (.gitignore: /devflow.config.local.json).
+SKIP_FILES = {"SHA256SUMS", "devflow.config.local.json"}
 MAX_BYTES = 64 * 1024 * 1024
 
 
@@ -79,7 +82,7 @@ def _collect(root: Path) -> dict[str, bytes]:
         for name in sorted(filenames):
             path = directory / name
             relative = path.relative_to(root).as_posix()
-            if path.suffix.lower() in SKIP_SUFFIXES or relative == "SHA256SUMS":
+            if path.suffix.lower() in SKIP_SUFFIXES or relative in SKIP_FILES:
                 continue
             if name == ".DS_Store" or name.casefold() == "thumbs.db":
                 continue

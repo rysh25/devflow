@@ -386,6 +386,16 @@ class DistributionTests(unittest.TestCase):
             package.build(cloned, self.base / "private.zip")
         self.assertFalse((self.base / "private.zip").exists())
 
+    def test_root_local_configuration_is_skipped(self):
+        cloned = self.clone()
+        (cloned / "devflow.config.local.json").write_bytes(b'{"schema_version": 1, "marker": "LOCAL ONLY"}')
+        self.assertNotIn("devflow.config.local.json", package._collect(cloned))
+        self.assertEqual(package.validate(cloned)["plugins"], package.validate(ROOT)["plugins"])
+        archive_path = package.build(cloned, self.base / "with-local.zip")
+        with zipfile.ZipFile(archive_path) as archive:
+            self.assertFalse(any(name.endswith("devflow.config.local.json") for name in archive.namelist()))
+            self.assertNotIn(b"devflow.config.local.json", archive.read("devflow/SHA256SUMS"))
+
     def test_extracted_plugin_runs_without_repository_shared(self):
         archive_path = package.build(ROOT, self.base / "release.zip")
         extracted = self.base / "extracted"
