@@ -1,4 +1,4 @@
-# DevFlow 0.12.1 — Claude Code / Codex CLI / Devin CLI Plugin
+# DevFlow 0.12.2 — Claude Code / Codex CLI / Devin CLI Plugin
 
 人間との要件整理から計画作成、実装、独立レビューまでを支援する **3つのホスト（Claude Code、Codex CLI、Devin CLI）で使える単一のプラグイン** です。インストールするプラグインは `devflow` だけです。
 
@@ -25,8 +25,8 @@ Plan / Implement の起動時にレビュアーの種類・モデル・effort �
 実際の選択画面は追加しません。次はレビュアー一覧を Claude と Codex の2人で置き換える例です。
 
 ```text
-/devflow:plan --reviewer claude opus high --reviewer codex gpt-6.1-sol xhigh -- REVIEW-42 を計画して
-$devflow:implement --reviewer claude opus high --reviewer codex gpt-6.1-sol xhigh -- docs/plans/REVIEW-42.md
+/devflow:plan --reviewer claude opus high --reviewer codex gpt-6.2-sol xhigh -- REVIEW-42 を計画して
+$devflow:implement --reviewer claude opus high --reviewer codex gpt-6.2-sol xhigh -- docs/plans/REVIEW-42.md
 ```
 
 Devin をレビュアーにするときは、たとえば `--reviewer devin swe-2 high` と指定します（[プロジェクト設定](#プロジェクト設定)）。
@@ -34,7 +34,7 @@ Devin をレビュアーにするときは、たとえば `--reviewer devin swe-
 `--max-reviews N` で、その run の最初のレビューの上限（`max_reviews`）を指定できます。`--reviewer` と一緒にも、単独でも使えます。
 
 ```text
-/devflow:plan --max-reviews 4 --reviewer codex gpt-6.1-sol high -- 依頼
+/devflow:plan --max-reviews 4 --reviewer codex gpt-6.2-sol high -- 依頼
 ```
 
 `N` は 1〜99 の整数（ASCII の数字だけ。`04` や `+4` はエラー）で、1回だけ指定できます。
@@ -153,7 +153,7 @@ claude plugin install devflow@devflow-marketplace --scope user
 
 この `devflow` は配布物のディレクトリです。対象プロジェクトの `.devflow/` 作業ディレクトリとは異なります。配布物はプロジェクト外の安定した場所に置いて構いません。ローカル marketplace の更新元になるため、インストール直後に削除・移動しないでください。
 
-ローカルの配布物から入れた場合の更新（中身を置き換えてから更新の操作をします。Codex では `codex plugin add` をもう一度実行します）、フォークや private のリポジトリから入れる方法、更新の前後の注意は [プラグインの導入と更新](docs/installation.md#プラグインの導入と更新) を参照してください。更新の前には、「[0.12.1 への更新](#0121-への更新)」（それより前の版から上げるときは「[0.12.0 への更新とバージョンを戻す場合](#0120-への更新とバージョンを戻す場合)」「[0.11.0 への更新とバージョンを戻す場合](#0110-への更新とバージョンを戻す場合)」「[0.10.1 への更新](#0101-への更新)」「[0.10.0 への更新](#0100-への更新)」「[0.7.3 への更新](#073-への更新)」「[0.7.2 への更新](#072-への更新)」「[0.7.1 への更新](#071-への更新)」「[0.7.0 への更新](#070-への更新)」「[0.6.0 への更新](#060-への更新)」「[0.5.1 への更新](#051-への更新)」「[0.5.0 への更新](#050-への更新)」「[0.4.0 への更新](#040-への更新)」も）で、その版の注意点を確認してください。入れ替えた版は、ホストを起動し直した新しいセッションから使われます。
+ローカルの配布物から入れた場合の更新（中身を置き換えてから更新の操作をします。Codex では `codex plugin add` をもう一度実行します）、フォークや private のリポジトリから入れる方法、更新の前後の注意は [プラグインの導入と更新](docs/installation.md#プラグインの導入と更新) を参照してください。更新の前には、「[0.12.2 への更新](#0122-への更新)」（それより前の版から上げるときは「[0.12.1 への更新](#0121-への更新)」「[0.12.0 への更新とバージョンを戻す場合](#0120-への更新とバージョンを戻す場合)」「[0.11.0 への更新とバージョンを戻す場合](#0110-への更新とバージョンを戻す場合)」「[0.10.1 への更新](#0101-への更新)」「[0.10.0 への更新](#0100-への更新)」「[0.7.3 への更新](#073-への更新)」「[0.7.2 への更新](#072-への更新)」「[0.7.1 への更新](#071-への更新)」「[0.7.0 への更新](#070-への更新)」「[0.6.0 への更新](#060-への更新)」「[0.5.1 への更新](#051-への更新)」「[0.5.0 への更新](#050-への更新)」「[0.4.0 への更新](#040-への更新)」も）で、その版の注意点を確認してください。入れ替えた版は、ホストを起動し直した新しいセッションから使われます。
 
 ## 必要なもの
 
@@ -226,7 +226,7 @@ Implement は開始時のプランと作業ツリーを固定し、Claude Code �
 
 | 回 | 既定レビュアー | 既定設定 |
 | --- | --- | --- |
-| 1, 3, 5, … | Codex | `gpt-6.1-sol` / `high` |
+| 1, 3, 5, … | Codex | `gpt-6.2-sol` / `high` |
 | 2, 4, 6, … | OpenCode | `opencode-go/deepseek-v4.1-flash` / `high` |
 
 これらはユーザー指定の設定値です。本配布物のテストで、各アカウントのモデル提供状況・認証・実際のモデル選択まで確認しているわけではありません。未対応時に別モデルへ黙って切り替えません。
@@ -297,7 +297,7 @@ Implement は開始時のプランと作業ツリーを固定し、Claude Code �
 {
   "schema_version": 1,
   "reviewers": [
-    {"id": "codex", "kind": "codex", "command": ["codex"], "model": "gpt-6.1-sol", "effort": "high",
+    {"id": "codex", "kind": "codex", "command": ["codex"], "model": "gpt-6.2-sol", "effort": "high",
      "timeout_seconds": 1800},
     {"id": "opencode", "kind": "opencode", "command": ["opencode"], "model": "opencode-go/deepseek-v4.1-flash",
      "effort": "high", "timeout_seconds": 1800}
@@ -391,6 +391,18 @@ uv --no-cache run --offline --no-project --no-config --no-python-downloads "PLUG
 - push、公開、デプロイ、依存の追加、破壊的移行の前には、人間に確認するようスキルで頼んでいます。
 
 詳しくは [設計](docs/architecture.md)、[信頼の考え方と注意](docs/security.md)、[検証範囲](docs/validation.md) を参照してください。
+
+## 0.12.2 への更新
+
+0.12.1 の run は、そのまま続けられます（run の形式は変わりません）。
+
+変わったこと：
+
+- **Codex レビュアーの既定のモデルが `gpt-6.1-sol` から `gpt-6.2-sol` になりました**（Plan と Implement の両方）。effort（`high`）と制限時間（1800 秒）は変わりません。
+- 新しい既定を使うのは、0.12.2 で始めた run のうち、設定ファイルで `reviewers` を書かず、起動時に `--reviewer` も指定しないものだけです。設定は run の開始時に固定されるので、続けられる既存の run は開始時のレビュアーのままで、旧既定の `gpt-6.1-sol` で始めた run は resume しても `gpt-6.1-sol` を使います。
+- 今までどおり `gpt-6.1-sol` を使うときは、`devflow.config.json` か `devflow.config.local.json` の `reviewers` に `"model": "gpt-6.1-sol"` を書くか（[プロジェクト設定](#プロジェクト設定)）、起動時に `--reviewer codex gpt-6.1-sol high` を指定してください。
+
+0.12.1 に戻すときは、プラグインを戻します。run の形式は同じなので、0.12.2 で作った run も読めます。
 
 ## 0.12.1 への更新
 

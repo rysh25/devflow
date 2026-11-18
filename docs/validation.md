@@ -1,4 +1,4 @@
-# DevFlow 0.12.1 の検証範囲
+# DevFlow 0.12.2 の検証範囲
 
 ## 再実行方法
 
@@ -219,7 +219,7 @@ DevFlow のレビューの後、PR の CI の macOS で、`tests/common/test_rev
 ## この環境では確認していないもの
 
 - 認証済み Codex / OpenCode の、モデルの利用権限、課金・レート制限。
-- `gpt-6.1-sol`、`opencode-go/deepseek-v4.1-flash` および effort 設定の、アカウントごとの提供状況。
+- `gpt-6.2-sol`、`opencode-go/deepseek-v4.1-flash` および effort 設定の、アカウントごとの提供状況。
 - サービス内部で実際に選択されたバックエンドモデルの独立した証明。
 - Windows ネイティブ / macOS の、実際の Claude Code・Codex・OpenCode での動作（自動テストは GitHub Actions で通っています）。ネットワークドライブや exFAT での動作。
 - Codex の `.codex/config.toml`（`developer_instructions` など）による誘導。
@@ -927,6 +927,34 @@ run の記録の形は 0.12.0 と同じです（`answer_follow_ups` と `follow-
 - `plan doctor`：凍結した設定を読み、通常どおりの診断を返しました。
 - `plan report`：全文のレポート（`review_summary_markdown` を含む）を生成しました。
 - 0.12.0 に戻しても 0.12.1 の run を読めます（README の「0.12.1 への更新」のとおり）。
+
+## 0.12.2 の検証（2026-11-18）
+
+0.12.2 は、Codex レビュアーの既定のモデルを `gpt-6.1-sol` から `gpt-6.2-sol` に変えました
+（Plan と Implement の両方）。effort（`high`）と制限時間（1800 秒）は変わりません。
+自動テスト（980 件）と配布物の検査は、リポジトリ直下に Git で無視されたローカル設定
+`devflow.config.local.json` がある状態のまま通しました（直下のローカル設定を読み飛ばす
+0.12.1 の `tools/package.py` の変更により、退避は不要です）。
+
+### 本物の Codex での既定モデルの確認
+
+人間の回答を送った対話の Claude Code 2.1.327 で、開発中のプラグインを `claude
+--plugin-dir` で読み込みました（インストール済みの devflow は `--settings` で無効）。
+DevFlow の設定ファイルがない一時的な Git リポジトリ（`greet.py` だけ）で、
+`/devflow:doctor` が 0.12.2 であることを確かめてから、`--reviewer` を指定せずに
+`/devflow:plan --max-reviews 2 --` を動かしました。
+
+- run（`20261118T133601Z-ec261f7ff339`）の固定設定のレビュアーは、Codex
+  （`gpt-6.2-sol` / `high`）と OpenCode（`opencode-go/deepseek-v4.1-flash` / `high`）でした。
+- 面接は人間の実回答（決定の確認を含む）で seal を通りました。
+- 1回目のレビュー（Codex、codex-cli 0.169.0）は `changes_required`（指摘3件）として
+  受け付けられ、記録の `requested_model` は `gpt-6.2-sol` でした（ツール呼び出し4回）。
+- 2回目のレビュー（OpenCode 2.3.0、既定の動作の確認）は `changes_required`（指摘1件）
+  として受け付けられ、記録の `requested_model` は `opencode-go/deepseek-v4.1-flash`
+  でした（ツール呼び出し10回）。
+- 2回の消費でレビュー上限に達し、人間の確認に「やめる」と答えて `exhausted` で終わりました。
+- 実際に選ばれたバックエンドのモデルまでは証明していません
+  （[この環境では確認していないもの](#この環境では確認していないもの)のとおり）。
 
 ## 配布物の検査とローカル設定（2026-11-17）
 

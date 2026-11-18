@@ -66,11 +66,11 @@ class DistributionTests(unittest.TestCase):
     def test_static_validate_current_bundle(self):
         result = package.validate(ROOT)
         self.assertEqual(result["marketplace"], "devflow-marketplace")
-        self.assertEqual(result["plugins"], {"devflow": "0.12.1"})
+        self.assertEqual(result["plugins"], {"devflow": "0.12.2"})
 
     def test_release_versions_are_consistent(self):
         manifest = json.loads((ROOT / "plugins/devflow/.claude-plugin/plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.12.1")
+        self.assertEqual(manifest["version"], "0.12.2")
         package = ROOT / "plugins/devflow/scripts/devflow_core"
         defining = []
         for source in sorted(package.rglob("*.py")):
@@ -103,6 +103,17 @@ class DistributionTests(unittest.TestCase):
         for relative in ("README.md", "docs/installation.md"):
             with self.subTest(document=relative):
                 self.assertIn(wait, (ROOT / relative).read_text(encoding="utf-8"))
+
+    def test_default_reviewer_models_are_documented(self):
+        # The review contract table in the README names every default reviewer's
+        # model and effort as `model` / `effort`; a forgotten update fails here.
+        core = ROOT / "plugins" / "devflow" / "scripts" / "devflow_core"
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for flow in ("plan", "implement"):
+            reviewers = json.loads((core / flow / "defaults.json").read_text(encoding="utf-8"))["reviewers"]
+            for reviewer in reviewers:
+                with self.subTest(flow=flow, reviewer=reviewer["id"]):
+                    self.assertIn("`{}` / `{}`".format(reviewer["model"], reviewer["effort"]), readme)
 
     def test_user_documents_only_describe_current_single_plugin(self):
         paths = [ROOT / "README.md"] + sorted((ROOT / "docs").rglob("*.md")) + sorted((ROOT / "examples").rglob("*.md"))
@@ -403,14 +414,14 @@ class DistributionTests(unittest.TestCase):
             # All paths were generated and checked in this test, not untrusted ZIP input.
             archive.extractall(extracted)
         release = extracted / "devflow"
-        self.assertEqual(package.validate(release)["version"], "0.12.1")
+        self.assertEqual(package.validate(release)["version"], "0.12.2")
         independent = self.base / "devflow-only"
         shutil.copytree(release / "plugins" / "devflow", independent)
         self.assertFalse((independent / "shared").exists())
         result = subprocess.run([sys.executable, "-B", str(independent / "scripts" / "devflow.py"), "--version"],
             cwd=self.base, capture_output=True, encoding="utf-8", timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("0.12.1", result.stdout)
+        self.assertIn("0.12.2", result.stdout)
         for flow in ("plan", "implement"):
             with self.subTest(flow=flow):
                 result = subprocess.run([sys.executable, "-B", str(independent / "scripts" / "devflow.py"), flow, "--help"],
