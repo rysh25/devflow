@@ -9,7 +9,7 @@
       "id": "codex",
       "kind": "codex",
       "command": ["codex"],
-      "model": "gpt-6.1-sol",
+      "model": "gpt-6.2-sol",
       "effort": "high",
       "timeout_seconds": 1800
     },
