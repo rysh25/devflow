@@ -242,6 +242,7 @@ Codex は隔離した `CODEX_HOME` で、標準の `/hooks` の画面からフ�
 | `--export` の値 | `--export [<PATH>]` は値を省略できる。後ろに位置引数のプロンプトを置くと、パスと区別されずに使い方の誤りになった | レビュアーの引数では `--export PATH` を最後に置く。プロンプトはファイル（`--prompt-file`）で渡す |
 | レビュアーの出力 | 標準出力は最終回答だけだった（訂正：下の「レビュアーの答えの読み方の訂正」）。`--export` の `steps[].tool_calls[].function_name` にツール名、`final_metrics` に `total_prompt_tokens`・`total_completion_tokens`・`total_cached_tokens` が入った | 活動とトークン数は export から読む（答えの読み方は下の訂正で変えた） |
 | 信頼していないプロジェクト | `devin -p` は `Refusing to run in an untrusted workspace` で終了コード 1 になった | レビュアーの失敗の文に「Devin でこのプロジェクトを一度信頼する」案内を足す。迂回のフラグは渡さない |
+| 信頼の判定の範囲（2026-11-19、Devin CLI 3000.14.30821） | 信頼したディレクトリの下は信頼済みとして動いた（信頼済みプロジェクト直下のディレクトリと、プロジェクトの中の Git で無視した worktree で起動できた）。プロジェクトの外の worktree は `Refusing to run in an untrusted workspace` で終了コード 1 になった | 案内は「実際にレビュアーを起動したディレクトリか、その上のディレクトリを信頼する」とする（「その上のディレクトリ」はこの測定に基づく。公開資料には書かれていない） |
 | `devin skills paths` | 利用者の `~/.config/devin/skills`、`~/.config/cognition/skills`、`~/.agents/skills` と、プロジェクトの `.devin/skills`、`.cognition/skills`、`.agents/skills` を示した | 公開資料の「Where skills live」「Configuration Import」の場所と合わせて、面接スキルの確認の表にする |
 
 公開資料（2026-11-15 に読み直した）は、Claude Code の取り込みとしてプロジェクトの
