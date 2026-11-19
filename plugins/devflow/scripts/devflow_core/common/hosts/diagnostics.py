@@ -66,7 +66,8 @@ def devin_version() -> dict:
             report.update(version=".".join(map(str, found)) if found else None,
                           supported=result.returncode == 0 and bool(found) and found >= version_numbers(MINIMUM_DEVIN),
                           reason=("Plugin hooks, workspace trust and ask_user_question need runtime verification; "
-                                  "trust this project in Devin once before using DevFlow"))
+                                  "trust this project in Devin once before using DevFlow, and trust a worktree "
+                                  "outside it before using it as an Implement workspace"))
         except (OSError, subprocess.SubprocessError) as exc:
             report["reason"] = str(exc)
     return report

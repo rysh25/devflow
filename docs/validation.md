@@ -1,4 +1,4 @@
-# DevFlow 0.12.2 の検証範囲
+# DevFlow 0.12.3 の検証範囲
 
 ## 再実行方法
 
@@ -955,6 +955,34 @@ DevFlow の設定ファイルがない一時的な Git リポジトリ（`greet.
 - 2回の消費でレビュー上限に達し、人間の確認に「やめる」と答えて `exhausted` で終わりました。
 - 実際に選ばれたバックエンドのモデルまでは証明していません
   （[この環境では確認していないもの](#この環境では確認していないもの)のとおり）。
+
+## 0.12.3 の検証（2026-11-19）
+
+0.12.3 は、Devin が信頼を拒んだときの案内を、実際にレビュアーを起動したディレクトリを示す形に
+変えました（`CLI.failure_hint` を固定の属性から `cwd` を取るメソッドにし、Devin だけが上書きします）。
+あわせて、3ホストの実装スキル・doctor・ドキュメントの案内を、「Devin は信頼したディレクトリと
+その下でだけ動き、Implement で別の worktree を実装場所にするとレビュアーはその worktree で
+起動する」内容にそろえました。自動テスト（981 件）と配布物の検査は、リポジトリ直下に Git で
+無視されたローカル設定 `devflow.config.local.json` がある状態のまま通しました。
+
+### 本物の Devin CLI での信頼の案内（確認 A）
+
+作業ツリーの `devflow_core.common.reviewers` を直接呼び、本物の Devin CLI 3000.14.30821
+（`devin --print`、swe-2-high）をレビュアーにしました（確かめた版 3000.12.57 より新しい。
+preflight の警告どおり、DevFlow は新しい版を止めません）。レビュアーの起動先は、プロジェクトの
+外に `git worktree` で作った `/tmp/devflow-verify-wt`、記録は `/tmp/devflow-verify-a/` に置きました。
+
+- 信頼していない状態では、`devin -p` が `Refusing to run in an untrusted workspace:
+  /tmp/devflow-verify-wt`（終了コード 1）で失敗し、`ReviewerError` の文に、解決済みの起動先
+  `/tmp/devflow-verify-wt` と「start devin once in … or a directory above it and trust it」が
+  入りました（`invocation.json` の `cwd` と同じパスです）。
+- 人間がその worktree で `devin` を一度起動して信頼したあと
+  （`~/.local/share/devin/cli/trusted_workspaces.json` に `/tmp/devflow-verify-wt` が足された）、
+  同じ `run_review` の経路は信頼を断られずに動き、レビュアーが起動して答えを返しました
+  （ツール呼び出し 14 回、出し直し 1 回）。
+- 確かめたあと、試しの worktree は消しました。`trusted_workspaces.json` に残った
+  `/tmp/devflow-verify-wt` の項目は、不要なら利用者が消してください（DevFlow とエージェントは、
+  そのファイルを直接書き換えません）。
 
 ## 配布物の検査とローカル設定（2026-11-17）
 

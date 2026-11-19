@@ -501,7 +501,7 @@ class CLI:
     Adding a CLI means adding one subclass to ``CLIS`` (and its kind to
     ``settings.REVIEWER_KINDS``): the subcommand, the arguments, the standard
     input, how to read the answer and the activity from the output, and
-    optionally how to read its token counts.
+    optionally how to read its token counts or a failure hint.
     """
 
     subcommand = ""
@@ -540,8 +540,10 @@ class CLI:
         recorded (the first turn's records stay in ``previous_dir``)."""
         return None
 
-    #: Added to the error when the CLI exits with a failure, for a cause the human can fix.
-    failure_hint = ""
+    def failure_hint(self, cwd: Path) -> str:
+        """Added to the error when the CLI exits with a failure, for a cause the human can fix;
+        ``cwd`` is the directory the CLI was started in."""
+        return ""
 
 
 class Codex(CLI):
@@ -696,8 +698,10 @@ class Devin(CLI):
     without waiting."""
 
     command = ("devin",)
-    failure_hint = ("; if Devin refused an untrusted workspace, start devin in this project once and trust it "
-                    "(DevFlow never skips the trust check)")
+
+    def failure_hint(self, cwd):
+        return (f"; if Devin refused an untrusted workspace, start devin once in {cwd} or a directory "
+                f"above it and trust it (DevFlow never skips the trust check)")
 
     def flags(self):
         return ["--print", "--prompt-file", "--resume", "--model", "--export"]
@@ -906,7 +910,7 @@ def _answer_follow_up(prepared: PreparedReview, work_dir: Path, argv: list[str],
         code, _ = _capture(follow, cwd=cwd, env=env, timeout=remaining, data=cli.stdin(request),
                            log_dir=follow_dir)
         if code:
-            raise ReviewerError(f"{kind} exited with {code} on the answer follow-up{cli.failure_hint}")
+            raise ReviewerError(f"{kind} exited with {code} on the answer follow-up{cli.failure_hint(cwd.resolve())}")
         value, activity = cli.answer(follow_dir / "stdout.jsonl", follow_dir)
         return validate(value), activity
     except Exception as exc:
@@ -955,7 +959,7 @@ def run_review(prepared: PreparedReview, validate: Callable[[Any], dict]) -> dic
     code, _ = _capture(argv, cwd=cwd, env=env, timeout=timeout,
                        data=cli.stdin(prepared.prompt.decode("utf-8")), log_dir=work_dir)
     if code:
-        raise ReviewerError(f"{kind} exited with {code}; inspect stderr.log (no automatic retry){cli.failure_hint}")
+        raise ReviewerError(f"{kind} exited with {code}; inspect stderr.log (no automatic retry){cli.failure_hint(cwd.resolve())}")
     try:
         value, activity = cli.answer(work_dir / "stdout.jsonl", work_dir)
         review = checked_review(validate, value)

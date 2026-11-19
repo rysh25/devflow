@@ -348,6 +348,10 @@ class DevinReviewerTests(unittest.TestCase):
                 with self.subTest(mode), self.assertRaisesRegex(ReviewerError, "follow-up") as caught:
                     self.run_review(mode, timeout_seconds=0.5 if mode == "slow" else 30)
                 self.assert_follow_up_failed(str(caught.exception), cause)
+                if mode == "exit-error":
+                    # A failed follow-up launch carries the same trust guidance.
+                    self.assertIn(str(self.project.resolve()), str(caught.exception))
+                    self.assertIn("or a directory above it and trust it", str(caught.exception))
         self.assertEqual(len(self.calls()), 4)  # Two launches each; never a second follow-up.
 
     def test_a_follow_up_answer_that_breaks_the_schema_fails_the_same_way(self):
@@ -466,8 +470,17 @@ class DevinReviewerTests(unittest.TestCase):
                 self.run_review(mode)
             self.assertTrue((self.work / "stdout.jsonl").is_file())
         self.work = self.base / "attempt untrusted"
-        with self.assertRaisesRegex(ReviewerError, "trust it"):
+        with self.assertRaisesRegex(ReviewerError, "trust it") as caught:
             self.run_review("untrusted")
+        # The hint names the resolved directory the CLI was started in.
+        self.assertIn(str(self.project.resolve()), str(caught.exception))
+        self.assertIn("or a directory above it", str(caught.exception))
+
+    def test_other_clis_have_no_failure_hint(self):
+        # The base CLI's default: nothing is added to another CLI's failure.
+        for kind in ("codex", "opencode", "claude"):
+            with self.subTest(kind=kind):
+                self.assertEqual(reviewers.CLIS[kind].failure_hint(Path("/somewhere")), "")
 
     def test_preflight_requires_every_flag_devflow_passes(self):
         self.assertEqual(reviewers.preflight(self.config())["cli_version"], "devin 3000.12.57 (96542e930752)")
