@@ -1,4 +1,4 @@
-# DevFlow 0.12.3 の検証範囲
+# DevFlow 0.12.4 の検証範囲
 
 ## 再実行方法
 
@@ -983,6 +983,77 @@ preflight の警告どおり、DevFlow は新しい版を止めません）。�
 - 確かめたあと、試しの worktree は消しました。`trusted_workspaces.json` に残った
   `/tmp/devflow-verify-wt` の項目は、不要なら利用者が消してください（DevFlow とエージェントは、
   そのファイルを直接書き換えません）。
+
+## 0.12.4 の検証（2026-11-20）
+
+0.12.4 は、プランをプランとプロジェクトだけで実装できるように書かせる指示を、Plan の手順書
+（`references/plan-workflow.md` の面接の手順 3、プランを書く手順 6、修正の手順 3）と
+プランのレビュアーへの指示（`plan/reviewer.md`）に足しました。ランナーと記録の形式は変えて
+いません。自動テスト（981 件）と配布物の検査（`python tools/package.py --validate-only`）を
+通しました。
+
+### 本物の Claude Code での Plan（一時的なプロジェクト）
+
+人間が操作する対話の Claude Code 2.1.329（確かめた版 2.1.319 より新しい）で、作業ツリーの
+プラグインを `claude --plugin-dir <作業ツリー>/plugins/devflow` で読み込み、インストール済みの
+devflow は `--settings '{"enabledPlugins": {"devflow@devflow-marketplace": false}}'` で
+無効にしました。プロジェクトは devflow の外に作った `/tmp/devflow-verify-selfcontained`
+（`README.md` の 1 行と、公開を止める `devflow.config.json` だけを commit したもの）です。
+レビュアーは Codex（codex-cli 0.170.0、`gpt-6.2-sol` high）と Devin（3000.14.30821、
+`swe-2` high）で、上限は 2 回です（`/devflow:plan --max-reviews 2 --reviewer codex
+gpt-6.2-sol high --reviewer devin swe-2 high -- この形の JSON Schema と例のファイルを足す
+プランを作成して`）。run は `20261120T030649Z-3719ddea272e` です。
+
+`/devflow:plan` を実行する前に、同じ会話で作業記録の JSON の形（`id`、40 字までの `title`、
+`todo`・`doing`・`done` の `status`、0〜3 の整数の `priority`、`owner`、文字列の配列の
+`tags`、ISO 8601 の日時の `created_at`、任意で 200 字までの `notes` の 8 項目と、例の JSON
+1 件）を決め、提出の前に止まって自然に書いたプランを `draft/plan-natural.md` に保存するよう
+頼みました。
+
+結果：
+
+- 面接（手順 3）：Claude は「この run の記録には、run を始める前の会話が残りません。そのため、
+  決定済みの形もここで全文を書き直して確認します」と述べ、Q1 で 8 項目の表と例の JSON を全文
+  示して人の確認を得ました。決定のまとめ（`decisions.json`）に 8 項目の名前・制約と例の JSON が
+  入り、面接の記録（`interview.json`）に人の確認の答えが入りました。`coverage.mode` は
+  `bounded-transcript-with-hook-provenance`、`coverage.assistant_messages` は 4、
+  `coverage.reason` はなしで、面接の記録には Claude が示した表と例も入っていました。
+- 自然に書いたプラン（手順 4）：8 項目と制約、細かい決まり、例の JSON がすべて本文にあり、
+  会話・面接・質問の番号への参照はありませんでした。
+- 参照だけの v0（手順 5〜8）：自然な版から項目の定義・細かい決まり・例・Schema の案・README の
+  細則・違反例の一覧を取り除き、「スキーマの項目は会話で示した項目のとおり」の 1 文に置き換え、
+  出どころの印「（Q10）」を 1 つ足した v0（`plan_hash` `c9a20178bb7424e183589b719f5579ad70df69c5eed54096717c9f4622030ad9`）
+  を提出しました。2 回のレビューの記録の `plan_hash` は、どちらもこの値です。
+  - Codex（1 回目、ツール呼び出し 23 回、判定は `human_required`。理由は下の「満たさなかったもの」）は、その 1 文を F01（high）として「計画だけを読む
+    実装者は、合意済みの 8 項目、必須キー、制約を確定できない」と指摘し、例・README の細則・
+    違反例の欠落も指摘しました。
+  - Devin（2 回目、ツール呼び出し 4 回、判定は `changes_required`。指摘は high 1 件、medium 4 件、
+    low 1 件で、`requires_human` のものはなし）も、その 1 文を F01（high）として同じ趣旨で指摘しました。
+    Devin のパケットには Codex の指摘と採否が入っていたので、先行する指摘が見える条件で、v0 の
+    該当箇所を根拠に指摘したものです（独立に見つけたとは言えません）。
+  - 「（Q10）」の印を付けた箇所は、どちらも指摘しませんでした。
+
+合格の条件のうち、満たさなかったもの：
+
+- Codex の判定は `changes_required` ではなく `human_required` でした。原因は別の指摘
+  F05（`requires_human`）で、面接で決めた「priority の `2.0` は不可」が JSON Schema
+  Draft 2020-12 では実現できない（小数部が 0 の数は整数として扱われる）ことです。この点は seal の
+  あとに分かり、人が「`2.0` を受け入れて README に書く」を選んで自然な版に理由とともに書きましたが、
+  v0 を作るときに細かい決まりと一緒にその説明も取り除いたため、v0 には面接の決定だけが残りました。
+  v0 から取り除くのを項目の定義だけにしていれば避けられた、検証の進め方の誤りです。
+- そのため run は計画した想定外の判定の分岐で終わりました。人の回答を記録したあと、v0 のまま
+  全指摘を `reject` して Devin のレビューを受け、上限に達したところで `cancel` しました
+  （`cancelled`）。自然な版の `apply` と `exhausted` での終わりは確かめていません。
+
+人間は、この結果を満たさなかった点ごと記録し、確かめをやり直さずに進めることを選びました
+（Implement の run `20261120T022715Z-0e502363e6ad` の人への質問）。
+
+最初の試みでは、`/devflow:plan` を実行する前に決める定義（提出の前に止まる依頼を含む）と
+`/devflow:plan` のコマンドを、誤って devflow で動いていた Devin の会話に送り、devflow 自身に
+Devin の Plan の run ができました。インストール済みの 0.12.3 で、プロジェクトも違うため結果には
+使わず、その run は取り消しました。一時的なプロジェクトは確かめのあとに消しました。Devin の
+`trusted_workspaces.json` に足された `/tmp/devflow-verify-selfcontained` は、不要なら利用者が
+消してください。
 
 ## 配布物の検査とローカル設定（2026-11-17）
 
