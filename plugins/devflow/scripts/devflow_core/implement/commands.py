@@ -5,7 +5,6 @@ import shutil
 
 from ..common.hosts import executable_name, host_profile
 
-from .. import __version__
 from ..common.environment import python_errors
 from ..common.errors import DevFlowError
 from ..common.reviewers import preflight
@@ -33,7 +32,7 @@ def doctor(engine, args, run_id, session) -> dict:
         except DevFlowError as exc:
             results.append({"id": provider["id"], "ready": False, "error": str(exc)})
     errors = python_errors()
-    return {"schema_version": 1, "plugin": "devflow", "workflow": workflow.name, "version": __version__,
+    return {"schema_version": 1, "workflow": workflow.name,
             "project": str(engine.project), "run_id": run_id, "config": config, "reviewers": results,
             "configuration_source": source,
             "executables": {name: shutil.which(name) for name in ("uv", executable_name(engine.host), "git")},

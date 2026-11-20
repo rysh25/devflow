@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from devflow_core import cli
+from devflow_core import __version__, cli
 from devflow_core.common import notices, paths, sessions
 from devflow_core.workflows import WORKFLOWS
 
@@ -50,9 +50,11 @@ class CliTests(unittest.TestCase):
 
     def assertJsonError(self, out, error="DevFlowError"):
         value = json.loads(out)
-        self.assertEqual(set(value), {"error", "message", "automatic_retry"})
+        self.assertEqual(set(value), {"error", "message", "automatic_retry", "plugin", "version"})
         self.assertEqual(value["error"], error)
         self.assertFalse(value["automatic_retry"])
+        self.assertEqual(value["plugin"], "devflow")
+        self.assertEqual(value["version"], __version__)
         return value["message"]
 
     def test_runtime_error_is_structured_and_nonretryable(self):
@@ -100,6 +102,48 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("from 1 to 99", self.assertJsonError(out))
 
+    def test_successful_results_carry_runner_fields(self):
+        state = self.start()
+        code, out, err = self.cli("--session", "cli-session", "status")
+        self.assertEqual(code, 0, err)
+        value = json.loads(out)
+        self.assertEqual((value["plugin"], value["version"]), ("devflow", __version__))
+        self.assertEqual(value["status"], "bound")
+        code, out, err = self.cli("--session", "cli-session", "--run", state["run_id"], "status")
+        self.assertEqual(code, 0, err)
+        value = json.loads(out)
+        self.assertEqual((value["plugin"], value["version"]), ("devflow", __version__))
+        self.assertEqual(value["run_id"], state["run_id"])
+        code, out, err = self.cli("--session", "cli-session", "--run", state["run_id"], "doctor")
+        self.assertEqual(code, 0, err)
+        value = json.loads(out)
+        self.assertEqual((value["plugin"], value["version"]), ("devflow", __version__))
+        self.assertIn("ready", value)
+        self.assertEqual(value["run_id"], state["run_id"])
+
+    def test_doctor_carries_runner_fields(self):
+        with patch("devflow_core.cli.preflight", return_value={"probe": "test"}), \
+                patch("devflow_core.cli.host_version", return_value={"version": "0.0.0", "supported": True}):
+            code, out, err = self.cli("doctor")
+        self.assertEqual(code, 0, err)
+        value = json.loads(out)
+        self.assertEqual((value["plugin"], value["version"]), ("devflow", __version__))
+        self.assertIn("ready", value)
+
+    def test_hook_output_has_no_runner_fields(self):
+        code, out, err = self.cli("hook", stdin=json.dumps(self.payload(prompt="/devflow:plan CLI test request")))
+        self.assertEqual(code, 0, err)
+        value = json.loads(out)
+        self.assertIn("hookSpecificOutput", value)
+        self.assertNotIn("plugin", value)
+        self.assertNotIn("version", value)
+        code, out, err = self.cli("hook", stdin=json.dumps(self.payload(prompt="Ordinary unrelated conversation")))
+        self.assertEqual((code, err), (0, ""))
+        if out:
+            value = json.loads(out)
+            self.assertNotIn("plugin", value)
+            self.assertNotIn("version", value)
+
     def test_unrelated_hook_is_inert(self):
         code, out, err = self.cli("hook", stdin=json.dumps(self.payload(prompt="Ordinary unrelated conversation")))
         self.assertEqual((code, out, err), (0, "", ""))
@@ -117,6 +161,31 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(out, "")
         self.assertIn("DevFlow hook failed", err)
+
+    def test_an_option_missing_its_value_does_not_hide_the_command(self):
+        # --session has no value; --project takes "hook" and the command is "doctor".
+        code, out, err = self.cli("--session", "--project", "hook", "doctor")
+        self.assertEqual(code, 2)
+        self.assertJsonError(out, "UsageError")
+        self.assertEqual(err, "")
+
+    def test_an_option_missing_its_value_keeps_a_hook_a_hook(self):
+        # --session has no value; --run takes "status" and the command is "hook". A malformed
+        # hook stays on the hook route: stderr and exit 1, never the JSON exit 2 that blocks.
+        code, out, err = self.cli("--session", "--run", "status", "hook")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("DevFlow hook failed", err)
+
+    def test_an_invalid_command_before_hook_is_not_a_hook(self):
+        # "statsu" is the first positional, so the invocation is not a hook: the versioned
+        # JSON usage error goes to stdout with exit status 2, and nothing to stderr.
+        code, out, err = self.cli("statsu", "hook")
+        self.assertEqual(code, 2)
+        value = json.loads(out)
+        self.assertEqual((value["error"], value["plugin"], value["version"]),
+                         ("UsageError", "devflow", __version__))
+        self.assertEqual(err, "")
 
     def test_hook_start_then_status_and_owner_error(self):
         state = self.start()
