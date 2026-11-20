@@ -126,6 +126,15 @@ class BundleContractTests(unittest.TestCase):
             self.assertNotIn("dangerously-skip-permissions", source)
             self.assertNotIn("--python 3.11", source)
 
+    def test_doctor_and_status_skills_open_the_reply_with_the_runner_version(self):
+        sentence = ("Begin the reply with a line that is exactly `DevFlow <version>`, where `<version>` is the runner "
+                    "JSON's top-level `version` value copied verbatim, with nothing else on that line. If the runner "
+                    "returned no JSON, do not state or guess a version; report why it could not run.")
+        for root in ("skills", "codex-skills", "devin-skills"):
+            for name in ("doctor", "status"):
+                with self.subTest(skill=root + "/" + name):
+                    self.assertIn(sentence, (PLUGIN / root / name / "SKILL.md").read_text(encoding="utf-8"))
+
     def test_configuration_rejects_advisory_only_validation(self):
         value = read_json(BUILD_PLUGIN / "defaults.json")
         value["checks"] = [{"id": "advisory", "argv": [sys.executable, "-c", "raise SystemExit(1)"], "required": False}]

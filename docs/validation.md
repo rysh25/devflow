@@ -1,4 +1,4 @@
-# DevFlow 0.12.5 の検証範囲
+# DevFlow 0.12.6 の検証範囲
 
 ## 再実行方法
 
@@ -1169,6 +1169,104 @@ Claude にだけ、プランにない設定クラスの階層（`BaseFormatConfi
   （`/tmp/devflow-verify-design-balance-plan`）は、その run を人間が解決したあとに
   消す予定のまま残してあります。Devin の `trusted_workspaces.json` に足された
   `/tmp/devflow-verify-design-balance` は、不要なら利用者が消してください。
+
+## 0.12.6 の検証（2026-11-21）
+
+0.12.6 は、ランナーの hook 以外の出力（エラー、`--run` を付けた status と doctor を含む）が
+いつも一番上に `plugin` と `version` を持つようにし（`devflow_core/cli.py` の `emit_result`
+1 か所で付ける）、3 つのホストの doctor と status のスキルに「回答の 1 行目を `DevFlow
+<version>` だけにする」指示文を足しました。run の記録の形式は変えていません。
+
+変えたファイル: `devflow_core/cli.py`（`emit_result` を追加し、hook 以外の `emit` を置き換え、
+モジュールの docstring に予約項目を記載。加えて `command_name` が、最初の位置トークンを
+コマンド候補として読み、値を取るオプションの直後のオプションらしきトークンを値とみなさない
+ように修正）、
+`devflow_core/router.py` と
+`devflow_core/implement/commands.py`（個別に付けていた `plugin` と `version` を撤去）、
+6 つの SKILL.md（`skills/`、`codex-skills/`、`devin-skills/` の doctor と status。同じ英文を
+1 文ずつ）、3 つのホストの `plugin.json`、`devflow_core/__init__.py`（0.12.6）、`README.md`、
+`docs/architecture.md`、`docs/installation.md`、この `docs/validation.md`、テスト
+（`tests/plan/test_cli.py` に T1〜T4 と `command_name` の退行テスト 3 件、
+`tests/test_integration.py` に T5、
+`tests/test_distribution.py` と `tests/router/test_entrypoint.py` の版の期待値）。
+
+自動テスト（988 件）と配布物の検査（`python tools/package.py --validate-only`）を
+通しました。
+
+確認用のプロジェクトは `/tmp/devflow-verify-0.12.6`（git リポジトリ、`devflow.config.json`・
+`devflow.config.local.json`・実データなし）。`status RUN_ID` で読む run として、0.12.6 の
+ランナーに `--host claude` で UserPromptSubmit の hook 入力を渡して pending start を作り、
+`implement start --plan` で作った implement run
+`20261120T163254Z-5170845364fd`（`awaiting_human`、オーナーは host `claude`・session
+`verify-session`）を使いました。
+
+### V1（Claude Code 2.1.329、確かめた版 2.1.319 より新しい）
+
+控えた導入: `claude plugin list` で `devflow@devflow-marketplace` 0.12.5（user スコープ、
+有効）。0.12.6 は `claude -p '<コマンド>' --plugin-dir /absolute/path/to/devflow/plugins/devflow
+--settings '{"enabledPlugins": {"devflow@devflow-marketplace": false}}'` で読み込み、
+インストール済みの devflow はその `--settings` で無効にしました（利用者の登録は不変）。
+
+- `/devflow:status`: 1 行目は `DevFlow 0.12.6` だけ。結果はエラーではなく、セッションの状態
+  （idle）とプロジェクトの run の一覧を示しました。
+- `/devflow:status 20261120T163254Z-5170845364fd`: 1 行目は `DevFlow 0.12.6` だけ。結果の
+  `run_id` は指定した ID と一致しました。
+- `/devflow:doctor`: 1 行目は `DevFlow 0.12.6` だけ。結果はエラーではなく、doctor の診断
+  （`ready`、レビュアーとスキルの確認、警告）を示しました。
+
+### V2（Codex CLI 0.170.0、確かめた版 0.166.0 より新しい）
+
+控えた導入: `codex plugin marketplace list` で `devflow-marketplace`（ルート
+`/absolute/path/to/devflow`）、`codex plugin list` で
+`devflow@devflow-marketplace`（installed, enabled、ソース
+`/absolute/path/to/devflow/plugins/devflow`）。利用者の marketplace 登録は外さず、
+検証は分けた `CODEX_HOME=/tmp/codex-verify-home`（`auth.json` を写してログイン）で行い、
+その中で `codex plugin marketplace add /absolute/path/to/devflow` と
+`codex plugin add devflow@devflow-marketplace` で 0.12.6 を入れました。
+`codex --enable default_mode_request_user_input` で起動し、`/hooks` で検証用プラグインの
+3 つのフック（UserPromptSubmit・PreToolUse・PostToolUse。コマンドは bundled 0.12.6 ランナーの
+`--host codex hook`）を確かめて信頼しました。`codex exec` では UserPromptSubmit の
+プラグインフックは動かなかったため、対話のセッションで確かめました。
+
+結果（セッションの記録で確認した最初の行）:
+
+- `$devflow:status`: `DevFlow 0.12.6` だけ。セッションの状態（idle）を示し、エラーでは
+  ありませんでした。
+- `$devflow:status 20261120T163254Z-5170845364fd`: `DevFlow 0.12.6` だけ。`run_id` が
+  一致しました。
+- `$devflow:doctor`: `DevFlow 0.12.6` だけ。doctor の診断を示しました（3 回とも同じ
+  1 行目）。
+
+確認後、検証用の `CODEX_HOME` は消しました。
+
+### V3（Devin CLI 3000.14.30821）
+
+控えた導入: `devin plugins list` で devflow v0.12.5、`devin plugins info devflow` と
+`~/.local/share/devin/cli/plugins/lock.json` で、取得元
+`https://github.com/rysh25/devflow#plugins/devflow`・範囲 user（個人プラグイン）を
+確認しました。0.12.6 は `devin plugins install --local
+/absolute/path/to/devflow/plugins/devflow` で入れました（この機械だけの導入で、
+個人プラグインの登録は変わりません）。同名が 2 つ並ぶため、検証用プロジェクトの
+`.devin/config.json` に repo スコープの `forbiddenPlugins`（GitHub の導入の識別子）を
+置き、そのプロジェクトでは個人プラグイン側をブロックし、`--local` の 0.12.6 を使いま
+した。プロジェクトは `devin` を一度起動して信頼しました（`trusted_workspaces.json` に
+`/tmp/devflow-verify-0.12.6` が足されています。不要なら利用者が消してください）。
+
+`devin -p '<コマンド>'`（非対話）での結果:
+
+- `/devflow:status`: 1 行目は `DevFlow 0.12.6` だけ。セッションの状態（idle）を示し、
+  エラーではありませんでした。
+- `/devflow:status 20261120T163254Z-5170845364fd`: `DevFlow 0.12.6` だけ。`run_id` が
+  一致しました。
+- `/devflow:doctor`: `DevFlow 0.12.6` だけ。doctor の診断（`ready: true`）を示しました。
+
+確認のあと `devin plugins remove plugins/devflow --local` で 0.12.6 を外し
+（個人プラグインの 0.12.5 と機械だけの 0.12.6 が表示名 `devflow` を共有していたため、
+機械だけの導入の ID `plugins/devflow` で指定）、`devin plugins list` と
+`devin plugins info` で個人プラグインの devflow v0.12.5
+（取得元 `https://github.com/rysh25/devflow#plugins/devflow`）だけが残ったことを
+確かめました。検証用プロジェクトは結果の記録のため残してあります。`status`・`doctor`
+だけを使ったため、確認用の run は `awaiting_human` のままです。
 
 ## 配布物の検査とローカル設定（2026-11-17）
 

@@ -2,7 +2,7 @@
 
 ## 一つの配布と独立したワークフロー
 
-DevFlow 0.12.5 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
+DevFlow 0.12.6 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
 
 ```mermaid
 flowchart TD
@@ -37,7 +37,7 @@ Python コードは `plugins/devflow/scripts/devflow_core/` の1つのパッケ�
 | `devin-skills/` | Devin の5つの明示操作（`triggers: [user]`）。共通の起動・待機手順は `references/devin-runner.md` を参照 |
 | `hooks/claude.json`、`hooks/codex.json`、`hooks.json` | 各ホストのフック。Devin はプラグインのルートの `hooks.json` だけを読む |
 | `scripts/devflow.py` | 唯一の起動点 |
-| `devflow_core/cli.py` | 登録表から組み立てる1つの argparse。エラーは常に JSON |
+| `devflow_core/cli.py` | 登録表から組み立てる1つの argparse。hook を除くコマンドの結果（エラーを含む）は JSON で、一番上に予約の項目 `plugin` と `version` が付く。hook の失敗は標準エラーと終了コード 1 |
 | `devflow_core/router.py` | セッションの紐付け、開始、resume、空き確認、フックの記録と状態の通知。フロー名で分岐しない |
 | `devflow_core/workflows.py` | ワークフローの登録表 |
 | `devflow_core/common/` | 全フロー共通の仕組み（下表） |

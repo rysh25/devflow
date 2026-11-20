@@ -15,7 +15,6 @@ import os
 import json
 from pathlib import Path
 
-from . import __version__
 from .common import notices, sessions
 from .common.paths import hook_project, project_root, same_path
 from .common.errors import DevFlowError
@@ -443,17 +442,17 @@ def status(project: Path, session: str | None, run_id: str | None, host: str) ->
     if run_id:
         flow, info = resolve_run(project, run_id, all_stores)
         if info.format == "unsupported":
-            return {"plugin": "devflow", **info.public()}
+            return info.public()
         if info.format == "invalid":
             raise DevFlowError(f"Run {run_id} cannot be read: {info.error}")
-        return {"plugin": "devflow", "flow": flow, **WORKFLOWS[flow].engine(project, host=host).status(run_id)}
+        return {"flow": flow, **WORKFLOWS[flow].engine(project, host=host).status(run_id)}
     record, record_error, current = None, None, None
     if session:
         try:
             path = sessions.session_path(project, session)
             info = sessions.inspect_record(path, WORKFLOWS) if path.exists() else None
             if info is not None and info.format == "unsupported":
-                return {"plugin": "devflow", "status": "unsupported", "session_host": info.host,
+                return {"status": "unsupported", "session_host": info.host,
                         "session_schema_version": info.schema_version, "owner_matches": False,
                         "session_record_error": (None if info.host == host else "Session host collision"),
                         **_overview(project, all_stores)}
@@ -465,7 +464,7 @@ def status(project: Path, session: str | None, run_id: str | None, host: str) ->
     caller = (("unsupported" if not current.supported else "bound" if current.owner else "stale") if current
               else "pending_start" if pending else "idle")
     extra = {"message": unsupported_message(current.run_id, current.schema_version)} if caller == "unsupported" else {}
-    return {"plugin": "devflow", "version": __version__, "project": str(project), "status": caller, **extra,
+    return {"project": str(project), "status": caller, **extra,
             "run": record["run"] if current else None, "owner_matches": current.owner if current else None,
             "pending_start": pending and {key: pending[key] for key in ("flow", "run_id", "args", "created_at")},
             "session_record_error": record_error,

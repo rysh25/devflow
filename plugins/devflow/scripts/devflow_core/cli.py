@@ -1,9 +1,13 @@
 """The single DevFlow runner: one argparse tree built from the workflow registry.
 
-Every runner error, including a malformed invocation, is one JSON object on
-stdout with exit status 2. ``--help`` and ``--version`` print text. Hook
-failures, including a malformed hook invocation, go to stderr with exit status
-1, which every supported host shows or records without blocking the tool or
+Every non-hook command result, including an error, is one JSON object on
+stdout whose top level always carries the reserved fields ``plugin`` and
+``version`` (the CLI's values win over any same-named fields a command
+returns). Every non-hook error, including a malformed invocation, exits
+with status 2. ``--help`` and ``--version`` print text, and a ``None``
+result prints nothing. Hook failures, including a malformed hook
+invocation, go to stderr with exit status 1, which every supported host
+shows or records without blocking the tool or
 the prompt (exit status 2 blocks on Claude Code and Devin).
 """
 from __future__ import annotations
@@ -53,6 +57,12 @@ def emit(value) -> None:
         print(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False))
 
 
+def emit_result(value: dict | None) -> None:
+    """Every non-hook command result names the runner that produced it."""
+    if value is not None:
+        emit({**value, "plugin": "devflow", "version": __version__})
+
+
 
 
 def host_version(host: str) -> dict:
@@ -65,21 +75,26 @@ VALUE_OPTIONS = ("--project", "--session", "--host", "--run")  # The global opti
 
 
 def command_name(arguments: list[str]) -> str | None:
-    """The first known command word, read before parsing.
+    """The command word, read before parsing.
 
-    Tokens that are not a command (an unknown or abbreviated option's value, for
-    example) are passed over, so a malformed hook invocation is still a hook.
+    Options and their values are passed over; the first positional token is the
+    would-be command. It is returned only when it names a command, so a malformed
+    hook invocation is still a hook while an invalid command word falls through
+    to the versioned JSON error.
     """
     index = 0
     while index < len(arguments):
         token = arguments[index]
         # argparse also accepts a prefix of a long option; any value option it may name takes the next token.
         if token.startswith("--") and len(token) > 2 and any(option.startswith(token) for option in VALUE_OPTIONS):
-            index += 2
+            # An option-like next token is not a value: argparse reports the missing value, so
+            # leave it for the scanner instead of skipping the command word it may contain.
+            index += 1 if index + 1 < len(arguments) and arguments[index + 1].startswith("-") else 2
             continue
-        if token in COMMANDS:
-            return token
-        index += 1
+        if token.startswith("-") and len(token) > 1:
+            index += 1
+            continue
+        return token if token in COMMANDS else None
     return None
 
 
@@ -111,7 +126,7 @@ def doctor(project: Path, host: str) -> dict:
     warnings.extend(version_warnings(host, version["version"]))
     executables = {name: shutil.which(name) for name in ("uv", executable_name(host), "git")}
     errors = python_errors()
-    return {"plugin": "devflow", "version": __version__, "project": str(project),
+    return {"project": str(project),
             "minimum_claude_code": MINIMUM_CLAUDE_CODE, "claude_code": version if host == "claude" else None, "host": host, "host_diagnostics": version,
             "python": {"version": sys.version.split()[0], "requires": ">=3.11", "fixed_minor": False,
                        "platform": sys.platform},
@@ -153,22 +168,22 @@ def main(argv=None) -> int:
             return 0
         project = router.project_root(args.project)
         if command == "status":
-            emit(router.status(project, args.session, args.run, host))
+            emit_result(router.status(project, args.session, args.run, host))
         elif command == "doctor":
             if args.run:
                 flow, info = router.resolve_run(project, args.run, router.stores(project, host=host))
                 if info.format != "current":
-                    emit({"ready": False, **info.public()})
+                    emit_result({"ready": False, **info.public()})
                 else:
                     args.action = "doctor"
-                    emit(WORKFLOWS[flow].run_command(args, project, args.run, args.session, host))
+                    emit_result(WORKFLOWS[flow].run_command(args, project, args.run, args.session, host))
             else:
-                emit(doctor(project, host))
+                emit_result(doctor(project, host))
         elif args.action == "start":
             if args.run:
                 raise DevFlowError("A new start cannot target an existing run")
             options = WORKFLOWS[command].start_options(args)
-            emit(router.runner_start(project, args.session, command, args.start_value, options, host=host))
+            emit_result(router.runner_start(project, args.session, command, args.start_value, options, host=host))
         else:
             args.pending_start = None
             if args.action == "doctor" and args.session:
@@ -176,8 +191,9 @@ def main(argv=None) -> int:
                 path = session_path(project, args.session)
                 info = inspect_record(path, WORKFLOWS) if path.exists() else None
                 if info is not None and (info.format != "current" or info.host != host):
-                    emit({"ready": False, "configuration_source": "session_record", "format": info.format,
-                          "session_host": info.host, "error": info.error or "Unsupported session record or host collision"})
+                    emit_result({"ready": False, "configuration_source": "session_record", "format": info.format,
+                                 "session_host": info.host,
+                                 "error": info.error or "Unsupported session record or host collision"})
                     return 0
                 if info is not None:
                     args.pending_start = info.record["pending_start"]
@@ -185,12 +201,12 @@ def main(argv=None) -> int:
             if run_id is None:
                 # Without a run, an action reads the current project settings.
                 validate_document(project, WORKFLOWS)
-            emit(WORKFLOWS[command].run_command(args, project, run_id, args.session, host))
+            emit_result(WORKFLOWS[command].run_command(args, project, run_id, args.session, host))
         return 0
     except Exception as exc:  # noqa: BLE001 - every failure is reported, never retried
         if command == "hook":
             print("DevFlow hook failed: " + str(exc), file=sys.stderr)
             # Exit status 2 would make Claude Code or Devin block the tool or the prompt.
             return 1
-        emit({"error": type(exc).__name__, "message": str(exc), "automatic_retry": False})
+        emit_result({"error": type(exc).__name__, "message": str(exc), "automatic_retry": False})
         return 2
