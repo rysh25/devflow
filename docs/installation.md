@@ -59,6 +59,8 @@ uv が MSYS2 や Cygwin の Python を選ぶと、パスの扱いが変わるた
 
 DevFlow の git は、利用者の git の設定（`core.autocrlf` など）をそのまま使います。改行の扱いは、利用者の git と同じになります。
 
+Codex の `elevated` のサンドボックスを使っていると、レビュアーの Codex が uv で入れた Python を起動できないことがあります。対処は[Windows の Codex レビュアーが Python を起動できない](#windows-の-codex-レビュアーが-python-を起動できない)にあります。
+
 ### 面接スキルの診断
 
 面接スキルの診断は静的な確認です。`static_ready` や `model_invocable` が真でも、Claude Code での実際の呼び出し確認を意味しません。`runtime_verified` は偽であることを区別してください。診断の探索範囲外なら `unverified`、探索できる場所で見つからない場合は `missing` として扱い、`reason` と `checked_locations` を確認します。
@@ -231,6 +233,51 @@ Git モードでは、新規作成された正式プランや設定ファイル�
 
 `status` の `last_error` と、`review-processes/NN/` の `stderr.log`・`stdout.jsonl` を確認してください。プロジェクトの CLI の設定（Codex の `.codex/config.toml` など）が壊れていると、レビュアーが起動できません。レビュアーがスナップショットの範囲のファイルを変えた回（テストがキャッシュやカバレッジのファイルを作った場合など）も、合格に数えられません。
 
+### Windows の Codex レビュアーが Python を起動できない
+
+Windows ネイティブの Codex で `elevated` のサンドボックスを使っていると、レビュアーの Codex がサンドボックスの中から Python を起動できないことがあります。`elevated` は、`%USERPROFILE%\.codex\config.toml` の `[windows]` に `sandbox = "elevated"` と書いたときの方式です。uv が既定の場所に入れた Python で起き、次のように表示されます。
+
+```text
+error: uv trampoline failed to spawn Python child process
+  Caused by: permission denied (os error 5)
+```
+
+`elevated` は、コマンドを Codex 専用の低い権限のユーザーで実行します。uv の既定では、起動用の `%USERPROFILE%\.local\bin\python.exe` が、本体（`%APPDATA%\uv\python\` の下）を起動します。起動用の exe は動きますが、本体を起動する権限がありません。対話で使う Codex では動くことがあります。DevFlow はレビュアーを `approval_policy="never"` で起動し、サンドボックスの外での実行を求めないので、この失敗がそのまま残ります。
+
+影響はレビュアーが自分で Python を使って確かめるときだけです。`implement.checks` は DevFlow がサンドボックスの外で実行するので、影響を受けません。WSL2 の Codex は Linux のサンドボックスを使うので、この設定の影響を受けません。
+
+**対処（確認済み）**: プロジェクト直下の `devflow.config.local.json` で、DevFlow のレビュアーの Codex にだけ `unelevated` のサンドボックスを使います。対話で使う Codex の `sandbox = "elevated"` は、そのまま残せます。
+
+```json
+{
+  "schema_version": 1,
+  "reviewers": [
+    {"id": "codex", "kind": "codex", "command": ["codex", "-c", "windows.sandbox=\"unelevated\""],
+     "model": "gpt-6.2-sol", "effort": "high", "timeout_seconds": 1800},
+    {"id": "opencode", "kind": "opencode", "command": ["opencode"], "model": "opencode-go/deepseek-v4.1-flash",
+     "effort": "high", "timeout_seconds": 1800}
+  ]
+}
+```
+
+- `command` の後ろに DevFlow の引数（`exec …`）がつながります。Codex の `-c` は `exec` の前に置いても効きます。
+- `reviewers` の配列は丸ごと置き換わります。使うレビュアーをすべて書いてください。
+- ローカルの共通の `reviewers` は、共有の `devflow.config.json` の `implement.reviewers` より優先されます。Implement で別の顔ぶれを使うなら、ローカルの `implement.reviewers` にも同じように書きます。
+- 利用者自身で `.gitignore` に `/devflow.config.local.json` を加えてください。
+- `unelevated` は、利用者のアカウントから作った権限の低いトークンで動きます。OpenAI の資料では、`elevated` よりネットワークの隔離が弱く、読み取りを禁止する場所の指定も使えないとされています。
+
+**別の対処（未確認）**: Python を全ユーザーが読める場所に入れ直します。uv なら、管理者の PowerShell で次を実行し、新しいターミナルを開きます。これで `elevated` のまま動くかは、まだ確かめていません。
+
+```powershell
+$env:UV_PYTHON_INSTALL_DIR = 'C:\Program Files\uv-python'
+$env:UV_PYTHON_BIN_DIR     = 'C:\Program Files\uv-python\bin'
+uv python install 3.14 --default
+$machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+[Environment]::SetEnvironmentVariable('Path', "$machine;C:\Program Files\uv-python\bin", 'Machine')
+```
+
+この Python を後で更新・削除するときも、同じ2つの環境変数を設定してから uv を実行します。
+
 ## 公式資料
 
 - [Claude Code plugin 導入・スコープ・private marketplace](https://code.claude.com/docs/en/discover-plugins)
@@ -238,6 +285,7 @@ Git モードでは、新規作成された正式プランや設定ファイル�
 - [Claude Code plugin の読み込み・版・更新](https://code.claude.com/docs/en/plugins/loading)
 - [Claude Code のツール（Bash の待ち時間とバックグラウンド実行）](https://code.claude.com/docs/en/tools-reference)
 - [Codex CLI のコマンド（`codex plugin`）](https://developers.openai.com/codex/cli/reference)
+- [Codex の Windows のサンドボックス](https://developers.openai.com/codex/windows)
 - [Devin CLI のプラグイン](https://docs.devin.ai/cli/extensibility/plugins/overview)
 - [uv script metadata](https://docs.astral.sh/uv/guides/scripts/)
 
