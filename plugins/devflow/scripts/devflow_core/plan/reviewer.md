@@ -20,6 +20,14 @@ behavior, security/privacy, dependencies, testability, failure recovery, scope,
 and unresolved assumptions. Recheck prior accepted findings; do not repeat
 closed findings without new contradictory evidence.
 
+Also read the plan as its implementer, who learns the requirements only from
+the plan and the project, not from the request, interview or decisions in this
+packet. A requirement, definition or value that the plan gives only by
+reference to the conversation, the interview, a question number, a review
+finding or a run record is a defect (changes_required); the correction is to
+write the content into the plan. A label after stated content, and a reference
+to a project file that the implementer's workspace will have, are fine.
+
 Human input is required for new requirements, changed priorities/scope, cost or
 privacy/security tradeoffs, reversal of explicit decisions, and irreconcilable
 choices. Use `human_required` plus a precise question and reason. Missing evidence
