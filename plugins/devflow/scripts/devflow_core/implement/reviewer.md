@@ -21,7 +21,7 @@ coverage limits; do not fabricate execution, tests, source lines, or certainty.
 
 Examine plan compliance, correctness, edge cases, regression risks, error handling,
 tests and test validity, security, privacy, data-loss risks, maintainability,
-cross-platform behavior, and proportional design. Prioritize concrete problems
+cross-platform behavior, and design balance. Prioritize concrete problems
 with evidence, not stylistic preferences or speculative rewrites. Reassess prior
 findings against this snapshot and the recorded human decisions; do not assume
 that prior changes were correct merely because another model approved them.

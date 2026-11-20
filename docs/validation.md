@@ -1,4 +1,4 @@
-# DevFlow 0.12.4 の検証範囲
+# DevFlow 0.12.5 の検証範囲
 
 ## 再実行方法
 
@@ -1054,6 +1054,121 @@ Devin の Plan の run ができました。インストール済みの 0.12.3 �
 使わず、その run は取り消しました。一時的なプロジェクトは確かめのあとに消しました。Devin の
 `trusted_workspaces.json` に足された `/tmp/devflow-verify-selfcontained` は、不要なら利用者が
 消してください。
+
+## 0.12.5 の検証（2026-11-20）
+
+0.12.5 は、全レビュアー共通の指示（`common/reviewer-rules.md`）に「設計の釣り合い」の
+判定基準と、修正案を最も単純な修正に限る節を足しました。計画と実装の各 `reviewer.md`
+の観点の一覧には "design balance" という名前だけを足し（実装側の既存の "proportional
+design" は置き換え）、計画を書く側（`references/plan-workflow.md`）と実装する側
+（`references/implement-workflow.md`）にも同じ方針を短く書きました。ランナーの Python
+コードと記録の形式、指摘のスキーマは変えていません。
+
+変えたファイル: `common/reviewer-rules.md`、`plan/reviewer.md`、`implement/reviewer.md`、
+`references/plan-workflow.md`、`references/implement-workflow.md`、3 つのホストの
+`plugin.json`、`devflow_core/__init__.py`（0.12.5）、`README.md`、`docs/architecture.md`、
+`docs/installation.md`、この `docs/validation.md`、版を確かめるテスト
+（`tests/test_distribution.py`、`tests/router/test_entrypoint.py`）。
+
+自動テスト（981 件）と配布物の検査（`python tools/package.py --validate-only`）を
+通しました。
+
+### 本物の Claude Code での Plan（一時的なプロジェクト）
+
+人間が操作する対話の Claude Code 2.1.329（確かめた版 2.1.319 より新しい）で、作業ツリーの
+プラグインを `claude --plugin-dir <作業ツリー>/plugins/devflow` で読み込み、インストール
+済みの devflow は `--settings '{"enabledPlugins": {"devflow@devflow-marketplace": false}}'`
+で無効にしました。プロジェクトは devflow の外に作った
+`/tmp/devflow-verify-design-balance` です。`report.py` は、出力形式を `FORMATTERS` 辞書に
+登録する小さなツールで、`csv` と `json` の 2 形式が登録済みです（既存の拡張点と「同じものに
+複数の実装がある」ソースコードの事実）。レビュアーは Codex（codex-cli 0.170.0、
+`gpt-6.2-sol` high）と Devin（devin 3000.14.30821、`swe-2` high）で、上限は 2 回です
+（`/devflow:plan --max-reviews 2 -- 3つ目の出力形式（TSV）を足すプランを作成して`）。
+run は `20261120T095410Z-5756e2434b71` です。
+
+結果（回ごと）:
+
+- Codex（1 回目、ツール呼び出し 9 回、判定は `human_required`）は v000
+  （`plan_hash` `b7a61cc7a30e0a11822849f0dd1773fdd07c0efff38a3f4b753136bb9e43ad97`）
+  を見ました。その版に試験用のプラグイン機構はなく、TSV は既存の `FORMATTERS` に
+  登録する形でした。指摘は high 1 件（TSV の Windows 改行）、low 3 件（追跡済み
+  `__pycache__`、TSV テストの網羅、Python 下限の根拠）で、改行の扱いを選ぶ人への
+  質問が 1 つ出ました。人は「既存 CSV と同じ改行処理」を選びました。
+- Devin（2 回目、ツール呼び出し 12 回、判定は `changes_required`）は v001
+  （`plan_hash` `32860d92dc5158a9aa019e3ae82a354323815c1388dd06e16bb8905a10046d86`）
+  を見ました。その版にも試験用のプラグイン機構はなく、TSV は既存の `FORMATTERS` に
+  登録する形でした。指摘は low 1 件（README の説明文を任意とする記述とリスク節の
+  不一致）。
+- 2 回の上限で人は「受け入れて終える」を選び、run は `accepted` で終わりました。最後の版
+  v002（README の文の必須化だけの修正）はレビューされていません。
+
+合格の条件ごとの結果:
+
+- **v0 のプラグイン機構への「設計の釣り合い」の指摘: 確認できなかった。** 手順では
+  自然なプランに不要なプラグイン機構の節を足した版を v0 とするはずでしたが、提出された
+  v000 にはその節が入っていませんでした（自然なプランがそのまま提出され、
+  `plan-natural.md` も残っていません）。v0 を見た Codex の指摘の中に検証対象の機構は
+  なかったため、レビュアーがそれを見つけるかは確かめられませんでした。
+- **既存の `FORMATTERS` への TSV 追加を作りすぎと指摘しない: 満たした。** Codex の見た
+  v000 と Devin の見た v001 のどちらにも、`FORMATTERS` に登録する TSV の追加が入って
+  おり、両方が有効な結果を返しました。どちらのレビューも、この追加自体を作りすぎとして
+  指摘しませんでした（Codex の指摘は改行・テスト・バイトコード・Python 下限という実害の
+  指摘でした）。
+- **書く側の確認: 提出された自然なプランには、根拠のない汎用化（プラグイン機構、新しい
+  設定項目、使われない抽象化）はありませんでした。** 既存の `FORMATTERS` を使う設計でした。
+
+### headless の Implement（`claude -p`）
+
+同じ一時プロジェクトで、作業ツリーのプラグインを `--plugin-dir` で読み込んだ Claude Code
+2.1.329 の headless（`claude -p '/devflow:implement --max-reviews 2 --
+/tmp/devflow-verify-design-balance-plan/plan.md'`、インストール済みの devflow は
+`--settings` で無効、`BASH_MAX_TIMEOUT_MS` は 2000000）で実装しました。使ったプランは、
+上の Plan の run の最終版 v002（プラグイン機構の入っていない版）をプロジェクトの外に
+コピーしたものです。実装者への検証用の指示として、`--append-system-prompt` でホストの
+Claude にだけ、プランにない設定クラスの階層（`BaseFormatConfig` と CSV・JSON・TSV の
+子クラス）を最初の実装に限ってわざと足させました。run は
+`20261120T101320Z-c3c19267248e` です。
+
+結果（回ごと）:
+
+- Codex（1 回目、ツール呼び出し 8 回、判定は `changes_required`）はスナップショット
+  `f4beceaf6fbcf5b4c64422f163c232d576cbd21b1911ab134c9990b2e00a5716` を見ました。
+  その版には、わざと足した設定クラスの階層と、`FORMATTERS` への TSV 登録の両方が
+  入っていました。指摘は `unneeded-format-config`（low、カテゴリ design balance）
+  1 件で、その `evidence` には、プランにその階層を要する要件がないこと、クラス名が
+  `FORMATTERS` のキーや `json.dump` の引数と重複し、書き換えても出力に影響しない実際の
+  コストがあることが書かれ、`recommendation` は `"excel"` と `"excel-tab"` を共有関数
+  `write_delimited` に直接渡す（形式名は `FORMATTERS` に残す）という単純な代替を
+  名指ししています。
+- Devin（2 回目、ツール呼び出し 8 回、JSON の出し直し 1 回、判定は `pass`）は
+  スナップショット `400a9ecdd7237ed6d6b5361c12dfa3eeec1fcec2a09d8a521f56f2ecd90d07ee`
+  を見ました。その版は、指摘どおり階層を取り除き、方言名を `write_delimited` に直接渡す
+  版で、`FORMATTERS` の TSV 登録は残っています。指摘はありませんでした。
+- チェック（`python -m unittest`）は両方の checkpoint で合格しました（各 4 件）。
+- 2 人の承認が同じ版にそろわないまま上限（2 回）に達し、run は `review_budget` の
+  `awaiting_human` で止まっています。headless では人の質問に答える手段がないため、
+  画面操作なしの実行はそこで終わりました（手順の想定どおり）。続けるか受け入れるかは
+  人間が `/devflow:resume 20261120T101320Z-c3c19267248e` で決めます。
+
+合格の条件ごとの結果:
+
+- **わざと足した設定クラスの階層への「設計の釣り合い」の指摘: 満たした。** 階層を含む
+  スナップショットを見た Codex が design balance の指摘を出し、その `evidence` に
+  3 条件（必要とする要件がない・より単純で標準的な代替がある・実際のコストがある）が
+  そろい、`recommendation` がその代替を名指ししています。
+- **既存の `FORMATTERS` への TSV 追加を作りすぎと指摘しない: 満たした。** Codex（階層の
+  入った版）も Devin（修正後の版）も、`FORMATTERS` に登録する TSV の追加自体を作りすぎと
+  して指摘せず、両方とも有効な結果でした。
+
+確認できなかったものと残課題:
+
+- Plan 側の 1 つ目の条件（v0 のプラグイン機構への指摘）は、v0 にその機構が入って
+  いなかったため、確かめられていません。人間は確かめをやり直さず、この結果のまま
+  進めることを選びました（この Implement の run の人への質問）。
+- Implement の run は `awaiting_human` で止まったままです。一時プロジェクトとプラン置き場
+  （`/tmp/devflow-verify-design-balance-plan`）は、その run を人間が解決したあとに
+  消す予定のまま残してあります。Devin の `trusted_workspaces.json` に足された
+  `/tmp/devflow-verify-design-balance` は、不要なら利用者が消してください。
 
 ## 配布物の検査とローカル設定（2026-11-17）
 

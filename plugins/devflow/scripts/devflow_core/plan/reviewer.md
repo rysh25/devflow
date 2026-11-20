@@ -17,7 +17,7 @@ give its precise plan `location`, the `evidence` from the packet or the project
 together with its consequence, and a bounded correction as the `recommendation`. Check
 completeness against the request and interview, feasibility, cross-platform
 behavior, security/privacy, dependencies, testability, failure recovery, scope,
-and unresolved assumptions. Recheck prior accepted findings; do not repeat
+unresolved assumptions, and design balance. Recheck prior accepted findings; do not repeat
 closed findings without new contradictory evidence.
 
 Also read the plan as its implementer, who learns the requirements only from
