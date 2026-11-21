@@ -1,4 +1,4 @@
-# DevFlow 0.12.7 — Claude Code / Codex CLI / Devin CLI Plugin
+# DevFlow 0.12.8 — Claude Code / Codex CLI / Devin CLI Plugin
 
 人間との要件整理から計画作成、実装、独立レビューまでを支援する **3つのホスト（Claude Code、Codex CLI、Devin CLI）で使える単一のプラグイン** です。インストールするプラグインは `devflow` だけです。
 
@@ -263,7 +263,7 @@ Implement は開始時のプランと作業ツリーを固定し、Claude Code �
 - Implement では、レビューの前後で実装場所のコード（スナップショットの範囲）が変わった回は、合格に数えません。
 - 計画レビューとコードレビューは、「設計の釣り合い」も確かめます（0.12.5 から）。作りすぎ（まだない種類のための抽象化・設定・プラグイン機構、裏付けのない最適化、理由のない独自のやり方）と、変更しやすさが足りないこと（重複、すでに複数の種類があるもののハードコード、既存の拡張点を塞ぐこと）を、1 つの観点として証拠で判定します。修正案は、欠陥を直す最も単純な修正に限ります。
 
-要件変更、重要な設計判断、権限・機密性・費用の問題では止まって、人間に確認します（エスカレーション）。解除には、止まった後に `AskUserQuestion` で得た実際の回答を記録します。普通の会話の返信や `/devflow:resume` だけを承認に読み替えません。
+要件変更、重要な設計判断、権限・機密性・費用の問題では止まって、人間に確認します（エスカレーション）。解除には、止まった後に `AskUserQuestion` で得た実際の回答を記録します。普通の会話の返信や `/devflow:resume` だけを承認に読み替えません。Claude Code では、Rewind で捨てた分岐の回答と、会話の記録（transcript）で確かめられない回答も使いません。使えない回答は `status` の `excluded_human_events` に理由付きで残り、その event ID での `resolve` は理由を示して断られます。
 
 ## プロジェクト設定
 
@@ -373,7 +373,9 @@ run-id は一回の作業を識別する自動生成 ID です。レビューご
 
 `.devflow/.gitignore` は非公開の実行データを無視するために作成します。プロジェクト直下の `.gitignore` を勝手に変更しません。Git で既に追跡済みのファイルは `.gitignore` では追跡解除されません。正式プランを保存しても `git add` / `commit` / `push` は実行しません。
 
-ランナーでは、読み取りも含めて常に `--host claude`、`--host codex`、`--host devin` のどれかを明示します。`--help` と `--version` はホスト指定なしで表示できます。run を変える操作（`cancel` など）は、run を所有する会話のセッションからだけ使えます。人間が自分の端末からランナーで操作するときは `--session` にそのセッションの ID を渡すか、先に `/devflow:resume RUN_ID` で今の会話へ引き継いでください。`status` と `doctor` は、どこからでも使えます。
+ランナーでは、読み取りも含めて常に `--host claude`、`--host codex`、`--host devin` のどれかを明示します。`--help` と `--version` はホスト指定なしで表示できます。run を変える操作（`cancel` など）は、run を所有する会話のセッションからだけ使えます。人間がランナーで操作するときは、Claude Code の外の端末（Claude Code の中の Bash や `!` からではなく）から、`--session` にそのセッションの ID を渡すか、先に `/devflow:resume RUN_ID` で今の会話へ引き継いでください。`status` と `doctor` は、どこからでも使えます。
+
+Claude Code の中で動くランナーは、`--session` が今の会話のセッション（`CLAUDE_CODE_SESSION_ID`）と違うとき、会話が Rewind やフォーク（Orca の rewind、`--fork-session` など）で別のセッションに代わったと見て、run を変える操作を止め、「この会話で `/devflow:resume RUN_ID` する」か「外の端末から `cancel` する」案内を出します。
 
 外部処理（チェック・レビュー）の途中で Claude Code を閉じた場合などは、run が処理中のまま残ります。関係するプロセスが止まったことを確かめてから、人間が自分の端末でランナーの `recover` を実行します。その回は使用済みのままです。`PLUGIN_DIR` はインストールしたプラグインのディレクトリ、`PROJECT_DIR` は対象プロジェクトです。Plan の `--expected-review` には、処理中だったレビューの回（`/devflow:status` の `review_count`）を渡します。
 
@@ -399,6 +401,21 @@ uv --no-cache run --offline --no-project --no-config --no-python-downloads "PLUG
 - push、公開、デプロイ、依存の追加、破壊的移行の前には、人間に確認するようスキルで頼んでいます。
 
 詳しくは [設計](docs/architecture.md)、[信頼の考え方と注意](docs/security.md)、[検証範囲](docs/validation.md) を参照してください。
+
+## 0.12.8 への更新
+
+0.12.7 の run は、そのまま続けられます（run の形式は変わりません。`status` に `excluded_human_events` が増えただけです）。
+
+変わったこと：
+
+- **Claude Code の会話の Rewind（巻き戻し）を、会話の記録（transcript）の構造から検知して止まるようになりました。** Plan の面接の封印（seal）で、面接の始まりより後に、新しい分岐が Claude の返事を含むそれまでの分岐を置き換えたと分かると、記録を残したまま止まり、run を cancel して面接をやり直すよう促します。取り下げた発言や、添付・進捗・写しだけの範囲の置き換えでは止まりません。transcript がないときは、今までどおりフックの記録だけで封印します。
+- **`AskUserQuestion` の答えは、質問が記録された transcript で確かめられるものだけを人間の判断として使います。** Rewind で捨てた分岐の答え、transcript が読めない・質問の記録がない答えは使いません。使えない答えは `status` の `excluded_human_events` に理由付きで残り、その event ID での `resolve` は理由を示して断られます。transcript が残らない起動のしかたで答え直しが進めないときは、封印後の Plan と Implement は、transcript が残る会話で `/devflow:resume RUN_ID` してから答え直してください。
+- **run を変える操作は、`--session` が今の会話のセッション（`CLAUDE_CODE_SESSION_ID`）と一致するときだけ受け付けます。** Orca の rewind や `--fork-session` などで会話が別のセッションに代わったあと、古い `--session` での操作は止め、「この会話で `/devflow:resume RUN_ID` する」か「Claude Code の外の端末から `cancel` する」案内を出します。`status`・`doctor`・`recover`（人間専用）は今までどおりどこからでも使え、`CLAUDE_CODE_SESSION_ID` がないとき（外の端末など）も今までどおりです。
+- **Codex の封印の停止メッセージに、巻き戻しの可能性と「cancel してやり直す」案内を足しました。** 判定は変わりません。
+
+分かっている制限：Claude Code の Rewind は、次の発言を送るまで transcript に残らないことがあります。その間に外の端末から `status` や `resolve` を使うと、巻き戻す前の答えがまだ数えられ得ます（Claude がランナーを動かすのは人間の次の発言のあとなので、Claude の操作では起きません）。Codex の resolve の穴と、Devin の `/revert`・`/fork` を検知しない制限は変わりません（[検証範囲](docs/validation.md) の「分かっている制限」）。
+
+0.12.7 に戻すときは、プラグインを戻します。手順は「0.12.7 への更新」の 0.12.6 に戻す手順と同じで、0.12.7 のコミットから取り出した配布物を、今の devflow と同じ範囲にローカルの配布物として入れ直し、各ホストのプラグインの一覧で 0.12.7 になったことを確かめます。run の形式は同じなので、0.12.8 で作った run も 0.12.7 で読めます。
 
 ## 0.12.7 への更新
 
@@ -692,7 +709,7 @@ uv --no-cache run --offline --no-project --no-config --no-python-downloads "PLUG
 - **CLI の版の制限をなくしました。** DevFlow が渡すフラグがあれば、どの版でも動きます。確かめた版より新しいときは、`doctor` が警告します。
 - **`BASH_MAX_TIMEOUT_MS` の設定は任意になりました。** 足りないときは、Claude がレビューをバックグラウンドで実行します（「[長い処理と Claude Code の Bash](#長い処理と-claude-code-の-bash)」）。
 - **DevFlow の git は、利用者の git の設定を使います。** 全体の gitignore（`core.excludesFile`）、改行の扱い（`core.autocrlf`）、`safe.directory` などが、利用者の git と同じに効きます。
-- **ランナーで run を変える操作には `--session` が要ります。** 人間が端末から `cancel` などをするときは、`--session` を付けるか、先に `/devflow:resume` で引き継いでください（「[保存場所と再開](#保存場所と再開)」）。
+- **ランナーで run を変える操作には `--session` が要ります。** 人間が端末から（Claude Code の中の Bash や `!` からではなく、Claude Code の外の端末から）`cancel` などをするときは、`--session` を付けるか、先に `/devflow:resume` で引き継いでください（「[保存場所と再開](#保存場所と再開)」）。
 - **Implement は worktree でも実装できます。** Claude Code が `start --workspace` で、同じリポジトリの別の worktree を実装場所に選べます。
 
 ## 開発・配布

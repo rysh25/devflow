@@ -14,6 +14,7 @@ from typing import Any, Callable
 
 from .environment import review_timeout_ms
 from .errors import DevFlowError
+from .sessions import require_caller
 
 RESOURCES = ("defaults.json", "reviewer.md", "review.schema.json")
 OPTION_KINDS = frozenset({"draft", "hash", "event", "decision", "text", "int", "confirm"})
@@ -198,4 +199,6 @@ class Workflow:
         engine = self.engine(project, session, host=host)
         if owned:
             engine.require_owner(run_id, session)
+            # The --session names the owner; it must also be THIS conversation.
+            require_caller(host, session, flow=self.name, run_id=run_id)
         return command.run(engine, args, run_id, session)

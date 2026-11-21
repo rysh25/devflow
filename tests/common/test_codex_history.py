@@ -118,6 +118,15 @@ class HistoryTests(RuntimeFixture):
         with patch.object(codex_interview, 'read_conversation', return_value=codex_host.Conversation(native, {}, {})):
             return codex_interview.capture_interview(marker, events, self.project)
 
+    def test_a_missing_start_or_question_turn_names_rewind_and_cancel(self):
+        marker, events, native = self.capture_case()
+        with self.assertRaisesRegex(CaptureError, 'rewound.*cancel this run'):
+            self.capture(dict(marker, turn_id='gone-turn'), events, native)
+        moved = [dict(event, turn_id='gone-turn') if index == 1 else event
+                 for index, event in enumerate(events)]
+        with self.assertRaisesRegex(CaptureError, 'rewound.*cancel this run'):
+            self.capture(marker, moved, native)
+
     def test_unanswered_native_result_is_preserved_without_counting_a_human(self):
         marker, events, native = self.capture_case('question_unanswered_pre.json', 'question_unanswered_post.json')
         out = self.capture(marker, events, native)

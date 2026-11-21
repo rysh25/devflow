@@ -240,6 +240,8 @@ def runner_start(project: Path, session: str | None, flow: str, raw: str, option
     """``FLOW start`` from the runner: creates exactly the run the user asked for."""
     if not session:
         raise DevFlowError("start requires the actual current host session ID")
+    # The --session names the session that asked; it must also be THIS conversation.
+    sessions.require_caller(host, session, flow=flow)
     workflow = WORKFLOWS[flow]
     all_stores = stores(project, host=host)
     refusal = f"Start only from an explicit /devflow:{flow} command in this session"

@@ -13,7 +13,7 @@ from . import summary
 from .errors import DevFlowError
 from .review import REVIEW_BUDGET
 from .runs import RUNNER_WAIT, TERMINAL, RunStore
-from .sessions import approval_candidates, prefilled_question_events
+from .sessions import approval_evidence, prefilled_question_events
 from .storage import now, read_json, writable_text
 
 
@@ -137,10 +137,11 @@ class RunEngine:
         # not raised. Acting on an event (resolve) still reads them strictly.
         try:
             events = self._events(state)
-            result.update(human_events=approval_candidates(state, events),
+            candidates, excluded = approval_evidence(state, events)
+            result.update(human_events=candidates, excluded_human_events=excluded,
                           prefilled_questions=len(prefilled_question_events(events)), events_error=None)
         except (DevFlowError, OSError, ValueError) as exc:
-            result.update(human_events=[], prefilled_questions=None,
+            result.update(human_events=[], excluded_human_events=[], prefilled_questions=None,
                           events_error=f"Human event records cannot be read: {exc}")
         self._review_summary(state, result)
         self._status_details(state, result)

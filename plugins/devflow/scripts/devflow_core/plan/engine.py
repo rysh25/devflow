@@ -16,7 +16,7 @@ from ..common.review import (LIMIT_DECISIONS, REVIEW_BUDGET, after_failed_review
 from ..common.reviewers import preflight, prepare_review, recorded_cli_version, review_tokens, run_review
 from ..common.engine import RunEngine
 from ..common.runs import RUNNER_WAIT, TERMINAL, ensure_data_root, open_escalation
-from ..common.sessions import approval_candidates
+from ..common.sessions import approval_evidence
 from ..common import summary
 from ..common.storage import (atomic_json, check_json_size, checked_text, digest, file_lock, json_bytes, no_symlinks,
                               now, read_json, within, write_new, writable_text)
@@ -460,9 +460,13 @@ class Engine(RunEngine):
                     or (budget and value["decision"] not in LIMIT_DECISIONS)):
                 raise DevFlowError("Human answer requires answer and actual recorded event_ids, and decision "
                                    "continue, stop or accept for the review limit question.")
-            available = {item["event_id"]: item["answer_text"] for item in approval_candidates(state, self._events(state))}
+            candidates, excluded = approval_evidence(state, self._events(state))
+            available = {item["event_id"]: item["answer_text"] for item in candidates}
+            reasons = {item["event_id"]: item["reason"] for item in excluded}
             if len(set(value["event_ids"])) != len(value["event_ids"]) or any(not isinstance(i, str) or i not in available for i in value["event_ids"]):
-                raise DevFlowError("Resolution must cite new successful AskUserQuestion responses after the pause; ordinary prompts are not approval.")
+                why = next((f" (event {i}: {reasons[i]})" for i in value["event_ids"] if i in reasons), "")
+                raise DevFlowError("Resolution must cite new successful AskUserQuestion responses after the pause; "
+                                   "ordinary prompts are not approval." + why)
             expected = "\n".join(available[i] for i in value["event_ids"])
             if value["answer"] != expected:
                 raise DevFlowError("Human answer must exactly match recorded answer_text; do not paraphrase or invent consent.")

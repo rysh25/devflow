@@ -13,7 +13,7 @@ from ..common import summary
 from ..common.reviewers import preflight, prepare_review, recorded_cli_version, review_tokens, run_review
 from ..common.engine import RunEngine
 from ..common.runs import RUNNER_WAIT, TERMINAL, open_escalation
-from ..common.sessions import approval_candidates
+from ..common.sessions import approval_evidence
 from ..common.storage import checked_text, digest, json_bytes, no_symlinks, now, read_json, within, writable_text
 
 
@@ -358,10 +358,13 @@ class Engine(RunEngine):
             self._owner(state,session_id)
             self._require(state,{"awaiting_human"})
             esc = state["escalation"]
-            matches = [x for x in approval_candidates(state, self.store.events(state)) if x["event_id"] == event_id]
+            candidates, excluded = approval_evidence(state, self.store.events(state))
+            matches = [x for x in candidates if x["event_id"] == event_id]
             if len(matches) != 1:
+                why = next((item["reason"] for item in excluded if item["event_id"] == event_id), None)
                 raise DevFlowError("Use the event ID of a successful AskUserQuestion answer recorded AFTER this escalation, "
-                                   "in the session that owns the run; ordinary prompts and the resume command are not answers")
+                                   "in the session that owns the run; ordinary prompts and the resume command are not answers"
+                                   + (f" ({why})" if why else ""))
             kind = esc["detail"]["kind"]
             budget = kind == REVIEW_BUDGET
             allowed = set(LIMIT_DECISIONS) if budget else {"continue","cancel"}

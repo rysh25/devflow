@@ -1255,5 +1255,113 @@ class ParallelRunTests(RuntimeFixture):
         root = self.project / ".devflow" / "runs" / "implement"
         self.assertEqual(sorted(path.name for path in root.iterdir()) if root.exists() else [], [])
 
+
+class CallerSessionTests(RuntimeFixture):
+    """``CLAUDE_CODE_SESSION_ID`` names the actual calling conversation.
+
+    An Orca rewind forks to a new Claude session while the run's instructions
+    still carry the old ``--session`` value. A command that changes a run must
+    stop then; looking is always allowed.
+    """
+
+    def test_a_start_from_a_forked_conversations_old_session_is_refused(self):
+        self.prompt("/devflow:implement feature.md")
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "forked-conversation"}):
+            with self.assertRaisesRegex(DevFlowError, "not this conversation's session"):
+                runtime.runner_start(self.project, self.session, "implement", "feature.md", host="claude")
+        self.assertIsNone(self.record()["run"])
+        # With no claim about the calling conversation (a terminal), the same start runs.
+        status = runtime.runner_start(self.project, self.session, "implement", "feature.md", host="claude")
+        self.assertEqual(status["status"], "implementing")
+
+    def test_an_owned_command_from_a_forked_conversation_is_refused_with_guidance(self):
+        run_id = self.implement_start()
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "forked-conversation"}):
+            code, out, _ = self.invoke("--session", self.session, "--run", run_id,
+                                       "implement", "cancel", "--reason", "stop")
+            self.assertEqual(code, 2)
+            message = json.loads(out)["message"]
+            self.assertIn("not this conversation's session", message)
+            self.assertIn("/devflow:resume " + run_id, message)
+            self.assertIn("implement cancel --reason", message)
+            # The message names no real path: placeholders only, as the README's recover example does.
+            self.assertIn('"PLUGIN_DIR', message)
+            self.assertNotIn(str(self.project), message)
+            self.assertNotIn(str(self.base), message)
+        self.assertEqual(self.engine("implement").status(run_id)["status"], "implementing")
+        # Read-only commands, hooks, and the human-only recover are unaffected.
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "forked-conversation"}):
+            code, out, _ = self.invoke("--session", self.session, "--run", run_id, "implement", "status")
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(out)["status"], "implementing")
+            code, out, _ = self.invoke("--session", self.session, "--run", run_id, "implement", "doctor")
+            self.assertEqual(code, 0)
+            self.assertIn("hookSpecificOutput", self.prompt("an ordinary prompt"))
+
+    def test_recover_from_a_forked_conversation_still_works(self):
+        # Human-only recover is owner-independent: the forked conversation may
+        # end an interrupted dispatch even though it cannot run owned commands.
+        run_id = self.implement_start()
+        state_path = self.run_dir("implement", run_id) / "state.json"
+        stored = read_json(state_path)
+        atomic_json(state_path, dict(stored, status="checking", inflight={
+            "kind": "check", "number": 1, "reviewer_id": None, "target": None,
+            "started_at": stored["created_at"]}))
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "forked-conversation"}):
+            code, out, _ = self.invoke("--session", self.session, "--run", run_id,
+                                       "implement", "recover", "--confirm-process-stopped")
+            self.assertEqual(code, 0, out)
+        recovered = self.engine("implement").status(run_id)
+        self.assertEqual(recovered["status"], "paused_error")
+        self.assertIsNone(recovered["inflight"])
+
+    def test_the_same_caller_session_and_no_claim_still_pass(self):
+        run_id = self.implement_start()
+        for environ in ({"CLAUDE_CODE_SESSION_ID": self.session}, {}):
+            with self.subTest(environ=environ), patch.dict(os.environ, environ):
+                code, out, _ = self.invoke("--session", self.session, "--run", run_id,
+                                           "implement", "cancel", "--reason", "stop")
+                self.assertEqual(code, 0)
+                self.assertEqual(self.engine("implement").status(run_id)["status"], "cancelled")
+                run_id = self.implement_start()
+
+    def test_other_hosts_have_no_caller_session(self):
+        from devflow_core.common.sessions import caller_session, require_caller
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "forked-conversation"}):
+            for host in ("codex", "devin"):
+                self.assertIsNone(caller_session(host))
+                require_caller(host, "owner-session", flow="implement", run_id="x")  # No raise.
+
+    def test_status_from_a_fork_shows_no_usable_answers(self):
+        run_id = self.implement_start()
+        engine = self.engine("implement")
+        path = self.run_dir("implement", run_id) / "draft" / "questions.json"
+        write_new(path, [json.dumps({"reason": "Decide.", "questions": ["Continue?"]}).encode()])
+        engine.escalate(run_id, self.session, path)
+        self.ask("asked", questions=[{"question": "Continue?"}])
+        self.tool_use("asked")
+        runtime.handle_hook(self.payload(event="PostToolUse", tool_name="AskUserQuestion", tool_use_id="asked",
+                                         tool_input={"questions": [{"question": "Continue?"}]},
+                                         tool_response={"answers": {"Continue?": "Yes"}}), PLUGIN, host="claude")
+        self.assertEqual(len(engine.status(run_id)["human_events"]), 1)
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "forked-conversation"}):
+            status = engine.status(run_id)
+        self.assertEqual(status["human_events"], [])
+        self.assertEqual([item["reason"] for item in status["excluded_human_events"]],
+                         ["the calling conversation is not the run's owner session"])
+        # The same status from the owning conversation keeps the answer.
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": self.session}):
+            self.assertEqual(len(engine.status(run_id)["human_events"]), 1)
+
+    def tool_use(self, tool_use_id):
+        """The question's tool_use record in the session transcript, a real chain record."""
+        record = {"type": "assistant", "uuid": "transcript-" + tool_use_id, "parentUuid": None,
+                  "message": {"role": "assistant", "content": [
+                      {"type": "tool_use", "id": tool_use_id, "name": "AskUserQuestion",
+                       "input": {"questions": [{"question": "Continue?"}]}}]}}
+        with self.transcript.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 if __name__ == "__main__":
     unittest.main()
