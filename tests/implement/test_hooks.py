@@ -48,14 +48,27 @@ class Fixture(unittest.TestCase):
         self.plan = self.project / "feature.md"
         self.plan.write_text("Implement a tested feature.\n", encoding="utf-8")
         self.session_id = "claude-session-123"
+        self.transcript = self.base / "claude-transcript.jsonl"
+        self._chain_tail = None  # Last uuid written to the transcript (chain records link to it).
         self.run = self.project / ".devflow" / "runs" / "implement" / RUN_ID
         self.draft = self.run / "draft"
 
     def payload(self, event="PreToolUse", tool="Read", **tool_input):
         return {
             "hook_event_name": event, "cwd": str(self.project), "session_id": self.session_id,
-            "tool_name": tool, "tool_input": tool_input,
+            "transcript_path": str(self.transcript), "tool_name": tool, "tool_input": tool_input,
         }
+
+    def tool_use(self, tool_use_id, tool_input=None):
+        """The question's ``tool_use`` record in the session transcript, a real chain record."""
+        uuid = "transcript-" + tool_use_id
+        record = {"type": "assistant", "uuid": uuid, "parentUuid": self._chain_tail,
+                  "message": {"role": "assistant", "content": [{"type": "tool_use", "id": tool_use_id,
+                      "name": "AskUserQuestion",
+                      "input": tool_input or {"questions": [{"question": "Continue?"}]}}]}}
+        self._chain_tail = uuid
+        with self.transcript.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def runner(self, *arguments, flow="implement"):
         arguments = list(arguments)
@@ -410,6 +423,8 @@ class SessionCaptureTests(Fixture):
         Claude sent it, without the screen's fields), then PostToolUse."""
         asked = {key: value for key, value in payload["tool_input"].items()
                  if key not in sessions.SCREEN_FILLED_QUESTION_FIELDS}
+        if isinstance(payload.get("tool_use_id"), str) and payload["tool_use_id"]:
+            self.tool_use(payload["tool_use_id"], asked)
         before = dict(payload, hook_event_name="PreToolUse", tool_input=asked)
         for key in ("tool_response", "is_error"):
             before.pop(key, None)
@@ -605,7 +620,17 @@ class ApprovalTests(Fixture):
     def ask(self, tool_use_id, **fields):
         payload = self.payload(tool="AskUserQuestion", questions=[{"question": "Continue?"}], **fields)
         payload["tool_use_id"] = tool_use_id
+        self.tool_use(tool_use_id, payload["tool_input"])
         self.assertIsNone(self.hook(payload))
+
+    def chain(self, kind, uuid, parent="tail"):
+        """Append a user/assistant chain record; "tail" links to the previous one."""
+        record = {"type": kind, "uuid": uuid,
+                  "parentUuid": self._chain_tail if parent == "tail" else (parent or None),
+                  "message": {"role": kind, "content": "record"}}
+        self._chain_tail = uuid
+        with self.transcript.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def reply(self, tool_use_id, **extra):
         payload = self.payload(event="PostToolUse", tool="AskUserQuestion", questions=[{"question": "Continue?"}],
@@ -658,6 +683,141 @@ class ApprovalTests(Fixture):
         event_id = self.reply("subagent-question", agent_id="agent-1", agent_type="Explore")
         self.assertEqual(self.candidates(), [])
         self.assert_cannot_resolve(event_id)
+
+    def status(self):
+        return Engine(self.project, host="claude").status(self.run_id)
+
+    def test_a_rewound_answer_is_excluded_and_says_why(self):
+        self.ask("asked")
+        event_id = self.reply("asked")
+        self.assertEqual(self.candidates(), [event_id])
+        self.chain("assistant", "after-asked")
+        # A real rewind: the new branch's first record reparents to a record the
+        # verification never saw, abandoning the branch that held the answer.
+        self.chain("user", "rewind-head", parent="before-this-conversation")
+        status = self.status()
+        self.assertEqual(status["human_events"], [])
+        self.assertEqual(status["excluded_human_events"],
+                         [{"event_id": event_id,
+                           "reason": "the answer is on a conversation branch a rewind discarded"}])
+        with self.assertRaisesRegex(DevFlowError, "a rewind discarded"):
+            Engine(self.project, host="claude").resolve(self.run_id, self.session_id, event_id,
+                                                        "continue", "The human agreed.")
+        self.assertEqual(self.stored()["status"], "awaiting_human")
+
+    def test_only_the_answer_on_the_discarded_branch_is_excluded(self):
+        self.ask("kept")
+        kept = self.reply("kept")
+        self.ask("lost")
+        lost = self.reply("lost")
+        self.assertEqual(self.candidates(), [kept, lost])
+        self.chain("assistant", "discarded-reply")
+        # The new branch reparents to the kept question's record: only the
+        # records between it and the head (lost's question and reply) are discarded.
+        self.chain("user", "rewind-head", parent="transcript-kept")
+        status = self.status()
+        self.assertEqual([item["event_id"] for item in status["human_events"]], [kept])
+        self.assertEqual(status["excluded_human_events"],
+                         [{"event_id": lost,
+                           "reason": "the answer is on a conversation branch a rewind discarded"}])
+
+    def test_an_unreadable_line_excludes_only_earlier_answers(self):
+        self.ask("early")
+        early = self.reply("early")
+        with self.transcript.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write('{"type": "assistant",\n')
+        self.ask("late")
+        late = self.reply("late")
+        status = self.status()
+        # The question after the unreadable line stays usable; the one before it cannot be verified.
+        self.assertEqual([item["event_id"] for item in status["human_events"]], [late])
+        self.assertEqual(status["excluded_human_events"],
+                         [{"event_id": early, "reason": "the transcript could not be read after the question"}])
+        # And the new answer resolves (R5-3: only the earlier answer is excluded).
+        result = Engine(self.project, host="claude").resolve(self.run_id, self.session_id, late,
+                                                             "continue", "The human agreed.")
+        self.assertNotEqual(result["status"], "awaiting_human")
+
+    def test_an_answer_is_unverifiable_when_the_transcript_cannot_be_read(self):
+        self.ask("gone")
+        post = self.payload(event="PostToolUse", tool="AskUserQuestion", questions=[{"question": "Continue?"}],
+                            answers={"Continue?": "Yes"})
+        post.update(tool_use_id="gone", tool_response={"answers": {"Continue?": "Yes"}},
+                    transcript_path=str(self.transcript.parent / "no-such-transcript.jsonl"))
+        self.hook(post)
+        event_id = self.events()[-1]["event_id"]
+        status = self.status()
+        self.assertEqual(status["human_events"], [])
+        [excluded] = status["excluded_human_events"]
+        self.assertEqual(excluded["event_id"], event_id)
+        self.assertTrue(excluded["reason"].startswith("the transcript cannot be read:"), excluded["reason"])
+
+    def test_an_invalid_transcript_path_excludes_only_its_own_answers(self):
+        # A path stat() cannot take (embedded NUL) and a path that is not a
+        # regular file are per-transcript failures: other groups still verify.
+        self.ask("kept")
+        kept = self.reply("kept")
+        for tool_id, path in (("nul-path", "bad\0transcript"),
+                              ("directory", str(self.project))):
+            self.ask(tool_id)
+            post = self.payload(event="PostToolUse", tool="AskUserQuestion",
+                                questions=[{"question": "Continue?"}], answers={"Continue?": "Yes"})
+            post.update(tool_use_id=tool_id, tool_response={"answers": {"Continue?": "Yes"}},
+                        transcript_path=path)
+            self.hook(post)
+        status = self.status()
+        self.assertEqual([item["event_id"] for item in status["human_events"]], [kept])
+        reasons = [item["reason"] for item in status["excluded_human_events"]]
+        self.assertEqual(len(reasons), 2)
+        for reason in reasons:
+            self.assertTrue(reason.startswith("the transcript cannot be read:"), reason)
+        result = Engine(self.project, host="claude").resolve(self.run_id, self.session_id, kept,
+                                                             "continue", "The human agreed.")
+        self.assertNotEqual(result["status"], "awaiting_human")
+
+    def test_several_answers_in_one_transcript_are_verified_in_one_read(self):
+        self.ask("first")
+        first = self.reply("first")
+        self.ask("second")
+        second = self.reply("second")
+        calls = []
+        real_scan = sessions._scan_tail
+
+        def counting(path, wanted):
+            calls.append(set(wanted))
+            return real_scan(path, wanted)
+
+        with patch("devflow_core.common.sessions._scan_tail", counting):
+            status = self.status()
+        self.assertEqual(calls, [{"first", "second"}])
+        self.assertEqual([item["event_id"] for item in status["human_events"]], [first, second])
+
+    def test_an_answer_without_a_named_transcript_cannot_be_verified(self):
+        self.ask("ghost")
+        post = self.payload(event="PostToolUse", tool="AskUserQuestion", questions=[{"question": "Continue?"}],
+                            answers={"Continue?": "Yes"})
+        post.update(tool_use_id="ghost", tool_response={"answers": {"Continue?": "Yes"}})
+        del post["transcript_path"]
+        self.hook(post)
+        event_id = self.events()[-1]["event_id"]
+        status = self.status()
+        self.assertEqual(status["human_events"], [])
+        self.assertEqual(status["excluded_human_events"],
+                         [{"event_id": event_id, "reason": "the answer's record does not name a transcript"}])
+
+    def test_a_question_missing_from_the_transcript_cannot_be_verified(self):
+        # A hook-recorded question whose tool_use never reached the transcript stays unverifiable.
+        self.chain("user", "root", parent="")  # The transcript exists; the question is not in it.
+        pre = self.payload(tool="AskUserQuestion", questions=[{"question": "Continue?"}])
+        pre["tool_use_id"] = "not-written"
+        self.assertIsNone(self.hook(pre))
+        self.reply("not-written")
+        event_id = self.events()[-1]["event_id"]
+        status = self.status()
+        self.assertEqual(status["human_events"], [])
+        self.assertEqual(status["excluded_human_events"],
+                         [{"event_id": event_id,
+                           "reason": "the question's tool_use record is not in the transcript"}])
 
 
 if __name__ == "__main__":

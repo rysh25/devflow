@@ -10,11 +10,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
+import stat
 from pathlib import Path
 from typing import Any, Mapping
 
+from . import rewinds
 from .errors import CaptureError, DevFlowError
-from .hosts import HOSTS, asked_questions
+from .hosts import HOSTS, asked_questions, host_profile
 from .runs import (RUN_ID, SESSION_ID, TERMINAL, RunStore, data_root, validate_event)
 from .storage import atomic_json, no_symlinks, read_json
 
@@ -225,6 +228,48 @@ def settle_pending_start(record: dict, stores: Mapping[str, RunStore]) -> dict:
     return dict(record, pending_start=None)
 
 
+# -- the calling conversation ---------------------------------------------------------------
+
+def caller_session(host: str) -> str | None:
+    """The calling conversation's session ID, when the host can name it.
+
+    Claude Code exports ``CLAUDE_CODE_SESSION_ID`` to hooks and to the commands
+    they run; an Orca rewind forks to a new Claude session while an old run's
+    instructions may still carry the previous ``--session`` value. Other hosts
+    cannot name the calling conversation, so they answer None and every caller
+    check keeps its previous behavior.
+    """
+    if host != "claude":
+        return None
+    return os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+
+
+def require_caller(host: str, session: str | None, *, flow: str, run_id: str | None = None) -> None:
+    """Stop a command whose ``--session`` names a different Claude conversation.
+
+    ``session`` is the ``--session`` the command was given (the run's owner for
+    an owned command). When the host can name the actual calling conversation
+    and it differs, the conversation was forked or replaced and the command
+    must not act through the old session's identity.
+    """
+    caller = caller_session(host)
+    if caller is None or session is None or caller == session:
+        return
+    profile = host_profile(host)
+    first = (f"--session {session} is not this conversation's session ({caller}); the conversation was "
+             "probably forked (Orca rewind, --fork-session) or replaced.")
+    if run_id is None:
+        raise DevFlowError(first + f" Start again in this conversation with {profile.command_prefix}{flow}.")
+    cancel = ('uv --no-cache run --offline --no-project --no-config --no-python-downloads '
+              '"PLUGIN_DIR/scripts/devflow.py" --host ' + host + ' --project "PROJECT_DIR" '
+              f"--session {session} --run {run_id} " +
+              ('implement cancel --reason "REASON"' if flow == "implement" else "plan cancel"))
+    raise DevFlowError(first + f" A run that can move sessions resumes here with "
+                       f"{profile.command_prefix}resume {run_id}.\n"
+                       f"An unsealed interview cannot move; cancel it from a terminal outside "
+                       f"{profile.label}: {cancel}")
+
+
 # -- human answers --------------------------------------------------------------------------
 
 def _json(value: Any) -> str:
@@ -323,7 +368,37 @@ def approval_candidates(state: dict, events: list[dict]) -> list[dict]:
     the question screen adds the human's answers. An answer counts only when
     that observation exists and shows the model did not fill the answers in
     itself; when the hook could not record it, the answer is not evidence.
+
+    A Claude answer must also be verifiable in the transcript the hook named: a
+    rewound conversation's discarded answer, an answer whose question is not in
+    the transcript, and an answer the transcript cannot prove are all rejected.
     """
+    return approval_evidence(state, events)[0]
+
+
+def approval_evidence(state: dict, events: list[dict]) -> tuple[list[dict], list[dict]]:
+    """``(candidates, excluded)``: usable answers, and qualified answers rejected
+    with a ``{"event_id", "reason"}`` each.
+
+    Exclusion never removes evidence of the answer itself: the event stays
+    recorded; it cannot resolve the escalation.
+    """
+    base = _qualified_answers(state, events)
+    if not base:
+        return [], []
+    caller = caller_session(state["owner_host"])
+    if caller is not None and caller != state["owner_session"]:
+        return [], [{"event_id": item["event_id"],
+                     "reason": "the calling conversation is not the run's owner session"}
+                    for item, _ in base]
+    if state["owner_host"] != "claude":
+        return [item for item, _ in base], []  # Only Claude has a transcript to check.
+    kept, rejected = _verify_answers(base)
+    return kept, [{"event_id": item["event_id"], "reason": reason} for item, reason in rejected]
+
+
+def _qualified_answers(state: dict, events: list[dict]) -> list[tuple[dict, dict]]:
+    """``(candidate, payload)`` pairs the timing, session and content rules accept."""
     escalation = state.get("escalation")
     if not escalation:
         return []
@@ -354,5 +429,114 @@ def approval_candidates(state: dict, events: list[dict]) -> list[dict]:
             text = human_answer_text(payload.get("tool_response"))
         except CaptureError:
             continue
-        result.append({"event_id": event["event_id"], "kind": "question", "answer_text": text})
+        result.append(({"event_id": event["event_id"], "kind": "question", "answer_text": text}, payload))
     return result
+
+
+#: Chunk size for the reverse transcript read in answer verification.
+_TAIL_CHUNK = 1 << 18
+
+
+def _scan_tail(path: Path, wanted: set) -> tuple[list, dict]:
+    """Reverse-read ``path``; parse every scanned line's structure.
+
+    The read starts at the file's size at this moment and never crosses it:
+    records appended during the read are not part of the conversation this
+    check sees. Returns ``(lines, found)`` — the parsed lines in file order
+    from the earliest scanned line, and each wanted tool_use id mapped to its
+    index there. Stops when every id is found or the file's first byte is
+    reached; the last in-file copy wins, matching which line the check finds.
+    """
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise DevFlowError("the transcript is not a regular file")
+    end = info.st_size
+    lines, found = [], {}
+    tail_parts: list = []       # Pieces of the rightmost incomplete line, in file order.
+
+    def take(raw: bytes) -> None:
+        lines.append(rewinds.parse_bytes(raw))
+        for tool_id in lines[-1].tool_use_ids:
+            if tool_id in wanted:
+                found.setdefault(tool_id, len(lines) - 1)
+
+    # O_NONBLOCK keeps a fifo swapped in after the check from blocking the open.
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(path, flags)
+    with os.fdopen(descriptor, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise DevFlowError("the transcript is not a regular file")
+        while end > 0 and len(found) < len(wanted):
+            start = max(0, end - _TAIL_CHUNK)
+            stream.seek(start)
+            chunk = stream.read(end - start)
+            if len(chunk) != end - start:
+                raise DevFlowError("the transcript shrank while it was being read")
+            parts = chunk.split(b"\n")
+            # The chunk's trailing piece completes the line accumulated to its
+            # right; a line spanning several chunks joins its pieces once.
+            tail_parts.insert(0, parts[-1])
+            if len(parts) > 1:
+                take(b"".join(tail_parts))
+                tail_parts = [parts[0]]
+                for raw in reversed(parts[1:-1]):
+                    take(raw)
+            end = start
+        if tail_parts and len(found) < len(wanted):
+            line = b"".join(tail_parts)
+            if line:
+                take(line)  # The file's first line (a boundary fragment is never complete).
+    lines.reverse()
+    return lines, {tool_id: len(lines) - 1 - at for tool_id, at in found.items()}
+
+
+def _verify_answers(pairs: list[tuple[dict, dict]]) -> tuple[list[dict], list[tuple[dict, str]]]:
+    """Keep qualified answers the transcript confirms; reject the rest with reasons."""
+    reasons: dict[int, str] = {}
+    groups: dict[str, dict[str, list[int]]] = {}
+    for index, (_, payload) in enumerate(pairs):
+        path = payload.get("transcript_path")
+        tool_id = payload.get("tool_use_id")
+        if not isinstance(path, str) or not path.strip():
+            reasons[index] = "the answer's record does not name a transcript"
+        elif not isinstance(tool_id, str) or not tool_id:
+            reasons[index] = "the answer's record does not name its question's tool_use id"
+        else:
+            groups.setdefault(path, {}).setdefault(tool_id, []).append(index)
+    for path, wanted in groups.items():
+        try:
+            scanned, found = _scan_tail(Path(path), set(wanted))
+        except (OSError, ValueError, DevFlowError) as exc:
+            for indexes in wanted.values():
+                for index in indexes:
+                    reasons[index] = f"the transcript cannot be read: {exc}"
+            continue
+        if found:
+            first = min(found.values())
+            # The fed range starts at the earliest found question: re-appended
+            # records whose originals precede it can mislead both directions
+            # (a documented, human-approved limitation).
+            tracker = rewinds.BranchTracker()
+            for line in scanned[first:]:
+                tracker.feed(line)
+            gone = tracker.discarded(set(found))
+            unreadable = [index for index, line in enumerate(scanned) if line.unreadable and index >= first]
+            for tool_id, indexes in wanted.items():
+                position = found.get(tool_id)
+                if position is None:
+                    reason = "the question's tool_use record is not in the transcript"
+                elif tool_id in gone:
+                    reason = "the answer is on a conversation branch a rewind discarded"
+                elif any(beyond > position for beyond in unreadable):
+                    reason = "the transcript could not be read after the question"
+                else:
+                    continue
+                for index in indexes:
+                    reasons[index] = reason
+        else:
+            for indexes in wanted.values():
+                for index in indexes:
+                    reasons[index] = "the question's tool_use record is not in the transcript"
+    kept = [item for index, (item, _) in enumerate(pairs) if index not in reasons]
+    rejected = [(pairs[index][0], reasons[index]) for index in sorted(reasons)]
+    return kept, rejected

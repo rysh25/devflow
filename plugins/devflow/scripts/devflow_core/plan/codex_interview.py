@@ -18,7 +18,9 @@ def capture_interview(marker: dict, events: list[dict], project) -> dict:
     unknown, ignored = dict(conversation.unknown_types), dict(conversation.ignored_types)
     first = next((i for i, row in enumerate(records) if row.turn_id == start and row.role == "user"), None)
     if first is None:
-        raise CaptureError("The actual start input is missing from Codex conversation records")
+        raise CaptureError("The actual start input is missing from Codex conversation records; "
+                           "the conversation may have been rewound (Esc Esc to an earlier message); "
+                           "cancel this run and start it again")
     records = records[first:]
     original = next((event for event in events if event.get("hook_event_name") == "UserPromptSubmit"
                      and event.get("turn_id") == start and event.get("session_id") == session), None)
@@ -46,7 +48,9 @@ def capture_interview(marker: dict, events: list[dict], project) -> dict:
     def add_event(event, index, role, content, kind):
         positions = turns.get(event.get("turn_id"))
         if not positions:
-            raise CaptureError("Question turn is missing from the native Codex conversation")
+            raise CaptureError("Question turn is missing from the native Codex conversation; "
+                               "the conversation may have been rewound (Esc Esc to an earlier message); "
+                               "cancel this run and start it again")
         stamp = event.get("captured_at")
         anchor = positions[-1] + 1
         resolution, ambiguous = None, True

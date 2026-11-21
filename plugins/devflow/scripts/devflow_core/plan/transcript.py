@@ -13,11 +13,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
 from ..common.operations import public_command
 from pathlib import Path
 from typing import Any
+from ..common import rewinds
 from ..common.counts import tally
 from ..common.errors import CaptureError
 from ..common.sessions import SCREEN_FILLED_QUESTION_FIELDS, answer_content as _answer_content, prefilled_question
@@ -87,16 +87,8 @@ def _read_answer(value: Any) -> str | None:
         return None
 
 
-def _invalid_constant(name: str) -> None:
-    raise ValueError(f"{name} is not JSON")
-
-
-def _finite(text: str) -> float:
-    """A JSON number that stays a JSON number (1e999 would become infinity)."""
-    value = float(text)
-    if not math.isfinite(value):
-        raise ValueError(f"{text} is out of range")
-    return value
+_invalid_constant = rewinds._invalid_constant
+_finite = rewinds._finite
 
 
 def transcript_marker(path: str | None) -> dict:
@@ -287,6 +279,8 @@ def capture_interview(marker: dict, events: list[dict], *, host: str = "claude")
     # No transcript (no path, or a file Claude Code never wrote): the hook records alone.
     missing = marker["path"] is None or not (marker.get("existed") or Path(marker["path"]).exists())
     segment = _Segment(marker)
+    # Rewind detection reads the same lines the capture loop reads, nothing else.
+    tracker = rewinds.BranchTracker() if host == "claude" else None
 
     messages: list[dict] = []
     questions: dict[str, dict] = {}
@@ -363,6 +357,8 @@ def capture_interview(marker: dict, events: list[dict], *, host: str = "claude")
             record = json.loads(line, parse_constant=_invalid_constant, parse_float=_finite)
         except ValueError as exc:
             raise CaptureError(f"Malformed or incomplete transcript JSONL at segment line {number}") from exc
+        if tracker is not None:
+            tracker.feed(rewinds.record_line(record))
         if not isinstance(record, dict):
             skip_unknown("records", "(line in another form)")
             ignored_records += 1
@@ -557,6 +553,10 @@ def capture_interview(marker: dict, events: list[dict], *, host: str = "claude")
                     unhooked.append(add("user", part, {**source, "kind": "prompt", "hook_record": False,
                                                        **({"origin_kind": "human"} if marked else {})}))
         visible_records += 1
+
+    if tracker is not None and tracker.rewound() is not None:
+        raise CaptureError("The conversation was rewound after the interview started (an abandoned "
+                           "branch holds Claude's reply); cancel this run and start the interview again")
 
     # The original slash command may not be serialized as literal text. Its raw
     # hook event is nevertheless authoritative and belongs at the start.

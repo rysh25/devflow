@@ -189,6 +189,7 @@ class FlowFixture(unittest.TestCase):
         self.source.write_text("VALUE = 1\n", encoding="utf-8")
         self.session = "integration-session-1"
         self.transcript = self.base / "claude-transcript.jsonl"
+        self._chain_tail = None  # Last uuid written to the transcript (chain records link to it).
         self.engine = BuildEngine(self.project, BUILD_PLUGIN, host="claude")
         self.plan_engine = PlanEngine(self.project, PLAN_PLUGIN, host="claude")
         self.run_id = None
@@ -206,6 +207,16 @@ class FlowFixture(unittest.TestCase):
 
     def submit(self, prompt, session=None):
         return hook(self.event(session=session, prompt=prompt), PLUGIN, host="claude")
+
+    def tool_use(self, tool_use_id, tool_input):
+        """The question's ``tool_use`` record in the session transcript, a real chain record."""
+        uuid = "transcript-" + tool_use_id
+        record = {"type": "assistant", "uuid": uuid, "parentUuid": self._chain_tail,
+                  "message": {"role": "assistant", "content": [{"type": "tool_use", "id": tool_use_id,
+                      "name": "AskUserQuestion", "input": tool_input}]}}
+        self._chain_tail = uuid
+        with self.transcript.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def record(self, session=None):
         return sessions.read_record(self.project, session or self.session, WORKFLOWS, host="claude")
@@ -386,6 +397,7 @@ class HookCliEngineTests(FlowFixture):
         actual = "Keep the existing API and continue with a compatible implementation."
         question = {"questions": [{"question": "Keep compatibility?"}]}
         # The question as Claude sent it (PreToolUse), then the human's answer (PostToolUse).
+        self.tool_use("human-resolution-1", question)
         hook(self.event("PreToolUse", tool_name="AskUserQuestion", tool_use_id="human-resolution-1",
                         tool_input=question), PLUGIN, host="claude")
         hook(self.event("PostToolUse", tool_name="AskUserQuestion", tool_use_id="human-resolution-1",
@@ -403,6 +415,7 @@ class HookCliEngineTests(FlowFixture):
         self.edit(questions, json.dumps({"reason": "Need a decision.", "questions": ["May the API change?"]}))
         self.invoke("escalate", "--questions-file", questions)
         question = {"questions": [{"question": "May the API change?"}]}
+        self.tool_use("stop-1", question)
         hook(self.event("PreToolUse", tool_name="AskUserQuestion", tool_use_id="stop-1", tool_input=question), PLUGIN, host="claude")
         hook(self.event("PostToolUse", tool_name="AskUserQuestion", tool_use_id="stop-1", tool_input=question,
                         tool_response={"answers": {"May the API change?": "No."}}), PLUGIN, host="claude")
@@ -428,6 +441,7 @@ class HookCliEngineTests(FlowFixture):
         self.assertIn("(3) accept the current version", asked["escalation"]["questions"][0])
         self.assertEqual([entry["status"] for entry in asked["review_summary"]["reviews"]], ["succeeded", "failed"])
         question = {"questions": [{"question": asked["escalation"]["questions"][0]}]}
+        self.tool_use("limit-1", question)
         hook(self.event("PreToolUse", tool_name="AskUserQuestion", tool_use_id="limit-1", tool_input=question), PLUGIN, host="claude")
         hook(self.event("PostToolUse", tool_name="AskUserQuestion", tool_use_id="limit-1", tool_input=question,
                         tool_response={"answers": {asked["escalation"]["questions"][0]: "Accept and finish"}}), PLUGIN, host="claude")

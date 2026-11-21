@@ -103,6 +103,7 @@ class EngineTests(unittest.TestCase):
         # Keep all run records within this test's own disposable project.
         (self.project / ".git").mkdir()
         self.transcript = self.project / "claude-transcript.jsonl"
+        self._chain_tail = None  # Last uuid written to the transcript (chain records link to it).
         self.session = "claude-test-session-1"
         self.engine = Engine(self.project, host="claude")
         self.run_id = None
@@ -124,9 +125,22 @@ class EngineTests(unittest.TestCase):
     def hook(self, payload):
         return router.handle_hook(payload, PLUGIN_ROOT, host="claude")
 
+    def tool_use(self, payload):
+        """The question's ``tool_use`` record in the session transcript, a real chain record."""
+        uuid = "transcript-" + payload["tool_use_id"]
+        record = {"type": "assistant", "uuid": uuid, "parentUuid": self._chain_tail,
+                  "message": {"role": "assistant", "content": [{"type": "tool_use", "id": payload["tool_use_id"],
+                      "name": "AskUserQuestion", "input": {key: value for key, value in payload["tool_input"].items()
+                                                           if key not in sessions.SCREEN_FILLED_QUESTION_FIELDS}}]}}
+        self._chain_tail = uuid
+        with self.transcript.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+
     def ask(self, payload):
         """The PreToolUse call before an AskUserQuestion result: the question as
         Claude sent it, before the question screen fills in the human's answers."""
+        if isinstance(payload.get("tool_use_id"), str) and payload["tool_use_id"]:
+            self.tool_use(payload)
         question = {key: value for key, value in payload["tool_input"].items()
                     if key not in sessions.SCREEN_FILLED_QUESTION_FIELDS}
         pre = {key: value for key, value in payload.items() if key not in {"tool_response", "is_error"}}
@@ -225,12 +239,32 @@ class EngineTests(unittest.TestCase):
         path.write_text(json.dumps(value, ensure_ascii=False) if isinstance(value, dict) else value, encoding="utf-8")
         return path
 
+    def chain(self, kind, uuid, parent="tail"):
+        """Append a user/assistant chain record; "tail" links to the previous one."""
+        record = {"type": kind, "uuid": uuid,
+                  "parentUuid": self._chain_tail if parent == "tail" else (parent or None),
+                  "message": {"role": kind, "content": "record"}}
+        self._chain_tail = uuid
+        with self.transcript.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+
     def seal(self):
         decisions = self.draft("decisions.json", {
             "summary": "Human confirmed the downtime limit.", "decisions": ["Plan only."],
             "constraints": ["Downtime at most five minutes."], "open_questions": [],
         })
         return self.engine.seal(self.run_id, decisions)
+
+    def test_a_rewound_transcript_stops_the_seal_without_saving(self):
+        self.start_interview()
+        # A rewind after the interview started: the new branch reparents over ca1, a reply.
+        self.chain("user", "cu1", parent="")
+        self.chain("assistant", "ca1")
+        self.chain("user", "cu2", parent="cu1")
+        with self.assertRaisesRegex(DevFlowError, "rewound.*cancel this run"):
+            self.seal()
+        self.assertEqual(self.engine.status(self.run_id)["status"], "interview")
+        self.assertFalse((self.run / "interview.json").exists())
 
     def ready(self, request=None):
         self.start_interview(request=request)
@@ -810,6 +844,30 @@ class EngineTests(unittest.TestCase):
                          [{"event_id": current, "kind": "question", "answer_text": "Expand scope"}])
         exact = self.draft("answer.json", {"answer": "Expand scope", "event_ids": [current]})
         self.assertEqual(self.resolve(exact)["status"], "awaiting_revision")
+
+    def test_a_discarded_answer_cannot_resolve_and_says_why(self):
+        self.ready()
+        self.submit(review_value("human_required", human=True))
+        self.assertEqual(self.engine.status(self.run_id)["status"], "awaiting_human")
+        # The question's tool_use record lands on the branch a later rewind abandons.
+        self.chain("user", "before-question", parent="")
+        lost = self.record(self.question("Rewound answer", tool_use_id="lost-answer"))
+        parent = "before-question"
+        self.chain("user", "rewind-head", parent=parent)
+        status = self.engine.status(self.run_id)
+        self.assertEqual(status["human_events"], [])
+        self.assertEqual(status["excluded_human_events"],
+                         [{"event_id": lost,
+                           "reason": "the answer is on a conversation branch a rewind discarded"}])
+        stale = self.draft("resolution.json", {"answer": "Rewound answer", "event_ids": [lost]})
+        with self.assertRaisesRegex(DevFlowError, f"event {lost}: the answer is on a conversation branch"):
+            self.resolve(stale)
+        self.assertEqual(self.engine.status(self.run_id)["status"], "awaiting_human")
+        # An answer verified on the current branch still resolves the question.
+        current = self.record(self.question("Current answer", tool_use_id="current-answer"))
+        resolved = self.resolve(self.draft("resolution.json",
+                                           {"answer": "Current answer", "event_ids": [current]}))
+        self.assertEqual(resolved["status"], "awaiting_revision")
 
     def test_human_events_are_empty_without_a_pending_escalation(self):
         self.ready()

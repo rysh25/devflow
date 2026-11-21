@@ -79,6 +79,8 @@ class EngineFixture(unittest.TestCase):
         self.write_config()
         self.engine = Engine(self.project, host="claude")
         self.session = "claude-engine-session"
+        self.transcript = self.base / "claude-transcript.jsonl"
+        self._chain_tail = None  # Last uuid written to the transcript (chain records link to it).
         self.run_id = None
         self.packets = []
         self.reviewers = []
@@ -98,7 +100,8 @@ class EngineFixture(unittest.TestCase):
         atomic_write_json(self.project / "devflow.config.json", {"schema_version": 1, "implement": self.config})
 
     def hook(self, event, session=None, **fields):
-        payload = {"hook_event_name": event, "cwd": str(self.project), "session_id": session or self.session, **fields}
+        payload = {"hook_event_name": event, "cwd": str(self.project), "session_id": session or self.session,
+                   "transcript_path": str(self.transcript), **fields}
         return router.handle_hook(payload, PLUGIN_ROOT, host="claude")
 
     def prompt(self, text, session=None):
@@ -110,10 +113,22 @@ class EngineFixture(unittest.TestCase):
         fields, _ = json.JSONDecoder().raw_decode(context, context.index('{"'))
         return fields.get("recorded_event_id")
 
+    def tool_use(self, tool_use_id, tool_input):
+        """The question's ``tool_use`` record in the session transcript, a real chain record."""
+        uuid = "transcript-" + tool_use_id
+        record = {"type": "assistant", "uuid": uuid, "parentUuid": self._chain_tail,
+                  "message": {"role": "assistant", "content": [{"type": "tool_use", "id": tool_use_id,
+                      "name": "AskUserQuestion", "input": tool_input}]}}
+        self._chain_tail = uuid
+        with self.transcript.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+
     def ask(self, session=None, **fields):
         """A human AskUserQuestion: the question as Claude sent it (PreToolUse, recorded as an
         observation without answers), then the answered result (PostToolUse); returns the latter's output."""
         asked = {key: value for key, value in fields["tool_input"].items() if key not in sessions.SCREEN_FILLED_QUESTION_FIELDS}
+        if isinstance(fields.get("tool_use_id"), str) and fields["tool_use_id"]:
+            self.tool_use(fields["tool_use_id"], asked)
         self.hook("PreToolUse", session, tool_name="AskUserQuestion", tool_use_id=fields["tool_use_id"], tool_input=asked)
         return self.hook("PostToolUse", session, tool_name="AskUserQuestion", **fields)
 
