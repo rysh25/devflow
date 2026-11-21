@@ -65,9 +65,11 @@ def devin_version() -> dict:
             found = version_numbers(result.stdout[:8192])
             report.update(version=".".join(map(str, found)) if found else None,
                           supported=result.returncode == 0 and bool(found) and found >= version_numbers(MINIMUM_DEVIN),
-                          reason=("Plugin hooks, workspace trust and ask_user_question need runtime verification; "
-                                  "trust this project in Devin once before using DevFlow, and trust a worktree "
-                                  "outside it before using it as an Implement workspace"))
+                          reason=("Plugin hooks, workspace trust and ask_user_question need runtime verification. "
+                                  "When Devin is a reviewer, DevFlow checks that Devin trusts the reviewer "
+                                  "directory in doctor, plan doctor, implement start and before each review, and "
+                                  "stops without using a review when it does not: the project (Plan) and the "
+                                  "Implement workspace must be in a directory Devin trusts or below one"))
         except (OSError, subprocess.SubprocessError) as exc:
             report["reason"] = str(exc)
     return report

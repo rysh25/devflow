@@ -220,7 +220,9 @@ class FrozenDoctorTests(InterviewFixture):
     def doctor(self, *selectors):
         """``devflow [selectors] plan doctor`` through the single runner."""
         output = io.StringIO()
-        with redirect_stdout(output), patch("devflow_core.plan.config.shutil.which", return_value="/fixture/tool"):
+        # The reviewer CLI checks are not the subject here.
+        with redirect_stdout(output), patch("devflow_core.plan.config.shutil.which", return_value="/fixture/tool"), \
+                patch("devflow_core.common.reviewers.preflight", return_value={}):
             code = cli.main(["--host", "claude", "--project", str(self.project), *selectors, "plan", "doctor"])
         return code, json.loads(output.getvalue())
 

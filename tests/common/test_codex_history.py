@@ -190,7 +190,7 @@ class HistoryTests(RuntimeFixture):
         for ready in (True, False):
             probe = {'checked':True, 'ready':ready, 'all_pages_verified':False}
             with self.subTest(ready=ready), \
-                    patch.object(plan_commands, 'diagnose', return_value={'ready':True,'config':{}}), \
+                    patch.object(plan_commands, 'diagnose', return_value={'ready':True,'config':{'reviewers':[]}}), \
                     patch.object(engine.workflow, 'doctor', return_value={'warnings':[]}), \
                     patch.object(plan_commands, 'python_errors', return_value=[]), \
                     patch.object(plan_commands, 'diagnose_conversation', return_value=probe, create=True) as check:
@@ -296,7 +296,7 @@ class HistoryTests(RuntimeFixture):
 
     def test_global_doctor_keeps_api_probe_offline_and_exposes_limits(self):
         from devflow_core import cli
-        with patch.object(cli, 'preflight', return_value={}), \
+        with patch('devflow_core.common.reviewers.preflight', return_value={}), \
                 patch.object(cli, 'codex_version', return_value={'supported':True, 'version':'0.166.0'}), \
                 patch.object(codex_host.subprocess, 'Popen') as launch:
             report = cli.doctor(self.project, 'codex')

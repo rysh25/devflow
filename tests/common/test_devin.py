@@ -9,8 +9,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shlex
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -39,19 +41,35 @@ def strict(value):
     return value
 
 FAKE_DEVIN = r'''
-import json, sys, time
+import json, os, sys, time
 from pathlib import Path
 args = sys.argv[1:]
 mode = args.pop(0)
 if args == ["--version"]:
-    print("devin 3000.12.57 (96542e930752)"); sys.exit(0)
+    print("devin 3000.12.57 (96542e930752)"); sys.exit(3 if mode == "version-fail" else 0)
 if args == ["--help"]:
+    if mode == "help-fail":
+        sys.exit(4)
     flags = ["--print", "--prompt-file", "--resume", "--model", "--export"]
     if mode == "old":
         flags.remove("--export")
     print("Usage: devin [OPTIONS]\n" + "\n".join("  " + f for f in flags)); sys.exit(0)
-if mode == "untrusted":
-    print("Error: Refusing to run in an untrusted workspace", file=sys.stderr); sys.exit(1)
+refusal = "Error: Refusing to run in an untrusted workspace: " + os.getcwd()
+if "--model" in args and args[args.index("--model") + 1] == "devflow-trust-probe":
+    # The trust check DevFlow runs before a review.
+    with open(Path(sys.argv[0]).parent / "probes.jsonl", "a", encoding="utf-8") as log:
+        log.write(json.dumps({"mode": mode, "argv": args, "cwd": os.getcwd(), "stdin": sys.stdin.read()}) + "\n")
+    if mode == "probe-slow":
+        time.sleep(30)
+    if mode == "untrusted" or mode == "probe-zero":
+        print(refusal, file=sys.stderr); sys.exit(1 if mode == "untrusted" else 0)
+    if mode == "probe-stdout":
+        print(refusal); sys.exit(1)
+    if mode == "probe-unknown-error":
+        print("Error: something else went wrong", file=sys.stderr); sys.exit(1)
+    print("Error: Unknown model: 'devflow-trust-probe'", file=sys.stderr); sys.exit(1)
+if mode in ("untrusted", "untrusted-review"):
+    print(refusal, file=sys.stderr); sys.exit(1)
 stdin = sys.stdin.read() if not sys.stdin.closed else ""
 values = dict(zip(args[1::2], args[2::2])) if args[0] == "--print" else {}
 work = Path(values["--prompt-file"]).parent
@@ -120,7 +138,7 @@ class DevinReviewerTests(unittest.TestCase):
 
     def prepare(self, config):
         return reviewers.prepare_review(config, b"packet", self.work, self.schema, self.instructions,
-                                        cwd=self.project, probe=reviewers.preflight(config))
+                                        cwd=self.project, probe=reviewers.preflight(config, cwd=self.project))
 
     def run_review(self, mode="pass", validate=lambda value: value, **changes):
         config = self.config(mode, **changes)
@@ -469,12 +487,110 @@ class DevinReviewerTests(unittest.TestCase):
             with self.subTest(mode), self.assertRaisesRegex(ReviewerError, "Devin finished without an answer"):
                 self.run_review(mode)
             self.assertTrue((self.work / "stdout.jsonl").is_file())
+        # The trust check passed but the review itself was refused: the failure hint says how to fix it.
         self.work = self.base / "attempt untrusted"
-        with self.assertRaisesRegex(ReviewerError, "trust it") as caught:
-            self.run_review("untrusted")
-        # The hint names the resolved directory the CLI was started in.
-        self.assertIn(str(self.project.resolve()), str(caught.exception))
-        self.assertIn("or a directory above it", str(caught.exception))
+        with self.assertRaises(ReviewerError) as caught:
+            self.run_review("untrusted-review")
+        # The hint names the resolved directory the CLI was started in, unchanged since 0.12.3.
+        cwd = self.project.resolve()
+        self.assertIn(f"; if Devin refused an untrusted workspace, start devin once in {cwd} or a directory "
+                      f"above it and trust it (DevFlow never skips the trust check)", str(caught.exception))
+
+    def untrusted_message(self, cwd):
+        return (f"Devin does not trust the reviewer directory {cwd}; start devin once in {cwd} or a directory "
+                f"above it and trust it (DevFlow never skips the trust check)")
+
+    def probes(self):
+        path = self.base / "probes.jsonl"
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+
+    def test_preflight_checks_that_devin_trusts_the_reviewer_directory(self):
+        probe = reviewers.preflight(self.config(), cwd=self.project)
+        self.assertEqual(probe["kind"], "devin")
+        [check] = self.probes()
+        self.assertEqual(check["argv"], ["--print", "--model", "devflow-trust-probe", "--",
+                                         reviewers.DEVIN_TRUST_PROBE_PROMPT])
+        self.assertEqual(Path(check["cwd"]).resolve(), self.project.resolve())
+        self.assertEqual(check["stdin"], "")  # closed: nothing is sent on standard input
+        self.assertEqual(self.calls(), [])  # no review ran
+
+    def test_an_untrusted_reviewer_directory_fails_preflight_before_any_review(self):
+        with self.assertRaises(ReviewerError) as caught:
+            self.prepare(self.config("untrusted"))
+        self.assertEqual(str(caught.exception), self.untrusted_message(self.project.resolve()))
+        self.assertEqual(self.calls(), [])
+        self.assertFalse(self.work.exists())
+
+    def test_the_trust_check_passes_whatever_it_cannot_decide(self):
+        for mode in ("probe-unknown-error", "probe-zero", "probe-stdout"):
+            with self.subTest(mode):
+                self.assertEqual(reviewers.preflight(self.config(mode), cwd=self.project)["kind"], "devin")
+        with patch.object(reviewers, "PROBE_SECONDS", 1):
+            started = time.monotonic()
+            self.assertEqual(reviewers.preflight(self.config("probe-slow"), cwd=self.project)["kind"], "devin")
+            self.assertLess(time.monotonic() - started, 20)
+        # A check that cannot start at all passes too.
+        cli, cwd = reviewers.CLIS["devin"], self.project.resolve()
+        self.assertIsNone(cli.check_cwd([str(self.base / "no such devin")], cwd, dict(os.environ)))
+
+    def test_the_trust_check_does_not_run_when_version_or_help_fails(self):
+        for mode, error in (("version-fail", "--version failed"), ("help-fail", "--help failed"),
+                            ("old", "--export")):
+            with self.subTest(mode), self.assertRaisesRegex(ReviewerError, error):
+                reviewers.preflight(self.config(mode), cwd=self.project)
+        self.assertEqual(self.probes(), [])
+
+    def launcher(self, path):
+        """A POSIX executable fake devin at ``path``: a shell script that starts this Python
+        (quoted, so a space in its path is safe) with the fake beside the launcher in "pass" mode."""
+        (path.parent / "fake_devin.py").write_text(FAKE_DEVIN, encoding="utf-8")
+        path.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$(dirname "$0")/fake_devin.py" pass "$@"\n',
+                        encoding="utf-8")
+        path.chmod(0o755)
+        for name in ("review_export.json", "follow_export.json"):
+            (path.parent / name).write_bytes((self.base / name).read_bytes())
+
+    @unittest.skipIf(os.name == "nt", "POSIX resolves a relative executable from the child's directory")
+    def test_a_relative_command_is_made_absolute_from_the_runner_directory(self):
+        runner = self.base / "runner"
+        (runner / "bin").mkdir(parents=True)
+        self.launcher(runner / "bin" / "devin")
+        config = {**self.config(), "command": ["./bin/devin"]}
+        cwd = os.getcwd()
+        os.chdir(runner)
+        self.addCleanup(os.chdir, cwd)
+        probe = reviewers.preflight(config, cwd=self.project)
+        self.assertEqual(probe["executable"], str(runner / "bin" / "devin"))
+        [check] = [json.loads(line) for line in (runner / "bin" / "probes.jsonl").read_text().splitlines()]
+        self.assertEqual(Path(check["cwd"]).resolve(), self.project.resolve())
+
+    @unittest.skipIf(os.name == "nt", "POSIX keeps .. after a symlink")
+    def test_a_relative_command_through_a_symlink_keeps_the_file_which_found(self):
+        runner = self.base / "runner"
+        (runner / "real" / "child").mkdir(parents=True)
+        (runner / "link").symlink_to(runner / "real" / "child")
+        self.launcher(runner / "real" / "tool")
+        # The file ./tool would name if .. were collapsed lexically: never started.
+        decoy = runner / "tool"
+        decoy.write_text("#!/bin/sh\necho decoy >> \"$(dirname \"$0\")/decoy.log\"; exit 3\n", encoding="utf-8")
+        decoy.chmod(0o755)
+        config = {**self.config(), "command": ["./link/../tool"]}
+        cwd = os.getcwd()
+        os.chdir(runner)
+        self.addCleanup(os.chdir, cwd)
+        prepared = reviewers.prepare_review(config, b"packet", self.work, self.schema, self.instructions,
+                                            cwd=self.project, probe=reviewers.preflight(config, cwd=self.project))
+        reviewers.run_review(prepared, lambda value: value)
+        self.assertTrue((runner / "real" / "probes.jsonl").is_file())  # the trust check
+        self.assertTrue((runner / "real" / "calls.jsonl").is_file())   # the review
+        self.assertFalse((runner / "decoy.log").exists())
+
+    @unittest.skipUnless(os.name == "nt", "a drive-relative path exists only on Windows")
+    def test_a_drive_relative_executable_is_made_absolute_on_windows(self):
+        import ntpath
+        with patch.object(reviewers.shutil, "which", return_value="D:tools\\devin.exe"):
+            resolved = reviewers._resolve(["devin"])
+        self.assertTrue(ntpath.isabs(resolved[0]))
 
     def test_other_clis_have_no_failure_hint(self):
         # The base CLI's default: nothing is added to another CLI's failure.
@@ -483,9 +599,9 @@ class DevinReviewerTests(unittest.TestCase):
                 self.assertEqual(reviewers.CLIS[kind].failure_hint(Path("/somewhere")), "")
 
     def test_preflight_requires_every_flag_devflow_passes(self):
-        self.assertEqual(reviewers.preflight(self.config())["cli_version"], "devin 3000.12.57 (96542e930752)")
+        self.assertEqual(reviewers.preflight(self.config(), cwd=self.project)["cli_version"], "devin 3000.12.57 (96542e930752)")
         with self.assertRaisesRegex(ReviewerError, "--export"):
-            reviewers.preflight(self.config("old"))
+            reviewers.preflight(self.config("old"), cwd=self.project)
 
     def test_a_startup_reviewer_without_devin_in_the_settings_uses_the_devin_command(self):
         config = {"max_reviews": 6, "reviewers": [

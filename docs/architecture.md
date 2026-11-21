@@ -2,7 +2,7 @@
 
 ## 一つの配布と独立したワークフロー
 
-DevFlow 0.12.6 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
+DevFlow 0.12.7 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
 
 ```mermaid
 flowchart TD
@@ -109,7 +109,7 @@ flowchart TD
 
 計画の実装・修正は現在の Claude Code のメインセッションが担当し、サブエージェントに分けることもできます。Python ランナーが新しい Claude セッションを起動することはありません。ランナーは明示的なアクション単位で進み、Claude は返された状態を読んで次のアクションを選びます。
 
-実装場所（workspace）は、開始時に Claude が選んだプロジェクトそのものか、同じリポジトリの別の worktree です（`start --workspace`）。開始時にパス、リポジトリ、ディレクトリの同一性を固定し、その後のチェックポイント・チェック・レビュー・最終レポートのたびに確かめ直します。
+実装場所（workspace）は、開始時に Claude が選んだプロジェクトそのものか、同じリポジトリの別の worktree です（`start --workspace`）。開始時にパス、リポジトリ、ディレクトリの同一性を固定し、その後のチェックポイント・チェック・レビュー・最終レポートのたびに確かめ直します。`start` は、実装場所を決めて入力計画を読んだあと、ベースラインを取る前に、各レビュアーの事前確認をその実装場所で行います。準備できていないレビュアーがあれば run を作りません。確認を待つ間に実装場所が置き換わっていないことを確かめ直してから、ベースラインを取ります。
 
 ## 同じコード版の定義
 
@@ -152,7 +152,7 @@ checkpoint では、開始時からの変更の一覧（`snapshots/NNN.json`）�
 
 差分のファイルは、開始時から今までのスナップショットの範囲の変更を、Git の unified diff と同じ形で書きます。空のファイルの追加・削除、モードだけの変更、バイナリの変更にも、必ず見出し（`diff --git`、`new file mode`、`old mode` / `new mode`、`Binary files … differ`）を付けます。
 
-レビュアーの CLI ごとの違いは、`reviewers.py` の `CLI` のサブクラス（`Codex`、`OpenCode`、`Claude`、`Devin`）に集めます。サブクラスは、使うサブコマンド、引数、標準入力、答えと動きの読み方を持ちます。事前確認は、引数に含まれるオプション（`--` で始まるもの）が、CLIまたはサブコマンドの `--help` にあることを確かめます。Claude は `claude --help` です。DevFlow が加えるのは、モデルと effort、承認を待たないこと（Codex には `approval_policy="never"` を渡す。OpenCode の `opencode run` は、利用者の設定で確認が要る操作を、自分で断って続ける）、JSON での出力、結果のスキーマ（Codex）、作業ディレクトリと `PWD`、標準入力（Codex にはプロンプトを渡してから閉じ、OpenCode と Devin は初めから閉じる）だけです。Devin には入力を `--prompt-file` のファイルで渡し、`--export` の ATIF の記録から答え（最後のエージェントの発言）と動きとトークン数を読みます。Devin の標準出力はエージェントの発言を区切りなしでつなぐので、答えには使いません。記録が無い・読めないときは、答えが無いとして失敗にします。答えの点検（厳密な JSON として読むことと、ワークフローの点検）で断られたとき、サブクラスの任意の `follow_up_arguments` が同じ会話を続ける引数を返し（書かなければ None で、出し直しはしません）、`run_review` がその回の中でもう1回だけ起動します。Devin は1回目の export の `session_id` を `--resume` に渡して会話を続け、同じモデルと effort、断られた理由とスキーマを埋めた依頼文（`common/answer-follow-up.md` の雛形）で、記録は `follow-up/` に置きます。出し直しがあったときは、その回の活動とトークン数は最後の回の記録から読みます（Devin の export は会話全体の累計）。活動には `answer_follow_ups`（0 か 1）が出ます。新しい CLI は、サブクラスを1つ書いて `CLIS` と `settings.REVIEWER_KINDS` に名前を足せば加えられます。トークン数は、サブクラスの `tokens` が CLI の名前のまま、平らな「名前 → 数」で返します（書かなければ unknown）。Codex は `turn.completed` の `usage` がスレッドの累計なので、スレッドごとの最後の値を足します。OpenCode は `step_finish` の `tokens` が1段階分なので、全部を足し、入れ子は `cache.read` のようにつなぎます。トークン数は答えの成否と関係なく、回の出力（`review-processes/NN/stdout.jsonl`。出し直しがあれば `review-processes/NN/follow-up/stdout.jsonl` を優先）から読み、成功・失敗・回復のどの回の記録にも残します。確かめた版を `environment.CHECKED_VERSIONS` に足すと、それより新しい版で `doctor` が警告します（足さなければ警告しません）。文章で返る答え（Codex の `final-response.json`、OpenCode の最後のステップの文章）は `answer_value` で読みます。答え全体がちょうど1つの ` ```json `（または言語名なし）のコードブロックなら、その中身を厳密な JSON として読み、中身には手を加えません。囲みの外に文章がある答えなど、ほかの形は今までどおり失敗にします。OpenCode には答えの形を強制する選択肢がないためです。プロンプトでは、出力スキーマをコードブロックで囲まずに載せます。入力の最後（パケットの後）には、答えの形の念押し（`reviewers.ANSWER_REMINDER`）を全レビュアー共通で1回置きます。答えの形の指示が長いパケットの前にしかないと、分析の文章を JSON の前に書くモデルがあったためです（Devin の swe-2-high で実測）。
+レビュアーの CLI ごとの違いは、`reviewers.py` の `CLI` のサブクラス（`Codex`、`OpenCode`、`Claude`、`Devin`）に集めます。サブクラスは、使うサブコマンド、引数、標準入力、答えと動きの読み方を持ちます。事前確認（`preflight(config, cwd=...)`）は、引数に含まれるオプション（`--` で始まるもの）が、CLIまたはサブコマンドの `--help` にあることを確かめます。Claude は `claude --help` です。そのあと、サブクラスの任意の `check_cwd` が、レビューでその CLI を起動するディレクトリ（`cwd`）で動けるかを確かめます（書かなければ何もしません）。今あるのは `Devin.check_cwd` だけで、存在しないモデル名で `devin --print` を起動し、信頼していないディレクトリの断りの文（`Refusing to run in an untrusted workspace`）が stderr に出て終了コードが 0 以外のときだけ失敗にします。判定できないときは通しますが、レビューで断られたときは `failure_hint` が信頼の手順を示します。実行ファイルは、ランナーのカレントディレクトリから見た絶対パスにしてから、version・help・`check_cwd`・本番のレビューのすべてで同じものを使います。`doctor` の各レビュアーの結果は `reviewers.readiness` で作ります。DevFlow が加えるのは、モデルと effort、承認を待たないこと（Codex には `approval_policy="never"` を渡す。OpenCode の `opencode run` は、利用者の設定で確認が要る操作を、自分で断って続ける）、JSON での出力、結果のスキーマ（Codex）、作業ディレクトリと `PWD`、標準入力（Codex にはプロンプトを渡してから閉じ、OpenCode と Devin は初めから閉じる）だけです。Devin には入力を `--prompt-file` のファイルで渡し、`--export` の ATIF の記録から答え（最後のエージェントの発言）と動きとトークン数を読みます。Devin の標準出力はエージェントの発言を区切りなしでつなぐので、答えには使いません。記録が無い・読めないときは、答えが無いとして失敗にします。答えの点検（厳密な JSON として読むことと、ワークフローの点検）で断られたとき、サブクラスの任意の `follow_up_arguments` が同じ会話を続ける引数を返し（書かなければ None で、出し直しはしません）、`run_review` がその回の中でもう1回だけ起動します。Devin は1回目の export の `session_id` を `--resume` に渡して会話を続け、同じモデルと effort、断られた理由とスキーマを埋めた依頼文（`common/answer-follow-up.md` の雛形）で、記録は `follow-up/` に置きます。出し直しがあったときは、その回の活動とトークン数は最後の回の記録から読みます（Devin の export は会話全体の累計）。活動には `answer_follow_ups`（0 か 1）が出ます。新しい CLI は、サブクラスを1つ書いて `CLIS` と `settings.REVIEWER_KINDS` に名前を足せば加えられます。トークン数は、サブクラスの `tokens` が CLI の名前のまま、平らな「名前 → 数」で返します（書かなければ unknown）。Codex は `turn.completed` の `usage` がスレッドの累計なので、スレッドごとの最後の値を足します。OpenCode は `step_finish` の `tokens` が1段階分なので、全部を足し、入れ子は `cache.read` のようにつなぎます。トークン数は答えの成否と関係なく、回の出力（`review-processes/NN/stdout.jsonl`。出し直しがあれば `review-processes/NN/follow-up/stdout.jsonl` を優先）から読み、成功・失敗・回復のどの回の記録にも残します。確かめた版を `environment.CHECKED_VERSIONS` に足すと、それより新しい版で `doctor` が警告します（足さなければ警告しません）。文章で返る答え（Codex の `final-response.json`、OpenCode の最後のステップの文章）は `answer_value` で読みます。答え全体がちょうど1つの ` ```json `（または言語名なし）のコードブロックなら、その中身を厳密な JSON として読み、中身には手を加えません。囲みの外に文章がある答えなど、ほかの形は今までどおり失敗にします。OpenCode には答えの形を強制する選択肢がないためです。プロンプトでは、出力スキーマをコードブロックで囲まずに載せます。入力の最後（パケットの後）には、答えの形の念押し（`reviewers.ANSWER_REMINDER`）を全レビュアー共通で1回置きます。答えの形の指示が長いパケットの前にしかないと、分析の文章を JSON の前に書くモデルがあったためです（Devin の swe-2-high で実測）。
 
 出力の検査は、壊れているとわかるときだけ失敗にします。
 
@@ -262,7 +262,7 @@ unsupported は整数の形式1・2かつ基本のセッション ID・ファイ
 未来の番号・bool・識別情報の不一致は invalid です。status で自動変換しません。
 run 形式9は RELEASES[9] = "0.7.x" と表示します。
 
-レビューは preflight → ロックと再確認 → ask_at_limit → packet と PreparedReview の準備・全サイズ検査
+レビューは preflight（レビュアーを起動するディレクトリで。Plan はプロジェクト、Implement は確かめ直した実装場所）→ ロックと再確認 → ask_at_limit → packet と PreparedReview の準備・全サイズ検査
 → artifact の stage → 回数加算 → reserve/save → 同じ入力の送信です。
 準備はファイルを作らず、超過時に .part や予約を残しません。指示の時刻はロック後の準備時に一度固定し、
 実際の制限時間はプロセス起動から測ります。承認のモデル・effort は固定済み設定を reviewer_id で参照します。

@@ -10,7 +10,7 @@ uv --no-cache run --offline --no-project --no-config --no-python-downloads "RUNN
 
 Every result is one JSON object; read its status rather than relying on the exit code.
 
-**Waiting.** For `review` and `check`, run the command once with exec, passing the result's `bash_timeout_ms` value for that action as exec's `timeout`. When exec moves the command to the background and returns a shell ID, call get_output with that ID (and a timeout) until the command has finished, then read its JSON. Never run the command a second time and never start another runner action while it is running.
+**Waiting.** For `review` and `check`, run the command once with exec, passing the result's `bash_timeout_ms` value for that action as exec's `timeout`. When exec moves the command to the background and returns a shell ID, call get_output with that ID (and a timeout) until the command has finished, then read its JSON. Never run the command a second time and never start another runner action while it is running. The same waiting applies to `doctor` and `start`, which check each reviewer CLI locally and may take a while.
 
 **Approval.** Devin's own permission settings and mode apply. When Devin asks to approve the runner command, the human approves it with Devin's standard approval. Never change the human's settings, never pass a flag that skips workspace trust or permissions, and never retry with broader permissions.
 

@@ -6,6 +6,7 @@ import io
 import json
 from pathlib import Path
 import re
+import sys
 import tempfile
 import threading
 import unittest
@@ -482,7 +483,7 @@ class EngineTests(unittest.TestCase):
         self.ready()
         caller = Engine(self.project, session=self.session, host="claude")
 
-        def move_ownership(provider):
+        def move_ownership(provider, **_):
             self.resume("session-that-took-over")
             return PROBE
 
@@ -511,6 +512,30 @@ class EngineTests(unittest.TestCase):
             reviewed = self.engine.review(self.run_id)
         self.assertEqual(call.call_args.args[0].config["id"], "codex")
         self.assertEqual(reviewed["review_count"], 1)
+
+    def test_review_checks_the_reviewer_in_the_project(self):
+        self.ready()
+        self.submit(review_value())
+        self.assertEqual(self.preflight.call_args.kwargs["cwd"], self.project)
+
+    def test_devin_refusing_the_project_before_a_review_does_not_consume_attempt(self):
+        from tests.common.test_devin import FAKE_DEVIN
+        fake = self.project.parent / "fake devin.py"
+        fake.write_text(FAKE_DEVIN, encoding="utf-8")
+        atomic_write_json(self.project / "devflow.config.json", {"schema_version": 1, "reviewers": [
+            {"id": "devin", "kind": "devin", "command": [sys.executable, str(fake), "untrusted"],
+             "model": "swe-2", "effort": "high", "timeout_seconds": 30}]})
+        self.ready()
+        from devflow_core.common.reviewers import preflight as real_preflight
+        # The real check runs before any reservation.
+        with patch(PREFLIGHT, real_preflight), patch(RUN_REVIEW) as call:
+            with self.assertRaisesRegex(ReviewerError, "Devin does not trust the reviewer directory"):
+                self.engine.review(self.run_id)
+        call.assert_not_called()
+        after = self.engine.status(self.run_id)
+        self.assertEqual((after["status"], after["review_count"], after["inflight"]), ("ready", 0, None))
+        self.assertFalse((self.run / "reviews").exists())
+        self.assertFalse((self.run / "review-processes").exists())
 
     def test_final_prompt_rejected_before_artifacts_and_reservation(self):
         self.ready()

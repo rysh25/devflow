@@ -298,7 +298,7 @@ class Engine(RunEngine):
         provider = (next_reviewer(state["config"]["reviewers"], state["review_count"], state["review_limit"])
                     if state["review_count"] < state["review_limit"] else None)
         # A missing or unsupported reviewer CLI must not consume an attempt.
-        probe = preflight(provider) if provider else None
+        probe = preflight(provider, cwd=self.project) if provider else None
 
         def prepare(state: dict):
             self._verify(state)

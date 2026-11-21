@@ -124,13 +124,17 @@ def verify_workspace(project: Path, frozen: dict, mode: str) -> Path:
         project = Path(project).resolve(strict=True)
         path = _directory(project, frozen["path"])
         current = _inspect(project, path, mode)
-    except (DevFlowError, OSError) as exc:
+        # Looked up with the other checks, so a workspace removed meanwhile is reported the same way.
+        found = identity(path) if frozen["identity"] is not None else None
+        # Comparing resolves the recorded paths; Python before 3.13 raises RuntimeError for a symlink loop.
+        changed = [key for key in ("path", "git_common_dir", "git_dir")
+                   if (frozen[key] is None) != (current[key] is None)
+                   or (frozen[key] is not None and not same_path(frozen[key], current[key]))]
+    except (DevFlowError, OSError, RuntimeError) as exc:
         raise DevFlowError(f"The implementation workspace is no longer valid: {exc}") from exc
-    for key in ("path", "git_common_dir", "git_dir"):
-        expected, actual = frozen[key], current[key]
-        if (expected is None) != (actual is None) or (expected is not None and not same_path(expected, actual)):
-            raise DevFlowError(f"The implementation workspace changed since start ({key}); start a new run")
-    if frozen["identity"] is not None and identity(path) != frozen["identity"]:
+    if changed:
+        raise DevFlowError(f"The implementation workspace changed since start ({changed[0]}); start a new run")
+    if frozen["identity"] is not None and found != frozen["identity"]:
         raise DevFlowError("The implementation workspace was removed and recreated since start; start a new run")
     return path
 

@@ -193,8 +193,9 @@ class FlowFixture(unittest.TestCase):
         self.plan_engine = PlanEngine(self.project, PLAN_PLUGIN, host="claude")
         self.run_id = None
         self.draft = None
+        # The engines import preflight by name; doctor and start reach it through common.reviewers.
         for target in ("devflow_core.implement.engine.preflight", "devflow_core.plan.engine.preflight",
-                       "devflow_core.cli.preflight", "devflow_core.implement.commands.preflight"):
+                       "devflow_core.common.reviewers.preflight"):
             patcher = patch(target, return_value={"ready": True, "kind": "synthetic"})
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -589,22 +590,22 @@ class BashTimeoutTests(FlowFixture):
 
     def test_results_follow_the_next_reviewer_and_drop_finished_actions(self):
         started = self.start()
-        self.assertEqual(started["bash_timeout_ms"], {"review": 400000, "check": 70000})
+        self.assertEqual(started["bash_timeout_ms"], {"review": 415000, "check": 70000})
         self.assertNotIn("warnings", started)
         self.edit(self.source, "VALUE = 2\n")
         self.checkpoint()
-        self.assertEqual(self.invoke("check")["bash_timeout_ms"]["review"], 400000)
+        self.assertEqual(self.invoke("check")["bash_timeout_ms"]["review"], 415000)
         with patch("devflow_core.implement.engine.run_review", side_effect=review_pass):
             first = self.invoke("review")
         # Same turn, next reviewer: the value changes with it.
-        self.assertEqual(first["bash_timeout_ms"], {"review": 1000000, "check": 70000})
+        self.assertEqual(first["bash_timeout_ms"], {"review": 1015000, "check": 70000})
         self.assertEqual(self.invoke("status")["bash_timeout_ms"], first["bash_timeout_ms"])
         context = self.submit("continue")["hookSpecificOutput"]["additionalContext"]
-        self.assertIn('"bash_timeout_ms": {"review": 1000000, "check": 70000}', context)
+        self.assertIn('"bash_timeout_ms": {"review": 1015000, "check": 70000}', context)
         with patch("devflow_core.implement.engine.run_review", side_effect=review_changes):
             second = self.invoke("review")
         self.assertEqual(second["status"], "needs_revision")
-        self.assertEqual(second["bash_timeout_ms"], {"review": 400000, "check": 70000})  # codex is next again
+        self.assertEqual(second["bash_timeout_ms"], {"review": 415000, "check": 70000})  # codex is next again
 
     def test_a_finished_run_has_no_review_or_check_timeout(self):
         self.start()
@@ -621,7 +622,7 @@ class BashTimeoutTests(FlowFixture):
         self.config["checks"] = []
         write_json(self.project / "devflow.config.json", {"schema_version": 1, "implement": self.config})
         started = self.start()
-        self.assertEqual(started["bash_timeout_ms"], {"review": 400000})
+        self.assertEqual(started["bash_timeout_ms"], {"review": 415000})
         state = read_json(Path(started["run_dir"]) / "state.json")
         for status in ("completed", "exhausted", "cancelled", "accepted"):
             with self.subTest(status=status):
@@ -636,12 +637,12 @@ class BashTimeoutTests(FlowFixture):
         with patch.dict(os.environ, {"BASH_MAX_TIMEOUT_MS": "60000"}):
             started = self.start()
         self.assertNotIn("warnings", started)
-        self.assertEqual(started["bash_timeout_ms"]["review"], 400000)
+        self.assertEqual(started["bash_timeout_ms"]["review"], 415000)
 
     def test_plan_start_context_gives_the_review_timeout_and_finished_plan_has_none(self):
         context = hook(self.event(prompt="/devflow:plan Make a tested pure function."), PLUGIN, host="claude")
         text = context["hookSpecificOutput"]["additionalContext"]
-        self.assertIn('"bash_timeout_ms": {"review": 1900000}', text)
+        self.assertIn('"bash_timeout_ms": {"review": 1915000}', text)
         self.assertIn("pass bash_timeout_ms as the Bash timeout, unchanged", text)
         self.assertIn("run the call in the background with that timeout", text)
         self.assertNotIn("shorter than", text)

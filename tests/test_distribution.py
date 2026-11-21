@@ -66,11 +66,11 @@ class DistributionTests(unittest.TestCase):
     def test_static_validate_current_bundle(self):
         result = package.validate(ROOT)
         self.assertEqual(result["marketplace"], "devflow-marketplace")
-        self.assertEqual(result["plugins"], {"devflow": "0.12.6"})
+        self.assertEqual(result["plugins"], {"devflow": "0.12.7"})
 
     def test_release_versions_are_consistent(self):
         manifest = json.loads((ROOT / "plugins/devflow/.claude-plugin/plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.12.6")
+        self.assertEqual(manifest["version"], "0.12.7")
         package = ROOT / "plugins/devflow/scripts/devflow_core"
         defining = []
         for source in sorted(package.rglob("*.py")):
@@ -99,7 +99,7 @@ class DistributionTests(unittest.TestCase):
                   for reviewer in json.loads((core / flow / "defaults.json").read_text(encoding="utf-8"))["reviewers"]}
         self.assertEqual(limits, {1800})
         wait = str(review_timeout_ms(1800))
-        self.assertEqual(wait, "1900000")
+        self.assertEqual(wait, "1915000")
         for relative in ("README.md", "docs/installation.md"):
             with self.subTest(document=relative):
                 self.assertIn(wait, (ROOT / relative).read_text(encoding="utf-8"))
@@ -414,14 +414,14 @@ class DistributionTests(unittest.TestCase):
             # All paths were generated and checked in this test, not untrusted ZIP input.
             archive.extractall(extracted)
         release = extracted / "devflow"
-        self.assertEqual(package.validate(release)["version"], "0.12.6")
+        self.assertEqual(package.validate(release)["version"], "0.12.7")
         independent = self.base / "devflow-only"
         shutil.copytree(release / "plugins" / "devflow", independent)
         self.assertFalse((independent / "shared").exists())
         result = subprocess.run([sys.executable, "-B", str(independent / "scripts" / "devflow.py"), "--version"],
             cwd=self.base, capture_output=True, encoding="utf-8", timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("0.12.6", result.stdout)
+        self.assertIn("0.12.7", result.stdout)
         for flow in ("plan", "implement"):
             with self.subTest(flow=flow):
                 result = subprocess.run([sys.executable, "-B", str(independent / "scripts" / "devflow.py"), flow, "--help"],

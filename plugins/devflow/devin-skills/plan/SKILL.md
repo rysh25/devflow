@@ -8,7 +8,7 @@ First read the Devin runner contract, `references/devin-runner.md` in the plugin
 
 The human typed /devflow:plan. The hook has already created the run and frozen the request and the effective settings, including any `--reviewer AGENT MODEL EFFORT` and `--max-reviews N` options; without them the project settings apply. Read `request.json` in the run directory instead of restating the request.
 
-1. Run `plan status`, then `plan doctor`. On Devin, doctor checks the configured interview skill statically only (there is no conversation API check, so do not expect `conversation_api`). Report any problem before the interview.
+1. Run `plan status`, then `plan doctor`. On Devin there is no conversation API check, so do not expect `conversation_api`. If a reviewer in `plan doctor`'s `reviewers` is not ready, stop before the interview as the shared references/plan-workflow.md step 1 says. Report any problem before the interview.
 2. Use the exact configured interview skill (`plan.grill_skill`, `interview_skill` in the hook context) with Devin's skill tool and follow its instructions. Do not replace it with another skill or imitate a skill that is blocked. Ask every interview question with ask_user_question in this conversation; ordinary chat answers are not counted, and a cancelled or skipped question must be asked again.
 3. Write only runner input files in the run's `draft/` directory. Then seal the interview, write the plan, and let the runner call each configured reviewer in turn; reflect on every finding. Never change project source, implement, commit or deploy.
 

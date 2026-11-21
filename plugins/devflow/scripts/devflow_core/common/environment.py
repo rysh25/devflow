@@ -13,12 +13,13 @@ import sys
 
 #: Time the runner itself needs around a reviewer or the checks.
 MARGIN_SECONDS = 60
-#: Limit for each local probe of a reviewer CLI (``--version``, then its subcommand's ``--help``).
+#: Limit for each local check of a reviewer CLI (``--version``, its subcommand's ``--help``, and
+#: the CLI's own check of the directory it will start in).
 PROBE_SECONDS = 15
 #: Limit for the git call that describes the implementation workspace for the reviewer.
 GIT_FACT_SECONDS = 10
-#: Work in the review call before the reviewer starts: two probes and the workspace facts.
-REVIEW_SETUP_SECONDS = 2 * PROBE_SECONDS + GIT_FACT_SECONDS
+#: Work in the review call before the reviewer starts: three checks and the workspace facts.
+REVIEW_SETUP_SECONDS = 3 * PROBE_SECONDS + GIT_FACT_SECONDS
 
 
 def bash_timeout_ms(seconds: int) -> int:

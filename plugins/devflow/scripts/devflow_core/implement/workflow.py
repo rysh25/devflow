@@ -69,8 +69,9 @@ class ImplementWorkflow(Workflow):
                     scratch: Path) -> tuple[dict, dict[str, bytes | Path]]:
         from . import snapshot
         from .config import load_config, validate_config
+        from ..common.reviewers import preflight
         from .engine import _plan_bytes
-        from .workspace import resolve_workspace
+        from .workspace import resolve_workspace, verify_workspace
         plan = Path(pending["args"])
         no_symlinks(plan)
         payload = pending["event"]["payload"]
@@ -81,6 +82,13 @@ class ImplementWorkflow(Workflow):
         # The workspace is decided once, before anything is created, and frozen.
         workspace = resolve_workspace(project, options.get("workspace"), config["snapshot"]["mode"])
         data = _plan_bytes(plan, config["max_plan_bytes"])
+        # Each reviewer is checked in the workspace before any work starts, so a reviewer that
+        # cannot run there (for example Devin in a directory it does not trust) stops the start
+        # and creates no run. The results are not kept: each review checks again.
+        for provider in config["reviewers"]:
+            preflight(provider, cwd=Path(workspace["path"]))
+        # The workspace must still be the one decided above after waiting for the checks.
+        verify_workspace(project, workspace, config["snapshot"]["mode"])
         # Only the text files Git does not hold are copied, once, into scratch/baseline.
         copies = scratch / "baseline"
         baseline = snapshot.capture(Path(workspace["path"]), config, copies=copies)

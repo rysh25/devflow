@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from devflow_core import __version__, cli
 from devflow_core.common import notices, paths, sessions
+from devflow_core.common.errors import ReviewerError
 from devflow_core.workflows import WORKFLOWS
 
 SCRIPT = notices.runner_path(paths.PLUGIN_ROOT)
@@ -80,21 +81,56 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(err, "")
         self.assertFalse((self.project / ".devflow").exists())
 
-    def test_offline_doctor_does_not_launch_any_process(self):
-        with patch("subprocess.Popen") as processes, patch("devflow_core.plan.engine.run_review") as reviews, \
+    def test_plan_doctor_checks_each_reviewer_in_the_project_without_a_model_or_a_review(self):
+        checked = []
+
+        def check(provider, cwd):
+            checked.append((provider["id"], cwd))
+            return {"kind": provider["kind"], "version_warnings": []}
+        with patch("devflow_core.common.reviewers.preflight", side_effect=check), \
+                patch("devflow_core.plan.engine.run_review") as reviews, \
                 patch("devflow_core.plan.config.shutil.which", return_value=None):
             code, out, err = self.cli("plan", "doctor")
         self.assertEqual(code, 0)
         value = json.loads(out)
         self.assertEqual(value["config"]["max_reviews"], 6)
         self.assertTrue(value["checks_not_performed"])
-        self.assertIn("Offline", value["note"])
+        self.assertIn("Normally no model calls", value["note"])
         self.assertFalse(value["binaries"]["codex"]["found"])
         self.assertIsNone(value["run_id"])
-        processes.assert_not_called()
+        ids = [provider["id"] for provider in value["config"]["reviewers"]]
+        self.assertEqual(checked, [(reviewer, self.project) for reviewer in ids])
+        self.assertEqual([(item["id"], item["ready"]) for item in value["reviewers"]], [(i, True) for i in ids])
+        self.assertEqual(value["reviewer_cwd"], str(self.project))
         reviews.assert_not_called()
         self.assertEqual(err, "")
         self.assertFalse((self.project / ".devflow").exists())
+
+    def test_plan_doctor_is_not_ready_when_a_reviewer_refuses_the_project(self):
+        refuse = []
+
+        def check(provider, cwd):
+            if provider["kind"] in refuse:
+                raise ReviewerError(f"Devin does not trust the reviewer directory {cwd}")
+            return {"kind": provider["kind"]}
+        skill = {"configured_name": "grilling", "status": "available", "static_ready": True,
+                 "runtime_verified": False, "reason": "Fixture metadata permits invocation"}
+
+        def doctor():
+            with patch("devflow_core.common.reviewers.preflight", side_effect=check), \
+                    patch("devflow_core.plan.config.inspect_interview_skill", return_value=skill), \
+                    patch("devflow_core.plan.config.shutil.which", return_value="/bin/found"):
+                code, out, err = self.cli("plan", "doctor")
+            self.assertEqual(code, 0)
+            return json.loads(out)
+        # Every other prerequisite is ready, so the reviewer result alone decides.
+        self.assertTrue(doctor()["ready"])
+        refuse.append("codex")
+        value = doctor()
+        self.assertFalse(value["ready"])
+        refused = [item for item in value["reviewers"] if not item["ready"]]
+        self.assertEqual([item["id"] for item in refused], ["codex"])
+        self.assertIn("does not trust the reviewer directory", refused[0]["error"])
 
     def test_invalid_config_reports_json(self):
         (self.project / "devflow.config.json").write_text('{"max_reviews":100}', encoding="utf-8")
@@ -122,7 +158,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(value["run_id"], state["run_id"])
 
     def test_doctor_carries_runner_fields(self):
-        with patch("devflow_core.cli.preflight", return_value={"probe": "test"}), \
+        with patch("devflow_core.common.reviewers.preflight", return_value={"probe": "test"}), \
                 patch("devflow_core.cli.host_version", return_value={"version": "0.0.0", "supported": True}):
             code, out, err = self.cli("doctor")
         self.assertEqual(code, 0, err)
