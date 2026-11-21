@@ -361,6 +361,24 @@ class CommandTests(unittest.TestCase):
                 self.prepare(config)
 
 
+class PreflightLaunchTests(unittest.TestCase):
+    def test_codex_opencode_and_claude_preflight_launch_only_version_and_help(self):
+        # Only Devin has a directory check; the other adapters launch exactly what they did before.
+        from devflow_core.common.process import Completed
+        for kind in ("codex", "opencode", "claude"):
+            launched = []
+
+            def bounded(argv, **options):
+                launched.append(argv[1:])
+                text = "99.0.0 " + " ".join(reviewers.CLIS[kind].flags())
+                return Completed(0, text.encode(), b"", False, False, None, 0.0)
+            with self.subTest(kind=kind), patch.object(reviewers, "run_bounded", bounded), \
+                    patch.object(reviewers, "_resolve", lambda prefix: prefix):
+                reviewers.preflight(reviewer(kind), cwd=Path.cwd())
+                subcommand = reviewers.CLIS[kind].subcommand
+                self.assertEqual(launched, [["--version"], ([subcommand] if subcommand else []) + ["--help"]])
+
+
 class ReviewerSettingsTests(unittest.TestCase):
     """The shared reviewer rules (common.settings), applied to every workflow."""
 
@@ -632,7 +650,7 @@ class ProcessTests(unittest.TestCase):
 
     def run_fixture(self, kind="codex", mode="pass", validate=accept, probe=None, **changes):
         config = self.config(kind, mode, **changes)
-        probe = probe if probe is not None else reviewers.preflight(config)
+        probe = probe if probe is not None else reviewers.preflight(config, cwd=Path.cwd())
         prepared = reviewers.prepare_review(config, self.packet.read_bytes(), self.output,
                                             self.schema, self.instructions, cwd=self.project, probe=probe)
         return reviewers.run_review(prepared, validate)
@@ -650,7 +668,7 @@ class ProcessTests(unittest.TestCase):
     def test_execution_uses_only_the_prepared_bytes_and_frozen_metadata(self):
         self.packet.write_bytes("First line\r\n日本語\nFinal line\r".encode("utf-8"))
         config = self.config()
-        probe = reviewers.preflight(config)
+        probe = reviewers.preflight(config, cwd=Path.cwd())
         prepared = reviewers.prepare_review(config, self.packet.read_bytes(), self.output,
                                             self.schema, self.instructions, cwd=self.project, probe=probe)
         self.assertFalse(self.output.exists())
@@ -665,7 +683,7 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(self.meta()['requested_model'], 'gpt-6.1-sol')
 
     def test_preflight_is_local_and_creates_nothing(self):
-        result = reviewers.preflight(self.config())
+        result = reviewers.preflight(self.config(), cwd=Path.cwd())
         self.assertEqual(result["kind"], "codex")
         self.assertEqual(result["requested_model"], "gpt-6.1-sol")
         self.assertEqual(result["requested_effort"], "xhigh")
@@ -676,7 +694,7 @@ class ProcessTests(unittest.TestCase):
     def test_preflight_accepts_any_version_that_has_the_flags(self):
         for kind in ("codex", "opencode"):
             with self.subTest(kind=kind):
-                result = reviewers.preflight(self.config(kind))
+                result = reviewers.preflight(self.config(kind), cwd=Path.cwd())
                 self.assertEqual(result["cli_version"], "opencode 3.0.1")
                 # Newer than the checked version: a warning, never a refusal.
                 self.assertEqual(len(result["version_warnings"]), 1)
@@ -693,11 +711,11 @@ class ProcessTests(unittest.TestCase):
 
     def test_missing_executable_and_cmd_shims_rejected(self):
         with self.assertRaisesRegex(ReviewerError, "not found"):
-            reviewers.preflight(reviewer(command=["devflow-missing-reviewer-cli"]))
+            reviewers.preflight(reviewer(command=["devflow-missing-reviewer-cli"]), cwd=Path.cwd())
         for shim in ("C:/bin/codex.cmd", "C:/bin/codex.BAT"):
             with self.subTest(shim=shim), patch.object(reviewers.shutil, "which", return_value=shim), \
                     self.assertRaisesRegex(ReviewerError, r"\.cmd/\.bat"):
-                reviewers.preflight(reviewer())
+                reviewers.preflight(reviewer(), cwd=Path.cwd())
 
     def test_invalid_config_rejected_before_any_file(self):
         incomplete = self.config()
@@ -814,7 +832,7 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(self.run_fixture("codex", "draft-in-stream")["review"], FIXTURE_REVIEW)
 
     def test_supplied_probe_is_not_repeated(self):
-        probe = reviewers.preflight(self.config())
+        probe = reviewers.preflight(self.config(), cwd=Path.cwd())
         with patch.object(reviewers, "preflight", side_effect=AssertionError("preflight repeated")):
             self.assertEqual(self.run_fixture(probe=probe)["review"], FIXTURE_REVIEW)
         self.assertEqual(self.meta()["cli_version"], probe["cli_version"])

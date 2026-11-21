@@ -81,20 +81,20 @@ class ClaudeTests(unittest.TestCase):
         help_text = " ".join(reviewers.Claude().flags()).encode()
         with patch.object(reviewers, "_resolve", return_value=["/native/claude"]), \
                 patch.object(reviewers, "_capture", side_effect=[(0, b"2.1.319 (Claude Code)"), (0, help_text)]) as capture:
-            self.assertEqual(reviewers.preflight(config)["kind"], "claude")
+            self.assertEqual(reviewers.preflight(config, cwd=Path.cwd())["kind"], "claude")
         self.assertEqual([call.args[0] for call in capture.call_args_list],
                          [["/native/claude", "--version"], ["/native/claude", "--help"]])
         with patch.object(reviewers, "_resolve", return_value=["/native/claude"]), \
                 patch.object(reviewers, "_capture", return_value=(0, b"2.1.318 (Claude Code)")) as capture:
             with self.assertRaisesRegex(ReviewerError, "2.1.319"):
-                reviewers.preflight(config)
+                reviewers.preflight(config, cwd=Path.cwd())
         self.assertEqual(capture.call_count, 1)
         for version in (b"2.1.319 (Claude Code)", b"2.1.320 (Claude Code)"):
             with self.subTest(version=version), \
                     patch.object(reviewers, "_resolve", return_value=["/native/claude"]), \
                     patch.object(reviewers, "_capture", side_effect=[(0, version), (0, help_text.replace(b"--verbose", b""))]):
                 with self.assertRaisesRegex(ReviewerError, "lacks flags.*--verbose"):
-                    reviewers.preflight(config)
+                    reviewers.preflight(config, cwd=Path.cwd())
 
     def test_raw_main_result_is_strict_even_in_unknown_fields(self):
         malformed = (self.raw.replace(b'"type":"result"', b'"type":"result","type":"result"'),

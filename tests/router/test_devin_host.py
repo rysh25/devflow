@@ -277,7 +277,7 @@ class DevinDoctorTests(RuntimeFixture):
         with patch.object(cli, "devin_version", return_value=version), \
              patch.object(cli, "codex_version", side_effect=AssertionError("Codex must not be probed")), \
              patch.object(cli, "claude_version", side_effect=AssertionError("Claude must not be probed")), \
-             patch.object(cli, "preflight", return_value={"offline": True}), \
+             patch("devflow_core.common.reviewers.preflight", return_value={"offline": True}), \
              patch("devflow_core.plan.interview.inspect_interview_skill", return_value=skill), \
              patch.object(cli.shutil, "which", side_effect=lambda name: "/synthetic/" + name):
             code, report = self.invoke_devin("doctor")
@@ -298,8 +298,8 @@ class DevinDoctorTests(RuntimeFixture):
         version = {"minimum_version": "3000.12.57", "version": "3000.12.57", "supported": True}
         skill = {"configured_name": "grilling", "status": "available", "static_ready": True, "reason": "Fixture"}
         for ready in (True, False):
-            probe = (patch.object(cli, "preflight", return_value={"offline": True}) if ready else
-                     patch.object(cli, "preflight", side_effect=DevFlowError("Reviewer executable not found")))
+            probe = (patch("devflow_core.common.reviewers.preflight", return_value={"offline": True}) if ready else
+                     patch("devflow_core.common.reviewers.preflight", side_effect=DevFlowError("Reviewer executable not found")))
             with self.subTest(ready=ready), probe, patch.object(cli, "devin_version", return_value=version), \
                  patch("devflow_core.plan.interview.inspect_interview_skill", return_value=skill), \
                  patch.object(cli.shutil, "which", side_effect=lambda name: "/synthetic/" + name):

@@ -89,6 +89,9 @@ class EngineFixture(unittest.TestCase):
         self.preflight_patch = patch("devflow_core.implement.engine.preflight",
                                      return_value={"available": True, "offline_probe": True})
         self.preflight = self.preflight_patch.start()
+        # The reviewer checks start runs in the workspace (build_start imports preflight when it runs).
+        self.start_preflight = patch("devflow_core.common.reviewers.preflight",
+                                     return_value={"available": True, "offline_probe": True}).start()
         self.reviewer = patch("devflow_core.implement.engine.run_review", side_effect=self.respond).start()
 
     def write_config(self):
@@ -230,13 +233,60 @@ class EngineFixture(unittest.TestCase):
 
 
 class EngineFlowTests(EngineFixture):
-    def test_start_does_not_preflight_reviewers(self):
-        # Reviewer CLIs are probed by doctor and before each review, never at start.
+    def test_start_preflights_every_reviewer_in_the_workspace(self):
+        # Each reviewer is checked once, in the workspace, before the baseline is captured.
+        from devflow_core.implement import snapshot
+        order, capture = [], snapshot.capture
+        self.start_preflight.side_effect = lambda provider, cwd: order.append((provider["id"], cwd)) or {}
+
+        def captured(*args, **kwargs):
+            order.append("baseline")
+            return capture(*args, **kwargs)
+        with patch.object(snapshot, "capture", side_effect=captured):
+            status = self.start()
+        self.assertEqual(status["status"], "implementing")
+        ids = [provider["id"] for provider in self.state()["config"]["reviewers"]]
+        self.assertEqual(order, [(reviewer, self.project) for reviewer in ids] + ["baseline"])
+        self.preflight.assert_not_called()  # the per-review check did not run
+        self.reviewer.assert_not_called()
+        self.assertNotIn("capabilities", self.state())  # the results are not kept
+
+    def test_a_reviewer_refused_at_start_creates_no_run_and_the_same_command_starts_again(self):
+        self.start_preflight.side_effect = ReviewerError("Devin does not trust the reviewer directory")
+        self.prompt(f'/devflow:implement "{self.plan}"')
+        with self.assertRaisesRegex(ReviewerError, "does not trust"):
+            router.runner_start(self.project, self.session, "implement", str(self.plan), host="claude")
+        self.assertEqual(self.runs(), [])
+        # An ordinary message discards the pending start, so start alone cannot be retried.
+        self.prompt("I trusted it in Devin.")
+        with self.assertRaises(DevFlowError):
+            router.runner_start(self.project, self.session, "implement", str(self.plan), host="claude")
+        self.assertEqual(self.runs(), [])
+        # The human types the same command again: the start succeeds.
+        self.start_preflight.side_effect = None
         status = self.start()
         self.assertEqual(status["status"], "implementing")
-        self.preflight.assert_not_called()
-        self.reviewer.assert_not_called()
-        self.assertNotIn("capabilities", self.state())
+        self.assertEqual(status["review_count"], 0)
+
+    def test_a_workspace_replaced_during_the_start_checks_creates_no_run(self):
+        from devflow_core.implement import snapshot
+        moved = self.base / "moved project"
+
+        def replace(provider, cwd):
+            if not moved.exists():  # once, during the first reviewer's check
+                self.project.rename(moved)
+                self.project.mkdir()
+            return {}
+        self.start_preflight.side_effect = replace
+        self.prompt(f'/devflow:implement "{self.plan}"')
+        with patch.object(snapshot, "capture") as capture:
+            with self.assertRaises(DevFlowError):
+                router.runner_start(self.project, self.session, "implement", str(self.plan), host="claude")
+        capture.assert_not_called()
+        # No run directory; the scratch directory moved away with the project is not a run.
+        root = moved / ".devflow" / "runs" / "implement"
+        self.assertEqual([path.name for path in root.iterdir() if not path.name.startswith(".")]
+                         if root.exists() else [], [])
 
     def test_start_plan_change_during_baseline_is_rejected_before_run(self):
         from devflow_core.implement import snapshot
@@ -514,6 +564,40 @@ class EngineFlowTests(EngineFixture):
         self.assertEqual(self.state()["status"], "ready_review")
         self.assertIsNone(self.state()["inflight"])
         self.assertFalse((self.run / "reviews").exists())
+        self.reviewer.assert_not_called()
+
+    def test_review_checks_the_reviewer_in_the_verified_workspace(self):
+        self.start()
+        self.ready()
+        self.review()
+        self.assertEqual(self.preflight.call_args.kwargs["cwd"], self.project)
+
+    def test_a_workspace_that_fails_verification_starts_no_reviewer_check(self):
+        self.start()
+        self.ready()
+        with patch.object(engine_module, "verify_workspace", side_effect=DevFlowError("workspace replaced")):
+            with self.assertRaisesRegex(DevFlowError, "workspace replaced"):
+                self.review()
+        self.preflight.assert_not_called()
+        state = self.state()
+        self.assertEqual((state["status"], state["attempts"], state["inflight"]), ("ready_review", [], None))
+
+    def test_devin_refusing_the_workspace_before_a_review_does_not_consume_attempt(self):
+        from tests.common.test_devin import FAKE_DEVIN
+        fake = self.base / "fake devin.py"
+        fake.write_text(FAKE_DEVIN, encoding="utf-8")
+        self.config["reviewers"] = [{"id": "devin", "kind": "devin", "command": [sys.executable, str(fake), "untrusted"],
+                                     "model": "swe-2", "effort": "high", "timeout_seconds": 30}]
+        self.write_config()
+        self.start()
+        self.ready()
+        self.preflight_patch.stop()  # The real check runs before any reservation.
+        with self.assertRaisesRegex(ReviewerError, "Devin does not trust the reviewer directory"):
+            self.review()
+        state = self.state()
+        self.assertEqual((state["status"], state["attempts"], state["inflight"]), ("ready_review", [], None))
+        self.assertFalse((self.run / "reviews").exists())
+        self.assertFalse((self.run / "review-processes").exists())
         self.reviewer.assert_not_called()
 
     def test_missing_reviewer_cli_fails_preflight_without_consuming_attempt(self):

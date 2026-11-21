@@ -8,7 +8,7 @@ Run the bundled runner with concrete values substituted and quoted for the shell
 uv --no-cache run --offline --no-project --no-config --no-python-downloads "RUNNER" --host codex --project "PROJECT" --session "SESSION_ID" COMMAND
 ```
 
-All global arguments precede the command. Read each JSON result. Use exec_command for long calls and poll its returned session_id with write_stdin until completion; do not replay the command or start another action while it runs. Use Codex's standard permissions. If an operation needs additional permission, explain the measured need and request standard approval; never change user settings or silently retry with broader permissions.
+All global arguments precede the command. Read each JSON result. Use exec_command for long calls and poll its returned session_id with write_stdin until completion; do not replay the command or start another action while it runs. This includes `doctor` and `start`, which check each reviewer CLI locally and may take a while. Use Codex's standard permissions. If an operation needs additional permission, explain the measured need and request standard approval; never change user settings or silently retry with broader permissions.
 
 Inside Codex's workspace-write sandbox, runner actions that start Codex themselves fail: `plan doctor --session` and `plan seal` (measured: "Codex conversation API closed before replying") and `review` when the next reviewer is Codex (measured: "os error 30" from the reviewer). Before running one of these, request standard approval to run that exact command outside the sandbox, so a review is not spent on the sandbox failure. If the human declines, report the blocker and the exact command.
 

@@ -22,6 +22,7 @@ from devflow_core.common.storage import atomic_write_json, read_json
 from devflow_core.implement import WORKFLOW
 from devflow_core.implement.engine import Engine
 from devflow_core.workflows import WORKFLOWS
+from tests.start_checks import skip_reviewer_checks
 
 PACKAGE = Path(__file__).resolve().parents[2] / "plugins" / "devflow" / "scripts" / "devflow_core" / "implement"
 RUN_ID = "20261101T123456Z-123456abcdef"
@@ -30,6 +31,7 @@ EVENT = "a" * 32
 
 class Fixture(unittest.TestCase):
     def setUp(self):
+        skip_reviewer_checks(self)
         self.temporary = tempfile.TemporaryDirectory(prefix="devflow implement hooks ")
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name).resolve()

@@ -22,6 +22,7 @@ from devflow_core.common.storage import atomic_write_json, read_json
 from devflow_core.workflows import WORKFLOWS
 from devflow_core.implement import WORKFLOW, workspace
 from devflow_core.implement.engine import Engine
+from tests.start_checks import skip_reviewer_checks
 
 CHECK = "import os, pathlib; print(pathlib.Path(os.getcwd()).resolve())"
 
@@ -29,6 +30,7 @@ CHECK = "import os, pathlib; print(pathlib.Path(os.getcwd()).resolve())"
 @unittest.skipUnless(shutil.which("git"), "Git is not installed")
 class WorkspaceFixture(unittest.TestCase):
     def setUp(self):
+        skip_reviewer_checks(self)
         temporary = tempfile.TemporaryDirectory(prefix="devflow workspace ")
         self.addCleanup(temporary.cleanup)
         self.base = Path(temporary.name).resolve()
@@ -90,6 +92,59 @@ class WorkspaceStartTests(WorkspaceFixture):
         self.assertEqual(checked["status"], "ready_review")
         results = read_json(Path(checked["run_dir"]) / checked["validation"]["path"])["results"]
         self.assertTrue(same_path(Path(results[0]["stdout_path"]).read_text().strip(), self.worktree))
+
+    def test_start_checks_each_reviewer_in_the_chosen_worktree(self):
+        with patch("devflow_core.common.reviewers.preflight", return_value={}) as check:
+            status = self.start(str(self.worktree))
+        reviewers = status["config"]["reviewers"]
+        self.assertEqual([call.args[0]["id"] for call in check.call_args_list], [r["id"] for r in reviewers])
+        for call in check.call_args_list:
+            self.assertTrue(same_path(call.kwargs["cwd"], self.worktree))
+
+    def test_doctor_names_the_runs_worktree_when_its_verification_fails(self):
+        status = self.start(str(self.worktree))
+        shutil.rmtree(self.worktree)
+        out = io.StringIO()
+        with patch("devflow_core.common.reviewers.preflight") as check, \
+                redirect_stdout(out), redirect_stderr(io.StringIO()):
+            code = cli.main(["--host", "claude", "--project", str(self.project), "--run", status["run_id"],
+                             "implement", "doctor"])
+        self.assertEqual(code, 0)
+        report = json.loads(out.getvalue())
+        check.assert_not_called()
+        self.assertFalse(report["ready"])
+        self.assertTrue(same_path(report["reviewer_cwd"], self.worktree))
+        for item in report["reviewers"]:
+            self.assertFalse(item["ready"])
+            self.assertTrue(item["error"].startswith("Workspace verification failed before any reviewer CLI ran: "))
+
+    def test_doctor_reports_path_failures_during_verification(self):
+        status = self.start(str(self.worktree))
+        recorded_git_dir = status["workspace"]["git_dir"]
+
+        def removed(path):
+            raise FileNotFoundError(f"No such directory: {path}")
+
+        def looping(left, right):
+            # Python before 3.13 raises RuntimeError when resolving a symlink loop.
+            if left == recorded_git_dir:
+                raise RuntimeError(f"Symlink loop from {left!r}")
+            return same_path(left, right)
+        failures = {"identity lookup": patch.object(workspace, "identity", side_effect=removed),
+                    "recorded path comparison": patch.object(workspace, "same_path", side_effect=looping)}
+        for name, failure in failures.items():
+            with self.subTest(name):
+                out = io.StringIO()
+                with failure, patch("devflow_core.common.reviewers.preflight") as check, \
+                        redirect_stdout(out), redirect_stderr(io.StringIO()):
+                    code = cli.main(["--host", "claude", "--project", str(self.project), "--run",
+                                     status["run_id"], "implement", "doctor"])
+                self.assertEqual(code, 0)
+                report = json.loads(out.getvalue())
+                check.assert_not_called()
+                self.assertTrue(same_path(report["reviewer_cwd"], self.worktree))
+                self.assertEqual({item["ready"] for item in report["reviewers"]}, {False})
+                self.assertIn("no longer valid", report["reviewers"][0]["error"])
 
     def test_a_relative_workspace_is_resolved_against_the_project(self):
         status = self.start("../feature worktree")

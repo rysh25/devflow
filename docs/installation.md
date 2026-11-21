@@ -7,16 +7,16 @@
 3. 使うホストに DevFlow のプラグインを入れます（[プラグインの導入と更新](#プラグインの導入と更新)）。GitHub からでも、ローカルの配布物からでも入れられます。
 4. 対象プロジェクトで `/devflow:doctor`（Codex では `$devflow:doctor`）を実行します。
 
-doctor は環境診断であり、アカウントで指定モデルが使えることまで保証するものではありません。doctor はプロジェクトのファイルを書きませんが、設定したレビュアー CLI の `--version` と、使うサブコマンドの `--help` を実行します。確かめた版より新しい CLI や Claude Code では警告を出します（止めません）。
+doctor は環境診断であり、アカウントで指定モデルが使えることまで保証するものではありません。DevFlow のランナー自身は、doctor でプロジェクトのファイルを書きません。ただし、設定したレビュアー CLI の `--version` と、使うサブコマンドの `--help` を実行します。Devin をレビュアーに設定した場合は、レビュアーを起動するディレクトリ（結果の `reviewer_cwd`）を Devin が信頼しているかも確かめます（存在しないモデル名で Devin を起動し、断りの文を見ます。通常モデルを呼びません。例外の範囲は、その場合に Devin がファイルを書きうることも含めて [信頼の考え方と注意](security.md)）。確かめた版より新しい CLI や Claude Code では警告を出します（止めません）。
 
 ### 長い処理の待ち時間（任意）
 
-`review` と `check` は、外部の処理が終わるまで待つランナーの操作です。Claude は、ランナーが返す `bash_timeout_ms`（既定では `review` が 1900000 ms）を Bash ツールの `timeout` に渡し、Claude Code の Bash の上限より大きいときはバックグラウンドで実行して、終わりの知らせを待ちます。そのため、何も設定しなくてもレビューは最後まで動きます。
+`review` と `check` は、外部の処理が終わるまで待つランナーの操作です。Claude は、ランナーが返す `bash_timeout_ms`（既定では `review` が 1915000 ms）を Bash ツールの `timeout` に渡し、Claude Code の Bash の上限より大きいときはバックグラウンドで実行して、終わりの知らせを待ちます。そのため、何も設定しなくてもレビューは最後まで動きます。
 
 バックグラウンドで動いたあとの次のターンでは、ランナーの呼び出しに承認を求められることがあります（スキルの事前の許可は、そのスキルを呼んだターンの間だけ効くため）。権限のモードが `auto` のときなど、Claude Code が自動で許可する場合は求められません。避けたい場合は、Bash の上限（`BASH_MAX_TIMEOUT_MS` と `BASH_DEFAULT_TIMEOUT_MS` の大きい方）を `bash_timeout_ms` 以上にします。
 
 ```json
-{"env": {"BASH_MAX_TIMEOUT_MS": "1900000"}}
+{"env": {"BASH_MAX_TIMEOUT_MS": "1915000"}}
 ```
 
 これを `~/.claude/settings.json`（またはプロジェクトの `.claude/settings.json`）に書き、Claude Code を起動し直します。`BASH_DEFAULT_TIMEOUT_MS` を上げると、すべての Bash の既定の待ち時間も長くなります。Implement のチェックは 1 回の `check` で全チェックを順に実行するので、各チェックの `timeout_seconds` の合計に 60 秒を足した時間が要ります。承認の確認で「今後は確認しない」を選ぶか、Claude Code の許可の設定にランナーを足しても、承認は求められなくなります。
@@ -58,6 +58,8 @@ Windows では Git for Windows を入れてください（DevFlow の git と、
 uv が MSYS2 や Cygwin の Python を選ぶと、パスの扱いが変わるため doctor がエラーにします。Windows 版の Python を使ってください。
 
 DevFlow の git は、利用者の git の設定（`core.autocrlf` など）をそのまま使います。改行の扱いは、利用者の git と同じになります。
+
+Codex の `elevated` のサンドボックスを使っていると、レビュアーの Codex が uv で入れた Python を起動できないことがあります。対処は[Windows の Codex レビュアーが Python を起動できない](#windows-の-codex-レビュアーが-python-を起動できない)にあります。
 
 ### 面接スキルの診断
 
@@ -181,7 +183,7 @@ public は必須ではありません。private も、実行環境の通常の G
 
 ### 更新の前後
 
-更新の前に、README の「0.12.6 への更新」（それより前の版から上げるときは「0.12.5 への更新」「0.12.4 への更新」「0.12.3 への更新」「0.12.2 への更新」「0.12.1 への更新」「0.12.0 への更新とバージョンを戻す場合」「0.11.0 への更新とバージョンを戻す場合」「0.10.1 への更新」「0.10.0 への更新」「0.9.1 への更新」「0.9.0 への更新」「0.8.1 への更新」「0.8.0 への更新とバージョンを戻す場合」「0.7.3 への更新」「0.7.2 への更新」「0.7.1 への更新」「0.7.0 への更新」「0.6.0 への更新」「0.5.1 への更新」「0.5.0 への更新」「0.4.0 への更新」も）で、その版の注意点を確認してください。版によっては、それまでの run を続けられないことがあります（例：0.6.x で始めた run は 0.7.0 では続けられません）。
+更新の前に、README の「0.12.7 への更新」（それより前の版から上げるときは「0.12.6 への更新」「0.12.5 への更新」「0.12.4 への更新」「0.12.3 への更新」「0.12.2 への更新」「0.12.1 への更新」「0.12.0 への更新とバージョンを戻す場合」「0.11.0 への更新とバージョンを戻す場合」「0.10.1 への更新」「0.10.0 への更新」「0.9.1 への更新」「0.9.0 への更新」「0.8.1 への更新」「0.8.0 への更新とバージョンを戻す場合」「0.7.3 への更新」「0.7.2 への更新」「0.7.1 への更新」「0.7.0 への更新」「0.6.0 への更新」「0.5.1 への更新」「0.5.0 への更新」「0.4.0 への更新」も）で、その版の注意点を確認してください。版によっては、それまでの run を続けられないことがあります（例：0.6.x で始めた run は 0.7.0 では続けられません）。
 
 更新の後：
 
@@ -231,6 +233,51 @@ Git モードでは、新規作成された正式プランや設定ファイル�
 
 `status` の `last_error` と、`review-processes/NN/` の `stderr.log`・`stdout.jsonl` を確認してください。プロジェクトの CLI の設定（Codex の `.codex/config.toml` など）が壊れていると、レビュアーが起動できません。レビュアーがスナップショットの範囲のファイルを変えた回（テストがキャッシュやカバレッジのファイルを作った場合など）も、合格に数えられません。
 
+### Windows の Codex レビュアーが Python を起動できない
+
+Windows ネイティブの Codex で `elevated` のサンドボックスを使っていると、レビュアーの Codex がサンドボックスの中から Python を起動できないことがあります。`elevated` は、`%USERPROFILE%\.codex\config.toml` の `[windows]` に `sandbox = "elevated"` と書いたときの方式です。uv が既定の場所に入れた Python で起き、次のように表示されます。
+
+```text
+error: uv trampoline failed to spawn Python child process
+  Caused by: permission denied (os error 5)
+```
+
+`elevated` は、コマンドを Codex 専用の低い権限のユーザーで実行します。uv の既定では、起動用の `%USERPROFILE%\.local\bin\python.exe` が、本体（`%APPDATA%\uv\python\` の下）を起動します。起動用の exe は動きますが、本体を起動する権限がありません。対話で使う Codex では動くことがあります。DevFlow はレビュアーを `approval_policy="never"` で起動し、サンドボックスの外での実行を求めないので、この失敗がそのまま残ります。
+
+影響はレビュアーが自分で Python を使って確かめるときだけです。`implement.checks` は DevFlow がサンドボックスの外で実行するので、影響を受けません。WSL2 の Codex は Linux のサンドボックスを使うので、この設定の影響を受けません。
+
+**対処（確認済み）**: プロジェクト直下の `devflow.config.local.json` で、DevFlow のレビュアーの Codex にだけ `unelevated` のサンドボックスを使います。対話で使う Codex の `sandbox = "elevated"` は、そのまま残せます。
+
+```json
+{
+  "schema_version": 1,
+  "reviewers": [
+    {"id": "codex", "kind": "codex", "command": ["codex", "-c", "windows.sandbox=\"unelevated\""],
+     "model": "gpt-6.2-sol", "effort": "high", "timeout_seconds": 1800},
+    {"id": "opencode", "kind": "opencode", "command": ["opencode"], "model": "opencode-go/deepseek-v4.1-flash",
+     "effort": "high", "timeout_seconds": 1800}
+  ]
+}
+```
+
+- `command` の後ろに DevFlow の引数（`exec …`）がつながります。Codex の `-c` は `exec` の前に置いても効きます。
+- `reviewers` の配列は丸ごと置き換わります。使うレビュアーをすべて書いてください。
+- ローカルの共通の `reviewers` は、共有の `devflow.config.json` の `implement.reviewers` より優先されます。Implement で別の顔ぶれを使うなら、ローカルの `implement.reviewers` にも同じように書きます。
+- 利用者自身で `.gitignore` に `/devflow.config.local.json` を加えてください。
+- `unelevated` は、利用者のアカウントから作った権限の低いトークンで動きます。OpenAI の資料では、`elevated` よりネットワークの隔離が弱く、読み取りを禁止する場所の指定も使えないとされています。
+
+**別の対処（未確認）**: Python を全ユーザーが読める場所に入れ直します。uv なら、管理者の PowerShell で次を実行し、新しいターミナルを開きます。これで `elevated` のまま動くかは、まだ確かめていません。
+
+```powershell
+$env:UV_PYTHON_INSTALL_DIR = 'C:\Program Files\uv-python'
+$env:UV_PYTHON_BIN_DIR     = 'C:\Program Files\uv-python\bin'
+uv python install 3.14 --default
+$machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+[Environment]::SetEnvironmentVariable('Path', "$machine;C:\Program Files\uv-python\bin", 'Machine')
+```
+
+この Python を後で更新・削除するときも、同じ2つの環境変数を設定してから uv を実行します。
+
 ## 公式資料
 
 - [Claude Code plugin 導入・スコープ・private marketplace](https://code.claude.com/docs/en/discover-plugins)
@@ -238,6 +285,7 @@ Git モードでは、新規作成された正式プランや設定ファイル�
 - [Claude Code plugin の読み込み・版・更新](https://code.claude.com/docs/en/plugins/loading)
 - [Claude Code のツール（Bash の待ち時間とバックグラウンド実行）](https://code.claude.com/docs/en/tools-reference)
 - [Codex CLI のコマンド（`codex plugin`）](https://developers.openai.com/codex/cli/reference)
+- [Codex の Windows のサンドボックス](https://developers.openai.com/codex/windows)
 - [Devin CLI のプラグイン](https://docs.devin.ai/cli/extensibility/plugins/overview)
 - [uv script metadata](https://docs.astral.sh/uv/guides/scripts/)
 
@@ -302,9 +350,9 @@ CLI の --host 常時必須化も0.8.0の破壊的変更です。0.7.x用の手�
 
 ## Codex の会話APIを面接前に確認する
 
-全体の doctor はプロジェクト設定と静的な前提だけを確認します。
+全体の doctor は、プロジェクト設定と静的な前提、各レビュアー CLI の手元での確認（`--version`、`--help`、Devin の信頼の確認）だけを行います。
 実際のセッションIDを指定した plan doctor は、app-server の初期化、ルートの識別、
-thread/items/list の先頭1ページまでを追加で確認します。モデル呼び出しやログインは行いません。
+thread/items/list の先頭1ページまでを追加で確認します。この会話 API の確認は、モデル呼び出しやログインを行いません（レビュアー CLI の確認の例外は [信頼の考え方と注意](security.md)）。
 
 ```text
 uv --no-cache run --offline --no-project --no-config --no-python-downloads "PLUGIN_DIR/scripts/devflow.py" --host codex --project "PROJECT_DIR" --session "ACTUAL_SESSION_ID" plan doctor
@@ -343,11 +391,14 @@ Devin は、プラグインのルートの `hooks.json` を読みます。DevFlo
 ### 信頼と承認
 
 1. **プロジェクトを信頼する。** 初めてのプロジェクトでは、`devin` をそのプロジェクトで起動し、信頼を選びます。
-   Devin は、信頼したディレクトリとその下でだけ動きます。Implement で別の worktree を実装場所にすると、
-   Devin レビュアーはその worktree で起動するので、その worktree が信頼したディレクトリの下になければ、
-   `start` の前にその worktree かその上のディレクトリを信頼してください。信頼していない場所では、
-   Devin をレビュアーにした回が `Refusing to run in an untrusted workspace` で失敗します。DevFlow は
-   `--respect-workspace-trust false` や `--permission-mode` を渡しません。
+   Devin は、信頼したディレクトリとその下でだけ動きます。Devin レビュアーは、Plan ではプロジェクト、Implement では
+   実装場所で起動します。本体の外にある worktree で Plan を始めた場合や、Implement で別の worktree を実装場所に
+   する場合は、その worktree かその上のディレクトリを信頼してください。DevFlow は、`doctor`、`plan doctor`、
+   `implement start`、各レビューの直前に、レビュアーを起動するディレクトリを Devin が信頼しているかを確かめ、
+   信頼していなければレビュー回数を使わずに止めて、そのディレクトリと信頼の手順を示します。`implement start` が
+   断ったときは、信頼したあと同じ `/devflow:implement` をもう一度入力します。確認は通常モデルを呼びません
+   （例外の範囲は [信頼の考え方と注意](security.md)）。DevFlow は `--respect-workspace-trust false` や
+   `--permission-mode` を渡しません。
 2. **ランナーを承認する。** スキルはランナーを事前に許可しません。Devin は許可の規則を文字どおりに照合し、
    プラグインのパスを展開しないので、ランナーだけを許す規則を配布物に書けないためです。Devin がランナーの
    コマンドの承認を求めたら、Devin の標準の承認で許可してください。DevFlow は利用者の設定を変えません。
@@ -361,7 +412,7 @@ Devin でプロジェクトを開き、次を送ります。
 ```
 
 `host_diagnostics` に Devin CLI の版、`workflows.plan.interview_skill` に面接スキルの判定が出ます。
-Devin の doctor は静的な確認だけで、会話の API の確認（Codex の `conversation_api`）はありません。
+Devin の doctor に、会話の API の確認（Codex の `conversation_api`）はありません。Devin をレビュアーに設定した場合、doctor はレビュアーを起動するディレクトリ（`reviewer_cwd`）を Devin が信頼しているかを確かめます。
 
 ### 面接スキルの場所
 

@@ -504,12 +504,13 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(version_warnings("a-new-cli", "9.9.9"), [])
 
     def test_review_timeout_covers_the_work_before_the_reviewer(self):
-        # Two CLI probes (version, then the subcommand's help) and the git call that
-        # describes the workspace run before the reviewer, in the same Bash call.
-        self.assertEqual(REVIEW_SETUP_SECONDS, 2 * PROBE_SECONDS + GIT_FACT_SECONDS)
+        # Three CLI checks (version, the subcommand's help, and the CLI's check of the
+        # directory it starts in) and the git call that describes the workspace run
+        # before the reviewer, in the same Bash call.
+        self.assertEqual(REVIEW_SETUP_SECONDS, 3 * PROBE_SECONDS + GIT_FACT_SECONDS)
         self.assertEqual((PROBE_SECONDS, GIT_FACT_SECONDS), (15, 10))
-        self.assertEqual(review_timeout_ms(900), 1000000)
-        self.assertEqual(review_timeout_ms(1800), 1900000)  # The default reviewer limit.
+        self.assertEqual(review_timeout_ms(900), 1015000)
+        self.assertEqual(review_timeout_ms(1800), 1915000)  # The default reviewer limit.
         from devflow_core.common import reviewers
         from devflow_core.common.process import Completed
         from devflow_core.implement import workspace
@@ -518,12 +519,12 @@ class EnvironmentTests(unittest.TestCase):
 
         def bounded(argv, **options):
             waited.append(options["timeout"])
-            text = " ".join(reviewers.CLIS["codex"].flags())
-            return Completed(0, f"codex 1.0.0 {text}".encode(), b"", False, False, None, 0.0)
+            text = " ".join(reviewers.CLIS["devin"].flags())
+            return Completed(0, f"devin 1.0.0 {text}".encode(), b"", False, False, None, 0.0)
         with patch.object(reviewers, "run_bounded", bounded), patch.object(reviewers, "_resolve", lambda prefix: prefix):
-            reviewers.preflight({"id": "codex", "kind": "codex", "command": ["codex"], "model": "m", "effort": "e",
-                                 "timeout_seconds": 10})
-        self.assertEqual(waited, [PROBE_SECONDS, PROBE_SECONDS])
+            reviewers.preflight({"id": "devin", "kind": "devin", "command": ["devin"], "model": "m", "effort": "e",
+                                 "timeout_seconds": 10}, cwd=Path.cwd())
+        self.assertEqual(waited, [PROBE_SECONDS, PROBE_SECONDS, PROBE_SECONDS])
         with patch.object(workspace, "run_git", return_value=b"main\n") as git:
             self.assertEqual(workspace.branch(Path("."), "git"), "main")
         self.assertEqual(git.call_args.kwargs["timeout"], GIT_FACT_SECONDS)

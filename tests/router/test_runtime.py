@@ -19,6 +19,7 @@ from devflow_core.common.errors import DevFlowError
 from devflow_core.common.runs import SCHEMA_VERSION, RunStore, make_event
 from devflow_core.common.storage import atomic_json, read_json, write_new
 from devflow_core.workflows import WORKFLOWS
+from tests.start_checks import skip_reviewer_checks
 
 ROOT = Path(__file__).resolve().parents[2]
 PLUGIN = ROOT / "plugins" / "devflow"
@@ -28,6 +29,7 @@ OTHER_ID = "20261101T123456Z-bbbbbbbbbbbb"
 
 class RuntimeFixture(unittest.TestCase):
     def setUp(self):
+        skip_reviewer_checks(self)
         temporary = tempfile.TemporaryDirectory(prefix="devflow unified ")
         self.addCleanup(temporary.cleanup)
         self.base = Path(temporary.name).resolve()
@@ -1045,7 +1047,7 @@ class UnifiedCliTests(RuntimeFixture):
     def doctor_patches(self, skill_report=None, supported=True, which=None):
         skill_report = skill_report or {"configured_name": "grilling", "status": "available", "static_ready": True,
                                         "runtime_verified": False, "reason": "Fixture metadata permits invocation"}
-        return (patch.object(cli, "preflight", return_value={"offline": True}),
+        return (patch("devflow_core.common.reviewers.preflight", return_value={"offline": True}),
                 patch("devflow_core.plan.interview.inspect_interview_skill", return_value=skill_report),
                 patch.object(cli, "claude_version", return_value={"supported": supported, "version": "2.1.316"}),
                 patch.object(cli.shutil, "which", side_effect=which or (lambda name: "/synthetic/available")))
@@ -1062,6 +1064,9 @@ class UnifiedCliTests(RuntimeFixture):
         self.assertEqual(report["workflows"]["plan"]["configuration_source"], "project_settings")
         self.assertFalse(report["python"]["fixed_minor"])
         self.assertEqual(preflight.call_count, 2)  # Shared provider probes are cached.
+        # Every workflow checks its reviewers in the project.
+        self.assertEqual({call.kwargs["cwd"] for call in preflight.call_args_list}, {self.project})
+        self.assertEqual(report["reviewer_cwd"], str(self.project))
         self.assertFalse((self.project / ".devflow").exists())
 
     def test_doctor_missing_interview_does_not_block_implementation_readiness(self):

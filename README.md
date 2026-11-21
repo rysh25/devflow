@@ -1,4 +1,4 @@
-# DevFlow 0.12.6 — Claude Code / Codex CLI / Devin CLI Plugin
+# DevFlow 0.12.7 — Claude Code / Codex CLI / Devin CLI Plugin
 
 人間との要件整理から計画作成、実装、独立レビューまでを支援する **3つのホスト（Claude Code、Codex CLI、Devin CLI）で使える単一のプラグイン** です。インストールするプラグインは `devflow` だけです。
 
@@ -8,7 +8,7 @@
 | `/devflow:implement <plan-file>` | 明示した Markdown プランを読み、Claude Code がコードを実装・修正する |
 | `/devflow:status [run-id]` | 保存された進捗・レビュー回数・停止理由を確認する |
 | `/devflow:resume <run-id>` | 中断した同じ実行を再開する。レビュー回数はリセットしない |
-| `/devflow:doctor` | 導入状態・設定・外部 CLI を診断する。モデルは呼び出さない |
+| `/devflow:doctor` | 導入状態・設定・外部 CLI を診断する。通常はモデルを呼び出さない |
 
 Plan と Implement はファイルで接続します。Implement は Plan の run-id、会話履歴、内部状態を必要とせず、人間や別のツールが書いた Markdown でも開始できます。Plan 完了後に実装を勝手に始めることはありません。
 
@@ -103,11 +103,14 @@ devin plugins install rysh25/devflow#plugins/devflow
 macOS とネイティブの Windows は確かめていません。
 
 - **プロジェクトを信頼する。** 初めてのプロジェクトでは、`devin` をそのプロジェクトで一度起動して信頼してください。
-  Devin は、信頼したディレクトリとその下でだけ動きます。Implement で別の worktree を実装場所にすると、Devin レビュアーは
-  その worktree で起動します。すでに信頼したディレクトリの下にある worktree（例：プロジェクトの中の Git で無視した
-  ディレクトリ）はその信頼を引き継ぎます。それ以外の場所の worktree は、`start` の前にその worktree で `devin` を
-  一度起動して信頼してください。DevFlow は信頼や権限の確認を迂回するフラグを渡しません。信頼していないと、
-  Devin をレビュアーにした回は失敗します。
+  Devin は、信頼したディレクトリとその下でだけ動きます。Devin レビュアーは、Plan ではプロジェクトで、Implement では
+  実装場所で起動します。そのため、Plan でもプロジェクト（たとえば本体の外にある worktree で Plan を始めた場合はその
+  worktree）が信頼したディレクトリの下にないと、Devin は断ります。Implement で別の worktree を実装場所にする場合も同じで、
+  すでに信頼したディレクトリの下にある worktree（例：プロジェクトの中の Git で無視したディレクトリ）はその信頼を引き継ぎます。
+  DevFlow は、`doctor`、`plan doctor`、`implement start`、各レビューの直前に、レビュアーを起動するディレクトリを Devin が
+  信頼しているかを確かめます。信頼していなければ、レビュー回数を使わずに止め、そのディレクトリと信頼の手順（そこかその上の
+  ディレクトリで `devin` を一度起動して信頼する）を示します。この確認は通常モデルを呼びません（例外の範囲は
+  [信頼の考え方と注意](docs/security.md)）。DevFlow は信頼や権限の確認を迂回するフラグを渡しません。
 - **ランナーの承認。** Devin のスキルは、ランナーのコマンドを事前に許可しません。Devin は許可の規則を文字どおりに照合し、
   プラグインのパスを展開しないため、ランナーだけを許す規則を配布物に書けないからです（[調査](docs/devin-host-research.md#実装時に追加で確かめたこと2026-11-15devin-cli-30001257)）。
   ランナーを起動するときに Devin が承認を求めたら、Devin の標準の承認で許可してください。DevFlow は利用者の設定を変えません。
@@ -320,7 +323,7 @@ Implement は開始時のプランと作業ツリーを固定し、Claude Code �
 
 知らない項目があると、その項目の名前を示すエラーになります。
 
-Devin をレビュアーにする例です。DevFlow は `devin --print --prompt-file <入力> --model <model>-<effort> --export <記録>` で起動し、`model` と `effort` を `-` でつないで渡します（`swe-2` と `high` なら `swe-2-high`）。選べる effort はモデルごとに違うので、`devin models list` で確かめてください。Devin は、信頼したディレクトリとその下でだけ動きます。Implement で別の worktree を実装場所にするとレビューはその worktree で起動するので、その worktree かその上のディレクトリを先に信頼しておいてください。答えは、Devin が `--export` に書く記録の最後の発言から読みます。Devin には答えの形を強制する機能が無いので、モデルが JSON の前後に文章を付けたり、スキーマに合わない JSON を返したりすることがあります。答えの点検で断られたときは、DevFlow が同じ会話の続き（`devin --print --prompt-file <出し直しの依頼> --resume <1回目の記録のセッション ID> --model <model>-<effort> --export <出し直しの記録>`）を1回だけ起動し、断られた理由とスキーマを添えてレビューを送り直してもらいます（DevFlow は文章から JSON を拾いません）。出し直しの答えも点検に通らなければ、その回は失敗です。出し直しの起動は新しいレビューではなく、元の制限時間の残りだけを使います。長い入力では Devin が会話を自動で要約し、要約でスキーマが消えることがあるので、出し直しの依頼にはスキーマを入れています。
+Devin をレビュアーにする例です。DevFlow は `devin --print --prompt-file <入力> --model <model>-<effort> --export <記録>` で起動し、`model` と `effort` を `-` でつないで渡します（`swe-2` と `high` なら `swe-2-high`）。選べる effort はモデルごとに違うので、`devin models list` で確かめてください。Devin は、信頼したディレクトリとその下でだけ動きます。レビューは Plan ではプロジェクト、Implement では実装場所（別の worktree ならその worktree）で起動するので、そこかその上のディレクトリを先に信頼しておいてください。信頼していなければ、DevFlow はレビュー回数を使う前に止めて信頼の手順を示します。答えは、Devin が `--export` に書く記録の最後の発言から読みます。Devin には答えの形を強制する機能が無いので、モデルが JSON の前後に文章を付けたり、スキーマに合わない JSON を返したりすることがあります。答えの点検で断られたときは、DevFlow が同じ会話の続き（`devin --print --prompt-file <出し直しの依頼> --resume <1回目の記録のセッション ID> --model <model>-<effort> --export <出し直しの記録>`）を1回だけ起動し、断られた理由とスキーマを添えてレビューを送り直してもらいます（DevFlow は文章から JSON を拾いません）。出し直しの答えも点検に通らなければ、その回は失敗です。出し直しの起動は新しいレビューではなく、元の制限時間の残りだけを使います。長い入力では Devin が会話を自動で要約し、要約でスキーマが消えることがあるので、出し直しの依頼にはスキーマを入れています。
 
 ```json
 {"id": "devin", "kind": "devin", "command": ["devin"], "model": "swe-2", "effort": "high", "timeout_seconds": 1800}
@@ -330,7 +333,7 @@ Devin をレビュアーにする例です。DevFlow は `devin --print --prompt
 
 ## 長い処理と Claude Code の Bash
 
-`review` と `check` は、外部の処理（レビュアー、チェック）が終わるまで待つランナーの操作です。ランナーの結果と状態の通知には、次の `review` と `check` に要る Bash の待ち時間 `bash_timeout_ms` が出ます（レビュアーの `timeout_seconds` に、事前の処理の 40 秒と余裕の 60 秒を足したもの。既定では `review` が 1900000 ms）。
+`review` と `check` は、外部の処理（レビュアー、チェック）が終わるまで待つランナーの操作です。ランナーの結果と状態の通知には、次の `review` と `check` に要る Bash の待ち時間 `bash_timeout_ms` が出ます（レビュアーの `timeout_seconds` に、事前の処理の 55 秒と余裕の 60 秒を足したもの。既定では `review` が 1915000 ms）。
 
 - Claude は、この値を小さくせずに Bash ツールの `timeout` に渡します。
 - この値が Claude Code の Bash の上限（`BASH_MAX_TIMEOUT_MS` と `BASH_DEFAULT_TIMEOUT_MS` の大きい方。既定 10 分）より大きいときは、同じ `timeout` でバックグラウンドで実行し、終わりの知らせを待ちます。
@@ -338,10 +341,10 @@ Devin をレビュアーにする例です。DevFlow は `devin --print --prompt
 
 ただし、バックグラウンドで動いたあとの次のターンでは、ランナーの呼び出しに Claude Code の承認を求められることがあります（スキルの事前の許可は、そのスキルを呼んだターンの間だけ効くため）。これを避けたい場合は、次のどちらかをします。
 
-- `BASH_MAX_TIMEOUT_MS` を `bash_timeout_ms` 以上（既定なら 1900000 以上）にする。いつも普通の実行になり、1つのターンで進みます。
+- `BASH_MAX_TIMEOUT_MS` を `bash_timeout_ms` 以上（既定なら 1915000 以上）にする。いつも普通の実行になり、1つのターンで進みます。
 
   ```json
-  {"env": {"BASH_MAX_TIMEOUT_MS": "1900000"}}
+  {"env": {"BASH_MAX_TIMEOUT_MS": "1915000"}}
   ```
 
   `~/.claude/settings.json`（またはプロジェクトの `.claude/settings.json`）に書き、Claude Code を起動し直します。
@@ -385,7 +388,7 @@ uv --no-cache run --offline --no-project --no-config --no-python-downloads "PLUG
 
 - DevFlow は OS サンドボックスではなく、どのツールも止めません。守りたいことは、Claude Code と各 CLI の権限・サンドボックスの設定で守ってください。
 - 1つのセッション（Claude Code / Codex / Devin の1つの会話）で進める run は1つです。並行作業は会話を分けて行います。Plan は何本でも並行できます。Implement は実装場所（プロジェクトか worktree）ごとに、未完了の run を1つまで持てます。
-- Implement を並行するときは、別の worktree を実装場所にします。worktree はプロジェクトの外か、`.gitignore` で除外した場所に作ってください。プロジェクトの中にある Git で無視されていない worktree は、プロジェクト本体を実装場所にする Implement のスナップショットを止めます（`Nested repositories require separate implementation runs`）。Devin をレビュアーにするときは、信頼したディレクトリの下にない worktree を `start` の前にその worktree かその上のディレクトリで信頼してください（Devin は信頼したディレクトリとその下でだけ動きます）。
+- Implement を並行するときは、別の worktree を実装場所にします。worktree はプロジェクトの外か、`.gitignore` で除外した場所に作ってください。プロジェクトの中にある Git で無視されていない worktree は、プロジェクト本体を実装場所にする Implement のスナップショットを止めます（`Nested repositories require separate implementation runs`）。Devin をレビュアーにするときは、信頼したディレクトリの下にない worktree を、その worktree かその上のディレクトリで信頼してください（Devin は信頼したディレクトリとその下でだけ動きます）。信頼していなければ `start` が run を作らずに断るので、信頼したあと同じ `/devflow:implement` をもう一度入力します。
 - 並行する会話は、どれも `.devflow` を持つ同じプロジェクトルートで始め、worktree は `--workspace` で指定します。worktree の中で始めた会話は worktree 側の `.devflow` を使うので、ほかの会話の run が見えず、この制約も共有されません。
 - 実装場所はパスで比べます。macOS の大文字小文字を区別しないファイルシステムで、同じ worktree を大文字小文字だけ違うパスで指定すると、別の実装場所とみなされます。いつも同じ書き方で指定してください。
 - 同じ実装場所で Plan の公開と Implement を同時に進めると、公開した計画のファイル（Git で無視されていない場合）が Implement の差分に入ります。同時に進めるなら、Implement は worktree で行ってください。
@@ -396,6 +399,22 @@ uv --no-cache run --offline --no-project --no-config --no-python-downloads "PLUG
 - push、公開、デプロイ、依存の追加、破壊的移行の前には、人間に確認するようスキルで頼んでいます。
 
 詳しくは [設計](docs/architecture.md)、[信頼の考え方と注意](docs/security.md)、[検証範囲](docs/validation.md) を参照してください。
+
+## 0.12.7 への更新
+
+0.12.6 の run は、そのまま続けられます（run の形式は変わりません）。
+
+変わったこと：
+
+- **Devin がレビュアーを起動するディレクトリを信頼しているかを、レビューの前に確かめるようになりました。** 確かめるのは `doctor`、`plan doctor`（面接の前）、`implement start`（run を作る前）、各レビューの直前です。信頼していなければレビュー回数を使わずに止め、そのディレクトリと「そこかその上のディレクトリで `devin` を一度起動して信頼する」手順を示します。これまでは、レビューを起動してから断られ、その回がレビュー回数の1回として数えられていました。確認は、存在しないモデル名で Devin を起動して断りの文を見るもので、通常モデルを呼びません（例外の範囲は [信頼の考え方と注意](docs/security.md)）。
+- **Plan でも同じことが起きる点を書きました。** Plan のレビュアーはプロジェクトで起動するので、本体の外にある worktree で Plan を始めると、その worktree が信頼したディレクトリの下にない限り Devin は断ります。
+- **`implement start` が断ったときは、信頼したあと同じ `/devflow:implement`（同じ引数）をもう一度入力します。** 普通のメッセージを送ると開始待ちの記録は消えるので、`start` だけをやり直すことはできません。
+- **レビュアー設定の `command` が相対パス（例：`["./tools/devin"]`）のとき、ランナーのカレントディレクトリから見た絶対パスにして使うようになりました。** レビュアーは実装場所（別の worktree）で起動するので、同じファイルを指すようにするためです。
+- 失敗したレビューの数え方と、レビューで断られたときの案内（0.12.3）は変わりません。
+
+`BASH_MAX_TIMEOUT_MS` を 1900000 にしていた場合は、1915000 以上にしてください。`review` の前の処理に Devin の確認の分（最大 15 秒）が増え、既定の `bash_timeout_ms.review` が 1915000 になったためです。そのままだと `review` はバックグラウンドで動き、次のターンで承認を求められることがあります（「[長い処理と Claude Code の Bash](#長い処理と-claude-code-の-bash)」）。
+
+0.12.6 に戻すときは、プラグインを戻します。手順は「0.12.6 への更新」の 0.12.5 に戻す手順と同じで、0.12.6 のコミット（`main` の `f8ae86f`）から取り出した配布物を、今の devflow と同じ範囲にローカルの配布物として入れ直し、各ホストのプラグインの一覧で 0.12.6 になったことを確かめます。run の形式は同じなので、0.12.7 で作った run も 0.12.6 で読めます。
 
 ## 0.12.6 への更新
 

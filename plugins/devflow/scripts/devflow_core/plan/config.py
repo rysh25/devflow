@@ -104,12 +104,17 @@ def diagnose(project: Path, workflow, effective_config: dict | None = None, *, h
         "binaries": binaries,
         "interview_skill": interview,
         "ready": interview["static_ready"] and all(item["found"] for item in binaries.values()),
-        "readiness_scope": "Offline prerequisites only; no runtime Skill or provider calls are verified.",
+        "readiness_scope": ("Local prerequisites only: settings, PATH, the interview skill, and the reviewer CLI "
+                            "checks in reviewer_cwd; no runtime Skill call is verified."),
         "checks_not_performed": [
             "CLI authentication, model availability, supported reasoning variants, and billing",
+            "Trust in any directory other than reviewer_cwd; ready is not proof of trust (a check that cannot "
+            "decide passes)",
             f"{host_profile(host).label} hooks, effective skill permissions/overrides, and actual interview "
             "skill execution",
             "Real Windows/macOS CLI execution",
         ],
-        "note": "Offline discovery only. Finding a binary does not verify provider readiness.",
+        "note": ("Reviewer CLIs: --version and --help in the runner's directory, and each CLI's check of the "
+                 "directory reviews start it in (Devin: whether it trusts it); the directory check fails only when the "
+                 "CLI clearly refuses. Normally no model calls (docs/security.md); provider readiness is not verified."),
     }

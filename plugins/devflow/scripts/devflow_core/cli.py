@@ -25,7 +25,7 @@ from .common.arguments import Parser
 from .common.hosts.diagnostics import MINIMUM_CLAUDE_CODE, claude_version, codex_version, devin_version
 from .common.environment import python_errors, version_warnings
 from .common.errors import DevFlowError
-from .common.reviewers import preflight
+from .common.reviewers import readiness
 from .common.settings import validate_document
 from .workflows import WORKFLOWS
 
@@ -43,7 +43,7 @@ def parser() -> Parser:
     result.add_argument("--run", help="Existing run ID; required to inspect or act on a particular run")
     commands = result.add_subparsers(dest="command", required=True, parser_class=Parser)
     commands.add_parser("status", help="Overview, or the bound/selected run; changes nothing")
-    commands.add_parser("doctor", help="Offline prerequisites for every workflow; never calls a model")
+    commands.add_parser("doctor", help="Local prerequisites and reviewer CLI checks for every workflow; normally no model calls")
     commands.add_parser("hook", help="Host hook entry; reads one JSON object from stdin")
     for name, workflow in WORKFLOWS.items():
         actions = commands.add_parser(name, help=f"The {name} workflow").add_subparsers(
@@ -99,7 +99,8 @@ def command_name(arguments: list[str]) -> str | None:
 
 
 def doctor(project: Path, host: str) -> dict:
-    """Offline project-settings readiness for every workflow; changes nothing."""
+    """Local project-settings readiness for every workflow, with each reviewer CLI checked in the
+    project; changes nothing."""
     reports, cache, warnings = {}, {}, []
     validate_document(project, WORKFLOWS)
     for name, workflow in WORKFLOWS.items():
@@ -108,10 +109,8 @@ def doctor(project: Path, host: str) -> dict:
         for provider in config["reviewers"]:
             key = json.dumps({k: v for k, v in provider.items() if k != "timeout_seconds"}, sort_keys=True)
             if key not in cache:
-                try:
-                    cache[key] = {"ready": True, "details": preflight(provider)}
-                except Exception as exc:  # noqa: BLE001 - diagnostics report every failure
-                    cache[key] = {"ready": False, "error": str(exc)}
+                # Every workflow checks the same directory, the project, so the key needs no cwd.
+                cache[key] = {k: v for k, v in readiness(provider, project).items() if k != "id"}
             reviewers.append({"id": provider["id"], **cache[key]})
         extra = workflow.doctor(project, config, host=host)
         warnings.extend(extra.get("warnings", []))
@@ -133,11 +132,17 @@ def doctor(project: Path, host: str) -> dict:
             "executables": executables, "workflows": reports, "warnings": warnings, "errors": errors,
             "ready": (bool(executables["uv"]) and version["supported"] and not errors
                       and all(item["ready"] for item in reports.values())),
-            "readiness_scope": "Offline project-settings prerequisites only; use a workflow's doctor with the active session/run to inspect frozen run configuration.",
+            "reviewer_cwd": str(project),
+            "readiness_scope": ("Local project-settings prerequisites and reviewer CLI checks in reviewer_cwd only; use a "
+                                "workflow's doctor with the active session/run to inspect frozen run configuration."),
             "not_verified": ["CLI authentication and model access", "Effective model and reasoning settings",
+                             "Reviewer CLI checks in any directory other than reviewer_cwd (an implementation worktree)",
                              f"Real {host_profile(host).label} hook and interview skill execution",
                              "Native Windows/macOS execution"],
-            "note": "Offline help/version probes only; no model calls, authentication, installation, or implicit fallback"}
+            "note": ("Reviewer CLIs: --version and --help in the runner's directory, and each CLI's check of reviewer_cwd "
+                     "(Devin: whether it trusts the directory); the directory check fails only when the CLI clearly "
+                     "refuses, so ready is not proof of trust. Normally no model calls (docs/security.md); no authentication, "
+                     "installation, or implicit fallback")}
 
 
 def _hook() -> dict | None:

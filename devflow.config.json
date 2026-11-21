@@ -1,9 +1,17 @@
 {
   "schema_version": 1,
+  "reviewers": [
+    {"id": "codex", "kind": "codex", "command": ["codex"], "model": "gpt-6.2-sol", "effort": "high",
+     "timeout_seconds": 1800},
+    {"id": "devin", "kind": "devin", "command": ["devin"], "model": "swe-2", "effort": "high",
+     "timeout_seconds": 1800}
+  ],
   "implement": {
-    "checks": [
-      {"id": "tests", "argv": ["python", "tools/test_all.py", "--quiet"], "timeout_seconds": 600},
-      {"id": "package", "argv": ["python", "tools/package.py", "--validate-only"], "timeout_seconds": 120}
+    "reviewers": [
+      {"id": "claude", "kind": "claude", "command": ["claude"], "model": "claude-opus-5-5", "effort": "high",
+       "timeout_seconds": 1800},
+      {"id": "codex", "kind": "codex", "command": ["codex"], "model": "gpt-6.2-sol", "effort": "high",
+       "timeout_seconds": 1800}
     ]
   }
 }

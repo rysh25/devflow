@@ -385,12 +385,26 @@ def _config(config: dict) -> tuple[str, list[str], str, str, float]:
 
 
 def _resolve(prefix: list[str]) -> list[str]:
+    """The executable as an absolute path plus the prefix arguments.
+
+    A relative command (``./tools/devin``) is found from the runner's directory, so it is made
+    absolute there: the CLI starts in another directory (the workspace) for its checks and the
+    review. On POSIX ``Path.absolute`` keeps ``..`` (collapsing it would bypass a symlink); on
+    Windows ``os.path.abspath`` also completes a drive-relative path, and Windows itself reads
+    ``..`` lexically.
+    """
     executable = shutil.which(prefix[0])
     if executable is None:
         raise ReviewerError(f"Reviewer executable not found: {prefix[0]}")
     if Path(executable).suffix.lower() in (".cmd", ".bat"):
         raise ReviewerError("Use a native executable or explicit Node executable plus CLI script; .cmd/.bat shims are unsupported")
+    executable = os.path.abspath(executable) if os.name == "nt" else str(Path(executable).absolute())
     return [executable, *prefix[1:]]
+
+
+def _reviewer_env(cwd: Path) -> dict:
+    """The environment a reviewer CLI starts with in ``cwd``: the runner's, with ``PWD`` set to it."""
+    return {**os.environ, "PWD": str(Path(cwd).resolve())}
 
 
 def _capture(argv: list[str], *, cwd: Path | None = None, env: dict | None = None,
@@ -424,8 +438,10 @@ def _run(argv, cwd, env, data, timeout, stdout, stderr):
         raise ReviewerError(f"Cannot run reviewer: {exc}") from exc
 
 
-def preflight(config: dict) -> dict:
-    """Local probes only (version and help); never log in or call a model.
+def preflight(config: dict, *, cwd: Path) -> dict:
+    """Local checks only (version, help, and the CLI's own check of ``cwd``, the directory a
+    review would start it in); never log in, and normally never call a model (the one
+    exception is described in ``Devin.check_cwd``).
 
     Checks only that the CLI has the subcommand and flags DevFlow passes, so
     any version that keeps them works.
@@ -446,9 +462,18 @@ def preflight(config: dict) -> dict:
     missing = [flag for flag in flags if flag not in help_text]
     if missing:
         raise ReviewerError(f"{kind} {subcommand} lacks flags DevFlow passes: {', '.join(missing)}")
+    CLIS[kind].check_cwd(resolved, Path(cwd).resolve(), _reviewer_env(cwd))
     return {"kind": kind, "executable": resolved[0], "cli_version": version[:1024],
             "version_warnings": version_warnings(kind, version),
             "requested_model": model, "requested_effort": effort, "effective_model_attested": False}
+
+
+def readiness(provider: dict, cwd: Path) -> dict:
+    """One reviewer's doctor entry: {"id", "ready": True, "details"} or {"id", "ready": False, "error"}."""
+    try:
+        return {"id": provider["id"], "ready": True, "details": preflight(provider, cwd=cwd)}
+    except Exception as exc:  # noqa: BLE001 - diagnostics report every failure
+        return {"id": provider["id"], "ready": False, "error": str(exc)}
 
 
 def _open_new(path: Path):
@@ -501,7 +526,8 @@ class CLI:
     Adding a CLI means adding one subclass to ``CLIS`` (and its kind to
     ``settings.REVIEWER_KINDS``): the subcommand, the arguments, the standard
     input, how to read the answer and the activity from the output, and
-    optionally how to read its token counts or a failure hint.
+    optionally how to read its token counts, a failure hint, or a check that it
+    will run in the directory a review starts it in.
     """
 
     subcommand = ""
@@ -544,6 +570,12 @@ class CLI:
         """Added to the error when the CLI exits with a failure, for a cause the human can fix;
         ``cwd`` is the directory the CLI was started in."""
         return ""
+
+    def check_cwd(self, argv: list[str], cwd: Path, env: dict) -> None:
+        """Raise ReviewerError when this CLI will refuse to run in ``cwd``, the directory a
+        review would start it in. ``argv`` is the resolved executable plus the user's prefix
+        arguments. Normally never calls a model (a subclass documents any exception, as
+        Devin.check_cwd does); anything the check cannot decide passes."""
 
 
 class Codex(CLI):
@@ -690,6 +722,18 @@ def _devin_answer(record: dict | None) -> str:
     return message
 
 
+#: The model name and prompt of Devin's trust check (``Devin.check_cwd``), and its refusal text.
+DEVIN_TRUST_PROBE_MODEL = "devflow-trust-probe"
+DEVIN_TRUST_PROBE_PROMPT = ("DevFlow trust check. Reply with exactly OK. Do not use any tools, read or change "
+                            "any files, or run any commands.")
+DEVIN_UNTRUSTED = "Refusing to run in an untrusted workspace"
+
+
+def _devin_trust_steps(cwd: Path) -> str:
+    return (f"start devin once in {cwd} or a directory above it and trust it "
+            f"(DevFlow never skips the trust check)")
+
+
 class Devin(CLI):
     """``devin -p``: the prompt from a file and a closed standard input (a prompt on standard
     input is an error). The answer, tool calls and token counts come from the session record
@@ -700,8 +744,24 @@ class Devin(CLI):
     command = ("devin",)
 
     def failure_hint(self, cwd):
-        return (f"; if Devin refused an untrusted workspace, start devin once in {cwd} or a directory "
-                f"above it and trust it (DevFlow never skips the trust check)")
+        return f"; if Devin refused an untrusted workspace, {_devin_trust_steps(cwd)}"
+
+    def check_cwd(self, argv, cwd, env):
+        """Devin runs ``--print`` only in a directory it trusts or below one. Started with a model
+        name that does not exist, it reports an untrusted directory before it checks the model, so
+        no model is called (measured on Devin CLI 3000.14.30821; docs/validation.md checks it
+        again on each update). Only that report fails the check; anything else passes. Should
+        Devin start accepting unknown models, this runs one ordinary turn under the user's own
+        Devin settings, whose prompt asks the model to do nothing (docs/security.md)."""
+        try:
+            result = _run([*argv, "--print", "--model", DEVIN_TRUST_PROBE_MODEL, "--", DEVIN_TRUST_PROBE_PROMPT],
+                          cwd, env, None, PROBE_SECONDS, None, None)
+        except ReviewerError:
+            return
+        if result.timed_out or result.output_error or result.retained_pipes:
+            return
+        if result.exit_code and DEVIN_UNTRUSTED in result.stderr.decode("utf-8", errors="replace"):
+            raise ReviewerError(f"Devin does not trust the reviewer directory {cwd}; {_devin_trust_steps(cwd)}")
 
     def flags(self):
         return ["--print", "--prompt-file", "--resume", "--model", "--export"]
@@ -946,7 +1006,7 @@ def run_review(prepared: PreparedReview, validate: Callable[[Any], dict]) -> dic
     _write_new(work_dir / "review-input.md", prepared.prompt)
     _write_new(work_dir / "review.schema.json", prepared.schema)
     argv = _resolve([prepared.argv[0]]) + list(prepared.argv[1:])
-    env = {**os.environ, "PWD": str(cwd.resolve())}
+    env = _reviewer_env(cwd)
     # Never log credentials or the inherited environment; prefix arguments may
     # hold secrets, so only their count is recorded.
     _write_new(work_dir / "invocation.json", json.dumps({**probe, "cwd": str(cwd.resolve()),

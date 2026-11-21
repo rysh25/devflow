@@ -222,8 +222,10 @@ class Engine(RunEngine):
         # At the review limit no reviewer starts; the request asks the human instead.
         provider = (next_reviewer(state["config"]["reviewers"],len(state["attempts"]),state["review_limit"])
                     if len(state["attempts"]) < state["review_limit"] else None)
-        # A missing or unsupported reviewer CLI must not consume an attempt.
-        probe = preflight(provider) if provider else None
+        # A missing or unsupported reviewer CLI must not consume an attempt. The CLI checks
+        # the verified workspace, the directory the review starts it in; prepare verifies it
+        # again under the lock.
+        probe = preflight(provider, cwd=self._workspace(state)) if provider else None
 
         def prepare(state):
             self._owner(state,session_id)

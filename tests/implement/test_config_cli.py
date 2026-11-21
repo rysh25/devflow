@@ -125,7 +125,7 @@ class ConfigCliTests(unittest.TestCase):
             validate_config({**self.config, "snapshot": {**self.config["snapshot"], "mode": "auto"}})
 
     def test_doctor_reports_offline_limits_and_missing_checks(self):
-        with patch("devflow_core.implement.commands.preflight", return_value={"offline": True}) as probe:
+        with patch("devflow_core.common.reviewers.preflight", return_value={"offline": True}) as probe:
             code, output, error = self.invoke("implement", "doctor")
         self.assertEqual((code, error), (0, ""))
         result = json.loads(output)
@@ -170,8 +170,59 @@ class ConfigCliTests(unittest.TestCase):
         with self.assertRaises(DevFlowError):
             load_config(self.project, WORKFLOW)
 
+    def started_run(self, session="claude-cli-session"):
+        """A real files-mode run started through the hook and the runner (reviewer checks mocked)."""
+        from devflow_core import router
+        from devflow_core.common.paths import PLUGIN_ROOT
+        atomic_write_json(self.project / "devflow.config.json",
+                          {"schema_version": 1, "implement": {"snapshot": {"mode": "files"}}})
+        plan = self.project / "plan.md"
+        plan.write_text("# Plan\n\nDo it.\n", encoding="utf-8")
+        router.handle_hook({"hook_event_name": "UserPromptSubmit", "cwd": str(self.project), "session_id": session,
+                            "prompt": f'/devflow:implement "{plan}"'}, PLUGIN_ROOT, host="claude")
+        with patch("devflow_core.common.reviewers.preflight", return_value={}):
+            return router.runner_start(self.project, session, "implement", str(plan), host="claude")
+
+    def test_doctor_checks_reviewers_in_the_project_without_a_run(self):
+        with patch("devflow_core.common.reviewers.preflight", return_value={"offline": True}) as probe:
+            code, output, error = self.invoke("implement", "doctor")
+        self.assertEqual((code, error), (0, ""))
+        result = json.loads(output)
+        self.assertEqual({call.kwargs["cwd"] for call in probe.call_args_list}, {self.project})
+        self.assertEqual(result["reviewer_cwd"], str(self.project))
+
+    def test_doctor_checks_reviewers_in_the_selected_runs_verified_workspace(self):
+        state = self.started_run()
+        for args in (("--run", state["run_id"], "implement", "doctor"),        # an explicit run
+                     ("--session", "claude-cli-session", "implement", "doctor")):  # the session's run
+            with self.subTest(args=args), \
+                    patch("devflow_core.common.reviewers.preflight", return_value={"offline": True}) as probe, \
+                    patch("devflow_core.implement.workspace.verify_workspace",
+                          return_value=self.project) as verified:
+                code, output, error = self.invoke(*args)
+                self.assertEqual((code, error), (0, ""))
+                result = json.loads(output)
+                self.assertEqual(result["run_id"], state["run_id"])
+                verified.assert_called_once()
+                self.assertEqual({call.kwargs["cwd"] for call in probe.call_args_list}, {self.project})
+                self.assertEqual(result["reviewer_cwd"], str(self.project))
+
+    def test_doctor_never_checks_reviewers_in_a_workspace_that_fails_verification(self):
+        state = self.started_run()
+        with patch("devflow_core.common.reviewers.preflight") as probe, \
+                patch("devflow_core.implement.workspace.verify_workspace",
+                      side_effect=DevFlowError("The workspace was replaced")):
+            code, output, error = self.invoke("--run", state["run_id"], "implement", "doctor")
+        self.assertEqual((code, error), (0, ""))
+        result = json.loads(output)
+        probe.assert_not_called()
+        self.assertFalse(result["ready"])
+        self.assertEqual({(item["ready"], item["error"]) for item in result["reviewers"]},
+                         {(False, "Workspace verification failed before any reviewer CLI ran: "
+                                  "The workspace was replaced")})
+
     def test_doctor_reports_missing_cli_not_a_false_ready(self):
-        with patch("devflow_core.implement.commands.preflight", side_effect=DevFlowError("CLI missing")):
+        with patch("devflow_core.common.reviewers.preflight", side_effect=DevFlowError("CLI missing")):
             code, output, error = self.invoke("implement", "doctor")
         self.assertEqual((code, error), (0, ""))
         result = json.loads(output)

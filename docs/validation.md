@@ -1,4 +1,4 @@
-# DevFlow 0.12.6 の検証範囲
+# DevFlow 0.12.7 の検証範囲
 
 ## 再実行方法
 
@@ -237,7 +237,16 @@ Claude Code、Codex、OpenCode の新しい版では、`doctor` が「確かめ�
    - `review-processes/NN/` のレビュアーの出力に、`other_events` に数えられた知らない出来事が増えていないか。増えていれば、その出来事の意味を各 CLI の文書で確かめる。
    - Plan の面接の記録の `coverage`：`mode` が `bounded-transcript-with-hook-provenance` で、`unknown_types` に人間の発言の取りこぼしにつながるものがない。
 5. プロジェクトの `AGENTS.md` にレビュアーを誘導する文を書き、誘導されないことを確かめる。
-6. 問題がなければ、`plugins/devflow/scripts/devflow_core/common/environment.py` の `CHECKED_VERSIONS` と、この文書の「確かめた環境」を新しい版に直す。
+6. Devin CLI の新しい版では、下の「Devin の信頼の確認」を通す。通らなければ、次の手順には進まない（版を確かめたことにすると、新しい版の警告が出なくなるため）。
+7. 問題がなければ、`plugins/devflow/scripts/devflow_core/common/environment.py` の `CHECKED_VERSIONS` と、この文書の「確かめた環境」を新しい版に直す。
+
+**Devin の信頼の確認**：信頼の確認（0.12.7 の `Devin.check_cwd`）の前提がまだ成り立つかを確かめます。製品と同じ引数で、信頼していないディレクトリ（信頼したどのディレクトリの下にもない一時的なディレクトリ）と信頼済みのディレクトリのそれぞれで次を実行します（標準入力は閉じます）。
+
+```text
+devin --print --model devflow-trust-probe -- "DevFlow trust check. Reply with exactly OK. Do not use any tools, read or change any files, or run any commands."
+```
+
+信頼していないディレクトリでは終了コードが 0 以外で stderr に `Refusing to run in an untrusted workspace`、信頼済みのディレクトリでは終了コードが 0 以外で stderr に `Unknown model` が出ること、どちらでも `~/.local/share/devin/cli/transcripts` が増えないこと（モデルが呼ばれていないこと）を確かめます。順番が変わっていた場合（信頼していないディレクトリで `Unknown model` が出るなど）、確認は判定できずに通すだけなので、レビューで断られる 0.12.6 までの動きに戻ります。そのときは判定の方法を見直します。信頼済みのディレクトリで `Unknown model` が出ずに答えが返った場合は、Devin が知らないモデル名を受け付けるように変わっています（[信頼の考え方と注意](security.md) の例外）。判定の方法を見直します。
 
 ## 初回利用時の受け入れ確認
 
@@ -1267,6 +1276,78 @@ Claude にだけ、プランにない設定クラスの階層（`BaseFormatConfi
 （取得元 `https://github.com/rysh25/devflow#plugins/devflow`）だけが残ったことを
 確かめました。検証用プロジェクトは結果の記録のため残してあります。`status`・`doctor`
 だけを使ったため、確認用の run は `awaiting_human` のままです。
+
+## 0.12.7 の検証（2026-11-21）
+
+0.12.7 は、Devin がレビュアーを起動するディレクトリを信頼しているかを、レビュー回数を使う前に
+確かめるようにしました（`preflight(config, cwd=...)` と `CLI.check_cwd`。今あるのは
+`Devin.check_cwd` だけ）。確かめるのは `doctor`、`plan doctor`、`implement start`、各レビューの
+直前です。自動テスト（1007 件、Windows 専用の 1 件は skip）は、通常の環境と、CI と同じく
+レビュアー CLI を PATH から外した環境の両方で通しました。配布物の検査
+（`python tools/package.py --validate-only`）も通しました。
+
+### 本物の Devin CLI（モデルを呼ばない確認）
+
+Devin CLI 3000.14.30821 で、製品と同じ引数（`<devin の絶対パス> --print --model
+devflow-trust-probe -- "DevFlow trust check. Reply with exactly OK. Do not use any tools, read or
+change any files, or run any commands."`、標準入力は閉じる）を直接実行しました。
+
+- 信頼したどのディレクトリの下にもない一時的な worktree（`/tmp/devflow-verify-0127-wt`）：
+  終了コード 1、stderr は `Error: Refusing to run in an untrusted workspace:
+  /tmp/devflow-verify-0127-wt`、stdout は空。
+- 信頼済みのプロジェクト（DevFlow のリポジトリ）：終了コード 1、stderr は
+  `Error: Unknown model: 'devflow-trust-probe'` と使えるモデルの一覧、stdout は空。
+- どちらでも、`~/.local/share/devin/cli/transcripts`（15 件）と `summaries`（53 件）は増えず、
+  `trusted_workspaces.json` の内容（SHA-256）も変わらず、worktree にファイルもできませんでした。
+- 作業ツリーの `preflight(..., cwd=worktree)` は `Devin does not trust the reviewer directory
+  /tmp/devflow-verify-0127-wt; start devin once in /tmp/devflow-verify-0127-wt or a directory above
+  it and trust it (DevFlow never skips the trust check)` を出し、`preflight(..., cwd=project)` は
+  通りました。
+
+### 本物の Claude Code（headless）
+
+Claude Code 2.1.329 の headless（`claude -p`）で、作業ツリーのプラグインを `--plugin-dir` で
+読み込み、インストール済みの devflow は `--settings` で無効にしました（`BASH_MAX_TIMEOUT_MS` は
+2000000）。既定のレビュアーに Devin はいないので、公開のコマンドで `--reviewer devin swe-2 high --`
+を付けました。
+
+- **Plan（Devin が信頼していない一時的なプロジェクト `/tmp/devflow-verify-0127-planproject`）**：
+  `/devflow:plan --reviewer devin swe-2 high -- <依頼>` で、`plan doctor` が Devin を
+  `ready: false`（上と同じ未信頼の文）と報告し、エージェントは面接の前に止まって、そのディレクトリで
+  `devin` を一度起動して信頼し、`plan doctor` をやり直す手順を示しました。run は `interview` のまま、
+  レビュー回数は 0 でした。
+- **Implement（Devin が信頼したディレクトリの下の一時的なプロジェクト
+  `/tmp/devflow-verify-selfcontained/project-0127` と、その worktree `/tmp/devflow-verify-0127-wt`）**：
+  作業場所の選び方は確認用の指示（`--append-system-prompt`）で、その worktree を
+  `implement start --workspace` に渡すようにしました。1 回目のターン
+  （`/devflow:implement --reviewer devin swe-2 high -- <プロジェクトの外のプラン>`）では、
+  `implement doctor` がプロジェクト（`reviewer_cwd`）を点検して Devin を `ready: true` と報告し、
+  `implement start --workspace /tmp/devflow-verify-0127-wt` は run を作らずに、worktree のパスを含む
+  未信頼のエラー（`ReviewerError`）で断りました。エージェントは、その worktree で `devin` を一度
+  起動して信頼し、同じ `/devflow:implement` を入力し直すよう案内して止まり、普通のメッセージを先に
+  送ると開始待ちが消えることも伝えました。
+- 人がその worktree で `devin` を一度起動して信頼したあと、同じ worktree で上と同じ引数を実行すると、
+  終了コード 1 と `Error: Unknown model: 'devflow-trust-probe'` が返り、セッションの記録は増えません
+  でした。同じセッションを `--resume` で続け、同じ指示で同じ `/devflow:implement` を送ると、
+  エージェントは同じ `--workspace` で `implement start` を呼び直し、run
+  `20261121T044212Z-b2188a4d839b`（`implementing`、作業場所 `/tmp/devflow-verify-0127-wt`、
+  レビュー回数 0）ができました。確認用の指示どおり、実装・チェック・レビューには進みませんでした。
+
+### 偽の devin のテストだけで確かめたもの
+
+各レビューの直前の点検で止まり、レビュー回数が増えないこと（Plan の
+`test_devin_refusing_the_project_before_a_review_does_not_consume_attempt`、Implement の
+`test_devin_refusing_the_workspace_before_a_review_does_not_consume_attempt`）は、偽の devin
+だけで確かめました。本物で再現するには、run の途中で利用者の Devin の信頼の一覧を書き換える
+必要があるためです。
+
+### 後片付け
+
+確認用の worktree、プロジェクト、プランは消しました。Devin の信頼の一覧
+（`~/.local/share/devin/cli/trusted_workspaces.json`）から、人が信頼した
+`/tmp/devflow-verify-0127-wt` を、検証のあとで人の依頼により消しました（DevFlow はこのファイルを
+書き換えません）。`/tmp/devflow-verify-selfcontained` は以前の検証から残っていた項目で、今回は
+その下に一時的なプロジェクトを作りました。
 
 ## 配布物の検査とローカル設定（2026-11-17）
 
