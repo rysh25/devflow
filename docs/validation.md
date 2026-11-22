@@ -1,4 +1,4 @@
-# DevFlow 0.12.9 の検証範囲
+# DevFlow 0.12.10 の検証範囲
 
 ## 再実行方法
 
@@ -1600,3 +1600,122 @@ commit しました。
   記録を取ったあと一時的なプロジェクトを消しました。4. のために同じ場所に作り直したプロジェクトも、
   run を取り消して記録を取ったあと消しました。Devin の `trusted_workspaces.json` に
   足された `/tmp/devflow-verify-recommendation` は、不要なら利用者が消してください。
+
+## 0.12.10 の検証（2026-11-22）
+
+0.12.10 は、レビューの上限の質問（`escalation.detail.kind` が `review_budget`）にもおすすめを
+付けるようにしました（0.12.9 の「上限の質問にはおすすめを付けない」を改めました）。Plan と
+Implement の手引き（`references/plan-workflow.md`、`references/implement-workflow.md`）の
+「Recommendations to the human」の節に、上限の質問だけの決まりを 1 段落足しました。品質は
+質問を待つ間の `status` が示す事実（残る指摘の重さと採否、今の版がレビュー済みか、`reviews[]`、
+成功したレビューの `finding_trend`、Implement では `validation`）だけで判断し、3 つの観点の評価は
+使いません。決まりは次の順に当てはめます。(1) 範囲の変更か人間の判断が要る指摘があれば
+「やめる」。(2) 重い問題（最新のレビューで未判断の critical・high、または採用した critical・high の
+直しが、記録の上で後の成功したレビューに見られていない）があり、指摘が減っていれば「続ける」、
+減っていなければ「やめる」、比べられなければおすすめなし。(3) それ以外は、成功したレビューが
+1 回以上あれば（Implement ではチェックか人間の確認も通っていれば）「受け入れて終える」、なければ
+おすすめなし。おすすめは要約と質問の間に書き、質問の文、選択肢の名前と順は変えず、どの選択肢にも
+おすすめの印を付けません。回数・時間・トークンを使う価値は人間が決めると添え、人間の決定
+（Plan はインタビューと決定と `human_decisions`、Implement は凍結したプランと `human_decisions`）
+と比べます。Implement で「受け入れて終える」を勧めるときは、作業ツリーがチェックポイントのままかは
+確かめていないと書きます。`awaiting_human` の行（Plan）と手順 5（Implement）は、要約、おすすめ、
+質問の順を書き、Codex と Devin のスキルは上限の質問の書き方を繰り返さずに手引きを指すように
+しました。ランナーの Python コード（版の番号を除く）、記録の形式、指摘のスキーマは変えていません。
+
+変えたファイル: `references/plan-workflow.md`、`references/implement-workflow.md`、
+`codex-skills/plan/SKILL.md`、`codex-skills/implement/SKILL.md`、`devin-skills/plan/SKILL.md`、
+`devin-skills/implement/SKILL.md`、3 つのホストの `plugin.json`、`devflow_core/__init__.py`
+（0.12.10）、`README.md`、`docs/architecture.md`、`docs/installation.md`、この
+`docs/validation.md`、テスト（版を確かめる `tests/test_distribution.py` の 4 か所と
+`tests/router/test_entrypoint.py` の 3 か所）。
+
+自動テスト（1072 件、Windows 専用の 1 件は skip）と配布物の検査
+（`python tools/package.py --validate-only`）を通しました。
+
+### 実機の確かめ
+
+Linux / WSL2 で、devflow の外の `/tmp/devflow-verify-budget` に使い捨ての Git のプロジェクトを
+場面ごとに作りました。中身は `textstats.py`（`count_words`）、`test_textstats.py`（unittest）、
+`devflow.config.json`（レビュアーは偽のレビュアー 2 つ、Implement のチェックは
+`python3 -m unittest`）です。偽のレビュアーは Claude Code の形（`kind: claude`）で答える
+Python のスクリプトで、`--version` と `--help` に Claude Code のように答え、決まった指摘を
+`changes_required` で返します。場面 1 は 1 回目に high 1 件と medium 1 件、2 回目に high 1 件
+（期待するおすすめは「続ける」）、場面 2 は 2 回とも low 1 件（期待するおすすめは
+「受け入れて終える」）です。上限はどの回も `--max-reviews 2` です。ホストが指摘を断ったときは、
+期待を採否に合わせて読み替えず、結果としてそのまま記録しました。
+
+ホストに作業ツリーのプラグイン（0.12.10）を読み込ませた方法は次のとおりです。
+
+- Claude Code 2.1.330：`--plugin-dir`（作業ツリーの `plugins/devflow`）と、入れてある devflow を
+  止める `--settings`。対話のセッションでは `/devflow:doctor` の 1 行目が `DevFlow 0.12.10` で
+  した。
+- Codex CLI 0.171.0：所有者だけが使える検証用の `CODEX_HOME`（`auth.json` を写した）で
+  `codex plugin marketplace add <作業ツリー>` と `codex plugin add devflow@devflow-marketplace
+  --json`（`version` は 0.12.10）。`codex --enable default_mode_request_user_input` で起動し、
+  `/hooks` でフックを信頼しました。人間は `$devflow:doctor` を打たずに始めたので、会話の記録で
+  ホストが呼んだランナーのパスがすべて `.../devflow/0.12.10/` だったことで版を確かめました。
+- Devin CLI 3000.14.30821（ホストのモデルは `swe-2-high`）：`devin plugins install --local -y
+  <作業ツリー>/plugins/devflow` で入れ、プロジェクトの `.devin/config.json` に repo スコープの
+  `forbiddenPlugins`（`https://github.com/rysh25/devflow#plugins/devflow`）を置いて commit
+  しました。`/devflow:doctor` の 1 行目は `DevFlow 0.12.10` でした。
+
+| 回 | ホストと場面 | run | 記録された採否と版 | 画面に出たおすすめ | 人間の答え |
+|---|---|---|---|---|---|
+| 1 | Claude Code Implement 場面 1（headless で上限まで、対話で `/devflow:resume`） | `20261122T083220Z-da2d37d0dca5` | 1 回目は already_addressed 1・reject 1、2 回目の high は accept（直しはチェックポイント 3 で未レビュー） | 続ける（採用した high の直しが未レビュー、断った high は数えない、指摘は 2 件から 1 件） | 受け入れて終える |
+| 2 | Claude Code Implement 場面 2（同じ） | `20261122T083220Z-b4469f3a0fe7` | 2 回とも already_addressed、今のチェックポイントはレビュー済み、`checks/003.json` は passed | 受け入れて終える（重い問題なし、成功したレビューあり、チェックが通過、作業ツリーがチェックポイントのままかは確かめられないと明記） | 受け入れて終える |
+| 3 | Claude Code Plan 場面 1（対話） | `20261122T094650Z-208931e1d026` | インタビューで指摘の中身がすでにプランに入り、3 件とも already_addressed、版は v000 のまま | 受け入れて終える（未判断・未レビューの重い問題なし、成功したレビュー 2 回） | 受け入れて終える |
+| 4 | Claude Code Plan 場面 1 のやり直し（対話） | `20261122T095256Z-2ed56c1f6124` | 1 回目の 2 件を accept（v001）、2 回目は v001 を見て high を accept（v002 は未レビュー） | 続ける（2 回目の high の直しは v002 で未レビュー、1 回目の high の直しは v001 で 2 回目が見た、指摘は 2 件から 1 件） | やめる |
+| 5 | Claude Code Plan 場面 2（対話） | `20261122T095802Z-ebdecb0c79ae` | 2 回とも already_addressed、v000 はレビュー済み | なし（下の「確かめられなかったこと」） | 受け入れて終える |
+| 6 | Codex Plan 場面 1（対話） | `20261122T100834Z-2e4f140ae92b` | 1 回目は accept 1・already_addressed 1、2 回目は v001 を見て high を accept（v002 は未レビュー） | 続ける（最後の high を反映した版は再レビュー前、指摘は 2 件から 1 件） | 受け入れて終える |
+| 7 | Devin Implement 場面 1（対話） | `20261122T103233Z-2152993f3767` | 1 回目は already_addressed 1・reject 1、2 回目の high は accept（直しはチェックポイント 3 で未レビュー）、`checks/003.json` は passed | 続ける（採用した high の直しを後の成功したレビューが見ていない、指摘は 2 件から 1 件） | 受け入れて終える |
+
+- 3 回目の偽の指摘（空文字列、テストのコマンド、`\r\n`）は、インタビューの答えですでにプランに
+  入ったため、場面 1 にはなりませんでした。偽の指摘をプランに入りにくい入力のテスト
+  （`'a\rb'`、`'\n\n'`、`'\n'`）に変えて、新しいプロジェクトで 4 回目として動かしました（6 回目の
+  Codex も変えたあとの指摘です）。3 回目の記録は場面 2 と同じ状態（重い問題なし、成功した
+  レビューあり、版はレビュー済み）で、Plan で「受け入れて終える」を勧める道はこの回で確かめました。
+- おすすめが出た 6 回は、どれも要約、おすすめ、質問の順に出て、回数・時間・トークンを使う価値は
+  人間が決めるという一言がありました。質問の文と選択肢の名前（continue、stop、accept and
+  finish）と順は変わらず、「(Recommended)」もほかの印も付いていませんでした。
+- Codex は、同じセッションのインタビューの質問では選択肢に「(Recommended)」を付けましたが、上限の
+  質問では付けませんでした。Codex が選択肢に添えた説明では、「accept and finish」が「現在の版を
+  承認して終了します」となっていて、人間の受け入れを「承認」と書いていました（選択肢の名前では
+  なくホストの書いた説明で、今回の変更とは別です）。
+- 1 回目と 2 回目の headless（`claude -p`）は、質問ツールが使えないので上限の質問を出せません
+  でした。それでも、ホストは上限の質問の文の手前に、それぞれ「続ける」「受け入れて終える」の
+  おすすめを、対話の回と同じ根拠で書いていました。
+- Devin は上限の質問を出す前に、手引きの「Recommendations to the human」の節をもう一度読んで
+  いました。おすすめには、人間の決定と食い違わないことが書かれていませんでした。
+
+### 確かめられなかったこと
+
+- 5 回目（Claude Code の Plan 場面 2）では、ホストが上限の `review` と `status` を呼んだあと、
+  要約もおすすめも画面に書かずに AskUserQuestion を出しました。「受け入れて終える」という判断は
+  考えの中（画面には考えの要約として 1 行）にだけありました。要約を出すのは 0.12.9 からの決まりで、
+  手引きの `awaiting_human` の行も要約、おすすめ、質問の順をはっきり書いているので、手引きは
+  変えていません。上限で要約とおすすめを飛ばすことがどのくらい起きるかは確かめていません
+  （人間の判断で、もう 1 回は動かしていません）。続けて起きるなら、ランナーが上限の質問を返す
+  ときに出す順を添える形を、別の変更として考えます。
+- Implement 場面 2 で計画した、low の指摘を 2 回とも採用して直し、今のチェックポイントが
+  未レビューのまま（チェックは通過）上限に達する場面は、ホストが 2 件とも already_addressed に
+  したため起きませんでした（2 回目は、今のチェックポイントをレビュー済みの状態での「受け入れて
+  終える」でした）。計画書の決まりどおり期待を読み替えずに記録し、やり直してはいません。
+  今のチェックポイントが未レビューで重い問題がないときの「受け入れて終える」は、実機では
+  確かめていません。
+- 比べられない（成功したレビューが 2 回ない）ときのおすすめなし、範囲の変更か人間の判断が要る
+  指摘での「やめる」、重い問題があり指摘が減っていないときの「やめる」は、実機では起こして
+  いません。
+
+### 片付け
+
+- 7 つの run はすべて終わっていました（`accepted` 6 件、`exhausted` 1 件）。記録を取ったあと、
+  `/tmp/devflow-verify-budget`（使い捨てのプロジェクト、偽のレビュアー、headless の記録）を
+  消しました。
+- 検証用の `CODEX_HOME` は消し、その `CODEX_HOME` から起動していた Codex の app-server の
+  プロセスを止めました。
+- Devin の `--local` の導入は `devin plugins remove plugins/devflow --local` で外し、
+  `devin plugins list` と `devin plugins info devflow` で、個人プラグインの devflow v0.12.9
+  （取得元 `https://github.com/rysh25/devflow#plugins/devflow`）だけが残ったことを確かめました。
+  Devin の `trusted_workspaces.json`（`~/.local/share/devin/cli/`）から、検証で足された
+  `/tmp/devflow-verify-budget/devin-impl-s1` の 1 件だけを消し、ほかの信頼の設定は変えていない
+  ことを、消す前の写しとの差分で確かめました（Devin CLI には信頼を外すコマンドがありません）。
