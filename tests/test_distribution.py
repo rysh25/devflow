@@ -66,11 +66,11 @@ class DistributionTests(unittest.TestCase):
     def test_static_validate_current_bundle(self):
         result = package.validate(ROOT)
         self.assertEqual(result["marketplace"], "devflow-marketplace")
-        self.assertEqual(result["plugins"], {"devflow": "0.12.8"})
+        self.assertEqual(result["plugins"], {"devflow": "0.12.9"})
 
     def test_release_versions_are_consistent(self):
         manifest = json.loads((ROOT / "plugins/devflow/.claude-plugin/plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.12.8")
+        self.assertEqual(manifest["version"], "0.12.9")
         package = ROOT / "plugins/devflow/scripts/devflow_core"
         defining = []
         for source in sorted(package.rglob("*.py")):
@@ -218,9 +218,12 @@ class DistributionTests(unittest.TestCase):
             package.validate(cloned)
 
     def test_no_workflow_repeats_the_rules_for_every_reviewer(self):
-        # common/reviewer-rules.md is the one place for what every reviewer is asked;
-        # a workflow's reviewer.md holds only its own instructions.
-        core = ROOT / "plugins" / "devflow" / "scripts" / "devflow_core"
+        # common/reviewer-rules.md is the one place for what every reviewer is asked
+        # and for the design judgment criteria (its Design balance section). A
+        # workflow's reviewer.md and the workflow references do not repeat it; the
+        # references point to that section instead.
+        plugin = ROOT / "plugins" / "devflow"
+        core = plugin / "scripts" / "devflow_core"
         rules = " ".join((core / "common" / "reviewer-rules.md").read_text(encoding="utf-8").split())
         sentences = [part.strip() for part in re.split(r"(?<=[.:])\s+", rules) if len(part.strip()) >= 30]
         self.assertGreaterEqual(len(sentences), 5)
@@ -229,6 +232,12 @@ class DistributionTests(unittest.TestCase):
             self.assertIn("The rules for every DevFlow reviewer come after these instructions.", text)
             for sentence in sentences:
                 with self.subTest(flow=flow, sentence=sentence[:40]):
+                    self.assertNotIn(sentence, text)
+        for name in ("plan-workflow.md", "implement-workflow.md"):
+            text = " ".join((plugin / "references" / name).read_text(encoding="utf-8").split())
+            self.assertIn("Design balance section of `scripts/devflow_core/common/reviewer-rules.md`", text)
+            for sentence in sentences:
+                with self.subTest(reference=name, sentence=sentence[:40]):
                     self.assertNotIn(sentence, text)
 
     def test_removed_mechanisms_leave_no_names_in_the_plugin_code(self):
@@ -414,14 +423,14 @@ class DistributionTests(unittest.TestCase):
             # All paths were generated and checked in this test, not untrusted ZIP input.
             archive.extractall(extracted)
         release = extracted / "devflow"
-        self.assertEqual(package.validate(release)["version"], "0.12.8")
+        self.assertEqual(package.validate(release)["version"], "0.12.9")
         independent = self.base / "devflow-only"
         shutil.copytree(release / "plugins" / "devflow", independent)
         self.assertFalse((independent / "shared").exists())
         result = subprocess.run([sys.executable, "-B", str(independent / "scripts" / "devflow.py"), "--version"],
             cwd=self.base, capture_output=True, encoding="utf-8", timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("0.12.8", result.stdout)
+        self.assertIn("0.12.9", result.stdout)
         for flow in ("plan", "implement"):
             with self.subTest(flow=flow):
                 result = subprocess.run([sys.executable, "-B", str(independent / "scripts" / "devflow.py"), flow, "--help"],

@@ -1,4 +1,4 @@
-# DevFlow 0.12.8 の検証範囲
+# DevFlow 0.12.9 の検証範囲
 
 ## 再実行方法
 
@@ -1438,3 +1438,165 @@ tools/package.py` が止まっていました（0.11.0・0.12.0・0.12.1 の検�
 - **Devin**：`/revert` と `/fork` を検知しません（巻き戻しで発火するフックがなく、
   `CLAUDE_CODE_SESSION_ID` に当たる仕組みもありません）。`/fork` した会話が新しいセッション ID
   を `--session` に渡した操作だけは、今の所有者の確認で止まります。
+
+## 0.12.9 の検証（2026-11-22）
+
+0.12.9 は、人間に選択肢を示しておすすめを言う場面（Plan のインタビュー、エスカレーションの質問、
+レビューの指摘の採否）に、3 つの観点（汎用性・拡張性を持った一貫した設計とつくり過ぎの釣り合い、
+実現可能性・効率性、一般的なつくり）の評価を添える指示を、Plan と Implement の手引き
+（`references/plan-workflow.md`、`references/implement-workflow.md`）の
+「Recommendations to the human」の節に足しました。設計の判断の基準の定義は、全レビュアー共通の
+指示（`common/reviewer-rules.md`）の「Design balance」の 1 か所にまとめ、避けられる非効率
+（Too wasteful）を足しました。手引きの手順 6（Plan）と手順 1（Implement）は定義を繰り返さずに
+その節を指し、Plan の手順 6 には頼る機能の実在を確かめる 1 文を足しました。Devin の Plan
+スキルはインタビューの前に手引きを読むようにし、Claude Code の Implement スキルの固定の
+おすすめ（チェックの設定）は共有の基準に従う文に置き換えました。指摘の採否の
+`reason` を書く箇所（Plan の `revision.json`、Implement の `decisions.json`）には、その節に従って書く
+ことを足し、`reason` の例を根拠と 3 つの観点の評価を並べた形にしました（Implement のレビュー 2 の
+指摘。下の実機の確かめ 3. は、この変更の前の版で行いました）。Implement の `escalate` の `reason` は
+ランナーがそのまま人間への質問にするので、質問として書くことも足しました。候補のない質問を聞くとき、
+質問ツールが自由記入の欄を出すためだけに要る項目（Codex CLI 0.170.0 の `request_user_input` は
+空の選択肢を拒み、Claude Code の AskUserQuestion は 2〜4 個の選択肢を求めます）は候補ではなく
+おすすめも付けないことを、人間の判断（Implement のレビュー 4）に従って書きました。その項目だけの答え
+（自由記入の欄が空のまま）は答えではないので、もう一度聞くことも足しました（Implement のレビュー 6。いくつかの質問を
+まとめて聞いたときも質問ごとに見ることは、レビュー 8）。ランナーの Python コード
+（版の番号を除く）、記録の形式、指摘のスキーマは変えていません。
+
+変えたファイル: `common/reviewer-rules.md`、`references/plan-workflow.md`、
+`references/implement-workflow.md`、`devin-skills/plan/SKILL.md`、`skills/implement/SKILL.md`、
+3 つのホストの `plugin.json`、`devflow_core/__init__.py`（0.12.9）、`README.md`、
+`docs/architecture.md`、`docs/installation.md`、この `docs/validation.md`、テスト
+（`tests/test_distribution.py` の `test_no_workflow_repeats_the_rules_for_every_reviewer` を
+2 つの手引きにも広げ、版を確かめる 4 か所。`tests/router/test_entrypoint.py` の 3 か所）。
+
+自動テスト（1072 件、Windows 専用の 1 件は skip）と配布物の検査
+（`python tools/package.py --validate-only`）を通しました。広げたテストの検査を 0.12.8 の
+手引きに当てると、どちらの手引きも「Design balance section of
+`scripts/devflow_core/common/reviewer-rules.md`」を持たず、`reviewer-rules.md` の文
+「TODO or FIXME comments and notes about future work, …」を繰り返しているので失敗します
+（変更前の失敗を、`git show HEAD:` の内容に同じ検査を当てて確かめました）。
+
+### 読めるかの確認（変更の前）
+
+Linux / WSL2 で、devflow の外に作った一時的なプロジェクト
+`/tmp/devflow-verify-recommendation` の中から、各ホストにランナーのパスだけを渡し、
+「ランナーの `scripts/` フォルダーを持つフォルダーから
+`scripts/devflow_core/common/reviewer-rules.md` を開き、「### Design balance」の節の最初の文を
+そのまま書き出す」よう頼みました（`reviewer-rules.md` の絶対パスは渡していません）。
+
+- Codex CLI 0.170.0（`codex exec`）：所有者だけが使える検証用の `CODEX_HOME`（`mktemp -d`、
+  権限 700）で `codex login` し、その中で `codex plugin marketplace add <作業ツリー>` と
+  `codex plugin add devflow@devflow-marketplace --json` で作業ツリーの版を入れました。
+  `--json` は `installedPath`（`<CODEX_HOME>/plugins/cache/devflow-marketplace/devflow/<版>`）を
+  返しました。そのランナーのパスを渡すと、節の最初の文を正しく書き出しました。
+- Devin CLI 3000.14.30821（`devin -p`）：`devin plugins install --local -y
+  <作業ツリー>/plugins/devflow` で入れました（`devin plugins info plugins/devflow` の取得元は
+  作業ツリーで、ランナーは作業ツリーの中にあります）。そのランナーのパスを渡すと、節の最初の
+  文を正しく書き出しました。
+- 一時的なプロジェクトの `.devin/config.json` には repo スコープの `forbiddenPlugins`
+  （`https://github.com/rysh25/devflow#plugins/devflow`）を置き、初期のコミットに含めました。
+  `devin plugins list` は、そのプロジェクトの中でも 2 つの devflow を表示しました。ただ、
+  そのプロジェクトでの Devin の `/devflow:doctor` の 1 行目は `DevFlow 0.12.9` でした。
+
+### 実機の確かめ
+
+一時的なプロジェクトは 0.12.5 の検証と同じ場面です。`report.py`（入力の CSV を読み、
+`FORMATTERS` 辞書に登録した `csv`（`csv.DictWriter`）と `json`（`json.dump`）で書き出す）、
+`test_report.py`（unittest 2 件）、`README.md`（「入力は最大 10 万行の CSV」）、
+`devflow.config.json`（レビュアーは Codex `gpt-6.2-sol` high と Devin `swe-2` high、Plan の
+公開は無効、Implement のチェックは `python -B -m unittest`）、`.devin/config.json` を
+commit しました。
+
+版の入れ替え：変更の後、Codex は検証用の `CODEX_HOME` で同じ `codex plugin add --json` を
+もう一度実行し、`version` が 0.12.9 になりました。Devin の `--local` は作業ツリーを指すので、
+そのまま 0.12.9 になりました。各ホストの doctor の 1 行目は、Claude Code（headless の
+`claude -p '/devflow:doctor'`、作業ツリーを `--plugin-dir`）と Devin（`devin -p`）では
+`DevFlow 0.12.9` でした。Codex は `codex exec` ではプラグインのフックが動かず doctor が
+文脈なしで止まったので、対話のセッションで `$devflow:doctor` の 1 行目が `DevFlow 0.12.9` で
+あることを確かめました。
+
+1. **Claude Code での比較（headless、人の操作なし）。** Claude Code 2.1.330（確かめた版
+   2.1.319 より新しい）の `claude -p` に作業ツリーのプラグインを `--plugin-dir` と `--add-dir`
+   で渡し、入れてある devflow は `--settings` で止め、ランナー（引用符で囲む形と囲まない形）・
+   `python`・`git status`・`git diff` だけを `--allowedTools` で許しました
+   （`BASH_MAX_TIMEOUT_MS` は 2000000）。
+   - 依頼 A（`/devflow:plan --max-reviews 2 -- 3つ目の出力形式（TSV）を足すプランを作成して`、
+     run `20261121T201405Z-92cc9d035b1d`）：最初の回の 5 問のどれにも、設計のバランス・
+     実現可能性と効率・慣習の評価が付きました。
+   - 依頼 B（依頼 A の末尾に 3 つの観点の 3 行を足したもの、run
+     `20261121T201510Z-94fd29ed5555`）：最初の回の 6 問のどれにも、同じ観点の評価が付きました。
+   - おすすめの答えは A と B で同じでした（`excel-tab` 方言、CSV と同じ CRLF、CSV と TSV の
+     共通の内部関数を 1 つ、空の入力は CSV と同じ、範囲は出力形式だけ）。B だけテストの質問が
+     1 つ多くありました。確かめられなかった点の明示は、A にも B にもありませんでした。
+   - 会話の記録では、A も B も、おすすめを出す前に `reviewer-rules.md` の Design balance の節を
+     開いていました（B は最初に `## Design balance` を探してから、`###` の節を読みました）。
+   - headless のプロセスが終わっても run は `interview` のまま残るので、外の端末から
+     `--host claude`、元の `--session`、`--run` を指定して `plan cancel` で取り消しました。
+2. **Codex と Devin（人が操作）。** 依頼 A を 1 回ずつ動かし、最初の回のおすすめが出たところで
+   止め、そのセッションで `plan cancel` で取り消しました。
+   - Codex（対話、`codex --enable default_mode_request_user_input`。共有の app-server の
+     機能の設定が合わないという確認には「Run without daemon this time」を選びました。run
+     `20261121T202212Z-3d5222ce99e2`）：`plan-workflow.md` を読み、Design balance の節を開いて
+     から、`request_user_input` で最初の質問を出しました。おすすめ（`excel-tab`）には、設定や
+     依存を増やさないこと、引用と CRLF を確かめたこと、1 回読んで 1 回書くこと、既存の
+     `FORMATTERS` と標準の csv を使うことが書かれていました。観点ごとの見出しはなく、確かめた
+     事実も書いていました（「確かめられなかった点だけを書く」からは外れます）。
+   - Devin（対話、run `20261121T202939Z-dee5a896de14`）：`plan-workflow.md` を読み、
+     Design balance の節を開いてから、`ask_user_question` で 3 問を出しました。どの問いの
+     おすすめにも「Design balance」「feasible」「conventional」の評価が付いていましたが、
+     効率への言及はありませんでした。
+3. **Plan を最後まで（人が操作する対話の Claude Code）。** 依頼 A で、レビュアーは Codex と
+   Devin、上限 2 回で動かしました（run `20261121T203236Z-6aad5fd374e1`）。
+   - プラン（v001）は、TSV を既存の `FORMATTERS` に登録する形で、プラグイン機構・新しい設定
+     項目・使われない抽象化はありませんでした。
+   - Codex（1 回目、v000、`changes_required`）の指摘は、Windows の標準出力の改行変換（high、
+     クロスプラットフォーム）、1 列の空の値の引用（low）、README の Excel 互換の書き方（low）で、
+     TSV の追加そのものをつくり過ぎや非効率とはしませんでした。Devin（2 回目、v001、`pass`）
+     も同じです。
+   - 採否の `reason` では、断った指摘（Windows の改行）に「Design balance」「Feasibility」
+     「Convention」の判断と、Windows では確かめていないことが書かれていました。採った 2 件の
+     `reason` は根拠の事実だけで、観点ごとの評価はありませんでした。
+   - 上限で人間が「やめる」を選び、run は `exhausted` で終わりました。
+4. **Implement での効率性（headless、計画の条件に加えて行ったもの）。** 計画では、3. の Plan が
+   `completed` か `accepted` で終わったときだけ、その版で行うことにしていました。3. は
+   `exhausted` だったので、Implement のレビューのあと、人間の了承を得て、TSV を足す短いプラン
+   （`excel-tab` 方言、CSV と同じ CRLF、`FORMATTERS` に登録、空の入力は何も書かない、
+   `test_tsv` を足す）を手で書き、一時的なプロジェクトの外に置いて使いました。一時的な
+   プロジェクトは同じ中身で作り直し（`git status --porcelain` は空）、1. と同じ headless の
+   起動の形（プランのフォルダーも `--add-dir`）で `/devflow:implement --max-reviews 2 -- <プラン>`
+   を動かしました（run `20261122T022732Z-3c9226ae6752`。プラグインは Implement で受け入れた
+   最後の版）。`--append-system-prompt` で、ホストの Claude にだけ、最初の実装に限って
+   `write_tsv` で行ごとに入力の CSV を `read_rows` で丸ごと読み直させました。
+   - Codex（1 回目、`changes_required`）：`tsv-reparses-input`（high、Performance and
+     correctness）で、プランと README の上限 10 万行では入力を 100,001 回読み、100 億行を超えて
+     解析すると規模の根拠を挙げ、標準のやり方として `write_csv` と同じ `writer.writerows(rows)` を
+     勧めました。Too wasteful の判定基準（規模を示すものと、標準的でより効率のよいやり方を挙げる）
+     のとおりです。あわせて、Windows の標準出力の改行変換（medium）も指摘しました。
+   - ホストの採否の `reason` は、採った指摘も断った指摘（Windows の改行。今の CSV も同じ出力の
+     経路で、プランは CSV と同じ CRLF を求め、ほかの形式を範囲外としているため）も、根拠の横に
+     「Design balance」「Feasibility and efficiency」「Convention」の評価を書き、断った指摘では
+     Windows で動かしていないことを書きました。
+   - Devin（2 回目、直した版、`pass`）は、直しを確かめました。Devin がテストを動かそうとした
+     呼び出しは拒まれ、記録されたチェックのログと読んだ内容で判断していました。
+   - 上限の質問で止まった run は、外の端末から `implement cancel` で取り消しました（同じ会話
+     の中からは、0.12.8 で入れた会話の分かれの検出で拒まれるので、`CLAUDE` で始まる環境変数を
+     外して呼びました）。
+
+確認できなかったものと残課題:
+
+- Too wasteful の判定は、4. で Codex が根拠付きで指摘したことを確かめましたが、Devin は非効率な
+  版を見ていない（2 回目に直した版だけを見た）ので、Devin がこの判定をするかは確かめていません。
+- ランナーが書いた質問（`review_decision`、`dirty_worktree`、`manual_validation` など）の
+  直前におすすめを書く動きと、候補のない質問をおすすめなしで聞く動きは、狙って起こしにくいため
+  実機では確かめていません。
+- Codex のおすすめには観点ごとの見出しがなく確かめた事実も書かれ、Devin のおすすめには効率の
+  評価がありませんでした。3. で採った指摘の `reason` には観点ごとの評価がありませんでした（`reason`
+  の書き方をレビューのあとで直した後の 4. では、どの `reason` にも観点ごとの評価がありました）。
+- 片付け：検証用の `CODEX_HOME` は消し、Devin の `--local` の導入は
+  `devin plugins remove plugins/devflow --local` で外しました。`devin plugins list` と
+  `devin plugins info devflow` で、個人プラグインの devflow v0.12.8（取得元
+  `https://github.com/rysh25/devflow#plugins/devflow`）だけが残ったことを確かめました。
+  一時的なプロジェクトのすべての run が終わった（`cancelled` 4 件、`exhausted` 1 件）ので、
+  記録を取ったあと一時的なプロジェクトを消しました。4. のために同じ場所に作り直したプロジェクトも、
+  run を取り消して記録を取ったあと消しました。Devin の `trusted_workspaces.json` に
+  足された `/tmp/devflow-verify-recommendation` は、不要なら利用者が消してください。

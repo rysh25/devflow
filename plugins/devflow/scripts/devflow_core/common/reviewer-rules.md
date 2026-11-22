@@ -30,8 +30,8 @@ by $answer_by. In `summary`, name any important point you could not verify.
 
 ### Design balance
 
-Check design balance in both directions as one point of view, and report a
-problem only with the evidence asked for below.
+Check design balance as one point of view, in the three directions below, and
+report a problem only with the evidence asked for below.
 
 Too much: abstractions, settings or plugin mechanisms for kinds of things that
 do not exist yet (over-engineering); optimization that no measurement or
@@ -46,6 +46,11 @@ operating systems) built for one kind only; a change that closes or breaks an
 existing extension point or interface. Being easy to change means clear
 boundaries, no duplication and simplicity, not more abstraction.
 
+Too wasteful: a way of doing something that is clearly less efficient than the
+standard way at the scale that the material or the project shows, chosen
+without a reason; for example, reading the same whole file again for every
+item, or a nested loop over input that has no upper bound.
+
 Look for requirements, stated changes and human decisions in the material this
 review receives: for a plan review, the request, the interview, the decisions
 and constraints recorded from it, the plan, the project and the human decisions
@@ -59,6 +64,12 @@ standard library, an existing function or convention of the project, or a
 widely used way of writing it), and the recommendation names it; and the
 complexity has a real cost, such as branches no test covers, more ways to fail,
 or maintenance work.
+
+Too wasteful is a defect only when the finding's evidence names what shows that
+scale (a requirement or a decision in that material, a project document, or the
+code) and the recommendation names the standard, more efficient way. Without
+such evidence, do not report it. An optimization beyond that, which no
+measurement or performance requirement supports, is still too much.
 
 A foreseeable change counts only when one of these shows it, and the finding's
 evidence names which one: that material states it (for a plan review, the
