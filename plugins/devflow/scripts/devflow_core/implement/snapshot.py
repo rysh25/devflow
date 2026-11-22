@@ -440,8 +440,14 @@ def capture(project: Path, config: dict, copies: Path | None = None) -> dict:
 def snapshot_id(files: dict[str, dict]) -> str:
     """The snapshot ID: the sha256 of every path's sha256, size and mode (nothing else)."""
     signature = {path: {key: value[key] for key in ("sha256", "size", "mode")} for path, value in sorted(files.items())}
-    return hashlib.sha256(json.dumps(signature, ensure_ascii=False, sort_keys=True,
-                                     separators=(",", ":")).encode("utf-8")).hexdigest()
+    try:
+        encoded = json.dumps(signature, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":")).encode("utf-8")
+    except UnicodeEncodeError as exc:
+        # A POSIX file name can hold bytes that do not decode as UTF-8. That is a
+        # workspace problem, not a stuck round: surface it as a policy error.
+        raise DevFlowError(f"A file path cannot be encoded for the snapshot signature: {exc}") from exc
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _file_diff(path: str, before: dict | None, after: dict | None, binary: bool,

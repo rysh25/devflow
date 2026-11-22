@@ -1,6 +1,8 @@
 """The single child-process runner shared by checks, reviewers and Git."""
 import io
 import os
+import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -8,7 +10,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from devflow_core.common.errors import DevFlowError
+from devflow_core.common.errors import DevFlowError, ProcessCleanupError
+from devflow_core.common import process as process_module
 from devflow_core.common.process import run_bounded
 
 MIB = 1024 * 1024
@@ -109,6 +112,178 @@ class RunBoundedTests(unittest.TestCase):
     def test_launch_failure_is_a_devflow_error(self):
         with self.assertRaisesRegex(DevFlowError, "Could not launch"):
             run_bounded([str(self.cwd / "missing-program")], cwd=self.cwd, timeout=5)
+
+    def test_a_child_that_never_stops_is_a_cleanup_error(self):
+        # With the stop made a no-op, both post-loop waits expire: the child may still run.
+        with patch.object(process_module, "stop_tree", lambda process: None):
+            with self.assertRaises(ProcessCleanupError) as caught:
+                self.python("import time; time.sleep(12)", timeout=0.2)
+        self.assertIn("did not terminate", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, subprocess.TimeoutExpired)
+
+    def test_an_interrupt_reraises_once_the_child_and_pipes_end(self):
+        real_sleep, calls = time.sleep, []
+
+        def suspicious(seconds):
+            calls.append(seconds)
+            if len(calls) == 3:
+                raise RuntimeError("monitor interrupted")
+            return real_sleep(seconds)
+
+        with patch.object(process_module.time, "sleep", suspicious):
+            with self.assertRaisesRegex(RuntimeError, "monitor interrupted"):
+                self.python("import time; time.sleep(30)", timeout=20)
+
+    def test_an_interrupt_with_a_child_that_wont_stop_is_a_cleanup_error(self):
+        class DeadThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("no threads")
+
+        # The stop is a no-op and the child is still sleeping after the five-second wait.
+        with patch.object(process_module, "stop_tree", lambda process: None), \
+                patch.object(process_module.threading, "Thread", DeadThread):
+            with self.assertRaises(ProcessCleanupError) as caught:
+                self.python("import time; time.sleep(6)", timeout=20)
+        self.assertIn("did not terminate", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+
+    def test_an_interrupt_with_pipes_held_open_is_a_cleanup_error(self):
+        # The child reports its pipe-holding descendant's pid, then keeps running.
+        pidfile = self.cwd / "descendant.pid"
+        code = ("import subprocess, sys, tempfile, time; "
+                "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'], "
+                "cwd=tempfile.gettempdir()); "
+                f"open(r'{pidfile}', 'w').write(str(p.pid)); time.sleep(30)")
+        real_sleep, fired = time.sleep, []
+
+        def suspicious(seconds):
+            # Interrupt the monitor once, only once the descendant holds the pipes.
+            if not fired and pidfile.exists():
+                fired.append(1)
+                raise RuntimeError("monitor interrupted")
+            return real_sleep(seconds)
+
+        try:
+            with patch.object(process_module.time, "sleep", suspicious), \
+                    patch.object(process_module, "stop_tree", lambda process: process.kill()):
+                with self.assertRaises(ProcessCleanupError) as caught:
+                    self.python(code, timeout=20)
+            self.assertIn("kept its output pipes open", str(caught.exception))
+            self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+        finally:
+            if pidfile.exists():
+                try:
+                    os.kill(int(pidfile.read_text().strip()), signal.SIGTERM)
+                except (OSError, ValueError):
+                    pass
+
+    def test_a_later_thread_start_failure_with_pipes_held_is_a_cleanup_error(self):
+        # The child reports its pipe-holding descendant's pid, then keeps running.
+        pidfile = self.cwd / "descendant.pid"
+        code = ("import subprocess, sys, tempfile, time; "
+                "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'], "
+                "cwd=tempfile.gettempdir()); "
+                f"open(r'{pidfile}', 'w').write(str(p.pid)); time.sleep(30)")
+        calls = []
+
+        class FlakyThread(process_module.threading.Thread):
+            def start(self):
+                calls.append(self)
+                if len(calls) == 3:
+                    # A later worker's start fails after both output readers
+                    # started, once the child has spawned its descendant.
+                    deadline = time.monotonic() + 10
+                    while not pidfile.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    raise RuntimeError("start failed")
+                super().start()
+
+        try:
+            with patch.object(process_module.threading, "Thread", FlakyThread), \
+                    patch.object(process_module, "stop_tree", lambda process: process.kill()):
+                with self.assertRaises(ProcessCleanupError) as caught:
+                    self.python(code, timeout=20, data=b"x")
+            self.assertIn("kept its output pipes open", str(caught.exception))
+            self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+        finally:
+            if pidfile.exists():
+                try:
+                    os.kill(int(pidfile.read_text().strip()), signal.SIGTERM)
+                except (OSError, ValueError):
+                    pass
+
+    def test_a_later_worker_start_failure_still_drains_started_writers(self):
+        # The last worker's start fails after both writers started, once the
+        # child's output is on its way; started writers finish draining before
+        # the exception propagates, so the caller's logs are complete when it
+        # closes them.
+        marker = self.cwd / "emitted"
+        code = (f"import sys, time, pathlib; print('queued-line', flush=True); "
+                f"pathlib.Path(r'{marker}').write_text('x'); time.sleep(30)")
+        started, calls = [], []
+
+        class FlakyThread(process_module.threading.Thread):
+            def start(self):
+                calls.append(self)
+                if len(calls) == 5:  # the feeder: after both readers and both writers
+                    deadline = time.monotonic() + 10
+                    while not marker.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    raise RuntimeError("start failed")
+                super().start()
+                started.append(self)
+
+        out, err = self.cwd / "out.log", self.cwd / "err.log"
+        with out.open("xb") as stdout, err.open("xb") as stderr:
+            with patch.object(process_module.threading, "Thread", FlakyThread):
+                with self.assertRaisesRegex(RuntimeError, "start failed"):
+                    self.python(code, timeout=20, stdout=stdout, stderr=stderr, data=b"x")
+        self.assertEqual(out.read_bytes().strip(), b"queued-line")
+        for thread in started[2:4]:  # the writers
+            self.assertFalse(thread.is_alive())
+
+    def test_a_child_that_fails_to_stop_still_drains_started_writers(self):
+        # The last worker's start fails once the child's output is on its way;
+        # the child does not stop within the wait, and the started writers
+        # still finish draining before the error propagates.
+        marker = self.cwd / "emitted2"
+        pidfile = self.cwd / "child.pid"
+        code = (f"import os, sys, time, pathlib; print('queued-line', flush=True); "
+                f"pathlib.Path(r'{marker}').write_text('x'); "
+                f"pathlib.Path(r'{pidfile}').write_text(str(os.getpid())); time.sleep(60)")
+        started, calls = [], []
+
+        class FlakyThread(process_module.threading.Thread):
+            def start(self):
+                calls.append(self)
+                if len(calls) == 5:  # the feeder: after both readers and both writers
+                    deadline = time.monotonic() + 10
+                    while not marker.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    raise RuntimeError("start failed")
+                super().start()
+                started.append(self)
+
+        out, err = self.cwd / "out2.log", self.cwd / "err2.log"
+        try:
+            # The stop is a no-op: the child is still running after the five-second wait.
+            with out.open("xb") as stdout, err.open("xb") as stderr:
+                with patch.object(process_module.threading, "Thread", FlakyThread), \
+                        patch.object(process_module, "stop_tree", lambda process: None):
+                    with self.assertRaisesRegex(ProcessCleanupError, "did not terminate"):
+                        self.python(code, timeout=20, stdout=stdout, stderr=stderr, data=b"x")
+            self.assertEqual(out.read_bytes().strip(), b"queued-line")
+            for thread in started[2:4]:  # the writers
+                self.assertFalse(thread.is_alive())
+        finally:
+            if pidfile.exists():
+                try:
+                    os.kill(int(pidfile.read_text().strip()), signal.SIGTERM)
+                except (OSError, ValueError):
+                    pass
 
     def test_without_data_the_standard_input_is_closed(self):
         result = self.python("import sys; print(repr(sys.stdin.read()))", timeout=20)

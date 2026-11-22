@@ -11,10 +11,10 @@ from pathlib import Path
 import re
 
 from ..common.environment import GIT_FACT_SECONDS
-from ..common.errors import DevFlowError
+from ..common.errors import DevFlowError, ProcessCleanupError
 from ..common.git import git_environment, git_executable, run_git
 from ..common.paths import msys_path, same_path
-from ..common.process import run_bounded
+from ..common.process import reraise_wrapped_cause, run_bounded
 from ..common.storage import no_symlinks
 
 #: ``rev-parse --path-format`` appeared in Git 2.31.
@@ -131,6 +131,10 @@ def verify_workspace(project: Path, frozen: dict, mode: str) -> Path:
                    if (frozen[key] is None) != (current[key] is None)
                    or (frozen[key] is not None and not same_path(frozen[key], current[key]))]
     except (DevFlowError, OSError, RuntimeError) as exc:
+        # An interrupt a Git cleanup failure wrapped is still the interrupt:
+        # let it out before the workspace error can hide it.
+        if isinstance(exc, ProcessCleanupError):
+            reraise_wrapped_cause(exc)
         raise DevFlowError(f"The implementation workspace is no longer valid: {exc}") from exc
     if changed:
         raise DevFlowError(f"The implementation workspace changed since start ({changed[0]}); start a new run")

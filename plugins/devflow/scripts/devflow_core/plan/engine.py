@@ -11,7 +11,7 @@ from uuid import uuid4
 from ..common.errors import CaptureError, DevFlowError
 from ..common.hosts import host_profile
 from ..common.paths import path_key
-from ..common.review import (LIMIT_DECISIONS, REVIEW_BUDGET, after_failed_review, all_approved, ask_at_limit, decide_at_limit,
+from ..common.review import (LIMIT_DECISIONS, REVIEW_BUDGET, after_review_failure, all_approved, ask_at_limit, decide_at_limit,
                              next_reviewer)
 from ..common.reviewers import preflight, prepare_review, recorded_cli_version, review_tokens, run_review
 from ..common.engine import RunEngine
@@ -333,20 +333,32 @@ class Engine(RunEngine):
         number = reservation["number"]
         review = result["review"] if error is None else None
         self._verify(state)
-        if error is None and state["plan_hash"] != reservation["target"]:
+        review_error = error
+        content_changed = state["plan_hash"] != reservation["target"]
+        if review_error is None and content_changed:
             error = DevFlowError("The plan changed while it was being reviewed.")
         # The time and the token counts of the attempt, whatever its outcome.
         attempt = {"started_at": reservation["started_at"], "finished_at": now(),
                    "tokens": review_tokens(provider, self._run(state["run_id"]) / "review-processes" / f"{number:02d}"),
                    "plan_version": state["plan_version"]}
         if error is not None:
-            state["last_error"] = {"review_number": number, "provider": provider["id"],
-                                   "plan_hash": reservation["target"], "message": writable_text(str(error)),
-                                   "retry_consumes_another_attempt": True, **attempt,
-                                   # What the reviewer did, when it ran to the end.
-                                   **({"activity": result["activity"]} if result is not None else {})}
-            state["status"] = after_failed_review(number, state, "ready")
-            self._artifact(state, f"{relative_dir}/error.json", json_bytes(state["last_error"]))
+            message = writable_text(str(error))
+            if review_error is not None and content_changed:
+                message += "; The plan changed while it was being reviewed."
+            # The earlier rounds must be read before this round's error.json is
+            # registered: _artifact puts the path in state before the file exists.
+            earlier = [entry for entry in self._reviews(state) if entry["number"] < number]
+            record = {"review_number": number, "provider": provider["id"],
+                      "plan_hash": reservation["target"], "message": message,
+                      "retry_consumes_another_attempt": True, **attempt,
+                      # What the reviewer did, when it ran to the end.
+                      **({"activity": result["activity"]} if result is not None else {})}
+            status, reason = after_review_failure(number, state, "ready", provider["id"],
+                                                  earlier, review_error, content_changed)
+            self._artifact(state, f"{relative_dir}/error.json", json_bytes(record))
+            state["last_error"] = (dict(record, message=f"{reason} Reviewer error: {message}")
+                                   if reason else record)
+            state["status"] = status
             return
         providers = state["config"]["reviewers"]
         wrapper = {"schema_version": 2, "number": number, "provider": provider["id"], "plan_hash": state["plan_hash"],

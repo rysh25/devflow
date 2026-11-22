@@ -15,7 +15,7 @@ from unittest.mock import patch
 from devflow_core import cli, router
 from devflow_core.common import paths, sessions
 from devflow_core.common import runs as runs_module
-from devflow_core.common.errors import DevFlowError, ReviewerError
+from devflow_core.common.errors import DevFlowError, ProcessCleanupError, ReviewerError
 from devflow_core.common.review import REVIEW_LIMIT_REASON
 from devflow_core.common.storage import atomic_write_json, file_lock, read_json
 from devflow_core.plan import engine as engine_module
@@ -466,24 +466,41 @@ class EngineTests(unittest.TestCase):
             self.engine._finish_review(state, reservation, "reviews/01", provider, adapter_result(review_value()), None)
             self.engine._save(state)
         status = self.engine.status(self.run_id)
+        # A content change during the review never auto-continues.
+        self.assertEqual(status["status"], "paused_error")
+        self.assertEqual(status["last_error"]["message"], "The plan changed while it was being reviewed.")
         self.assertEqual(status["last_error"]["activity"], ACTIVITY)
         self.assertEqual([(r["status"], r["plan_hash"], r["tool_calls"]) for r in status["reviews"]],
                          [("failed", "0" * 64, ACTIVITY["tool_calls"])])
 
-    def test_failed_attempt_consumed_resume_explicit_and_alternating(self):
+    def test_reviewer_failure_and_plan_change_stay_paused(self):
+        self.ready()
+        provider = self.engine.status(self.run_id)["config"]["reviewers"][0]
+        with self.engine._lock(self.run_id):
+            state = self.engine._state(self.run_id)
+            state["review_count"] = 1
+            # The reviewer failed and the plan hash no longer matches: both are recorded.
+            reservation = {"number": 1, "target": "0" * 64, "started_at": "2026-11-05T00:00:00+00:00"}
+            self.engine._finish_review(state, reservation, "reviews/01", provider, None, ReviewerError("codex down"))
+            self.engine._save(state)
+        status = self.engine.status(self.run_id)
+        self.assertEqual(status["status"], "paused_error")
+        self.assertEqual(status["last_error"]["message"],
+                         "codex down; The plan changed while it was being reviewed.")
+        record = read_json(self.run / "reviews" / "01" / "error.json")
+        self.assertEqual(record["message"], "codex down; The plan changed while it was being reviewed.")
+
+    def test_failed_attempt_consumed_and_the_next_reviewer_runs(self):
         self.ready()
         with patch(RUN_REVIEW, side_effect=RuntimeError("mock provider unavailable")):
             failed = self.engine.review(self.run_id)
-        self.assertEqual(failed["status"], "paused_error")
+        self.assertEqual(failed["status"], "ready")
         self.assertEqual(failed["review_count"], 1)
         self.assertEqual(failed["next_reviewer"], "opencode")
         self.assertIsNone(failed["inflight"])
         self.assertEqual([(r["status"], r["reviewer_id"], r["plan_hash"]) for r in failed["reviews"]],
                          [("failed", "codex", failed["plan_hash"])])
-        with patch(RUN_REVIEW) as no_call:
-            with self.assertRaises(DevFlowError):
-                self.engine.review(self.run_id)
-            no_call.assert_not_called()
+        # No resume is needed: the next review request runs the next reviewer.
         resumed = self.resume("second-session")
         self.assertEqual(resumed["review_count"], 1)
         self.assertEqual(resumed["owner_session"], "second-session")
@@ -495,16 +512,155 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(next_state["review_count"], 2)
         self.assertEqual(next_state["status"], "ready")
 
+    def test_repeated_failure_by_the_same_reviewer_pauses(self):
+        self.ready()
+        outcomes = [RuntimeError("codex down"), RuntimeError("opencode down"), RuntimeError("codex still down")]
+        with patch(RUN_REVIEW, side_effect=outcomes) as call:
+            first = self.engine.review(self.run_id)
+            second = self.engine.review(self.run_id)
+            third = self.engine.review(self.run_id)
+        # Each reviewer's first failure moves on to the next configured reviewer.
+        self.assertEqual(first["status"], "ready")
+        self.assertEqual(second["status"], "ready")
+        # Codex's own previous round (review 1) also failed: the run pauses.
+        self.assertEqual(third["status"], "paused_error")
+        self.assertEqual([c.args[0].config["id"] for c in call.call_args_list], ["codex", "opencode", "codex"])
+        message = third["last_error"]["message"]
+        self.assertIn("Reviewer codex failed in reviews 1 and 3 in a row", message)
+        self.assertIn(f"/devflow:resume {self.run_id}", message)
+        self.assertTrue(message.endswith("Reviewer error: codex still down"), message)
+        # The record keeps the reviewer's own message, without the pause reason.
+        self.assertEqual(read_json(self.run / "reviews" / "03" / "error.json")["message"], "codex still down")
+        resumed = self.resume(self.session)
+        self.assertEqual(resumed["status"], "ready")
+        with patch(RUN_REVIEW, return_value=adapter_result(review_value())):
+            final = self.engine.review(self.run_id)
+        self.assertEqual(final["status"], "ready")
+        self.assertEqual(final["review_count"], 4)
+
+    def test_process_cleanup_failure_pauses_below_the_limit(self):
+        self.ready()
+        with patch(RUN_REVIEW, side_effect=ProcessCleanupError(
+                "A child process did not terminate; stop it manually before continuing")):
+            failed = self.engine.review(self.run_id)
+        self.assertEqual(failed["status"], "paused_error")
+        self.assertIsNone(failed["inflight"])
+        self.assertIn("did not terminate", failed["last_error"]["message"])
+        self.assertEqual(read_json(self.run / "reviews" / "01" / "error.json")["message"],
+                         "A child process did not terminate; stop it manually before continuing")
+        self.assertEqual(self.resume(self.session)["status"], "ready")
+
+    def test_process_cleanup_failure_pauses_even_at_the_limit(self):
+        (self.project / "devflow.config.json").write_text('{"max_reviews":2}', encoding="utf-8")
+        self.ready()
+        # Even at the review limit a cleanup failure pauses instead of asking the human.
+        outcomes = [RuntimeError("codex down"), ProcessCleanupError(
+            "A child process's descendants kept its output pipes open; stop them manually before continuing")]
+        with patch(RUN_REVIEW, side_effect=outcomes):
+            self.assertEqual(self.engine.review(self.run_id)["status"], "ready")
+            failed = self.engine.review(self.run_id)
+        self.assertEqual(failed["status"], "paused_error")
+        self.assertEqual(self.resume(self.session)["status"], "ready")
+        self.assertEqual(self.ask_at_limit()["status"], "awaiting_human")
+
+    def test_a_recovered_round_counts_as_a_failure_for_the_same_reviewer(self):
+        self.ready()
+        with patch(RUN_REVIEW, side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.engine.review(self.run_id)
+        recovered = self.engine.recover(self.run_id, confirmed=True, expected_review=1)
+        self.assertEqual(recovered["status"], "paused_error")
+        self.resume(self.session)
+        outcomes = [adapter_result(review_value()), RuntimeError("codex down")]
+        with patch(RUN_REVIEW, side_effect=outcomes):
+            self.assertEqual(self.engine.review(self.run_id)["status"], "ready")  # opencode passes
+            third = self.engine.review(self.run_id)  # codex fails
+        # Codex's own previous round is the recovered one, whose record is a failure.
+        self.assertEqual(third["status"], "paused_error")
+        self.assertIn("Reviewer codex failed in reviews 1 and 3 in a row", third["last_error"]["message"])
+
+    def test_the_single_configured_reviewer_failing_twice_pauses(self):
+        atomic_write_json(self.project / "devflow.config.json", {"schema_version": 1, "reviewers": [
+            {"id": "codex", "kind": "codex", "command": ["fixture", "--go"],
+             "model": "fixture-model", "effort": "high", "timeout_seconds": 30}],
+            "max_reviews": 3})
+        self.ready()
+        # With one reviewer the "next" reviewer is the same one: its second failure pauses.
+        outcomes = [RuntimeError("codex down"), RuntimeError("codex still down")]
+        with patch(RUN_REVIEW, side_effect=outcomes):
+            self.assertEqual(self.engine.review(self.run_id)["status"], "ready")
+            failed = self.engine.review(self.run_id)
+        self.assertEqual(failed["status"], "paused_error")
+        self.assertIn("Reviewer codex failed in reviews 1 and 2 in a row", failed["last_error"]["message"])
+
+    def single_reviewer(self, max_reviews=4):
+        atomic_write_json(self.project / "devflow.config.json", {"schema_version": 1, "reviewers": [
+            {"id": "codex", "kind": "codex", "command": ["fixture", "--go"],
+             "model": "fixture-model", "effort": "high", "timeout_seconds": 30}],
+            "max_reviews": max_reviews})
+
+    def test_the_single_configured_reviewer_passing_after_a_failure_completes(self):
+        self.single_reviewer()
+        self.ready()
+        # With one reviewer the next round is the same reviewer; a pass then completes.
+        outcomes = [RuntimeError("codex down"), adapter_result(review_value())]
+        with patch(RUN_REVIEW, side_effect=outcomes) as call:
+            self.assertEqual(self.engine.review(self.run_id)["status"], "ready")
+            result = self.engine.review(self.run_id)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual([c.args[0].config["id"] for c in call.call_args_list], ["codex", "codex"])
+
+    def test_the_single_configured_reviewer_failing_again_after_resume_pauses(self):
+        self.single_reviewer()
+        self.ready()
+        with patch(RUN_REVIEW, side_effect=RuntimeError("codex down")):
+            self.assertEqual(self.engine.review(self.run_id)["status"], "ready")
+            self.assertEqual(self.engine.review(self.run_id)["status"], "paused_error")
+            self.assertEqual(self.resume("human-session")["status"], "ready")
+            # Resume does not restart the count: the next failure is consecutive again.
+            failed = self.engine.review(self.run_id)
+        self.assertEqual(failed["status"], "paused_error")
+        self.assertIn("Reviewer codex failed in reviews 2 and 3 in a row", failed["last_error"]["message"])
+
+    def test_the_single_configured_reviewers_second_failure_at_the_limit_asks(self):
+        self.single_reviewer(max_reviews=2)
+        self.ready()
+        with patch(RUN_REVIEW, side_effect=RuntimeError("codex down")) as call:
+            self.assertEqual(self.engine.review(self.run_id)["status"], "ready")
+            # The second consecutive failure lands at the limit: ready for the
+            # budget question rather than the repeated-failure pause.
+            self.assertEqual(self.engine.review(self.run_id)["status"], "ready")
+            asked = self.engine.review(self.run_id)
+            self.assertEqual(asked["status"], "awaiting_human")
+            # The limit question starts no reviewer.
+            self.assertEqual(call.call_count, 2)
+        self.assertEqual(self.at_limit("stop")["status"], "exhausted")
+
+    def test_a_repeated_failure_after_the_other_reviewer_passed_pauses(self):
+        self.ready()
+        # codex fails, opencode passes, codex fails in its own next round.
+        outcomes = [RuntimeError("codex down"), adapter_result(review_value()), RuntimeError("codex still down")]
+        with patch(RUN_REVIEW, side_effect=outcomes):
+            self.assertEqual(self.engine.review(self.run_id)["status"], "ready")
+            passed = self.engine.review(self.run_id)
+            self.assertEqual(passed["status"], "ready")
+            failed = self.engine.review(self.run_id)
+        # Codex's own previous round failed too: the run pauses even though
+        # opencode approved in between, and that pass is kept.
+        self.assertEqual(failed["status"], "paused_error")
+        self.assertIn("Reviewer codex failed in reviews 1 and 3 in a row", failed["last_error"]["message"])
+        state = self.engine.status(self.run_id)
+        self.assertEqual([item["provider"] for item in state["passes"]], ["opencode"])
+        self.assertEqual(state["passes"][0]["plan_hash"], state["plan_hash"])
+
     def test_reviewer_failure_keeps_other_passes_for_the_same_plan(self):
         initial = self.ready()
         outcomes = [adapter_result(review_value()), ReviewerError("malformed opencode reply"),
                     ReviewerError("malformed codex reply"), adapter_result(review_value())]
         with patch(RUN_REVIEW, side_effect=outcomes) as call:
             self.assertEqual(self.engine.review(self.run_id)["status"], "ready")
-            self.assertEqual(self.engine.review(self.run_id)["status"], "paused_error")
-            self.resume(self.session)
-            self.assertEqual(self.engine.review(self.run_id)["status"], "paused_error")
-            self.resume(self.session)
+            self.assertEqual(self.engine.review(self.run_id)["status"], "ready")
+            self.assertEqual(self.engine.review(self.run_id)["status"], "ready")
             final = self.engine.review(self.run_id)
         self.assertEqual(final["status"], "completed")
         self.assertEqual(final["review_count"], 4)
@@ -585,7 +741,7 @@ class EngineTests(unittest.TestCase):
     def test_invalid_semantic_review_is_a_consumed_failure(self):
         self.ready()
         result = self.submit({"unexpected": "not a review"})
-        self.assertEqual(result["status"], "paused_error")
+        self.assertEqual(result["status"], "ready")
         self.assertEqual(result["review_count"], 1)
         self.assertTrue((self.run / "reviews" / "01" / "error.json").exists())
 
@@ -2268,12 +2424,20 @@ class EngineTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 with patch(RUN_REVIEW, side_effect=lambda *args, kind=kind, **kwargs: raise_unwritable(kind)):
                     failed = self.engine.review(self.run_id)
-                self.assertEqual(failed["status"], "paused_error")
                 record = read_json(self.run / "reviews" / f"{number:02d}" / "error.json")
                 self.assertEqual(record["message"], UNWRITABLE[kind])
-                self.assertEqual(failed["last_error"]["message"], UNWRITABLE[kind])
                 json.dumps(self.engine.status(self.run_id), ensure_ascii=False).encode("utf-8")  # runner output
-                self.resume(self.session)
+                if number <= 2:
+                    # Each reviewer's first failure moves on to the next reviewer.
+                    self.assertEqual(failed["status"], "ready")
+                    self.assertEqual(failed["last_error"]["message"], UNWRITABLE[kind])
+                else:
+                    # The same reviewer's second consecutive failure pauses.
+                    self.assertEqual(failed["status"], "paused_error")
+                    self.assertIn("failed in reviews", failed["last_error"]["message"])
+                    self.assertTrue(failed["last_error"]["message"].endswith(
+                        f"Reviewer error: {UNWRITABLE[kind]}"))
+                    self.resume(self.session)
         # A successful review whose activity names cannot be held counts them as unnamed.
         with patch(RUN_REVIEW, return_value={"review": validate_review(review_value("changes_required")),
                                              "activity": unwritable_activity()}):

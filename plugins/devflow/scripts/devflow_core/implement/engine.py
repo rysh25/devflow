@@ -3,11 +3,14 @@ from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
 
+import subprocess
+
 from . import checks, snapshot
 from .review import validate_review
 from .workspace import branch, verify_workspace
-from ..common.errors import DevFlowError
-from ..common.review import (LIMIT_DECISIONS, REVIEW_BUDGET, after_failed_review, all_approved, ask_at_limit, decide_at_limit,
+from ..common.errors import DevFlowError, ProcessCleanupError
+from ..common.process import reraise_wrapped_cause
+from ..common.review import (LIMIT_DECISIONS, REVIEW_BUDGET, after_review_failure, all_approved, ask_at_limit, decide_at_limit,
                              next_reviewer)
 from ..common import summary
 from ..common.reviewers import preflight, prepare_review, recorded_cli_version, review_tokens, run_review
@@ -163,7 +166,12 @@ class Engine(RunEngine):
         if error is None:
             try:
                 self._current(state)
-            except DevFlowError as exc:  # e.g. the check itself rewrote source
+            except ProcessCleanupError as exc:
+                # An interrupt the cleanup wrapped is still the interrupt: it
+                # keeps the reservation in checking for human recovery.
+                reraise_wrapped_cause(exc)
+                error = exc
+            except (DevFlowError, OSError) as exc:  # e.g. the check itself rewrote source
                 error = exc
         if error is not None:
             state.update(status="paused_error",resume_status="implementing",last_error=str(error),approvals={})
@@ -274,21 +282,36 @@ class Engine(RunEngine):
         review = result["review"] if error is None else None
         # The token counts the CLI printed, whatever the outcome.
         tokens = review_tokens(provider, self._run(state["run_id"])/"review-processes"/f"{number:02}")
-        current = None
-        if error is None:
-            try:
-                current = self._current(state)
-            except DevFlowError as exc:
-                error = exc
+        review_error = error
+        current, change_error = None, None
+        try:
+            current = self._current(state)
+        except ProcessCleanupError as exc:
+            # An interrupt the cleanup wrapped is still the interrupt: it keeps
+            # the reservation in reviewing for human recovery.
+            reraise_wrapped_cause(exc)
+            change_error = exc
+        except (DevFlowError, OSError) as exc:
+            # A changed workspace is a policy error; a raw filesystem error from
+            # the snapshot capture still counts as the content not matching.
+            change_error = exc
+        content_changed = change_error is not None
+        if review_error is None:
+            error = change_error
         if error is not None:
             # What the reviewer did is kept when it ran to the end.
             # The error text may carry a CLI's output: a record holds it escaped.
             message = writable_text(str(error))
+            if review_error is not None and content_changed:
+                message += "; " + writable_text(str(change_error))
             state["attempts"][-1].update(status="failed",error=message,finished_at=now(),tokens=tokens,
                                          **({"activity":result["activity"]} if result is not None else {}))
             # A reviewer failure says nothing about the code: approvals for this
             # snapshot stay (as in plan); this attempt never adds one.
-            state.update(status=after_failed_review(number,state,"ready_review"),resume_status="ready_review",last_error=message)
+            status, reason = after_review_failure(number,state,"ready_review",provider["id"],
+                                                  state["attempts"][:-1],review_error,content_changed)
+            state.update(status=status,resume_status="ready_review",
+                         last_error=f"{reason} Reviewer error: {message}" if reason else message)
             return
         review_path = f"reviews/{number:02}/review.json"
         self._artifact(state,review_path,json_bytes(review))

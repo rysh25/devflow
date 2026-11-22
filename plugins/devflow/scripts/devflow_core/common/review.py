@@ -1,7 +1,8 @@
 """Shared budget, approval and verdict mechanics; domain policy remains in each flow."""
 from typing import Callable, Collection
 
-from .errors import DevFlowError, ReviewerError, shown_name
+from .errors import DevFlowError, ProcessCleanupError, ReviewerError, shown_name
+from .hosts import host_profile
 from .runs import TERMINAL
 
 # The ceiling of both the configured max_reviews (the initial limit) and one
@@ -18,6 +19,10 @@ REVIEW_LIMIT_QUESTION = ("Review limit reached: {used} of {limit} reviews used. 
                          "(accepted by the human, not approved by every reviewer).")
 #: The answers to the review limit question, in the order it lists them.
 LIMIT_DECISIONS = ("continue", "stop", "accept")
+#: ``last_error`` gains this prefix when one reviewer fails twice in a row.
+REPEATED_FAILURE_REASON = ("Reviewer {reviewer} failed in reviews {previous} and {current} in a row; "
+                           "fix the cause (for example sign-in, a usage limit or Devin's directory trust), "
+                           "then use {resume} {run_id}.")
 # Field names in a rejected response come from the model: show a bounded,
 # escaped, deterministic selection.
 SHOWN_FIELD_NAMES = 8
@@ -42,10 +47,56 @@ def all_approved(reviewers: list, approvals: dict, artifact_digest: str) -> bool
 
 
 def after_failed_review(used: int, state: dict, ready_status: str) -> str:
-    """The status after a failed or interrupted round, which used its attempt: paused
-    for a retry while attempts remain; at the limit ``ready_status``, from which the
-    next review request asks the human (``ask_at_limit``)."""
+    """The status after a round a human should look at — a recovered round, or a
+    round whose reviewed content changed during the review: paused while attempts
+    remain; at the limit ``ready_status``, from which the next review request
+    asks the human (``ask_at_limit``). Ordinary reviewer failures take
+    ``after_review_failure`` instead."""
     return "paused_error" if used < state["review_limit"] else ready_status
+
+
+def after_review_failure(used: int, state: dict, ready_status: str, reviewer_id: str,
+                         earlier: list[dict], review_error: BaseException | None,
+                         content_changed: bool) -> tuple[str, str | None]:
+    """The status after a review round that failed or was interrupted, and the
+    reason the human should see, if one applies.
+
+    ``used`` is the review's number after the attempt was reserved (the count of
+    attempts used); ``earlier`` the rounds before it, each holding ``number``,
+    ``reviewer_id`` and ``status`` (``succeeded``, ``failed`` or, for an
+    interrupted round left dispatched, ``dispatched``); ``review_error`` the
+    exception the reviewer execution raised (``None`` when it succeeded); and
+    ``content_changed`` whether the runner's own check after the review found
+    the reviewed content changed.
+
+    In order: a ``ProcessCleanupError`` from the reviewer execution pauses as
+    ``paused_error`` whatever the limit (a child may still run); a content
+    change follows ``after_failed_review`` (paused while attempts remain,
+    ``ready_status`` at the limit); at or beyond the review limit the status is
+    ``ready_status`` so the next review request asks the human the budget
+    question; otherwise, when the reviewer's own most recent earlier round
+    (found scanning ``earlier`` backwards) also failed, it pauses as
+    ``paused_error`` with ``REPEATED_FAILURE_REASON`` — a recovered round's
+    record reads ``failed``, so it counts — and any other failure returns
+    ``ready_status`` so the next configured reviewer runs. Returns ``(status,
+    reason)``; ``reason`` is ``None`` unless the run pauses on a repeated
+    failure.
+    """
+    if isinstance(review_error, ProcessCleanupError):
+        return "paused_error", None
+    if content_changed:
+        return after_failed_review(used, state, ready_status), None
+    if used >= state["review_limit"]:
+        return ready_status, None
+    for round_ in reversed(earlier):
+        if round_["reviewer_id"] == reviewer_id:
+            if round_["status"] == "failed":
+                return "paused_error", REPEATED_FAILURE_REASON.format(
+                    reviewer=reviewer_id, previous=round_["number"], current=used,
+                    resume=host_profile(state["owner_host"]).command_prefix + "resume",
+                    run_id=state["run_id"])
+            break
+    return ready_status, None
 
 
 def ask_at_limit(state: dict, used: int, approved: Collection[str], version: str,

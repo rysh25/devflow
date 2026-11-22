@@ -8,8 +8,9 @@ from unittest.mock import patch
 from devflow_core.common.storage import (DevFlowError, atomic_json, checked_text, digest,
     file_lock, json_bytes, no_symlinks, read_json, within, writable, writable_text, write_new)
 from devflow_core.common.counts import MAX_NAMES, tally
-from devflow_core.common.errors import ReviewerError
-from devflow_core.common.review import (REVIEW_LIMIT_REASON, all_approved, ask_at_limit, check_fields,
+from devflow_core.common.errors import ProcessCleanupError, ReviewerError
+from devflow_core.common.review import (REVIEW_LIMIT_REASON, REPEATED_FAILURE_REASON, after_review_failure,
+                                        all_approved, ask_at_limit, check_fields,
                                         check_review_budget, decide_at_limit, next_reviewer, review_budget,
                                         validate_limit)
 from devflow_core.common.settings import validate_document
@@ -539,6 +540,74 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(runs.release_name(4), "an older version (run format 4)")
         self.assertEqual(runs.release_name(5), "an older version (run format 5)")
         self.assertEqual(runs.release_name(10), "an older version (run format 10)")
+
+
+class AfterReviewFailureTests(unittest.TestCase):
+    """The one ordinary-failure policy shared by both flows."""
+
+    def state(self, host="claude", limit=6):
+        return {"review_limit": limit, "owner_host": host, "run_id": "run-1"}
+
+    def earlier(self, number, reviewer_id="codex", status="failed"):
+        return {"number": number, "reviewer_id": reviewer_id, "status": status}
+
+    def test_an_ordinary_failure_returns_the_ready_status(self):
+        self.assertEqual(after_review_failure(1, self.state(), "ready_review", "codex", [], RuntimeError("x"), False),
+                         ("ready_review", None))
+
+    def test_the_same_reviewer_failing_twice_in_a_row_pauses_with_context(self):
+        earlier = [self.earlier(1)]
+        status, reason = after_review_failure(3, self.state(), "ready_review", "codex", earlier,
+                                              RuntimeError("down"), False)
+        self.assertEqual(status, "paused_error")
+        self.assertIn("codex", reason)
+        self.assertIn("reviews 1 and 3", reason)
+        self.assertIn("/devflow:resume run-1", reason)
+
+    def test_the_resume_command_follows_the_run_host(self):
+        earlier = [self.earlier(2)]
+        _, reason = after_review_failure(4, self.state(host="codex"), "ready", "codex", earlier,
+                                         RuntimeError("down"), False)
+        self.assertIn("$devflow:resume run-1", reason)
+        _, reason = after_review_failure(4, self.state(host="devin"), "ready", "codex", earlier,
+                                         RuntimeError("down"), False)
+        self.assertIn("/devflow:resume run-1", reason)
+
+    def test_a_success_or_another_reviewer_between_failures_breaks_the_streak(self):
+        for earlier in ([self.earlier(1, status="succeeded")],
+                        [self.earlier(1, status="dispatched")],
+                        [self.earlier(1, reviewer_id="opencode")],
+                        [self.earlier(1, reviewer_id="opencode"), self.earlier(2, status="succeeded")]):
+            with self.subTest(earlier=earlier):
+                self.assertEqual(after_review_failure(3, self.state(), "ready", "codex", earlier,
+                                                      RuntimeError("x"), False), ("ready", None))
+
+    def test_at_the_limit_an_ordinary_failure_leaves_the_run_ready(self):
+        for earlier in ([], [self.earlier(4)]):
+            with self.subTest(earlier=earlier):
+                self.assertEqual(after_review_failure(6, self.state(), "ready", "codex", earlier,
+                                                      RuntimeError("x"), False), ("ready", None))
+
+    def test_a_cleanup_failure_pauses_at_any_point_including_the_limit(self):
+        for used in (1, 6):
+            with self.subTest(used=used):
+                self.assertEqual(after_review_failure(used, self.state(), "ready", "codex", [],
+                                                      ProcessCleanupError("leftover"), False),
+                                 ("paused_error", None))
+        # The cleanup check wins even when the content also changed.
+        self.assertEqual(after_review_failure(6, self.state(), "ready", "codex", [],
+                                              ProcessCleanupError("leftover"), True),
+                         ("paused_error", None))
+
+    def test_changed_content_keeps_the_old_pause_or_limit_behavior(self):
+        self.assertEqual(after_review_failure(2, self.state(), "ready", "codex", [], RuntimeError("x"), True),
+                         ("paused_error", None))
+        self.assertEqual(after_review_failure(6, self.state(), "ready", "codex", [], RuntimeError("x"), True),
+                         ("ready", None))
+        # A reviewer that failed while the content changed reports both facts as one failure.
+        self.assertEqual(after_review_failure(2, self.state(), "ready", "codex",
+                                              [self.earlier(1, status="succeeded")], None, True),
+                         ("paused_error", None))
 
 
 if __name__ == "__main__":

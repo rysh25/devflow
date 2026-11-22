@@ -19,7 +19,7 @@ import unittest
 from unittest.mock import patch
 
 from devflow_core.common import reviewers, settings, storage
-from devflow_core.common.errors import DevFlowError, ReviewerError
+from devflow_core.common.errors import DevFlowError, ProcessCleanupError, ReviewerError
 
 MIB = 1024 * 1024
 SENTINEL = "REVIEWER-INSTRUCTIONS-SENTINEL-7f3a"
@@ -519,6 +519,74 @@ class CaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(ReviewerError, "Cannot run reviewer"):
             reviewers._capture([str(self.work / "missing-cli")], log_dir=self.work)
         self.assertEqual([(self.work / name).read_bytes() for name in ("stdout.jsonl", "stderr.log")], [b"", b""])
+
+    def test_a_cleanup_failure_keeps_its_type_and_message(self):
+        # run_bounded could not stop the child: _run re-raises the same class, and
+        # closing the log files cannot hide it.
+        def bounded(argv, **options):
+            raise ProcessCleanupError("A child process did not terminate; stop it manually before continuing")
+        for log_dir in (None, self.work):
+            with self.subTest(log_dir=log_dir):
+                with patch.object(reviewers, "run_bounded", bounded), \
+                        self.assertRaises(ProcessCleanupError) as caught:
+                    reviewers._capture([sys.executable, "-c", ""], log_dir=log_dir)
+                self.assertEqual(str(caught.exception),
+                                 "Cannot run reviewer: A child process did not terminate; "
+                                 "stop it manually before continuing")
+                self.assertNotIsInstance(caught.exception, ReviewerError)
+        self.assertEqual([(self.work / name).read_bytes() for name in ("stdout.jsonl", "stderr.log")], [b"", b""])
+        # An ordinary run error is still wrapped as a reviewer error.
+        with patch.object(reviewers, "run_bounded", side_effect=DevFlowError("broken")), \
+                self.assertRaises(ReviewerError) as ordinary:
+            reviewers._capture([sys.executable, "-c", ""])
+        self.assertNotIsInstance(ordinary.exception, ProcessCleanupError)
+
+    def test_retained_pipes_are_a_cleanup_failure_naming_every_cause(self):
+        from devflow_core.common.process import Completed
+        cases = (
+            (False, None, "Reviewer descendants kept pipes open; cleanup is incomplete"),
+            (True, None, "Reviewer descendants kept pipes open; cleanup is incomplete "
+                         "(after the reviewer timed out after 5 seconds)"),
+            (False, "cannot read stdout: EIO", "Reviewer descendants kept pipes open; cleanup is incomplete "
+                                               "(output error: cannot read stdout: EIO)"),
+            (True, "cannot read stdout: EIO",
+             "Reviewer descendants kept pipes open; cleanup is incomplete "
+             "(after the reviewer timed out after 5 seconds) (output error: cannot read stdout: EIO)"),
+        )
+        for index, (timed_out, output_error, expected) in enumerate(cases):
+            with self.subTest(timed_out=timed_out, output_error=output_error):
+                completed = Completed(0, b"", b"", timed_out, True, output_error, 1.0)
+                (self.work / f"logs{index}").mkdir()
+                for log_dir in (None, self.work / f"logs{index}"):
+                    with self.subTest(log_dir=log_dir):
+                        with patch.object(reviewers, "run_bounded", return_value=completed), \
+                                self.assertRaises(ProcessCleanupError) as caught:
+                            reviewers._capture([sys.executable, "-c", ""], timeout=5, log_dir=log_dir)
+                        self.assertEqual(str(caught.exception), expected)
+
+    def test_a_close_failure_does_not_hide_a_cleanup_error(self):
+        import io
+        from devflow_core.common.process import Completed
+
+        class BadClose(io.BytesIO):
+            def close(self):
+                raise OSError("close failed")
+
+        # A retained-pipe run still reports the cleanup error and the close error.
+        completed = Completed(0, b"", b"", False, True, None, 1.0)
+        with patch.object(reviewers, "_open_new", side_effect=lambda path: BadClose()), \
+                patch.object(reviewers, "run_bounded", return_value=completed), \
+                self.assertRaises(ProcessCleanupError) as caught:
+            reviewers._capture([sys.executable, "-c", ""], timeout=5, log_dir=self.work)
+        self.assertIn("kept pipes open", str(caught.exception))
+        self.assertIn("cannot write stdout: close failed", str(caught.exception))
+        # A cleanup error from the run itself is never hidden by the close errors.
+        with patch.object(reviewers, "_open_new", side_effect=lambda path: BadClose()), \
+                patch.object(reviewers, "run_bounded",
+                             side_effect=ProcessCleanupError("child did not stop")), \
+                self.assertRaises(ProcessCleanupError) as caught:
+            reviewers._capture([sys.executable, "-c", ""], timeout=5, log_dir=self.work)
+        self.assertEqual(str(caught.exception), "Cannot run reviewer: child did not stop")
 
     def test_lines_split_only_at_newline(self):
         path = self.work / "stdout.jsonl"

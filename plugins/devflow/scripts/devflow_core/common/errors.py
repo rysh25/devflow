@@ -34,3 +34,8 @@ class AnswerRefusedError(ReviewerError):
 
 class CaptureError(DevFlowError):
     """The interview record cannot be captured faithfully."""
+
+
+class ProcessCleanupError(DevFlowError):
+    """A child process may still be running after DevFlow tried to stop it
+    (it did not terminate, or a descendant kept its output pipes open)."""
