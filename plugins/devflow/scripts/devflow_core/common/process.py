@@ -18,7 +18,7 @@ import threading
 import time
 from typing import BinaryIO
 
-from .errors import DevFlowError
+from .errors import DevFlowError, ProcessCleanupError
 
 #: How long the output pipes (and the standard input writer) may stay open
 #: after the command exits before a descendant is taken to hold them.
@@ -133,22 +133,56 @@ def run_bounded(argv: list[str], *, cwd: Path | None, timeout: float, env: dict 
         finally:
             process.stdin.close()
 
-    readers = [threading.Thread(target=read, args=(process.stdout, "stdout"), daemon=True),
-               threading.Thread(target=read, args=(process.stderr, "stderr"), daemon=True)]
-    writers = {name: threading.Thread(target=write, args=(name,), daemon=True) for name in chunks}
-    feeder = threading.Thread(target=feed, daemon=True) if data is not None else None
-    for thread in [*readers, *writers.values(), *([feeder] if feeder else [])]:
-        thread.start()
     timed_out = False
+    readers: list[threading.Thread] = []
+    writers: dict[str, threading.Thread] = {}
+    feeder = None
+    reading = []  # Readers that started; an unstarted thread's ``ended`` event is never set.
+    draining = []  # Writers that started; they get their queue's end and a join.
+
+    def finish_writers() -> None:
+        """Let started writers drain what arrived before the caller closes the logs."""
+        for name, writer in writers.items():
+            if writer in draining:
+                if not ended[name].is_set():
+                    chunks[name].put(None)  # The pipe never ended: write what arrived, then stop.
+                writer.join()
+
     try:
+        readers = [threading.Thread(target=read, args=(process.stdout, "stdout"), daemon=True),
+                   threading.Thread(target=read, args=(process.stderr, "stderr"), daemon=True)]
+        writers = {name: threading.Thread(target=write, args=(name,), daemon=True) for name in chunks}
+        feeder = threading.Thread(target=feed, daemon=True) if data is not None else None
+        for thread in [*readers, *writers.values(), *([feeder] if feeder else [])]:
+            thread.start()
+            if thread in readers:
+                reading.append("stdout" if thread is readers[0] else "stderr")
+            elif thread is not feeder:
+                draining.append(thread)
         while process.poll() is None:
             if time.monotonic() - started >= timeout:
                 timed_out = True
                 stop_tree(process)
                 break
             time.sleep(0.01)
-    except BaseException:
+    except BaseException as exc:
         stop_tree(process)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            finish_writers()
+            raise ProcessCleanupError(
+                "A child process did not terminate; stop it manually before continuing") from exc
+        # A descendant that keeps a pipe open is noticed by the pipe not ending.
+        deadline = time.monotonic() + PIPE_GRACE_SECONDS
+        retained = not all(ended[name].wait(max(0.0, deadline - time.monotonic())) for name in reading)
+        if retained:
+            stop_tree(process)
+        finish_writers()
+        if retained:
+            raise ProcessCleanupError(
+                "A child process's descendants kept its output pipes open; "
+                "stop them manually before continuing") from exc
         raise
     try:
         process.wait(timeout=5)
@@ -157,7 +191,8 @@ def run_bounded(argv: list[str], *, cwd: Path | None, timeout: float, env: dict 
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired as exc:
-            raise DevFlowError("A child process did not terminate; stop it manually before continuing") from exc
+            finish_writers()
+            raise ProcessCleanupError("A child process did not terminate; stop it manually before continuing") from exc
     # A descendant that keeps a pipe open is noticed by the pipe not ending,
     # never by DevFlow's own writes being slow.
     deadline = time.monotonic() + PIPE_GRACE_SECONDS
@@ -177,3 +212,14 @@ def run_bounded(argv: list[str], *, cwd: Path | None, timeout: float, env: dict 
         out, err = bytes(buffers["stdout"]), bytes(buffers["stderr"])
     return Completed(process.returncode, out, err, timed_out, retained,
                      errors[0] if errors else None, round(time.monotonic() - started, 4))
+
+
+def reraise_wrapped_cause(exc: ProcessCleanupError) -> None:
+    """Re-raise what a cleanup failure wrapped only when it is an interruption
+    (a ``BaseException`` that is not an ``Exception``, like ``KeyboardInterrupt``):
+    the interrupt keeps the caller's reservation for human recovery instead of
+    being recorded as an ordinary failure while a child may still run. Any other
+    cause stays wrapped, so the cleanup failure itself is recorded."""
+    cause = exc.__cause__
+    if cause is not None and not isinstance(cause, Exception):
+        raise cause

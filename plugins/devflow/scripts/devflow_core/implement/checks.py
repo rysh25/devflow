@@ -11,11 +11,12 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import subprocess
 
 from typing import BinaryIO
 
-from ..common.errors import DevFlowError
-from ..common.process import run_bounded
+from ..common.errors import DevFlowError, ProcessCleanupError
+from ..common.process import reraise_wrapped_cause, run_bounded
 
 
 def _resolve_executable(argv: list[str]) -> list[str]:
@@ -39,8 +40,14 @@ def bounded_run(argv: list[str], cwd: Path, timeout_seconds: float, stdout: Bina
     A timeout, a descendant retaining the pipes, or an output that could not
     be captured is a recorded result, not a pass.
     """
-    result = run_bounded(_resolve_executable(argv), cwd=cwd, timeout=timeout_seconds, env=env,
-                         stdout=stdout, stderr=stderr)
+    try:
+        result = run_bounded(_resolve_executable(argv), cwd=cwd, timeout=timeout_seconds, env=env,
+                             stdout=stdout, stderr=stderr)
+    except ProcessCleanupError as exc:
+        # An interrupt that the cleanup wrapped is still the interrupt: it keeps
+        # the reservation in checking for human recovery.
+        reraise_wrapped_cause(exc)
+        raise
     error = None
     if result.timed_out:
         error = f"Check exceeded {timeout_seconds} seconds; process-tree termination was requested."

@@ -238,10 +238,10 @@ class FullStackTests(unittest.TestCase):
         self.assertEqual(result["approvals"], {})
         self.assertFalse((self.run / "reviews" / "01" / "review.json").exists())
 
-    def test_malformed_final_file_consumes_reserved_attempt_and_stops(self):
+    def test_malformed_final_file_consumes_reserved_attempt_and_continues(self):
         self.prepare("bad-final")
         result = self.engine.review(self.run_id, self.session)
-        self.assertEqual(result["status"], "paused_error")
+        self.assertEqual(result["status"], "ready_review")
         self.assertEqual(result["review_count"], 1)
         self.assertEqual(result["remaining_reviews"], 5)
         self.assertEqual(result["next_reviewer"], "opencode")
@@ -255,12 +255,11 @@ class FullStackTests(unittest.TestCase):
         self.assertEqual(lines[-1]["type"], "turn.completed")
         self.assertFalse((self.run / "reviews" / "01" / "review.json").exists())
         self.assertFalse((self.run / "review-processes" / "02").exists())
-        with self.assertRaises(DevFlowError):
-            self.engine.review(self.run_id, self.session)
-        stored = read_json(self.run / "state.json")
-        self.assertEqual(len(stored["attempts"]), 1)
-        self.assertEqual(stored["status"], "paused_error")
-        self.assertFalse((self.run / "review-processes" / "02").exists())
+        # The next review request runs the next configured reviewer automatically.
+        second = self.engine.review(self.run_id, self.session)
+        self.assertEqual(second["status"], "ready_review")
+        self.assertEqual(second["attempts"][1]["status"], "succeeded")
+        self.assertEqual(second["approvals"], {"opencode": self.snapshot_id})
 
 
 if __name__ == "__main__":

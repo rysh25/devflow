@@ -17,7 +17,7 @@ import unittest
 from unittest.mock import patch
 
 from devflow_core.common import reviewers
-from devflow_core.common.errors import ReviewerError
+from devflow_core.common.errors import ProcessCleanupError, ReviewerError
 from devflow_core.common.review import check_fields, check_verdict
 from devflow_core.common.hosts.skills import DEVIN_PROJECT_SKILLS, devin_user_skill_roots
 from devflow_core.common.startup import apply_startup, parse_start
@@ -239,6 +239,25 @@ class DevinReviewerTests(unittest.TestCase):
         self.assertEqual(reviewers.review_tokens(config, self.work),
                          {"total_cached_tokens": 23040, "total_completion_tokens": 240,
                           "total_prompt_tokens": 58188})
+
+    def test_a_follow_up_cleanup_failure_keeps_its_type(self):
+        prepared = self.prepare(self.config("prose"))
+        capture, launched = reviewers._capture, []
+
+        def flaky(argv, **options):
+            launched.append(argv)
+            if len(launched) == 2:
+                raise ProcessCleanupError("A child process did not terminate; stop it manually before continuing")
+            return capture(argv, **options)
+
+        with patch.object(reviewers, "_capture", side_effect=flaky):
+            with self.assertRaises(ProcessCleanupError) as caught:
+                reviewers.run_review(prepared, lambda value: value)
+        message = str(caught.exception)
+        self.assertIn("did not terminate", message)
+        self.assert_follow_up_failed(message, "A child process did not terminate")
+        self.assertNotIsInstance(caught.exception, ReviewerError)
+        self.assertTrue((self.work / "follow-up" / "invocation.json").is_file())
 
     def test_the_follow_up_gets_only_the_time_left(self):
         config = self.config("tidy")
@@ -532,6 +551,9 @@ class DevinReviewerTests(unittest.TestCase):
         # A check that cannot start at all passes too.
         cli, cwd = reviewers.CLIS["devin"], self.project.resolve()
         self.assertIsNone(cli.check_cwd([str(self.base / "no such devin")], cwd, dict(os.environ)))
+        # So does one whose cleanup failed: the probe answers nothing, like any other error.
+        with patch.object(reviewers, "_run", side_effect=ProcessCleanupError("stuck")):
+            self.assertIsNone(cli.check_cwd(["devin"], cwd, dict(os.environ)))
 
     def test_the_trust_check_does_not_run_when_version_or_help_fails(self):
         for mode, error in (("version-fail", "--version failed"), ("help-fail", "--help failed"),

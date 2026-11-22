@@ -22,7 +22,7 @@ from unittest.mock import patch
 
 from devflow_core import router
 from devflow_core.common import runs, sessions
-from devflow_core.common.errors import DevFlowError, ReviewerError
+from devflow_core.common.errors import DevFlowError, ProcessCleanupError, ReviewerError
 from devflow_core.common.paths import PLUGIN_ROOT
 from devflow_core.common.storage import atomic_write_json, digest, json_bytes, read_json
 from devflow_core.implement import checks as checks_module
@@ -202,6 +202,16 @@ class EngineFixture(unittest.TestCase):
 
     def review(self):
         return self.engine.review(self.run_id, self.session)
+
+    def run_checks_with(self, during):
+        """Patch ``run_checks`` so ``during`` runs before the real checks."""
+        original = checks_module.run_checks
+
+        def wrapper(*args, **kwargs):
+            during()
+            return original(*args, **kwargs)
+
+        return patch.object(checks_module, "run_checks", side_effect=wrapper)
 
     def reflect(self, action="accept"):
         state = self.state()
@@ -651,9 +661,13 @@ class EngineFlowTests(EngineFixture):
         for number in range(1, 7):
             result = self.review()
             self.assertEqual(result["review_count"], number)
-            # The last failure leaves no attempt to retry: the next review request asks the human.
-            self.assertEqual(result["status"], "ready_review" if number == 6 else "paused_error")
-            if number != 6:
+            # A failure moves on to the next configured reviewer; only the same
+            # reviewer's second consecutive failure pauses. The last failure
+            # leaves no attempt to retry: the next review request asks the human.
+            expected = "ready_review" if number in {1, 2, 6} else "paused_error"
+            self.assertEqual(result["status"], expected)
+            if expected == "paused_error":
+                self.assertIn("failed in reviews", result["last_error"])
                 resumed = self.resume()
                 self.assertEqual(resumed["review_count"], number)
                 self.assertEqual(resumed["status"], "ready_review")
@@ -699,18 +713,17 @@ class EngineFlowTests(EngineFixture):
         expected = self.state()["candidate"]["snapshot_id"]
         self.alter = lambda review: review.update(snapshot_id="different-snapshot")
         result = self.review()
-        self.assertEqual(result["status"], "paused_error")
+        self.assertEqual(result["status"], "ready_review")
         self.assertEqual(result["approvals"], {})
         self.assertEqual(result["review_count"], 1)
         # The snapshot check lives in the answer checks now: its message is the
         # attempt's error (the fake reviewer cannot be asked again).
         self.assertEqual(result["attempts"][0]["error"],
                          f"snapshot_id must be the snapshot under review: {expected}")
-        self.resume()
 
         self.alter = lambda review: review.update(unexpected="not allowed")
         result = self.review()
-        self.assertEqual(result["status"], "paused_error")
+        self.assertEqual(result["status"], "ready_review")
         self.assertEqual(result["review_count"], 2)
         self.assertEqual(result["approvals"], {})
 
@@ -721,13 +734,11 @@ class EngineFlowTests(EngineFixture):
         snapshot = self.state()["candidate"]["snapshot_id"]
         self.alter = lambda review: review.update(unexpected="not allowed")
         failed = self.review()  # opencode: a reply with an extra field
-        self.assertEqual(failed["status"], "paused_error")
+        self.assertEqual(failed["status"], "ready_review")
         self.assertEqual(failed["approvals"], {"codex": snapshot})
-        self.resume()
         failed = self.review()  # codex fails too; its earlier pass still counts
-        self.assertEqual(failed["status"], "paused_error")
+        self.assertEqual(failed["status"], "ready_review")
         self.assertEqual(failed["approvals"], {"codex": snapshot})
-        self.resume()
         self.alter = None
         final = self.review()  # opencode passes
         self.assertEqual(final["status"], "completed")
@@ -735,6 +746,325 @@ class EngineFlowTests(EngineFixture):
         self.assertEqual([r["id"] for r in self.reviewers], ["codex", "opencode", "codex", "opencode"])
         self.assertEqual([a["status"] for a in final["attempts"]], ["succeeded", "failed", "failed", "succeeded"])
         self.assertEqual(final["approvals"], {"codex": snapshot, "opencode": snapshot})
+
+    def test_repeated_failure_by_the_same_reviewer_pauses(self):
+        self.start()
+        self.ready()
+        self.reviewer.side_effect = DevFlowError("Offline simulated provider failure")
+        first, second, third = self.review(), self.review(), self.review()
+        # Each reviewer's first failure moves on to the next configured reviewer.
+        self.assertEqual(first["status"], "ready_review")
+        self.assertEqual(second["status"], "ready_review")
+        # Codex's own previous round (review 1) also failed: the run pauses.
+        self.assertEqual(third["status"], "paused_error")
+        self.assertEqual(third["attempts"][2]["reviewer_id"], "codex")
+        self.assertIn("Reviewer codex failed in reviews 1 and 3 in a row", third["last_error"])
+        self.assertIn(f"/devflow:resume {self.run_id}", third["last_error"])
+        self.assertTrue(third["last_error"].endswith("Reviewer error: Offline simulated provider failure"))
+        # The attempt's own record keeps the plain message.
+        self.assertEqual(third["attempts"][2]["error"], "Offline simulated provider failure")
+        self.assertEqual(self.resume()["status"], "ready_review")
+
+    def test_a_repeated_failure_after_the_other_reviewer_passed_pauses(self):
+        self.start()
+        self.ready()
+        # codex fails, opencode passes, codex fails in its own next round.
+        def sequence(prepared, validate):
+            if prepared.config["id"] == "opencode":
+                return self.respond(prepared, validate)
+            raise DevFlowError("codex down")
+
+        self.reviewer.side_effect = sequence
+        self.assertEqual(self.review()["status"], "ready_review")
+        passed = self.review()
+        self.assertEqual(passed["status"], "ready_review")
+        snapshot = passed["attempts"][1]["snapshot_id"]
+        failed = self.review()
+        # Codex's own previous round failed too: the run pauses even though
+        # opencode approved in between, and that approval is kept.
+        self.assertEqual(failed["status"], "paused_error")
+        self.assertIn("Reviewer codex failed in reviews 1 and 3 in a row", failed["last_error"])
+        self.assertEqual(failed["approvals"], {"opencode": snapshot})
+
+    def test_process_cleanup_failure_pauses_at_any_point(self):
+        self.start()
+        self.ready()
+        self.reviewer.side_effect = ProcessCleanupError(
+            "A child process did not terminate; stop it manually before continuing")
+        failed = self.review()
+        self.assertEqual(failed["status"], "paused_error")
+        self.assertEqual(failed["attempts"][0]["status"], "failed")
+        self.assertIn("did not terminate", failed["last_error"])
+        self.assertEqual(self.resume()["status"], "ready_review")
+
+    def test_process_cleanup_failure_pauses_even_at_the_limit(self):
+        self.config["max_reviews"] = 2
+        self.write_config()
+        self.start()
+        self.ready()
+        # An ordinary failure advances to the next reviewer; the cleanup failure
+        # at the limit still pauses instead of asking the human.
+        self.reviewer.side_effect = DevFlowError("Unsuccessful independent review")
+        self.assertEqual(self.review()["status"], "ready_review")
+        self.reviewer.side_effect = ProcessCleanupError(
+            "A child process's descendants kept its output pipes open; stop them manually before continuing")
+        failed = self.review()
+        self.assertEqual(failed["status"], "paused_error")
+        self.assertIn("kept its output pipes open", failed["last_error"])
+        self.assertEqual(self.resume()["status"], "ready_review")
+        # From ready_review, the next review request asks the human at the limit.
+        asked = self.review()
+        self.assertEqual(asked["status"], "awaiting_human")
+        self.assertEqual(self.reviewer.call_count, 2)
+
+    def single_reviewer(self, max_reviews=4):
+        self.config["reviewers"] = [{"id": "codex", "kind": "codex", "command": ["fixture", "--go"],
+                                     "model": "fixture-model", "effort": "high", "timeout_seconds": 30}]
+        self.config["max_reviews"] = max_reviews
+        self.write_config()
+
+    def test_the_single_configured_reviewer_passing_after_a_failure_completes(self):
+        self.single_reviewer()
+        self.start()
+        self.ready()
+        self.reviewer.side_effect = DevFlowError("codex down")
+        self.assertEqual(self.review()["status"], "ready_review")
+        self.reviewer.side_effect = self.respond
+        result = self.review()
+        # With one reviewer the next round is the same reviewer; a pass completes.
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual([c.args[0].config["id"] for c in self.reviewer.call_args_list],
+                         ["codex", "codex"])
+
+    def test_the_single_configured_reviewer_failing_again_after_resume_pauses(self):
+        self.single_reviewer()
+        self.start()
+        self.ready()
+        self.reviewer.side_effect = DevFlowError("codex down")
+        self.assertEqual(self.review()["status"], "ready_review")
+        failed = self.review()
+        self.assertEqual(failed["status"], "paused_error")
+        self.assertIn("failed in reviews 1 and 2 in a row", failed["last_error"])
+        self.assertEqual(self.resume()["status"], "ready_review")
+        # Resume does not restart the count: one more failure pauses again.
+        failed = self.review()
+        self.assertEqual(failed["status"], "paused_error")
+        self.assertIn("failed in reviews 2 and 3 in a row", failed["last_error"])
+
+    def test_the_single_configured_reviewers_second_failure_at_the_limit_asks(self):
+        self.single_reviewer(max_reviews=2)
+        self.start()
+        self.ready()
+        self.reviewer.side_effect = DevFlowError("codex down")
+        self.assertEqual(self.review()["status"], "ready_review")
+        # The second consecutive failure lands at the limit: ready for the
+        # budget question rather than the repeated-failure pause.
+        self.assertEqual(self.review()["status"], "ready_review")
+        asked = self.review()
+        self.assertEqual(asked["status"], "awaiting_human")
+        self.assertEqual(self.reviewer.call_count, 2)
+        self.assertEqual(self.at_limit("stop")["status"], "exhausted")
+
+    def test_a_failed_round_sets_last_error_until_the_next_review(self):
+        self.start()
+        self.ready()
+        self.reviewer.side_effect = DevFlowError("codex down")
+        failed = self.review()
+        self.assertEqual((failed["status"], failed["last_error"]), ("ready_review", "codex down"))
+        self.assertIsNotNone(self.state()["last_error"])
+        # The next review request clears it before dispatching the next reviewer.
+        self.reviewer.side_effect = self.respond
+        passed = self.review()
+        self.assertIsNone(passed["last_error"])
+        self.assertIsNone(self.state()["last_error"])
+
+    def test_a_recovered_round_counts_as_a_failure_for_the_same_reviewer(self):
+        self.start()
+        self.ready()
+        self.reviewer.side_effect = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.review()
+        recovered = self.engine.recover(self.run_id, confirmed=True)
+        self.assertEqual((recovered["status"], recovered["attempts"][0]["status"]),
+                         ("paused_error", "failed"))
+        self.resume()
+        # Codex's own previous round is the recovered one, whose record is a failure.
+        self.reviewer.side_effect = DevFlowError("down")
+        self.assertEqual(self.review()["status"], "ready_review")  # opencode fails once
+        failed = self.review()  # codex fails again
+        self.assertEqual(failed["status"], "paused_error")
+        self.assertIn("Reviewer codex failed in reviews 1 and 3 in a row", failed["last_error"])
+
+    def test_a_cleanup_failure_checking_the_workspace_after_a_review_pauses(self):
+        self.start()
+        self.ready()
+        with self.patch_current_after_dispatch():
+            failed = self.review()
+        self.assertEqual(failed["status"], "paused_error")
+        self.assertIn("kept pipes", failed["last_error"])
+
+    def test_a_cleanup_failure_checking_the_workspace_at_the_limit_stays_ready(self):
+        self.config["max_reviews"] = 2
+        self.write_config()
+        self.start()
+        self.ready()
+        self.reviewer.side_effect = DevFlowError("codex down")
+        self.assertEqual(self.review()["status"], "ready_review")
+        self.reviewer.side_effect = self.respond
+        with self.patch_current_after_dispatch():
+            failed = self.review()
+        # A changed-workspace pause honors the limit: ready for the budget question.
+        self.assertEqual(failed["status"], "ready_review")
+        self.assertEqual(self.review()["status"], "awaiting_human")
+
+    def patch_current_after_dispatch(self, error=None):
+        """_current works at dispatch (before the reviewer) and raises the given error
+        (a ProcessCleanupError by default) at finish (the workspace check after the
+        review ran)."""
+        error = error if error is not None else ProcessCleanupError("descendants kept pipes")
+        real_current = self.engine._current
+        calls = []
+
+        def flaky(state):
+            calls.append(1)
+            if len(calls) > 1:
+                raise error
+            return real_current(state)
+
+        return patch.object(self.engine, "_current", side_effect=flaky)
+
+    def test_a_raw_oserror_checking_the_workspace_pauses_below_the_limit(self):
+        self.start()
+        self.ready()
+        with self.patch_current_after_dispatch(NotADirectoryError("lost a directory")):
+            failed = self.review()
+        # A filesystem error in the post-review check is treated like a changed
+        # workspace: the round is finalized, not left in reviewing.
+        self.assertEqual(failed["status"], "paused_error")
+        self.assertEqual(failed["attempts"][0]["status"], "failed")
+        self.assertIn("lost a directory", failed["attempts"][0]["error"])
+        self.assertIn("lost a directory", failed["last_error"])
+
+    def test_a_raw_oserror_checking_the_workspace_at_the_limit_stays_ready(self):
+        self.config["max_reviews"] = 2
+        self.write_config()
+        self.start()
+        self.ready()
+        self.reviewer.side_effect = DevFlowError("codex down")
+        self.assertEqual(self.review()["status"], "ready_review")
+        self.reviewer.side_effect = self.respond
+        with self.patch_current_after_dispatch(OSError("snapshot unreadable")):
+            failed = self.review()
+        # The same pause rule as a changed workspace: at the limit, ready for the
+        # budget question.
+        self.assertEqual(failed["status"], "ready_review")
+        self.assertEqual(failed["attempts"][1]["status"], "failed")
+        self.assertEqual(self.review()["status"], "awaiting_human")
+
+    def test_reviewer_failure_and_workspace_oserror_record_both_messages(self):
+        self.start()
+        self.ready()
+
+        def reviewer(prepared, validate):
+            raise ReviewerError("provider down")
+
+        self.reviewer.side_effect = reviewer
+        with self.patch_current_after_dispatch(NotADirectoryError("lost a directory")):
+            failed = self.review()
+        self.assertEqual(failed["status"], "paused_error")
+        self.assertIn("provider down; ", failed["attempts"][0]["error"])
+        self.assertIn("lost a directory", failed["attempts"][0]["error"])
+        self.assertIn("provider down; ", failed["last_error"])
+        self.assertIn("lost a directory", failed["last_error"])
+
+    def test_an_interrupt_wrapped_by_post_review_cleanup_stays_in_reviewing(self):
+        self.start()
+        self.ready()
+        wrapped = ProcessCleanupError(
+            "A child process's descendants kept its output pipes open; "
+            "stop them manually before continuing")
+        wrapped.__cause__ = KeyboardInterrupt("simulated caller interruption")
+        # The post-review workspace check fails cleanup around an interrupt; the
+        # interrupt itself propagates and the reservation stays for recovery.
+        with self.patch_current_after_dispatch(wrapped):
+            with self.assertRaises(KeyboardInterrupt):
+                self.review()
+        self.assertEqual(self.state()["status"], "reviewing")
+        recovered = self.engine.recover(self.run_id, confirmed=True)
+        # A recovered round pauses while attempts remain; its record is a failure.
+        self.assertEqual(recovered["status"], "paused_error")
+        self.assertEqual(recovered["attempts"][0]["status"], "failed")
+
+    def undecodable_name(self):
+        """A file name with undecodable UTF-8 bytes; skip when the filesystem
+        (for example APFS) refuses to create it."""
+        bad = os.fsencode(self.project) + b"/bad-\xff-name.py"
+        try:
+            os.close(os.open(bad, os.O_WRONLY | os.O_CREAT, 0o644))
+            os.unlink(bad)
+        except OSError:
+            self.skipTest("the filesystem rejects undecodable UTF-8 file names")
+        return bad
+
+    @unittest.skipIf(os.name != "posix", "POSIX file names can hold undecodable bytes")
+    def test_an_undecodable_file_name_during_review_is_a_failed_round(self):
+        self.start()
+        self.ready()
+        bad = self.undecodable_name()
+
+        def reviewer(prepared, validate):
+            # A file whose name does not decode as UTF-8 appears during the review.
+            os.close(os.open(bad, os.O_WRONLY | os.O_CREAT, 0o644))
+            return self.respond(prepared, validate)
+
+        self.reviewer.side_effect = reviewer
+        try:
+            failed = self.review()
+        finally:
+            if os.path.exists(bad):
+                os.unlink(bad)
+        # The snapshot signature's encoding failure is a content problem, not a
+        # stuck round: the attempt is finalized like a changed workspace.
+        self.assertEqual(failed["status"], "paused_error")
+        self.assertEqual(failed["attempts"][0]["status"], "failed")
+        self.assertIn("cannot be encoded", failed["attempts"][0]["error"])
+        self.assertIn("cannot be encoded", failed["last_error"])
+
+    @unittest.skipIf(os.name != "posix", "POSIX file names can hold undecodable bytes")
+    def test_reviewer_failure_and_an_undecodable_file_name_record_both(self):
+        self.start()
+        self.ready()
+        bad = self.undecodable_name()
+
+        def reviewer(prepared, validate):
+            os.close(os.open(bad, os.O_WRONLY | os.O_CREAT, 0o644))
+            raise ReviewerError("provider down")
+
+        self.reviewer.side_effect = reviewer
+        try:
+            failed = self.review()
+        finally:
+            if os.path.exists(bad):
+                os.unlink(bad)
+        self.assertEqual(failed["status"], "paused_error")
+        self.assertIn("provider down; ", failed["attempts"][0]["error"])
+        self.assertIn("cannot be encoded", failed["attempts"][0]["error"])
+
+    def test_reviewer_failure_and_workspace_change_record_both_messages(self):
+        self.start()
+        self.ready()
+
+        def reviewer(prepared, validate):
+            self.source.write_text("VALUE = 99\n", encoding="utf-8")
+            raise ReviewerError("provider down")
+
+        self.reviewer.side_effect = reviewer
+        failed = self.review()
+        # A content change during the review never auto-continues.
+        self.assertEqual(failed["status"], "paused_error")
+        self.assertEqual(failed["attempts"][0]["status"], "failed")
+        self.assertIn("provider down; ", failed["attempts"][0]["error"])
+        self.assertIn("changed since checkpoint", failed["attempts"][0]["error"])
 
     def test_sixth_correction_is_checked_then_stopping_at_the_limit_leaves_it_unreviewed(self):
         self.start()
@@ -1389,15 +1719,6 @@ class RecoveryAndIntegrityTests(EngineFixture):
         self.assertEqual([(r["status"], r["tool_calls"]) for r in result["reviews"]],
                          [("failed", ACTIVITY["tool_calls"])])
 
-    def run_checks_with(self, during):
-        original = checks_module.run_checks
-
-        def wrapper(*args, **kwargs):
-            during()
-            return original(*args, **kwargs)
-
-        return patch.object(checks_module, "run_checks", side_effect=wrapper)
-
     def test_event_appended_from_another_thread_during_review_survives(self):
         self.start()
         self.ready()
@@ -1515,6 +1836,49 @@ class RecoveryAndIntegrityTests(EngineFixture):
         self.assertEqual(recovered["check_attempts"], 1)
         self.assertEqual(recovered["review_count"], 0)
         self.assertEqual(self.resume()["status"], "implementing")
+
+    def test_an_interrupted_check_keeps_the_interrupt_when_cleanup_failed(self):
+        self.start()
+        self.source.write_text("VALUE = 1\n", encoding="utf-8")
+        self.checkpoint()
+
+        def interrupted(*args, **kwargs):
+            raise ProcessCleanupError(
+                "A child process did not terminate; stop it manually before continuing") \
+                from KeyboardInterrupt("simulated caller interruption")
+
+        # The wrapped interrupt is re-raised as itself: the run stays in checking
+        # for human recovery instead of recording an ordinary check error.
+        with patch.object(checks_module, "run_bounded", side_effect=interrupted), \
+                self.assertRaises(KeyboardInterrupt):
+            self.engine.check(self.run_id, self.session)
+        self.assertEqual(self.state()["status"], "checking")
+        recovered = self.engine.recover(self.run_id, confirmed=True)
+        self.assertEqual(recovered["status"], "paused_error")
+        self.assertEqual(recovered["resume_status"], "implementing")
+
+    def test_an_interrupt_wrapped_by_post_check_cleanup_stays_in_checking(self):
+        self.start()
+        self.source.write_text("VALUE = 1\n", encoding="utf-8")
+        self.checkpoint()
+
+        wrapped = ProcessCleanupError(
+            "A child process's descendants kept its output pipes open; "
+            "stop them manually before continuing")
+        wrapped.__cause__ = KeyboardInterrupt("simulated caller interruption")
+
+        # The pre-check workspace read passes; the post-check verification (which
+        # also reaches run_bounded through Git) fails cleanup around an interrupt.
+        # The interrupt itself propagates: the reservation stays for recovery.
+        with patch.object(self.engine, "_current",
+                          side_effect=[self.engine._current(self.state()), wrapped]) as current:
+            with self.assertRaises(KeyboardInterrupt):
+                self.engine.check(self.run_id, self.session)
+        self.assertEqual(current.call_count, 2)
+        self.assertEqual(self.state()["status"], "checking")
+        recovered = self.engine.recover(self.run_id, confirmed=True)
+        self.assertEqual(recovered["status"], "paused_error")
+        self.assertEqual(recovered["resume_status"], "implementing")
 
     def assertLate(self, kind, number, *, error):
         late = sorted((self.run / "late").glob(f"{kind}-{number:03}-*.json"))
@@ -1691,6 +2055,116 @@ class DirtyGitProjectTests(EngineFixture):
         self.assertEqual(result["escalations"], [])
         self.assertIsNone(result["escalation"])
         self.assertEqual(self.source.read_bytes(), original)
+
+    def test_an_interrupt_wrapped_by_post_check_git_cleanup_stays_in_checking(self):
+        self.clean_git()
+        self.start()
+        self.source.write_text("VALUE = 1\n", encoding="utf-8")
+        self.checkpoint()
+        wrapped = ProcessCleanupError(
+            "A child process's descendants kept its output pipes open; "
+            "stop them manually before continuing")
+        wrapped.__cause__ = KeyboardInterrupt("simulated caller interruption")
+        # The post-check workspace verification's rev-parse fails cleanup around
+        # an interrupt; the workspace wrapper lets the interrupt out and the
+        # reservation stays for recovery.
+        patcher = patch("devflow_core.implement.workspace.run_git", side_effect=wrapped)
+        try:
+            with self.run_checks_with(patcher.start), self.assertRaises(KeyboardInterrupt):
+                self.engine.check(self.run_id, self.session)
+        finally:
+            patcher.stop()
+        self.assertEqual(self.state()["status"], "checking")
+        recovered = self.engine.recover(self.run_id, confirmed=True)
+        self.assertEqual(recovered["status"], "paused_error")
+        self.assertEqual(recovered["resume_status"], "implementing")
+
+    def test_an_ordinary_git_cleanup_failure_in_post_check_is_recorded(self):
+        self.clean_git()
+        self.start()
+        self.source.write_text("VALUE = 1\n", encoding="utf-8")
+        self.checkpoint()
+        wrapped = ProcessCleanupError(
+            "A child process's descendants kept its output pipes open; "
+            "stop them manually before continuing")
+        wrapped.__cause__ = RuntimeError("reader start failed")
+        # An ordinary cleanup cause stays wrapped and is recorded as a
+        # verification failure: paused, never left dispatched.
+        patcher = patch("devflow_core.implement.workspace.run_git", side_effect=wrapped)
+        try:
+            with self.run_checks_with(patcher.start):
+                failed = self.engine.check(self.run_id, self.session)
+        finally:
+            patcher.stop()
+        self.assertEqual(failed["status"], "paused_error")
+        self.assertIn("no longer valid", failed["last_error"])
+        self.assertIn("kept its output pipes open", failed["last_error"])
+        self.assertIsNone(failed["inflight"])
+
+    def test_an_interrupt_wrapped_by_post_review_git_cleanup_stays_in_reviewing(self):
+        self.clean_git()
+        self.start()
+        self.ready()
+        wrapped = ProcessCleanupError(
+            "A child process's descendants kept its output pipes open; "
+            "stop them manually before continuing")
+        wrapped.__cause__ = KeyboardInterrupt("simulated caller interruption")
+        patcher = patch("devflow_core.implement.workspace.run_git", side_effect=wrapped)
+        started = []
+
+        def reviewer(prepared, validate):
+            patcher.start()  # fails the post-review workspace verification
+            started.append(1)
+            return self.respond(prepared, validate)
+
+        self.reviewer.side_effect = reviewer
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                self.review()
+        finally:
+            if started:
+                patcher.stop()
+        self.assertEqual(self.state()["status"], "reviewing")
+        recovered = self.engine.recover(self.run_id, confirmed=True)
+        self.assertEqual(recovered["status"], "paused_error")
+        self.assertEqual(recovered["attempts"][0]["status"], "failed")
+
+    def test_an_ordinary_git_cleanup_failure_in_post_review_is_recorded(self):
+        from devflow_core.implement import snapshot as snapshot_module
+        self.clean_git()
+        self.start()
+        self.ready()
+        wrapped = ProcessCleanupError(
+            "A child process's descendants kept its output pipes open; "
+            "stop them manually before continuing")
+        wrapped.__cause__ = RuntimeError("reader start failed")
+        real_git = snapshot_module.run_git
+
+        def flaky_git(root, *args, **kwargs):
+            if "ls-files" in args:
+                raise wrapped
+            return real_git(root, *args, **kwargs)
+
+        patcher = patch("devflow_core.implement.snapshot.run_git", side_effect=flaky_git)
+        started = []
+
+        def reviewer(prepared, validate):
+            patcher.start()  # fails the post-review snapshot's ls-files
+            started.append(1)
+            return self.respond(prepared, validate)
+
+        self.reviewer.side_effect = reviewer
+        try:
+            failed = self.review()
+        finally:
+            if started:
+                patcher.stop()
+        # An ordinary cleanup cause stays wrapped: the verification failure is
+        # recorded and the run pauses instead of staying dispatched.
+        self.assertEqual(failed["status"], "paused_error")
+        self.assertEqual(failed["attempts"][0]["status"], "failed")
+        self.assertIn("kept its output pipes open", failed["attempts"][0]["error"])
+        self.assertIn("kept its output pipes open", failed["last_error"])
 
 
 class SummaryAndAcceptanceTests(EngineFixture):
@@ -1956,11 +2430,18 @@ class UnwritableReviewerTextTests(EngineFixture):
             with self.subTest(kind=kind):
                 self.reviewer.side_effect = lambda *args, kind=kind, **kwargs: raise_unwritable(kind)
                 failed = self.review()
-                self.assertEqual(failed["status"], "paused_error")
                 self.assertEqual(failed["attempts"][number - 1]["error"], UNWRITABLE[kind])
-                self.assertEqual(failed["last_error"], UNWRITABLE[kind])
                 json.dumps(self.engine.status(self.run_id), ensure_ascii=False).encode("utf-8")  # runner output
-                self.resume()
+                if number <= 2:
+                    # Each reviewer's first failure moves on to the next reviewer.
+                    self.assertEqual(failed["status"], "ready_review")
+                    self.assertEqual(failed["last_error"], UNWRITABLE[kind])
+                else:
+                    # The same reviewer's second consecutive failure pauses.
+                    self.assertEqual(failed["status"], "paused_error")
+                    self.assertIn("failed in reviews", failed["last_error"])
+                    self.assertTrue(failed["last_error"].endswith(f"Reviewer error: {UNWRITABLE[kind]}"))
+                    self.resume()
         # A successful review whose activity names cannot be held counts them as unnamed.
         def with_unwritable_names(prepared, validate):
             return {**self.respond(prepared, validate), "activity": unwritable_activity()}

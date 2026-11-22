@@ -50,7 +50,7 @@ from typing import Any, Callable
 
 from .counts import tally
 from .environment import PROBE_SECONDS, version_numbers, version_warnings
-from .errors import AnswerRefusedError, DevFlowError, ReviewerError, shown_name
+from .errors import AnswerRefusedError, DevFlowError, ProcessCleanupError, ReviewerError, shown_name
 from .process import run_bounded
 from .settings import validate_reviewer
 from .storage import json_bytes, read_json, writable
@@ -419,21 +419,56 @@ def _capture(argv: list[str], *, cwd: Path | None = None, env: dict | None = Non
     """
     if log_dir is None:
         result = _run(argv, cwd, env, data, timeout, None, None)
+        output_error = result.output_error
     else:
-        with _open_new(log_dir / "stdout.jsonl") as stdout, _open_new(log_dir / "stderr.log") as stderr:
+        # One guarded close per log: a close that fails (a buffered write error,
+        # for example) must never hide what the run itself reported — least of
+        # all a ProcessCleanupError, after which a child may still run.
+        stdout = _open_new(log_dir / "stdout.jsonl")
+        try:
+            stderr = _open_new(log_dir / "stderr.log")
+        except BaseException:
+            try:
+                stdout.close()
+            except OSError:
+                pass
+            raise
+        output_error = None
+        try:
             result = _run(argv, cwd, env, data, timeout, stdout, stderr)
-    if result.timed_out:
-        raise ReviewerError(f"Reviewer timed out after {timeout:g} seconds; no automatic retry")
-    if result.output_error:
-        raise ReviewerError("Reviewer output could not be captured: " + result.output_error)
+        except BaseException:
+            for stream in (stdout, stderr):
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+            raise
+        output_error = result.output_error
+        for name, stream in (("stdout", stdout), ("stderr", stderr)):
+            try:
+                stream.close()
+            except OSError as exc:
+                if output_error is None:
+                    output_error = f"cannot write {name}: {exc}"
     if result.retained_pipes:
-        raise ReviewerError("Reviewer descendants kept pipes open; cleanup is incomplete")
+        message = "Reviewer descendants kept pipes open; cleanup is incomplete"
+        if result.timed_out:
+            message += f" (after the reviewer timed out after {timeout:g} seconds)"
+        if output_error:
+            message += f" (output error: {output_error})"
+        raise ProcessCleanupError(message)
+    if result.timed_out:
+        raise ReviewerError(f"Reviewer timed out after {timeout:g} seconds")
+    if output_error:
+        raise ReviewerError("Reviewer output could not be captured: " + output_error)
     return result.exit_code, result.stdout
 
 
 def _run(argv, cwd, env, data, timeout, stdout, stderr):
     try:
         return run_bounded(argv, cwd=cwd, env=env, data=data, timeout=timeout, stdout=stdout, stderr=stderr)
+    except ProcessCleanupError as exc:
+        raise ProcessCleanupError(f"Cannot run reviewer: {exc}") from exc
     except DevFlowError as exc:
         raise ReviewerError(f"Cannot run reviewer: {exc}") from exc
 
@@ -756,7 +791,7 @@ class Devin(CLI):
         try:
             result = _run([*argv, "--print", "--model", DEVIN_TRUST_PROBE_MODEL, "--", DEVIN_TRUST_PROBE_PROMPT],
                           cwd, env, None, PROBE_SECONDS, None, None)
-        except ReviewerError:
+        except (ReviewerError, ProcessCleanupError):
             return
         if result.timed_out or result.output_error or result.retained_pipes:
             return
@@ -974,11 +1009,13 @@ def _answer_follow_up(prepared: PreparedReview, work_dir: Path, argv: list[str],
         value, activity = cli.answer(follow_dir / "stdout.jsonl", follow_dir)
         return validate(value), activity
     except Exception as exc:
-        raise ReviewerError(
-            f"The answer follow-up failed: the reviewer was asked once, in the same session, to send "
-            f"its review again with the refusal's reason and the required output schema after its "
-            f"first answer was refused ({first}); the follow-up failed ({exc}); "
-            f"its records are in {follow_dir}") from exc
+        message = (f"The answer follow-up failed: the reviewer was asked once, in the same session, to send "
+                   f"its review again with the refusal's reason and the required output schema after its "
+                   f"first answer was refused ({first}); the follow-up failed ({exc}); "
+                   f"its records are in {follow_dir}")
+        if isinstance(exc, ProcessCleanupError):
+            raise ProcessCleanupError(message) from exc
+        raise ReviewerError(message) from exc
 
 
 def run_review(prepared: PreparedReview, validate: Callable[[Any], dict]) -> dict:
@@ -1019,7 +1056,7 @@ def run_review(prepared: PreparedReview, validate: Callable[[Any], dict]) -> dic
     code, _ = _capture(argv, cwd=cwd, env=env, timeout=timeout,
                        data=cli.stdin(prepared.prompt.decode("utf-8")), log_dir=work_dir)
     if code:
-        raise ReviewerError(f"{kind} exited with {code}; inspect stderr.log (no automatic retry){cli.failure_hint(cwd.resolve())}")
+        raise ReviewerError(f"{kind} exited with {code}; inspect stderr.log{cli.failure_hint(cwd.resolve())}")
     try:
         value, activity = cli.answer(work_dir / "stdout.jsonl", work_dir)
         review = checked_review(validate, value)
