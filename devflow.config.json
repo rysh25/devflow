@@ -12,6 +12,10 @@
        "timeout_seconds": 1800},
       {"id": "codex", "kind": "codex", "command": ["codex"], "model": "gpt-6.2-sol", "effort": "high",
        "timeout_seconds": 1800}
+    ],
+    "checks": [
+      {"id": "tests", "argv": ["python3", "tools/test_all.py", "--quiet"],
+       "timeout_seconds": 600, "required": true, "cwd": "."}
     ]
   }
 }
