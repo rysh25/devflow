@@ -12,13 +12,13 @@ web page or a project file, put its URL or path in the finding's `evidence`.
 The rules for every DevFlow reviewer come after these instructions.
 
 Preserve explicit human decisions. Do not invent requirements, evidence, files,
-or a consensus. Distinguish demonstrable defects from preferences. For a defect,
-give its precise plan `location`, the `evidence` from the packet or the project
-together with its consequence, and a bounded correction as the `recommendation`. Check
-completeness against the request and interview, feasibility, cross-platform
-behavior, security/privacy, dependencies, testability, failure recovery, scope,
-unresolved assumptions, and design balance. Recheck prior accepted findings; do not repeat
-closed findings without new contradictory evidence.
+or a consensus. For a defect, give its precise plan `location`, the `evidence`
+from the packet or the project together with its consequence, and a bounded
+correction as the `recommendation`. Check completeness against the request and
+interview, feasibility, cross-platform behavior, security/privacy, dependencies,
+testability, failure recovery, scope, unresolved assumptions, and design
+balance. Recheck prior accepted findings; do not repeat closed findings without
+new contradictory evidence.
 
 Also read the plan as its implementer, who learns the requirements only from
 the plan and the project, not from the request, interview or decisions in this

@@ -66,11 +66,11 @@ class DistributionTests(unittest.TestCase):
     def test_static_validate_current_bundle(self):
         result = package.validate(ROOT)
         self.assertEqual(result["marketplace"], "devflow-marketplace")
-        self.assertEqual(result["plugins"], {"devflow": "0.12.11"})
+        self.assertEqual(result["plugins"], {"devflow": "0.12.12"})
 
     def test_release_versions_are_consistent(self):
         manifest = json.loads((ROOT / "plugins/devflow/.claude-plugin/plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.12.11")
+        self.assertEqual(manifest["version"], "0.12.12")
         package = ROOT / "plugins/devflow/scripts/devflow_core"
         defining = []
         for source in sorted(package.rglob("*.py")):
@@ -238,6 +238,33 @@ class DistributionTests(unittest.TestCase):
             self.assertIn("Design balance section of `scripts/devflow_core/common/reviewer-rules.md`", text)
             for sentence in sentences:
                 with self.subTest(reference=name, sentence=sentence[:40]):
+                    self.assertNotIn(sentence, text)
+
+    def test_the_rules_for_every_reviewer_define_what_to_report_and_severity(self):
+        # The What to report section sits before Design balance in the one common
+        # rules file, defines each of the four severities exactly once, and the
+        # two sentences it replaced are gone from the per-flow reviewer.md files.
+        core = ROOT / "plugins" / "devflow" / "scripts" / "devflow_core"
+        rules = (core / "common" / "reviewer-rules.md").read_text(encoding="utf-8")
+        headings = list(re.finditer(r"(?m)^### What to report$", rules))
+        self.assertEqual(len(headings), 1)
+        design = re.search(r"(?m)^### Design balance$", rules)
+        self.assertIsNotNone(design)
+        self.assertLess(headings[0].start(), design.start())
+        section = rules[headings[0].end():design.start()]
+        for severity in ("critical", "high", "medium", "low"):
+            labels = list(re.finditer(r"(?m)^- " + severity + r":", section))
+            with self.subTest(severity=severity):
+                self.assertEqual(len(labels), 1)
+                following = re.search(r"(?m)^- ", section[labels[0].end():])
+                body = section[labels[0].end():labels[0].end() + (following.start() if following else len(section))]
+                self.assertTrue(body.strip())
+        removed = ("Prioritize concrete problems with evidence, not stylistic preferences or speculative rewrites.",
+                   "Distinguish demonstrable defects from preferences.")
+        for flow in ("plan", "implement"):
+            text = " ".join((core / flow / "reviewer.md").read_text(encoding="utf-8").split())
+            for sentence in removed:
+                with self.subTest(flow=flow, sentence=sentence[:40]):
                     self.assertNotIn(sentence, text)
 
     def test_removed_mechanisms_leave_no_names_in_the_plugin_code(self):
@@ -423,14 +450,14 @@ class DistributionTests(unittest.TestCase):
             # All paths were generated and checked in this test, not untrusted ZIP input.
             archive.extractall(extracted)
         release = extracted / "devflow"
-        self.assertEqual(package.validate(release)["version"], "0.12.11")
+        self.assertEqual(package.validate(release)["version"], "0.12.12")
         independent = self.base / "devflow-only"
         shutil.copytree(release / "plugins" / "devflow", independent)
         self.assertFalse((independent / "shared").exists())
         result = subprocess.run([sys.executable, "-B", str(independent / "scripts" / "devflow.py"), "--version"],
             cwd=self.base, capture_output=True, encoding="utf-8", timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("0.12.11", result.stdout)
+        self.assertIn("0.12.12", result.stdout)
         for flow in ("plan", "implement"):
             with self.subTest(flow=flow):
                 result = subprocess.run([sys.executable, "-B", str(independent / "scripts" / "devflow.py"), flow, "--help"],

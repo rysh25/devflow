@@ -28,6 +28,48 @@ with your tools now and then. Plan your investigation to fit this time
 without lowering your standard of checking, and start writing your answer
 by $answer_by. In `summary`, name any important point you could not verify.
 
+### What to report
+
+Report a problem only when it is one of these, and show it with evidence:
+
+- Wrong behavior: the code, or the plan as written, would act wrongly, fail,
+  or lose or expose data.
+- A departure from the request, the plan, a stated requirement or a recorded
+  human decision.
+- A wrong test, check or verification step: one that fails for a correct
+  result or passes for a wrong one. A missing test counts only when the plan or
+  its acceptance criteria require it, or when behavior the change adds has no
+  test at all.
+- A document or plan error or omission that would lead its reader (a user, or
+  the plan's implementer) to a wrong action or decision, or leave them without
+  what they need to act, such as a plan requirement given only by reference;
+  this includes a factual inconsistency in a document users rely on, such as
+  the README, with the behavior or with another document.
+- A design balance problem, as the next section defines it.
+
+Do not report wording or style preferences, an alternative that is only as good
+as what is there, a concern without evidence that it can happen, or a problem
+that was there before the change under review (the plan, or the diff) when the
+change neither relies on it nor makes it worse. Do not report a choice the human
+explicitly made; when such a choice leads to one of the problems above and no
+recorded human decision already covers that consequence, ask the human a
+question (`human_required`) instead.
+
+Decide whether to report from the kind of problem, never from its severity:
+report a real problem even when it is small. Give each finding the severity
+whose definition fits its consequence, and the highest one when several fit:
+
+- critical: could lose or expose data, break security or privacy, or cause harm
+  that is hard to undo; in an implementation review DevFlow then asks the
+  human, and in a plan review only a human decision can set it aside.
+- high: wrong behavior or a broken requirement on a main path, so the result
+  cannot be used as intended or a main decision would be wrong.
+- medium: wrong behavior, or a broken requirement, test, check or document that
+  leads to wrong behavior or a wrong decision, when it is not high or critical,
+  such as one in a less common case or one that affects only a secondary result.
+- low: a real problem that, left unfixed, leads to no wrong behavior and no
+  wrong decision.
+
 ### Design balance
 
 Check design balance as one point of view, in the three directions below, and

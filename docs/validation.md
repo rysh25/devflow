@@ -1,4 +1,4 @@
-# DevFlow 0.12.11 の検証範囲
+# DevFlow 0.12.12 の検証範囲
 
 ## 再実行方法
 
@@ -1726,3 +1726,285 @@ Python のスクリプトで、`--version` と `--help` に Claude Code のよ�
 
 - 自動テスト（`tests/common/test_process.py`、`tests/common/test_reviewers.py`、`tests/common/test_devin.py`、`tests/plan/test_engine.py`、`tests/implement/test_engine.py`、`tests/implement/test_full_stack.py`）で確かめました：普通の失敗のあと `ready` / `ready_review` に戻って次の `review` が設定の順で次のレビュアーを実行すること、同じレビュアーの直前の回の失敗（回復して失敗と記録した回を含む）で `paused_error` に止まり `last_error` に続けて失敗したレビュアーと 2 つの回の番号と `/devflow:resume` の案内が入ること、レビューの最中にレビューの対象が変わった回（レビュアー自体も失敗した回を含む）が止まること、`ProcessCleanupError`（レビュアーの子プロセスを終わらせられなかった可能性）が種類を失わずに届いてどの回でも止まること（上限の回を含む）、上限の回ではほかの失敗が `ready` に戻ること、失敗が同じスナップショットへの承認を取り消さないこと。
 - 実機（実際の CLI）でのレビュアーの失敗→次のレビュアーへの進行、同じレビュアーの連続した失敗での停止、子プロセスが残ったときの停止は、この環境では起こしていません。
+
+## 0.12.12 の検証（2026-11-23）
+
+全レビュアー共通の指示（`common/reviewer-rules.md`）に「What to report」の節を足し、
+レビュアーが報告するもの・しないものの基準と、重要度 4 つ（critical・high・medium・low）の
+1 行の定義を書きました。基準は、誤った動き・要求や計画からのずれ・誤ったテストや検証・
+読み手を誤った行動に導く文書や計画の誤り・設計の釣り合いの問題だけを報告し、言い回しの
+好み・同じくらい良い別のやり方・根拠のない心配・その変更が頼っても悪くもしていない
+前からの問題は報告しない、というものです。Implement の "Prioritize concrete problems ..." と
+Plan の "Distinguish demonstrable defects from preferences." の 2 文は、この節にまとめたので
+各フローの `reviewer.md` から消しました。指摘の形（スキーマ）、記録の形式、設定項目、
+ランナーの Python コード（版の番号を除く）は変えていません。
+
+変えたファイル: `common/reviewer-rules.md`、`implement/reviewer.md`、`plan/reviewer.md`、
+3 つのホストの `plugin.json`、`devflow_core/__init__.py`（0.12.12）、`README.md`、
+`docs/architecture.md`、`docs/installation.md`、この `docs/validation.md`、テスト
+（`tests/test_distribution.py` に
+`test_the_rules_for_every_reviewer_define_what_to_report_and_severity` を 1 つ足し、
+版を確かめる 4 か所と `tests/router/test_entrypoint.py` の 3 か所の版を更新）。
+
+自動テスト（1125 件、Windows 専用の 1 件は skip）と配布物の検査
+（`python tools/package.py --validate-only`）を通しました。
+
+### 効果の測り方（前の数字を記録、後の数字は 0.12.12 を入れて何本か run を重ねてから）
+
+#### 使う記録
+
+各プロジェクトの、すべての作業ツリーの `.devflow/runs/plan/*/` と `.devflow/runs/implement/*/`（同じ run が 2 か所にあれば、フローと `run_id` で 1 つにまとめる）。
+
+- Plan の run：ランナーの `review_records`（`plugins/devflow/scripts/devflow_core/plan/engine.py`）と同じく、`state.json` の `artifacts` に登録されたファイルだけを使う。`artifacts` に `reviews/NN/review.json` があればその回は成功したレビューで、`result.verdict` と `result.findings[].severity` を使う。`reviews/NN/error.json` か `reviews/NN/recovery.json` が登録されていればその回は失敗したレビュー。ディスクにあっても `artifacts` に無いファイルは、確定しなかった保存の残り（`common/runs.py` の `save` の説明）なので数えない。run のレビュー回数は `state.json` の `review_count`。
+- Implement の run：`state.json` の `attempts[]` の 1 件が 1 回のレビュー。`status` が `succeeded` のものが成功したレビューで、その `review_path`（`reviews/NN/review.json`）の `verdict` と `findings[].severity` を使う。run のレビュー回数は `attempts` の件数（失敗を含む）。
+- 両フロー共通：回の番号 `NN` の `review-processes/NN/review-input.md`（レビュアーに渡した指示の全文）と `review-processes/NN/invocation.json`（`kind`、`requested_effort`）。`follow-up/` の中のものは使わない。
+
+#### 前と後の分け方
+
+版や日付ではなく、各レビューの `review-processes/NN/review-input.md` に、行頭の `### What to report` があるかで分ける。ある回が「後」、ない回が「前」。run の途中でプラグインを上げても取り違えない。
+
+入力の保存が終わったと確かめられる回だけを分ける。ランナーは回を予約してから `review-input.md` を書き、そのあとで `invocation.json` を書く（`plugins/devflow/scripts/devflow_core/common/reviewers.py`）ので、書いている途中で止まると、空か途中までの `review-input.md` が残りうる。そのため、`review-input.md` があり、同じ回の `invocation.json` が JSON として読める回だけを「保存を確かめられた回」とする。そうでない回は数えず、件数を書き添える。
+
+#### 測る値（成功したレビューだけを数える。失敗したレビューは 3 の回数にだけ入る）
+
+1. フローごとに、承認されなかったレビュー（`verdict` が `changes_required` か `human_required`）のうち、指摘がすべて `low` のもの（指摘が 1 件以上あり、すべて `low`）の割合。
+2. フローごとに、指摘の重要度 4 つの件数と割合。
+3. フローごとに、終わった run（`state.json` の `status` が `completed`・`accepted`・`exhausted`・`cancelled`）1 本あたりのレビュー回数（失敗を含む）。run 単位の値なので、run 単位で分ける。レビューが 0 回のまま終わった run は、どちらの指示か決められないので「分けられない」に入れる。レビューが 1 回以上ある run について、その run のすべての回（失敗した回を含む。Plan は 1 から `review_count` まで、Implement は `attempts` のすべて）が「保存を確かめられた回」（上の「前と後の分け方」の定義）で、すべてが新しい節を持てば「後」、すべてが持たなければ「前」。両方が混ざる run と、保存を確かめられない回が 1 回でもある run（ランナーは回を予約してから入力を保存するので、中断で欠けたり途中までになったりしうる）は「分けられない」として、別に件数だけを書く。前後に分けた run の回数には、失敗した回も入れる。
+   - 3 の前後の差には、0.12.11 の変更（レビュアーが失敗したとき、条件付きで止まらずに次のレビューへ進む）の効果も入る。「前」には 0.12.11 より古い版の run（失敗で `paused_error` に止まる）が入るので、同じレビュアーの構成でも、失敗のあと何回進むかや、終わった run として数えられるかが変わりうる。記録からは run を動かした版がわからないので、3 は「0.12.11 と 0.12.12 の両方の変更を含む前後の差」として示し、そのことを結果と一緒に書く。
+   - 1・2 の前後の差にも、0.12.11 の影響が入りうる。0.12.11 より古い版では失敗で `paused_error` に止まり、再開されなかった run ではそのあとのレビューが行われないが、0.12.11 では失敗のあとに続いたレビューが成功し、1・2 に数えられうる。失敗した回を除き、OpenCode の effort をそろえても、数えられる成功したレビューの顔ぶれは変わりうるので、このことを測り方と結果に書く。D4 の考え直す条件は、合意どおり 1 の「後」の値を目安に判断する。
+
+#### OpenCode の effort の変更と分ける
+
+world-took-shape と minecraft-ai-movie では、2026-11-22 に Implement の OpenCode の effort を high から low に変えた。その効果と混ぜないため、次のように分けて別々に出す。
+
+- 1・2（レビュー単位の値）は、`invocation.json` の `kind` と `requested_effort` で分ける。
+  - (i) OpenCode 以外のレビュアー（`kind` が `opencode` でない回）の前後。
+  - (ii) OpenCode で `requested_effort` が `low` の回の前後。「前」は 2026-11-22 以降の古い指示の回だけになり、件数が少ない見込み。少なすぎて比べられないときは、そう書く。
+  - (ii-a) (ii) のうち、設定された OpenCode がすべて effort `low` の run（下の (ii') の run）の回だけの前後。同じ run に effort `high` の OpenCode がいると、その指摘で直した版を `low` の回が見るので、(ii) には別の effort の影響が入りうる。(ii-a) はその影響を受けない。
+  - (i-a) (i) のうち、レビュアーに OpenCode を含まない run（下の (i') の run）のレビューだけの前後。1 つの run の中ではレビュアーが順に交代し、あるレビュアーの指摘で直した版を次のレビュアーが見るので、(i) には同じ run の OpenCode の effort の変更が間接に効きうる。(i-a) はその影響を受けない。
+- 3（run 単位の値）は、run の始めに固定されたレビュアーの構成（`state.json` の `config.reviewers` の `kind` と `effort`）で分ける。同じ種類のレビュアーを別の ID で複数登録できるので、構成で分ける。
+  - (i') レビュアーに OpenCode を含まない run の前後。
+  - (ii') OpenCode を 1 つ以上含み、その OpenCode がすべて effort `low` の run の前後。
+  - OpenCode を含み、effort が `low` でないものがある run（`low` と `high` が混ざる run を含む）は、別に件数と値を書く。
+- 全体の数字も出すが、判断は (i-a)・(ii-a)・(i')・(ii') で行い、(i) と (ii) は間接の影響を含むものとして添える。
+
+### 「前」の数字（2026-11-23 に集計）
+
+3 つのプロジェクト（devflow、world-took-shape、minecraft-ai-movie）のすべての作業ツリーの
+記録を、上の定義で数え直しました。集計のスクリプトはその場で書いて使い、リポジトリには
+入れていません。見つけたレビューの回は合計 618 回で、そのうち入力の保存を確かめられ
+なかった回は 12 回（world-took-shape の Plan の 2 本の `exhausted` run の回。どちらも
+上の定義で「分けられない」run になりました）。新しい節を持つ「後」の回・run はまだ
+1 つもありません。成功したレビューのうち保存を確かめられたのは 579 回
+（Plan 355 回、Implement 224 回）です。
+
+**1. 承認されなかったレビューのうち、指摘がすべて low のものの割合**（分母は
+`changes_required`・`human_required` の回数）
+
+| フロー | 集まり | devflow | world-took-shape | minecraft-ai-movie | 合計 |
+|---|---|---|---|---|---|
+| Plan | 全体 | 17/92 (18.5%) | 11/164 (6.7%) | 4/28 (14.3%) | 32/284 (11.3%) |
+| Plan | (i) OpenCode 以外 | 16/74 (21.6%) | 9/92 (9.8%) | 1/11 (9.1%) | 26/177 (14.7%) |
+| Plan | (i-a) (i) のうち OpenCode を含まない run | 13/56 (23.2%) | 3/16 (18.8%) | 0/0 (—) | 16/72 (22.2%) |
+| Plan | (ii) OpenCode effort=low | 0/0 (—) | 0/0 (—) | 0/0 (—) | 0/0 (—) |
+| Plan | (ii-a) (ii) のうち全部 low の run | 0/0 (—) | 0/0 (—) | 0/0 (—) | 0/0 (—) |
+| Implement | 全体 | 20/43 (46.5%) | 22/80 (27.5%) | 3/10 (30.0%) | 45/133 (33.8%) |
+| Implement | (i) OpenCode 以外 | 16/38 (42.1%) | 4/53 (7.5%) | 0/6 (0.0%) | 20/97 (20.6%) |
+| Implement | (i-a) (i) のうち OpenCode を含まない run | 14/27 (51.9%) | 3/15 (20.0%) | 0/0 (—) | 17/42 (40.5%) |
+| Implement | (ii) OpenCode effort=low | 0/0 (—) | 0/0 (—) | 0/0 (—) | 0/0 (—) |
+| Implement | (ii-a) (ii) のうち全部 low の run | 0/0 (—) | 0/0 (—) | 0/0 (—) | 0/0 (—) |
+
+**2. 指摘の重要度の件数と割合**（各集まりの、そのプロジェクトの全指摘に対する割合。
+critical は全部 0 件なので列を省く）
+
+Plan:
+
+| 集まり | プロジェクト | high | medium | low | 指摘の合計 |
+|---|---|---|---|---|---|
+| 全体 | devflow | 36 (11.8%) | 188 (61.6%) | 81 (26.6%) | 305 |
+| 全体 | world-took-shape | 182 (26.5%) | 384 (55.8%) | 122 (17.7%) | 688 |
+| 全体 | minecraft-ai-movie | 6 (6.1%) | 60 (61.2%) | 32 (32.7%) | 98 |
+| 全体 | 合計 | 224 (20.5%) | 632 (57.9%) | 235 (21.5%) | 1091 |
+| (i) | devflow | 29 (12.2%) | 149 (62.9%) | 59 (24.9%) | 237 |
+| (i) | world-took-shape | 113 (32.3%) | 202 (57.7%) | 35 (10.0%) | 350 |
+| (i) | minecraft-ai-movie | 3 (7.7%) | 32 (82.1%) | 4 (10.3%) | 39 |
+| (i) | 合計 | 145 (23.2%) | 383 (61.2%) | 98 (15.7%) | 626 |
+| (i-a) | devflow | 23 (12.0%) | 120 (62.5%) | 49 (25.5%) | 192 |
+| (i-a) | world-took-shape | 39 (38.2%) | 51 (50.0%) | 12 (11.8%) | 102 |
+| (i-a) | minecraft-ai-movie | 0 | 0 | 0 | 0 |
+| (i-a) | 合計 | 62 (21.1%) | 171 (58.2%) | 61 (20.7%) | 294 |
+| (ii)・(ii-a) | すべて | 0 | 0 | 0 | 0 |
+
+Implement:
+
+| 集まり | プロジェクト | high | medium | low | 指摘の合計 |
+|---|---|---|---|---|---|
+| 全体 | devflow | 0 (0.0%) | 36 (40.9%) | 52 (59.1%) | 88 |
+| 全体 | world-took-shape | 16 (6.3%) | 161 (63.9%) | 75 (29.8%) | 252 |
+| 全体 | minecraft-ai-movie | 2 (13.3%) | 10 (66.7%) | 3 (20.0%) | 15 |
+| 全体 | 合計 | 18 (5.1%) | 207 (58.3%) | 130 (36.6%) | 355 |
+| (i) | devflow | 0 (0.0%) | 35 (42.7%) | 47 (57.3%) | 82 |
+| (i) | world-took-shape | 16 (8.0%) | 150 (74.6%) | 35 (17.4%) | 201 |
+| (i) | minecraft-ai-movie | 2 (18.2%) | 9 (81.8%) | 0 (0.0%) | 11 |
+| (i) | 合計 | 18 (6.1%) | 194 (66.0%) | 82 (27.9%) | 294 |
+| (i-a) | devflow | 0 (0.0%) | 20 (32.3%) | 42 (67.7%) | 62 |
+| (i-a) | world-took-shape | 8 (8.9%) | 59 (65.6%) | 23 (25.6%) | 90 |
+| (i-a) | minecraft-ai-movie | 0 | 0 | 0 | 0 |
+| (i-a) | 合計 | 8 (5.3%) | 79 (52.0%) | 65 (42.8%) | 152 |
+| (ii)・(ii-a) | すべて | 0 | 0 | 0 | 0 |
+
+**3. 終わった run 1 本あたりのレビュー回数**（失敗を含む。「前」の run だけ。
+run を動かした版は記録からわからないので、「前」には 0.12.11 より古い版の run が
+入り、この前後の差は 0.12.11 と 0.12.12 の両方の変更を含みます）
+
+| フロー | 集まり | devflow | world-took-shape | minecraft-ai-movie | 合計 |
+|---|---|---|---|---|---|
+| Plan | 全体 | 25 本・平均 5.80 | 23 本・平均 8.35 | 6 本・平均 6.83 | 54 本・平均 7.00 |
+| Plan | (i') OpenCode を含まない | 13 本・平均 6.77 | 2 本・平均 11.00 | 0 本 (—) | 15 本・平均 7.33 |
+| Plan | (ii') OpenCode が全部 effort=low | 0 本 (—) | 0 本 (—) | 0 本 (—) | 0 本 (—) |
+| Plan | OpenCode で low 以外を含む | 12 本・平均 4.75 | 21 本・平均 8.10 | 6 本・平均 6.83 | 39 本・平均 6.87 |
+| Implement | 全体 | 23 本・平均 3.87 | 20 本・平均 5.30 | 3 本・平均 5.00 | 46 本・平均 4.57 |
+| Implement | (i') OpenCode を含まない | 11 本・平均 4.36 | 1 本・平均 12.00 | 0 本 (—) | 12 本・平均 5.00 |
+| Implement | (ii') OpenCode が全部 effort=low | 0 本 (—) | 0 本 (—) | 0 本 (—) | 0 本 (—) |
+| Implement | OpenCode で low 以外を含む | 12 本・平均 3.42 | 19 本・平均 4.95 | 3 本・平均 5.00 | 34 本・平均 4.41 |
+
+「分けられない」run：Plan 6 本（`cancelled` 4 本はレビュー 0 回で終わったもの
+＝devflow 1 本・world-took-shape 3 本、`exhausted` 2 本は入力の保存を確かめ
+られない回があるもの）、Implement 2 本（どちらも `cancelled` でレビュー 0 回、
+world-took-shape）。終わっていない run は Plan 2 本・Implement 3 本で、
+数えていません。
+
+1・2 の「後」の差には、0.12.11（失敗のあとに続いたレビューが成功して数えられうる）の
+影響が入りうるので、そのことを後の数字と一緒に見ます。(ii)・(ii-a) の OpenCode
+effort=low の回は、Implement の minecraft-ai-movie に合格・指摘 0 件の 1 回だけ
+あり、分母（承認されなかった回）が 0 で比べられません。
+
+### 実機の確かめ
+
+計画どおり、リポジトリの外の使い捨てプロジェクト（`/tmp` 以下、小さい Python
+モジュールと unittest、Implement の設定だけ）で、0.12.11（`main` の worktree）と
+0.12.12（この作業ツリー）のレビュアー指示を比べました。各 run が始まってから同じ
+`seed.patch` を当て、パッチには (1) 本物の小さい動作の誤り（`floor=None` のとき負の
+積を 0 に潰す。追加したテストは見逃す）と (2) 好みだけの問題（ローカル変数の
+camelCase / snake_case の混在とコメントの言い回し）を入れました。Implement は
+4 種のレビュアー（Codex `gpt-6.2-sol`、Devin `swe-2`、OpenCode
+`opencode-go/deepseek-v4.1-flash`、Claude `claude-opus-5-5`、全部 effort=high、
+`--max-reviews 1`。モデルはすべて要求した値で、すべての回の
+`invocation.json` で `effective_model_attested` は `false` です）を
+新旧の指示で 1 回ずつ、合計 8 本動かしました。Claude Code の headless セッションが各 run を
+動かし、最初のレビューの結果を記録してから run を `implement cancel` で終えました。
+
+全部の run で、レビュアーに渡した指示（`review-processes/01/review-input.md`）が
+期待どおりの版であることを確かめました（新しい指示の packet にだけ
+`### What to report` がある）。
+
+**結果**（verdict は 8 本とも `changes_required`）
+
+| 指示 | レビュアー | (1) 本物の誤り | (2) 好みの問題 | その他の指摘 |
+|---|---|---|---|---|
+| 0.12.11 | codex | medium で指摘 | なし | なし |
+| 0.12.11 | devin | high で指摘 | low で指摘（camelCase の命名） | なし |
+| 0.12.11 | opencode | high で指摘 | なし | medium: no-floor の負の結果のテストが無く、(1) の誤りをテストが通してしまう |
+| 0.12.11 | claude | high で指摘 | low で指摘（camelCase の命名） | medium: 同上（負の入力のテストの不足） |
+| 0.12.12 | codex | high で指摘 | なし | なし |
+| 0.12.12 | devin | high で指摘 | なし | なし |
+| 0.12.12 | opencode | high で指摘 | なし | medium: 同上（負の入力のテストの不足） |
+| 0.12.12 | claude | high で指摘 | なし | なし |
+
+読み取り：(1) の本物の誤りは、新旧の指示で 8 本すべてが `medium` 以上で指摘しま
+した（重大な見落としなし）。(2) の好みだけの指摘（文書レベルではない余計な
+style 指摘）は、古い指示で 2 本（devin と claude、どちらも `low`）、新しい指示で
+0 本でした。「負の入力のテストが無い」という指摘は、種の計画が要求したテスト
+（floor ありと no-floor の正の結果の 2 件は差分に入っていた）の外の、負の結果を
+確かめる範囲への要望で、実演された (1) の誤りをテストが通してしまう穴を指すもの
+なので、新旧どちらでも出てよい本物の指摘として残りました。どのレビュアーも
+動かせなかった、という制限はありませんでした（4 種
+すべて両方の指示で動きました。Devin のレビュアーは、使い捨てのディレクトリを
+人間が Devin に信頼させてから動かしました）。
+
+比較の限界（数えたまま残します）：各回の `draft/implementation.md`（レビュアーに
+渡るパケットの一部）は、headless セッションがそれぞれ書いたため、種明かしの度合いが
+回ごとに違いました。古い指示の codex・devin・claude と新しい指示の codex の要約は
+(1) の誤りと (2) の好みの問題をどちらも名指しで書いていました。古い指示と新しい
+指示の opencode と新しい指示の devin の要約は (1) だけを書き、新しい指示の claude
+の要約は「no-floor の負の場合のテストが無い」までに留めていました。要約に種が
+明かされている回では、レビュアーは自分で見つけたのと同じ評価ではないので、
+新旧の差は「指示の差だけ」とは言えません（古い指示の devin・claude の style 指摘は、
+要約が style 問題を名指ししていた回でした）。また、モデルの答えは毎回同じとは
+限らないので、1 条件 1 回ずつの結果は傾向を見るものであって証明ではありません。
+同じ中立の要約で回し直した比較はしていません。
+
+ホスト側の版の確かめ（`docs/plans/plan-...4878b24e756b.md` の合格条件）：
+
+- Devin CLI 3000.14.30821：作業ツリーのプラグインを `devin plugins install --local`
+  で入れると、`devin plugins list` に `devflow (plugins/devflow) v0.12.12` が出て、
+  `devin -p "/devflow:doctor"`（使い捨てプロジェクトで実行）の 1 行目は
+  `DevFlow 0.12.12` でした。
+- Codex CLI 0.171.0：検証用の `CODEX_HOME` に `codex plugin marketplace add`（作業
+  ツリー）と `codex plugin add devflow@devflow-marketplace --json` を実行すると
+  `"version": "0.12.12"`、`codex plugin list` にも `devflow` 0.12.12（作業ツリー
+  由来）が出ました。対話セッションの `$devflow:doctor` の 1 行目は
+  `DevFlow 0.12.12` でした（`codex exec` ではプラグインのフックが動かないため、
+  対話 TUI で確かめました。0.12.9 の検証と同じ制限です）。
+
+**Plan のレビュー**（使い捨てのプロジェクトを 2 つ作り、それぞれレビュアーを
+1 種だけに設定しました。`plan.publish.enabled` は `false`、レビュアーは
+effort=high、`gpt-6.2-sol`（codex）と `swe-2`（devin）。両方で同じ依頼文から
+最初の草稿を作らせ、手順（`math.floor` で切り捨てた整数を返す）と受け入れ条件
+（戻り値は小数第 2 位までの文字列）の矛盾と、「値」「要素」の言い換え語を
+そのまま残しました。インタビューには「計画の内容は上のとおりで変えない」と
+答えています）：
+
+- **codex の run**（`/tmp/devflow-verify-report/plan-codex`、run
+  `20261122T175228Z-ec9dca4e9d37`）：`review-processes/01/review-input.md` に
+  `### What to report` と、種の 2 項目を残した `plan_markdown` が入っている
+  ことを確かめました。採否は `human_required` で、指摘は 2 件：
+  `return-contract`（**high**、種の矛盾そのもの。手順の整数と受け入れ条件の
+  小数文字列が両立せず、追加テストの合否を一意に決められない、として
+  `requires_human: true`）と `nonfinite-total`（medium、合計が `inf` に
+  なると `math.floor` が `OverflowError` になる入力範囲の指摘。種ではない
+  追加の本物の問題）。言い換え語についての style だけの指摘はありません
+  でした。レビュー記録後に run を外から `plan cancel` で終えました。
+- **devin の run**（`/tmp/devflow-verify-report/plan-devin`、run
+  `20261122T190713Z-cef27b86aadc`）：`review-processes/01/review-input.md` に
+  `### What to report` と、種の 2 項目を残した `plan_markdown` が入っている
+  ことを確かめました。採否は **`pass`、指摘 0 件** で、種の矛盾は指摘されま
+  せんでした。要約には、矛盾は人間が明示的に「残したまま進める」と決定した
+  事項で計画のリスク節に説明済みであり、実装者への判断仰ぎの指示もある、
+  という判断が書かれています（レビュアーは「人間が決めた既知の事項」として
+  指摘しない解釈を取りました）。style だけの指摘もありませんでした。
+  レビュアーが 1 種で合格したため run は `completed` で終わりました。
+- **数えなかった回**：plan-codex の 1 回目のセッションが作った run
+  `20261122T173345Z-9b7d046864e8` は、レビューの標準出力・標準エラー・
+  final-response が全部空のままレビュアーのプロセスが死に、結果が作られ
+  ませんでした。プロセスが止まっていることを確かめたうえで
+  `plan recover --confirm-process-stopped` で中断レビューを失敗として記録し、
+  `plan cancel` で終えました。この run は確かめられなかったため、判定から
+  除いています。
+
+読み取り：両 run ともレビュアーに渡した指示は新しい版（`### What to report`
+入り）で、種の草稿は文言どおり残っていました。style だけの指摘は 2 本とも
+0 件でした。種の矛盾の扱いはレビュアーで分かれ、codex は `high` で指摘し、
+devin は「人間が決定しリスク節に記録済みの事項」として指摘しませんでした。
+これは計画の期待（本物の問題は小さくても報告する）からのずれですが、レビュアー
+が出した理由（依頼者の決定が計画に明記されている）は、渡した種の作り方に由来
+する解釈の余地です。
+
+**判定からの除外**：計画は「同じ種の初版」を両レビュアーに渡すことを求めて
+いますが、上の 2 本は各セッションが別々に草稿を作ったため、`plan_markdown`
+のハッシュが違い（接頭 `244022f44ab3` と `5caa634166ba`）、かつ devin 側の
+草稿だけが「矛盾で実装・テストが決められない場合は依頼者に判断を仰げ」と
+実装者に指示していました。devin の合格の理由はその差を引いていたため、
+この差は確かめたい動作に影響します。そこで上の 2 本は観測として残し、
+D12（この節）の合格判定からは除きます。計画の決まり（合格の条件に合わない
+レビュアーがあったら、指示の文を直すかどうかを人間に聞く）にしたがって人間に
+聞いた結果、**レビュアー指示の文言は変えず、devin の見逃しを実測として記録し、
+同一の草稿でのやり直しはしない**ことが決まりました（記録の E001）。
+したがって、この節の Plan の部分は**完全には確かめられなかった**ものとして
+記録します（codex は条件どおり種の矛盾を `high` で指摘しましたが、devin は
+指摘せず、かつ草稿が同一でなかったために再試行の結果もありません）。
+1 条件 1 回の結果は傾向を見るものであって証明ではありません。なお、
+plan-devin のセッションはエージェントが Claude Code の対話 TUI を PTY 越しに
+操作して進めました（最初の質問は操作の都合で「辞退」になり、その後メッセージで
+「計画の内容は上のとおりで変えない」と答え、完了確認の質問で「進める」を
+選びました）。
