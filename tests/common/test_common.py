@@ -318,6 +318,36 @@ class SharedSettingsTests(unittest.TestCase):
         with self.assertRaises(DevFlowError):
             WORKFLOWS["implement"].load_config(self.project)
 
+    def test_auto_accept_at_review_limit_layers_with_the_existing_precedence(self):
+        for flow in ("plan", "implement"):
+            with self.subTest(flow=flow):
+                self.assertFalse(WORKFLOWS[flow].load_config(self.project)["auto_accept_at_review_limit"])
+        atomic_json(self.path, {"schema_version": 1, "auto_accept_at_review_limit": True,
+                                "plan": {"auto_accept_at_review_limit": False}})
+        self.assertFalse(WORKFLOWS["plan"].load_config(self.project)["auto_accept_at_review_limit"])
+        self.assertTrue(WORKFLOWS["implement"].load_config(self.project)["auto_accept_at_review_limit"])
+        atomic_json(self.project / "devflow.config.local.json",
+                    {"schema_version": 1, "auto_accept_at_review_limit": False})
+        self.assertFalse(WORKFLOWS["implement"].load_config(self.project)["auto_accept_at_review_limit"])
+        atomic_json(self.project / "devflow.config.local.json",
+                    {"schema_version": 1, "implement": {"auto_accept_at_review_limit": True}})
+        self.assertTrue(WORKFLOWS["implement"].load_config(self.project)["auto_accept_at_review_limit"])
+
+    def test_auto_accept_at_review_limit_accepts_only_a_boolean(self):
+        from devflow_core.plan.config import validate_config as plan_validate
+        from devflow_core.implement.config import validate_config as implement_validate
+        for flow, validate in (("plan", plan_validate), ("implement", implement_validate)):
+            base = WORKFLOWS[flow].load_config(self.project)  # a complete config; only the new key goes bad
+            for bad in ("true", 1, 0, None):
+                with self.subTest(flow=flow, value=bad):
+                    with self.assertRaisesRegex(DevFlowError, "must be a boolean"):
+                        validate({**base, "auto_accept_at_review_limit": bad})
+        for bad in ("true", 1, 0):
+            with self.subTest(value=bad):
+                atomic_json(self.path, {"schema_version": 1, "auto_accept_at_review_limit": bad})
+                with self.assertRaises(DevFlowError):
+                    WORKFLOWS["plan"].load_config(self.project)
+
 
 class ReviewBudgetTests(unittest.TestCase):
     def test_the_listed_next_reviewer_is_the_one_that_will_be_dispatched(self):

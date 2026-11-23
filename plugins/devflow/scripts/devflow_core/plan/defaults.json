@@ -1,5 +1,6 @@
 {
   "schema_version": 1,
+  "auto_accept_at_review_limit": false,
   "grill_skill": "grilling",
   "max_reviews": 6,
   "max_packet_bytes": 2097152,

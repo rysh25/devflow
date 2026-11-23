@@ -33,7 +33,7 @@ def _documents(project: Path):
 
 def validate_document(project: Path, workflows) -> None:
     """Reject unknown top-level keys; the caller passes the registered workflow names."""
-    allowed = {"schema_version", "reviewers", "max_reviews", *workflows}
+    allowed = {"schema_version", "reviewers", "max_reviews", "auto_accept_at_review_limit", *workflows}
     for name, document in _documents(project):
         if set(document) - allowed:
             raise DevFlowError(f"Unknown {name} keys: " + ", ".join(sorted(set(document) - allowed)))
@@ -45,7 +45,8 @@ def validate_document(project: Path, workflows) -> None:
 def _layers(name: str, document: dict, workflow: str):
     if workflow in document and not isinstance(document[workflow], dict):
         raise DevFlowError(f"{name} {workflow} must contain an object")
-    return ({key: document[key] for key in ("reviewers", "max_reviews") if key in document},
+    return ({key: document[key] for key in ("reviewers", "max_reviews", "auto_accept_at_review_limit")
+             if key in document},
             document.get(workflow, {}))
 
 

@@ -7,7 +7,8 @@ from pathlib import Path
 from ..common import summary
 from ..common.errors import DevFlowError, UsageError
 from ..common.environment import bash_timeout_ms
-from ..common.review import after_failed_review, check_review_budget, check_review_config, review_budget
+from ..common.review import (after_failed_review, check_auto_accepted, check_review_budget,
+                             check_review_config, review_budget)
 from ..common.runs import TERMINAL
 from ..common.sessions import prefilled_question_events
 from ..common.operations import public_command
@@ -139,6 +140,7 @@ class ImplementWorkflow(Workflow):
         if not isinstance(state["attempts"], list):
             raise DevFlowError("Incompatible/corrupt run state; never reset the review count")
         check_review_budget(state, len(state["attempts"]))
+        check_auto_accepted(state)
 
     def on_recover(self, store, state: dict) -> None:
         if state["status"] == "checking":
@@ -167,7 +169,12 @@ class ImplementWorkflow(Workflow):
 
     def before_save(self, store, state: dict) -> None:
         if state["status"] in TERMINAL:
-            from .engine import terminal_report
+            # An auto_accepted run keeps the report finalized with its acceptance:
+            # later saves (status reads, an explicit resume) reuse it and never
+            # recapture the workspace.
+            if state["status"] == "auto_accepted" and state["report_path"]:
+                return
+            from .engine import _auto_acceptance_entry, terminal_report
             relative = f"reports/final-{state['state_revision'] + 1:06}.json"
             # Ending a run must not depend on every event file being readable;
             # a damaged one is reported instead of blocking cancel or recover.
@@ -176,7 +183,18 @@ class ImplementWorkflow(Workflow):
                 observed_error = None
             except (DevFlowError, OSError, ValueError) as exc:
                 observed, observed_error = None, str(exc)
-            report = terminal_report(store, state, observed, observed_error)
+            verified = None
+            if state["status"] == "auto_accepted":
+                # The acceptance and its report share the snapshot _current
+                # verified during preparation; a second capture could fail and
+                # lose the pause, and could disagree about the target. The full
+                # entry check — frozen config record, candidate and reviewed
+                # facts — runs before the terminal state commits: a verification
+                # failure propagates and leaves the prior state in effect.
+                evidence = _auto_acceptance_entry(
+                    state, lambda relative: store.record_json(state, relative))
+                verified = {"snapshot_id": evidence["version"], "reviewed": evidence["version_reviewed"]}
+            report = terminal_report(store, state, observed, observed_error, verified)
             data = json_bytes(report)
             try:
                 check_json_size(relative, data)

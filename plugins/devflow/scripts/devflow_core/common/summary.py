@@ -49,6 +49,8 @@ SEVERITIES = ("critical", "high", "medium", "low")
 STATUS_TEXT = {
     "completed": "completed — every reviewer approved the same version",
     "accepted": "accepted — accepted by the human at the review limit, not approved by every reviewer",
+    "auto_accepted": "auto_accepted — accepted by configuration at the review limit, "
+                     "not approved by every reviewer",
     "exhausted": "exhausted — ended without approval from every reviewer",
     "cancelled": "cancelled",
 }
@@ -137,7 +139,8 @@ def build(source: dict, now: str) -> dict:
             "all_reviewers_approved": bool(source["reviewers"]) and all(
                 reviewer["id"] in approving for reviewer in source["reviewers"]),
             "reviewers": approval_reviewers,
-            "human_acceptance": source["human_acceptance"]},
+            "human_acceptance": source["human_acceptance"],
+            "auto_acceptance": source.get("auto_acceptance")},
         "remaining_findings": {"count": count, "items": remaining},
         "reviewer_totals": totals,
         "human_decisions": source["human_decisions"],
@@ -198,6 +201,10 @@ def render(summary: dict) -> str:
                           for item in approval["reviewers"]) or "none"
     lines.append(f"- Current version: {approval['current_version']['label']}, "
                  f"{'reviewed' if approval['latest_version_reviewed'] else 'not reviewed'}; approvals: {approvals}")
+    auto = approval.get("auto_acceptance")
+    if auto:
+        lines.append(f"- Auto-accepted by configuration at the review limit (record: {auto['record']}; "
+                     f"accepted version {'reviewed' if auto['version_reviewed'] else 'not reviewed'})")
 
     lines.append("")
     if reviews:

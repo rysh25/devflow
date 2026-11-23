@@ -33,8 +33,10 @@ RELEASES = {1: "0.1.x", 2: "0.2.x", 3: "0.3.x", 6: "0.4.x", 7: "0.5.x", 8: "0.6.
 def release_name(version: int) -> str:
     return RELEASES.get(version, f"an older version (run format {version})")
 #: How a run ends. ``completed`` only when every reviewer approved the same version;
-#: ``accepted`` when the human accepted the current version at the review limit.
-TERMINAL = frozenset({"completed", "exhausted", "cancelled", "accepted"})
+#: ``accepted`` when the human accepted the current version at the review limit;
+#: ``auto_accepted`` when the run's frozen ``auto_accept_at_review_limit`` setting
+#: accepted it at the review limit (evidence: ``auto-acceptance.json``).
+TERMINAL = frozenset({"completed", "exhausted", "cancelled", "accepted", "auto_accepted"})
 RUN_ID = re.compile(r"[0-9]{8}T[0-9]{6}Z-[a-f0-9]{12}\Z")
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}\Z")
 EVENT_ID = re.compile(r"[a-f0-9]{32}\Z")

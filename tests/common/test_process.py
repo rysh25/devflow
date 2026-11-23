@@ -5,6 +5,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -109,6 +110,33 @@ class RunBoundedTests(unittest.TestCase):
         result = self.python("import sys; print(sys.stdin.read().upper())", timeout=20, data=b"packet")
         self.assertEqual(result.stdout.strip(), b"PACKET")
 
+    def test_a_child_that_exits_before_reading_stdin_is_not_retained(self):
+        # The buffered ``stdin`` close can retry a flush and raise ``BrokenPipeError``
+        # after the child exits; the feeder's completion event must still be set so
+        # cleanup treats the finished feeding as done, not as a retained pipe.
+        result = self.python("import sys; sys.exit(0)", timeout=20, data=b"x" * 200000)
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(result.retained_pipes)
+
+    def test_an_interrupt_during_feeder_start_is_a_cleanup_error(self):
+        # The feeder is registered before ``Thread.start`` returns, so an interrupt
+        # during startup still waits on it: the stop cannot be confirmed and the
+        # interrupt is kept as the cleanup error's cause.
+        real_start = threading.Thread.start
+        starts = {"n": 0}
+
+        def flaky_start(thread):
+            real_start(thread)
+            starts["n"] += 1
+            if starts["n"] == 3:  # the two stream readers, then the stdin feeder
+                raise KeyboardInterrupt()
+
+        with patch.object(process_module, "stop_tree", lambda process: None):
+            with patch.object(threading.Thread, "start", flaky_start):
+                with self.assertRaises(ProcessCleanupError) as caught:
+                    self.python("import time; time.sleep(12)", timeout=20, data=b"data")
+        self.assertIsInstance(caught.exception.__cause__, KeyboardInterrupt)
+
     def test_launch_failure_is_a_devflow_error(self):
         with self.assertRaisesRegex(DevFlowError, "Could not launch"):
             run_bounded([str(self.cwd / "missing-program")], cwd=self.cwd, timeout=5)
@@ -168,6 +196,54 @@ class RunBoundedTests(unittest.TestCase):
 
         try:
             with patch.object(process_module.time, "sleep", suspicious), \
+                    patch.object(process_module, "stop_tree", lambda process: process.kill()):
+                with self.assertRaises(ProcessCleanupError) as caught:
+                    self.python(code, timeout=20)
+            self.assertIn("kept its output pipes open", str(caught.exception))
+            self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+        finally:
+            if pidfile.exists():
+                try:
+                    os.kill(int(pidfile.read_text().strip()), signal.SIGTERM)
+                except (OSError, ValueError):
+                    pass
+
+    def test_an_interrupt_in_the_exit_wait_still_stops_the_child(self):
+        # An interrupt landing on the post-monitor exit confirmation goes
+        # through the shared cleanup once, then propagates.
+        real_wait, calls, stops = process_module.subprocess.Popen.wait, [], []
+        real_stop = process_module.stop_tree
+
+        def suspicious(process, timeout=None):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("exit wait interrupted")
+            return real_wait(process, timeout=timeout)
+
+        with patch.object(process_module.subprocess.Popen, "wait", suspicious), \
+                patch.object(process_module, "stop_tree", lambda process: (stops.append(1), real_stop(process))):
+            with self.assertRaisesRegex(RuntimeError, "exit wait interrupted"):
+                self.python("import sys; sys.stdout.write('done'); sys.stdout.flush()", timeout=20)
+        self.assertEqual(len(stops), 1)  # the cleanup ran, and exactly once
+
+    def test_an_interrupt_waiting_on_held_pipes_is_a_cleanup_error(self):
+        # The child reports its pipe-holding descendant's pid, then exits.
+        pidfile = self.cwd / "descendant.pid"
+        code = ("import subprocess, sys, tempfile; "
+                "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'], "
+                "cwd=tempfile.gettempdir()); "
+                f"open(r'{pidfile}', 'w').write(str(p.pid))")
+        real_wait, fired = process_module.threading.Event.wait, []
+
+        def suspicious(event, timeout=None):
+            # Interrupt the pipe-grace wait once, only once the descendant holds the pipes.
+            if not fired and pidfile.exists():
+                fired.append(1)
+                raise RuntimeError("pipe wait interrupted")
+            return real_wait(event, timeout)
+
+        try:
+            with patch.object(process_module.threading.Event, "wait", suspicious), \
                     patch.object(process_module, "stop_tree", lambda process: process.kill()):
                 with self.assertRaises(ProcessCleanupError) as caught:
                     self.python(code, timeout=20)

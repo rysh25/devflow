@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 from . import summary
 from .errors import DevFlowError
-from .review import REVIEW_BUDGET
+from .review import REVIEW_BUDGET, check_auto_accept
 from .runs import RUNNER_WAIT, TERMINAL, RunStore
 from .sessions import approval_evidence, prefilled_question_events
 from .storage import now, read_json, writable_text
@@ -70,8 +70,14 @@ class RunEngine:
 
     def _check_frozen_config(self, state: dict) -> dict | None:
         config = self.workflow.frozen_config(state)
-        if config is not None and read_json(self._run(state["run_id"]) / "config.json") != config:
-            raise DevFlowError("Run configuration changed; never replace frozen configuration during a run.")
+        if config is not None:
+            stored = read_json(self._run(state["run_id"]) / "config.json")
+            # A written 0/1 equals the frozen boolean in a dict comparison:
+            # check the key's type on both sides before comparing.
+            check_auto_accept(config)
+            check_auto_accept(stored)
+            if stored != config:
+                raise DevFlowError("Run configuration changed; never replace frozen configuration during a run.")
         return config
 
     def _verify(self, state: dict) -> None:

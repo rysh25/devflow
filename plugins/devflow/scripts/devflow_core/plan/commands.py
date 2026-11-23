@@ -52,7 +52,7 @@ COMMANDS = (
             (Option("--decisions-file", "draft"),)),
     Command("plan", "Commit the initial plan from the draft directory",
             lambda e, a, run, s: e.plan(run, a.file), (Option("--file", "draft"),)),
-    Command("review", "Dispatch the next reviewer and reserve one attempt; at the review limit, ask the human instead",
+    Command("review", "Dispatch the next reviewer and reserve one attempt; at the review limit, accept by the run's frozen setting or ask the human instead",
             lambda e, a, run, s: e.review(run)),
     Command("apply", "Commit this review's finding dispositions and the updated plan",
             lambda e, a, run, s: e.apply(run, a.plan_file, a.decisions_file, a.expected_hash),

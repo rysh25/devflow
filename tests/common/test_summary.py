@@ -143,6 +143,15 @@ class RenderTests(unittest.TestCase):
                    finished_at=None, record=None)]
         return summary.render(summary.build(source(reviews, **extra), "2026-11-05T09:00:00+00:00"))
 
+    def test_an_auto_accepted_run_renders_its_own_status_and_record(self):
+        text = self.render(status="auto_accepted", auto_acceptance={
+            "record": "auto-acceptance.json", "source": "config", "version": "hash9",
+            "accepted_at": "2026-11-05T03:05:44+00:00", "version_reviewed": False})
+        self.assertIn("- Status: auto_accepted — accepted by configuration at the review limit, "
+                      "not approved by every reviewer", text)
+        self.assertIn("- Auto-accepted by configuration at the review limit (record: auto-acceptance.json; "
+                      "accepted version not reviewed)", text)
+
     def test_the_fixed_form(self):
         text = self.render(status="accepted", human_acceptance={
             "event_ids": ["e1"], "answer": "Accept", "version": "hash9", "accepted_at": "2026-11-05T03:05:44+00:00",

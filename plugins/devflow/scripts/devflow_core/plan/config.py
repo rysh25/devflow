@@ -11,7 +11,7 @@ from ..common.hosts import executable_name, host_profile
 
 from ..common.errors import DevFlowError
 from .interview import INTERVIEW_NAME_PATTERN, inspect_interview_skill
-from ..common.review import validate_limit
+from ..common.review import check_auto_accept, validate_limit
 from ..common.settings import load_workflow_config, validate_reviewers
 
 
@@ -50,11 +50,13 @@ def publish_name(template: str, request: str, run_id: str) -> str:
 
 
 def validate_config(config: dict) -> dict:
-    expected = {"schema_version", "grill_skill", "max_reviews", "max_packet_bytes", "reviewers", "publish"}
+    expected = {"schema_version", "grill_skill", "max_reviews", "max_packet_bytes", "reviewers", "publish",
+                "auto_accept_at_review_limit"}
     if set(config) - expected:
         raise DevFlowError(f"Unknown configuration fields: {sorted(set(config) - expected)}")
     if type(config.get("schema_version")) is not int or config.get("schema_version") != 1:
         raise DevFlowError("Unsupported configuration schema_version (expected 1).")
+    check_auto_accept(config)
     skill = config.get("grill_skill")
     if not isinstance(skill, str) or not INTERVIEW_NAME_PATTERN.fullmatch(skill):
         raise DevFlowError("grill_skill must be an installed skill name, with no leading slash.")

@@ -3,9 +3,11 @@ import ast
 import hashlib
 import importlib.util
 import json
+import os
 import re
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -51,6 +53,29 @@ def removed_patterns(extra_wording=()):
     return names, texts
 
 
+def release_files():
+    """The files a release ships: tracked files plus untracked files still
+    eligible to ship; Git-ignored local work products never enter, and an
+    index entry whose file was removed counts for neither. None outside a
+    Git checkout, where no tracking can be consulted."""
+    listed = subprocess.run(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                            cwd=ROOT, capture_output=True, timeout=30)
+    if listed.returncode:
+        return None
+    return sorted(name for name in filter(None, listed.stdout.decode("utf-8").split("\0"))
+                  if os.path.lexists(ROOT / name))
+
+
+def shipped_documents(paths):
+    """The repository's documents among ``paths``: exactly the release-files
+    set, so the content checks and the archive see the same inputs."""
+    names = release_files()
+    if names is None:
+        return list(paths)
+    shipped = {ROOT / name for name in names}
+    return [path for path in paths if path in shipped]
+
+
 class DistributionTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="devflow distribution ")
@@ -58,13 +83,27 @@ class DistributionTests(unittest.TestCase):
         self.base = Path(temporary.name).resolve()
 
     def clone(self):
-        # A new directory for every copy, so a failed case never leaves one in the next one's way.
+        """A clean release input in a new directory: exactly the release-files
+        set, so a preserved local note can stay in the checkout without
+        entering the package or the checks that cover the same files."""
         destination = Path(tempfile.mkdtemp(dir=self.base)) / "repository"
-        return Path(shutil.copytree(ROOT, destination, ignore=shutil.ignore_patterns(
-            "__pycache__", "*.pyc", "dist", ".git", ".devflow")))
+        names = release_files()
+        if names is None:
+            return Path(shutil.copytree(ROOT, destination, ignore=shutil.ignore_patterns(
+                "__pycache__", "*.pyc", "dist", ".git", ".devflow")))
+        for name in names:
+            source = ROOT / name
+            info = source.lstat()
+            self.assertFalse(stat.S_ISLNK(info.st_mode)
+                             or (getattr(info, "st_file_attributes", 0) & 0x400),
+                             f"release input is a symlink/reparse point: {name}")
+            target = destination / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target, follow_symlinks=False)
+        return destination
 
     def test_static_validate_current_bundle(self):
-        result = package.validate(ROOT)
+        result = package.validate(self.clone())
         self.assertEqual(result["marketplace"], "devflow-marketplace")
         self.assertEqual(result["plugins"], {"devflow": "0.12.12"})
 
@@ -116,7 +155,8 @@ class DistributionTests(unittest.TestCase):
                     self.assertIn("`{}` / `{}`".format(reviewer["model"], reviewer["effort"]), readme)
 
     def test_user_documents_only_describe_current_single_plugin(self):
-        paths = [ROOT / "README.md"] + sorted((ROOT / "docs").rglob("*.md")) + sorted((ROOT / "examples").rglob("*.md"))
+        paths = shipped_documents([ROOT / "README.md"] + sorted((ROOT / "docs").rglob("*.md"))
+                                  + sorted((ROOT / "examples").rglob("*.md")))
         old_names = ("plan" + "flow", "build" + "flow")
         # Upgrade instructions are required for 0.8.0's host/record changes;
         # the generic term must not be confused with the removed plugins.
@@ -146,8 +186,9 @@ class DistributionTests(unittest.TestCase):
         self.assertEqual(minimal["plan"]["grill_skill"], "grilling")
 
     def test_zip_deterministic_and_every_entry_hashes(self):
-        first = package.build(ROOT, self.base / "first.zip")
-        second = package.build(ROOT, self.base / "second.zip")
+        source = self.clone()
+        first = package.build(source, self.base / "first.zip")
+        second = package.build(source, self.base / "second.zip")
         self.assertEqual(first.read_bytes(), second.read_bytes())
         with zipfile.ZipFile(first) as archive:
             names = archive.namelist()
@@ -296,8 +337,9 @@ class DistributionTests(unittest.TestCase):
                    ("docs/validation.md", "## 0.8.0 実装の検証（2026-11-07）"): {"拒否"},
                    ("tools/package.py", None): {"onfailure"}}
         names, texts = removed_patterns(JAPANESE_WORDING)
-        paths = [ROOT / "README.md", *(ROOT / "docs").glob("*.md"), *(ROOT / "examples").iterdir(),
-                 *(path for path in (ROOT / ".github").rglob("*") if path.is_file()), *(ROOT / "tools").glob("*.py")]
+        paths = shipped_documents(
+            [ROOT / "README.md", *(ROOT / "docs").glob("*.md"), *(ROOT / "examples").iterdir(),
+             *(path for path in (ROOT / ".github").rglob("*") if path.is_file()), *(ROOT / "tools").glob("*.py")])
         for path in sorted(paths):
             relative = path.relative_to(ROOT).as_posix()
             text = path.read_text(encoding="utf-8")
@@ -419,6 +461,23 @@ class DistributionTests(unittest.TestCase):
             self.skipTest("Creating symlinks requires OS permission")
         with self.assertRaisesRegex(package.PackagingError, "symlink/reparse"):
             package.validate(cloned)
+
+    def test_a_symlink_in_the_release_input_is_rejected_before_copying(self):
+        # A link among the source inputs is refused by ``lstat`` before the copy
+        # could follow it and leak out-of-tree bytes into the checked clone.
+        link = self.base / "release-link"
+        try:
+            link.symlink_to(ROOT / "tools" / "package.py")
+        except (OSError, NotImplementedError):
+            self.skipTest("Creating symlinks requires OS permission")
+        global release_files
+        original = release_files
+        release_files = lambda: [str(link)] + original()
+        try:
+            with self.assertRaisesRegex(AssertionError, "symlink/reparse"):
+                self.clone()
+        finally:
+            release_files = original
 
     def test_local_configuration_file_is_never_packaged(self):
         files = package._collect(ROOT)

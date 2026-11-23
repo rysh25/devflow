@@ -53,7 +53,13 @@ class DowngradeTests(RuntimeFixture):
         state=read_json(self.run_dir('plan',run)/'state.json')
         state['schema_version']=9
         del state['owner_host']
+        # A simulated 0.7.3 run carries only the settings a 0.7.3 runner could
+        # freeze: the newer auto_accept_at_review_limit key goes from both copies.
+        state['config'].pop('auto_accept_at_review_limit',None)
         atomic_json(self.run_dir('plan',run)/'state.json',state)
+        config=read_json(self.run_dir('plan',run)/'config.json')
+        config.pop('auto_accept_at_review_limit',None)
+        atomic_json(self.run_dir('plan',run)/'config.json',config)
         code,result=self.run_old('--run',run,'plan','doctor')
         self.assertEqual(code,2)
         self.assertIn('reviewer kind',result['message'])
