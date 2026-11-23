@@ -1,4 +1,5 @@
 """The single child-process runner shared by checks, reviewers and Git."""
+from contextlib import contextmanager
 import io
 import os
 import signal
@@ -50,6 +51,29 @@ class RunBoundedTests(unittest.TestCase):
 
     def python(self, code, **options):
         return run_bounded([sys.executable, "-c", code], cwd=self.cwd, **options)
+
+    @contextmanager
+    def simulate_failed_stop(self, *, close_unread_output=False):
+        real_popen = subprocess.Popen
+
+        def reap_child(child):
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+
+        def spawn(*args, **kwargs):
+            child = real_popen(*args, **kwargs)
+            if close_unread_output:
+                self.addCleanup(child.stdout.close)
+                self.addCleanup(child.stderr.close)
+            # Cleanups run in reverse order. On Windows the child must exit
+            # before the fixture can remove its working directory.
+            self.addCleanup(reap_child, child)
+            return child
+
+        with (patch.object(process_module, "stop_tree", lambda process: None),
+              patch.object(process_module.subprocess, "Popen", spawn)):
+            yield
 
     def test_completes_with_exit_code_and_both_streams(self):
         result = self.python("import sys; print('out'); print('err', file=sys.stderr); raise SystemExit(3)",
@@ -122,20 +146,8 @@ class RunBoundedTests(unittest.TestCase):
         # The feeder is registered before ``Thread.start`` returns, so an interrupt
         # during startup still waits on it: the stop cannot be confirmed and the
         # interrupt is kept as the cleanup error's cause.
-        real_popen = subprocess.Popen
         real_start = threading.Thread.start
         starts = {"n": 0}
-
-        def reap_child(child):
-            if child.poll() is None:
-                child.kill()
-            child.wait(timeout=5)
-
-        def spawn(*args, **kwargs):
-            child = real_popen(*args, **kwargs)
-            # Reap the child before the fixture removes its working directory.
-            self.addCleanup(reap_child, child)
-            return child
 
         def flaky_start(thread):
             real_start(thread)
@@ -143,11 +155,9 @@ class RunBoundedTests(unittest.TestCase):
             if starts["n"] == 3:  # the two stream readers, then the stdin feeder
                 raise KeyboardInterrupt()
 
-        with (patch.object(process_module, "stop_tree", lambda process: None),
-              patch.object(process_module.subprocess, "Popen", spawn)):
-            with patch.object(threading.Thread, "start", flaky_start):
-                with self.assertRaises(ProcessCleanupError) as caught:
-                    self.python("import time; time.sleep(12)", timeout=20, data=b"data")
+        with self.simulate_failed_stop(), patch.object(threading.Thread, "start", flaky_start):
+            with self.assertRaises(ProcessCleanupError) as caught:
+                self.python("import time; time.sleep(12)", timeout=20, data=b"data")
         self.assertIsInstance(caught.exception.__cause__, KeyboardInterrupt)
 
     def test_launch_failure_is_a_devflow_error(self):
@@ -156,7 +166,7 @@ class RunBoundedTests(unittest.TestCase):
 
     def test_a_child_that_never_stops_is_a_cleanup_error(self):
         # With the stop made a no-op, both post-loop waits expire: the child may still run.
-        with patch.object(process_module, "stop_tree", lambda process: None):
+        with self.simulate_failed_stop():
             with self.assertRaises(ProcessCleanupError) as caught:
                 self.python("import time; time.sleep(12)", timeout=0.2)
         self.assertIn("did not terminate", str(caught.exception))
@@ -184,8 +194,8 @@ class RunBoundedTests(unittest.TestCase):
                 raise RuntimeError("no threads")
 
         # The stop is a no-op and the child is still sleeping after the five-second wait.
-        with patch.object(process_module, "stop_tree", lambda process: None), \
-                patch.object(process_module.threading, "Thread", DeadThread):
+        with (self.simulate_failed_stop(close_unread_output=True),
+              patch.object(process_module.threading, "Thread", DeadThread)):
             with self.assertRaises(ProcessCleanupError) as caught:
                 self.python("import time; time.sleep(6)", timeout=20)
         self.assertIn("did not terminate", str(caught.exception))
