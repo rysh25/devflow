@@ -12,7 +12,7 @@ from ..common.hosts import executable_name, host_profile
 from ..common.errors import DevFlowError
 from .interview import INTERVIEW_NAME_PATTERN, inspect_interview_skill
 from ..common.review import check_auto_accept, validate_limit
-from ..common.settings import SettingsDocument, load_workflow_config, validate_reviewers
+from ..common.settings import SettingsDocument, load_workflow_config, validate_reviewer_list, validate_reviewers
 
 
 # The published plan's name: a template whose only values are {run_id} and {ticket}.
@@ -50,6 +50,16 @@ def publish_name(template: str, request: str, run_id: str) -> str:
 
 
 def validate_config(config: dict) -> dict:
+    return _validate(config, match_reviewer_limit=True)
+
+
+def validate_stage(config: dict) -> dict:
+    """Every ``validate_config`` check but the reviewer-count/review-limit match,
+    which applies to a document's effective value, not mid-layer combinations."""
+    return _validate(config, match_reviewer_limit=False)
+
+
+def _validate(config: dict, *, match_reviewer_limit: bool) -> dict:
     expected = {"schema_version", "grill_skill", "max_reviews", "max_packet_bytes", "reviewers", "publish",
                 "auto_accept_at_review_limit"}
     if set(config) - expected:
@@ -84,12 +94,15 @@ def validate_config(config: dict) -> dict:
         if not safe_name(sample) or len(sample) > FILENAME_MAX:
             raise DevFlowError("publish.filename must be a file name without an extension that uses only "
                                "{run_id}, {ticket} and safe characters, at most 128 characters with the longest values.")
-    validate_reviewers(config.get("reviewers"), count)
+    if match_reviewer_limit:
+        validate_reviewers(config.get("reviewers"), count)
+    else:
+        validate_reviewer_list(config.get("reviewers"))
     return copy.deepcopy(config)
 
 
 def load_config(documents: tuple[SettingsDocument, ...], workflow) -> dict:
-    return load_workflow_config(documents, workflow, validate_config)
+    return load_workflow_config(documents, workflow, validate_config, validate_stage=validate_stage)
 
 
 def diagnose(project: Path, config: dict, *, host: str, frozen: bool = False) -> dict:

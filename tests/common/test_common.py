@@ -334,10 +334,12 @@ class SharedSettingsTests(unittest.TestCase):
                     {"schema_version": 1, "implement": {"auto_accept_at_review_limit": True}})
         self.assertTrue(self.config("implement")["auto_accept_at_review_limit"])
 
-        atomic_json(self.project / "devflow.config.codex.local.json",
-                    {"schema_version": 1, "implement": {"auto_accept_at_review_limit": False}})
+        # The launch host's own block inside the common local file applies to it alone.
+        atomic_json(self.project / "devflow.config.local.json",
+                    {"schema_version": 1, "hosts": {"codex": {"implement": {"auto_accept_at_review_limit": False}}}})
         self.assertFalse(self.config("implement", host="codex")["auto_accept_at_review_limit"])
         self.assertTrue(self.config("implement")["auto_accept_at_review_limit"])
+        self.assertTrue(self.config("implement", host="devin")["auto_accept_at_review_limit"])
 
     def test_auto_accept_at_review_limit_accepts_only_a_boolean(self):
         from devflow_core.plan.config import validate_config as plan_validate

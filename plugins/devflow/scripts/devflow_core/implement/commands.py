@@ -29,6 +29,9 @@ def doctor(engine, args, run_id, session) -> dict:
             prompt = pending["event"]["payload"]["prompt"]
             config = validate_config(apply_startup(config, parse_start(public_command(prompt, engine.host)[1])))
             source = "pending_start"
+    # Resolved-settings diagnostics run before any reviewer CLI probe; a selected
+    # run's frozen configuration keeps its own comparison path instead.
+    workflow_report = workflow.doctor(engine.project, config, host=engine.host, frozen=bool(run_id))
     reviewer_cwd, results = engine.project, None
     if run_id:
         from .workspace import verify_workspace
@@ -51,7 +54,7 @@ def doctor(engine, args, run_id, session) -> dict:
             "configuration_source": source,
             "executables": {name: shutil.which(name) for name in ("uv", executable_name(engine.host), "git")},
             "ready": all(item["ready"] for item in results) and not errors, "errors": errors,
-            "warnings": workflow.doctor(engine.project, config, host=engine.host).get("warnings", [])
+            "warnings": workflow_report.get("warnings", [])
                         + [text for item in results for text in item.get("details", {}).get("version_warnings", [])],
             "not_verified": ["CLI authentication and model access", "Actual model used by provider",
                              "Reviewer CLI checks in any directory other than reviewer_cwd",

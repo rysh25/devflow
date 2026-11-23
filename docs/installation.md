@@ -262,8 +262,8 @@ error: uv trampoline failed to spawn Python child process
 
 - `command` の後ろに DevFlow の引数（`exec …`）がつながります。Codex の `-c` は `exec` の前に置いても効きます。
 - `reviewers` の配列は丸ごと置き換わります。使うレビュアーをすべて書いてください。
-- ローカルの共通の `reviewers` は、選ばれた共有設定の `implement.reviewers` より優先されます。Implement で別の顔ぶれを使うなら、ローカルの `implement.reviewers` にも同じように書きます。
-- 利用者自身で、共通名と全ホスト専用ローカル名を `.gitignore` に追加してください。名前とスナップショット・配布の扱いは [ローカル設定の除外](../README.md#ローカル設定の除外) にあります。
+- ローカルの共通の `reviewers` は、共有設定 `devflow.config.json` の `implement.reviewers`（`hosts.<起動ホスト>` 内を含む）より優先されます。Implement で別の顔ぶれを使うなら、ローカルの `implement.reviewers` にも同じように書きます。ただしローカルの `hosts.<起動ホスト>.reviewers` がある場合はそちらが優先されるため、その起動ホスト専用の Implement 設定は `hosts.<起動ホスト>.implement.reviewers` に書いてください。
+- 利用者自身で、共通名と全旧ホスト別ローカル名を `.gitignore` に追加してください。名前とスナップショット・配布の扱いは [ローカル設定の除外](../README.md#ローカル設定の除外) にあります。
 - `unelevated` は、利用者のアカウントから作った権限の低いトークンで動きます。OpenAI の資料では、`elevated` よりネットワークの隔離が弱く、読み取りを禁止する場所の指定も使えないとされています。
 
 **別の対処（未確認）**: Python を全ユーザーが読める場所に入れ直します。uv なら、管理者の PowerShell で次を実行し、新しいターミナルを開きます。これで `elevated` のまま動くかは、まだ確かめていません。
@@ -337,7 +337,7 @@ Claude レビュアーを使う場合は command: ["claude"], model: "opus", eff
 Windows では .cmd / .bat のレビュアーを起動しません。npm の claude.cmd ではなく
 ネイティブ版 Claude を導入してください。設定ファイルの例と優先順位は README を参照してください。
 
-ローカルの切り替えにはプロジェクト直下で選ばれる共通名またはホスト専用名のローカル設定を使います。利用者自身で、共通名と全ホスト専用ローカル名を `.gitignore` に追加してください。[ローカル設定の除外](../README.md#ローカル設定の除外) を参照してください。POSIX は umask 077 / chmod 600、
+ローカルの切り替えにはプロジェクト直下の `devflow.config.local.json` を使います（ホスト専用の差分はその `hosts` に書きます）。利用者自身で、共通名と全旧ホスト別ローカル名を `.gitignore` に追加してください。[ローカル設定の除外](../README.md#ローカル設定の除外) を参照してください。POSIX は umask 077 / chmod 600、
 Windows は所有者だけのアクセス権を推奨します。利用者のファイルを自動作成・編集しません。
 
 0.8.0 は run 形式10・セッション形式3です。0.7.x の進行中 run は更新前に終えてください。

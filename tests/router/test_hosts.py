@@ -11,7 +11,7 @@ from devflow_core.common import sessions
 from devflow_core.common.errors import DevFlowError
 from devflow_core.common.hosts import HOSTS, canonical_payload, question_context
 from devflow_core.common.runs import RunStore, make_event, open_escalation
-from devflow_core.common.storage import atomic_json, read_json
+from devflow_core.common.storage import atomic_json, digest_file, read_json
 from devflow_core.workflows import WORKFLOWS
 from tests.router.test_runtime import RuntimeFixture, PLUGIN
 
@@ -45,15 +45,18 @@ class HostSettingsTests(RuntimeFixture):
             with self.subTest(host=host):
                 project = self.base / host
                 project.mkdir()
-                atomic_json(project / "devflow.config.json", {})
-                shared = project / f"devflow.config.{host}.json"
-                local = project / f"devflow.config.{host}.local.json"
-                atomic_json(shared, {"max_reviews": 12, "implement": {"snapshot": {"mode": "files"}}})
-                atomic_json(local, {"max_reviews": 21 + index, "plan": {"publish": {"directory": f"plans-{host}"}},
-                                    "implement": {"max_reviews": 31 + index, "max_check_attempts": 5 + index}})
+                shared = project / "devflow.config.json"
+                local = project / "devflow.config.local.json"
+                atomic_json(shared, {"hosts": {host: {"max_reviews": 12,
+                                     "implement": {"snapshot": {"mode": "files"}}}}})
+                atomic_json(local, {"hosts": {host: {"max_reviews": 21 + index,
+                                    "plan": {"publish": {"directory": f"plans-{host}"}},
+                                    "implement": {"max_reviews": 31 + index,
+                                                  "max_check_attempts": 5 + index}}}})
                 child = project / "nested"
                 child.mkdir()
-                (child / shared.name).write_text("ignored", encoding="utf-8")
+                # The former host-specific name is neither a root marker nor a settings candidate.
+                (child / f"devflow.config.{host}.local.json").write_text("ignored", encoding="utf-8")
                 (project / "feature.md").write_text("# Feature\n", encoding="utf-8")
                 global_report = self.cli_result(host, child, "doctor")
                 self.assertEqual(global_report["workflows"]["plan"]["config"]["max_reviews"], 21 + index)
@@ -76,30 +79,41 @@ class HostSettingsTests(RuntimeFixture):
 
                 shared.write_text("broken", encoding="utf-8")
                 local.unlink()
-                (project / "devflow.config.json").write_text("broken", encoding="utf-8")
                 for flow, session, run, expected in (("plan", plan_session, plan_run, 51),
                                                       ("implement", impl_session, started["run_id"], 52)):
+                    state_path = project / ".devflow" / "runs" / flow / run / "state.json"
+                    events_before = len(read_json(state_path)["event_ids"])
                     self.submit(host, project, session, "resume", run, cwd=child)
+                    self.assertGreater(len(read_json(state_path)["event_ids"]), events_before)
                     report = self.cli_result(host, project, "--run", run, flow, "doctor")
                     self.assertEqual((report["configuration_source"], report["config"]["max_reviews"]),
                                      ("frozen_run", expected))
                 self.assertIn(shared.name, self.cli_result(host, project, "doctor", code=2)["message"])
 
-    def test_selected_document_is_read_once_per_start_or_global_doctor(self):
-        path = self.project / "devflow.config.codex.json"
-        state = {"max_reviews": 17, "implement": {"snapshot": {"mode": "files"}}}
+    def test_selected_documents_are_read_once_per_start_or_global_doctor(self):
+        shared = self.project / "devflow.config.json"
+        local = self.project / "devflow.config.local.json"
+        state = {"hosts": {"codex": {"max_reviews": 17, "implement": {"snapshot": {"mode": "files"}}}}}
 
         def read_and_replace(path_read):
             value = read_json(path_read)
-            if path_read == path:
-                atomic_json(path, {"unknown": 1})
+            if path_read in (shared, local):
+                atomic_json(path_read, {"unknown": 1})
             return value
 
         plan_session = "codex-file-once"
         for command in ("plan", "doctor", "implement"):
-            atomic_json(path, state)
+            atomic_json(shared, state)
+            atomic_json(local, {})
             if command == "implement":
-                self.submit("codex", self.project, self.session, "implement", "feature.md")
+                # The hook is its own operation: it reads each file once, then the
+                # actual start below reads them again.
+                with patch("devflow_core.common.settings.read_json", side_effect=read_and_replace) as hook_reads:
+                    self.submit("codex", self.project, self.session, "implement", "feature.md")
+                for path in (shared, local):
+                    self.assertEqual(sum(call.args == (path,) for call in hook_reads.call_args_list), 1, command)
+                atomic_json(shared, state)
+                atomic_json(local, {})
             with patch("devflow_core.common.settings.read_json", side_effect=read_and_replace) as reading:
                 if command == "plan":
                     self.submit("codex", self.project, plan_session, "plan", "request")
@@ -113,10 +127,26 @@ class HostSettingsTests(RuntimeFixture):
                 else:
                     started = router.runner_start(self.project, self.session, "implement", "feature.md", host="codex")
                     self.assertEqual(started["config"]["max_reviews"], 17)
-                self.assertEqual(sum(call.args == (path,) for call in reading.call_args_list), 1, command)
+                for path in (shared, local):
+                    self.assertEqual(sum(call.args == (path,) for call in reading.call_args_list), 1, command)
 
-    def test_implement_start_revalidates_the_file_selected_after_the_hook(self):
-        path = self.project / "devflow.config.codex.json"
+    def test_implement_hook_confirms_settings_before_recording_pending(self):
+        path = self.project / "devflow.config.json"
+        atomic_json(path, {"hosts": {"codex": {"implement": {"max_reviews": 0}}}})
+        context = self.submit("codex", self.project, self.session, "implement", "feature.md")
+        self.assertIn("did not accept", context["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("hosts.codex.implement", context["hookSpecificOutput"]["additionalContext"])
+        record = sessions.read_record(self.project, self.session, WORKFLOWS, "codex")
+        self.assertFalse((record or {}).get("pending_start"))
+        # A settings change after a valid hook is caught again at the actual start.
+        atomic_json(path, {"hosts": {"codex": {"implement": {"max_reviews": 7}}}})
+        self.submit("codex", self.project, self.session, "implement", "feature.md")
+        atomic_json(path, {"hosts": {"codex": {"implement": {"max_reviews": 0}}}})
+        with self.assertRaisesRegex(DevFlowError, "hosts.codex.implement"):
+            router.runner_start(self.project, self.session, "implement", "feature.md", host="codex")
+
+    def test_implement_start_revalidates_the_files_after_the_hook(self):
+        path = self.project / "devflow.config.json"
         self.submit("codex", self.project, self.session, "implement", "feature.md")
         atomic_json(path, {"unknown": 1})
         with self.assertRaisesRegex(DevFlowError, f"Unknown {path.name} keys"):
@@ -124,24 +154,75 @@ class HostSettingsTests(RuntimeFixture):
         root = self.project / ".devflow" / "runs" / "implement"
         self.assertFalse(any(root.glob("*/state.json")))
 
-    def test_selected_dedicated_snapshot_syntax_is_checked_at_doctor_and_start(self):
-        shared = self.project / "devflow.config.codex.json"
-        local = self.project / "devflow.config.codex.local.json"
+    def test_selected_host_snapshot_syntax_is_checked_at_doctor_and_start(self):
+        shared = self.project / "devflow.config.json"
+        local = self.project / "devflow.config.local.json"
         cases = (
             ("include", ["../outside/**"], ["**"], "Unsafe snapshot glob"),
             ("context_paths", ["../outside.py"], [], "Non-portable file path"),
         )
         for field, bad, override, error in cases:
             with self.subTest(field=field):
-                atomic_json(shared, {"implement": {"snapshot": {field: bad}}})
+                atomic_json(shared, {"hosts": {"codex": {"implement": {"snapshot": {field: bad}}}}})
                 atomic_json(local, {"implement": {"snapshot": {field: override}}})
-                self.submit("codex", self.project, self.session, "implement", "feature.md")
+                # The hook itself confirms the selected settings before any pending
+                # start is recorded.
+                context = self.submit("codex", self.project, self.session, "implement", "feature.md")
+                self.assertIn("did not accept", context["hookSpecificOutput"]["additionalContext"])
+                self.assertIn(f"{shared.name}: hosts.codex.implement: {error}",
+                              context["hookSpecificOutput"]["additionalContext"])
+                record = sessions.read_record(self.project, self.session, WORKFLOWS, "codex")
+                self.assertFalse((record or {}).get("pending_start"))
                 doctor = self.cli_result("codex", self.project, "--session", self.session, "implement", "doctor", code=2)
-                self.assertIn(f"{shared.name}: {error}", doctor["message"])
-                with self.assertRaisesRegex(DevFlowError, f"{shared.name}: {error}"):
+                self.assertIn(f"{shared.name}: hosts.codex.implement: {error}", doctor["message"])
+                # The actual start reads the files again and hits the same error.
+                atomic_json(shared, {})
+                self.submit("codex", self.project, self.session, "implement", "feature.md")
+                atomic_json(shared, {"hosts": {"codex": {"implement": {"snapshot": {field: bad}}}}})
+                with self.assertRaisesRegex(DevFlowError, f"{shared.name}: hosts.codex.implement: {error}"):
                     router.runner_start(self.project, self.session, "implement", "feature.md", host="codex")
                 root = self.project / ".devflow" / "runs" / "implement"
                 self.assertFalse(any(root.glob("*/state.json")))
+
+    def test_selected_run_doctor_keeps_its_frozen_config_comparison(self):
+        # The resolved snapshot syntax check applies only to diagnostics over current
+        # project settings; a saved run's doctor reads its frozen config as recorded.
+        self.submit("codex", self.project, self.session, "implement", "feature.md")
+        started = router.runner_start(self.project, self.session, "implement", "feature.md", host="codex")
+        run_dir = self.run_dir("implement", started["run_id"])
+        config_path = run_dir / "config.json"
+        frozen = read_json(config_path)
+        frozen["snapshot"]["context_paths"] = ["../outside.py"]
+        atomic_json(config_path, frozen)
+        state_path = run_dir / "state.json"
+        state = read_json(state_path)
+        state["artifacts"]["config.json"] = digest_file(config_path)
+        state["config"] = frozen
+        atomic_json(state_path, state)
+        report = self.cli_result("codex", self.project, "--run", started["run_id"], "implement", "doctor")
+        self.assertEqual(report["configuration_source"], "frozen_run")
+        self.assertEqual(report["config"]["snapshot"]["context_paths"], ["../outside.py"])
+
+    def test_root_snapshot_syntax_left_in_the_resolved_config_is_rejected_at_doctor(self):
+        # A root-level bad pattern that no later layer replaces stays in the resolved
+        # settings; the global and the per-flow doctor reject it.
+        shared = self.project / "devflow.config.json"
+        atomic_json(shared, {"implement": {"snapshot": {"context_paths": ["../outside.py"]}}})
+        self.assertIn("Non-portable file path",
+                      self.cli_result("codex", self.project, "doctor", code=2)["message"])
+        self.assertIn("Non-portable file path",
+                      self.cli_result("codex", self.project, "implement", "doctor", code=2)["message"])
+        # A pending start's session doctor is current-settings diagnostics too.
+        shared.unlink()
+        self.submit("codex", self.project, self.session, "implement", "feature.md")
+        atomic_json(shared, {"implement": {"snapshot": {"context_paths": ["../outside.py"]}}})
+        self.assertIn("Non-portable file path",
+                      self.cli_result("codex", self.project, "--session", self.session,
+                                      "implement", "doctor", code=2)["message"])
+        # The same value is allowed when a later layer replaces the array.
+        atomic_json(self.project / "devflow.config.local.json",
+                    {"implement": {"snapshot": {"context_paths": []}}})
+        self.cli_result("codex", self.project, "doctor")
 
 
 class HostTests(RuntimeFixture):

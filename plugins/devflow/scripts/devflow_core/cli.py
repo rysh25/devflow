@@ -105,6 +105,8 @@ def doctor(project: Path, host: str) -> dict:
     documents = read_project_settings(project, host, WORKFLOWS)
     for name, workflow in WORKFLOWS.items():
         config = workflow.load_config(documents)
+        # Settings-level diagnostics run before any reviewer CLI probe.
+        extra = workflow.doctor(project, config, host=host)
         reviewers = []
         for provider in config["reviewers"]:
             key = json.dumps({k: v for k, v in provider.items() if k != "timeout_seconds"}, sort_keys=True)
@@ -112,7 +114,6 @@ def doctor(project: Path, host: str) -> dict:
                 # Every workflow checks the same directory, the project, so the key needs no cwd.
                 cache[key] = {k: v for k, v in readiness(provider, project).items() if k != "id"}
             reviewers.append({"id": provider["id"], **cache[key]})
-        extra = workflow.doctor(project, config, host=host)
         warnings.extend(extra.get("warnings", []))
         ready = all(item["ready"] for item in reviewers) and extra.get("ready", True)
         reports[name] = {"config": config, "configuration_source": "project_settings", "reviewers": reviewers,
