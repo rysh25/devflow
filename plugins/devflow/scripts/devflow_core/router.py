@@ -23,7 +23,7 @@ from .common.operations import public_command as detect_command
 from .common.startup import parse_start
 from .common.runs import (HOOK_WAIT, RUN_ID, RUNNER_WAIT, TERMINAL, RunStore, data_root, ensure_data_root,
                           event_bytes, make_event, new_run_id, unsupported_message, validate_run_id)
-from .common.settings import validate_document
+from .common.settings import read_project_settings
 from .common.storage import file_lock, now
 from .workflows import WORKFLOWS
 
@@ -123,15 +123,16 @@ def _same_workspace(frozen: str, target: str) -> bool:
 
 
 @contextmanager
-def _prepared(project: Path, pending: dict, all_stores: dict[str, RunStore], options: dict | None):
+def _prepared(project: Path, pending: dict, all_stores: dict[str, RunStore], documents, options: dict | None = None):
     """The workflow fields and start records of a pending start, before any run exists.
 
     Large start records are written into the scratch directory, which is removed
     afterwards; ``_commit`` moves them into the run.
     """
     workflow = WORKFLOWS[pending["flow"]]
+    project_config = workflow.load_config(documents)
     with all_stores[pending["flow"]].scratch(pending["run_id"]) as scratch:
-        yield workflow.build_start(project, pending, dict(options or {}), scratch)
+        yield workflow.build_start(project, pending, dict(options or {}), scratch, project_config=project_config)
 
 
 def _commit(session: str, pending: dict, all_stores: dict[str, RunStore], prepared) -> dict:
@@ -143,10 +144,9 @@ def _commit(session: str, pending: dict, all_stores: dict[str, RunStore], prepar
                         first_event=pending["event"], owner_host=store.host)
 
 
-def _create(project: Path, session: str, pending: dict, all_stores: dict[str, RunStore],
-            options: dict | None = None) -> dict:
+def _create(project: Path, session: str, pending: dict, all_stores: dict[str, RunStore], documents) -> dict:
     """Prepare and create in one step, for a start whose records are small (inside the prompt hook)."""
-    with _prepared(project, pending, all_stores, options) as prepared:
+    with _prepared(project, pending, all_stores, documents) as prepared:
         return _commit(session, pending, all_stores, prepared)
 
 
@@ -189,7 +189,7 @@ def _start(project: Path, session: str, flow: str, argument: str, payload: dict,
     if current is not None and not current.terminal:
         raise DevFlowError("Finish or cancel this session's active workflow before starting another")
     args = workflow.normalize_args(parse_start(argument).body, project)
-    validate_document(project, WORKFLOWS)
+    documents = read_project_settings(project, all_stores[flow].host, WORKFLOWS)
     pending = {"flow": flow, "run_id": new_run_id(), "args": args, "event": make_event(payload, "prompt"),
                "created_at": now()}
     record = dict(record, run=None, pending_start=pending)
@@ -202,7 +202,7 @@ def _start(project: Path, session: str, flow: str, argument: str, payload: dict,
             f"DevFlow {flow} start is pending. Run the {flow} start action with {workflow.start_option} naming "
             f"exactly this input.{extra} Runner: {notices.runner_path(plugin_root)}. Pending input: {args}"))
     try:
-        state = _create(project, session, pending, all_stores, {})
+        state = _create(project, session, pending, all_stores, documents)
     except Exception:
         # No run exists after a failed creation; drop the pending start, which
         # no run will apply. A killed process is settled next prompt.
@@ -250,13 +250,13 @@ def runner_start(project: Path, session: str | None, flow: str, raw: str, option
         pending = record and record["pending_start"]
         if not pending or pending["flow"] != flow:
             raise DevFlowError(refusal)
-        validate_document(project, WORKFLOWS)
         if workflow.normalize_args(raw, project) != pending["args"]:
             raise DevFlowError(f"The {workflow.start_option} value does not match the user's explicit start command")
+        documents = read_project_settings(project, host, WORKFLOWS)
     # Prepared outside the lock: an implementation start captures its baseline
     # snapshot here, which can take long. The lock is taken again to re-check
     # the pending start and the workspace before the run is created.
-    with _prepared(project, pending, all_stores, options) as prepared:
+    with _prepared(project, pending, all_stores, documents, options) as prepared:
         with dispatch_lock(project, RUNNER_WAIT):
             record = sessions.read_record(project, session, WORKFLOWS, host)
             if not record or record["pending_start"] != pending:

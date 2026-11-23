@@ -17,11 +17,12 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 from uuid import uuid4
 
 from .errors import DevFlowError
 from .hosts import HOSTS, CanonicalEvent, canonical_payload
-from .storage import (atomic_json, check_json_file, check_json_size, digest, digest_file, file_lock, json_bytes,
+from .storage import (JSON_LIMIT, atomic_json, check_json_file, check_json_size, digest, digest_file, file_lock, json_bytes,
                       no_symlinks, now, parse_json, read_json, replace_file, within, write_new)
 
 SCHEMA_VERSION = 10
@@ -348,7 +349,7 @@ class RunStore:
                 raise DevFlowError(f"Refusing to replace a non-file at an artifact place: {relative}")
             replace_file(target, data)
 
-    def record(self, state: dict, relative: str) -> bytes:
+    def record(self, state: dict, relative: str, *, limit: int | None = None) -> bytes:
         """The bytes of one listed record: held for the next save, or on disk and verified.
 
         A terminal report is made in the same save as the run's last records, so a
@@ -358,21 +359,34 @@ class RunStore:
             raise DevFlowError(f"Not a record of this run: {relative}")
         held = state.get("_pending_writes", {})
         if relative in held:
+            if limit is not None and len(held[relative]) > limit:
+                raise DevFlowError(f"Record exceeds {limit} bytes: {relative}")
             return held[relative]
         run = self.run_dir(state["run_id"])
         path = within(run / relative, run)
         no_symlinks(path)
         try:
-            data = path.read_bytes()
+            if limit is None:
+                data = path.read_bytes()
+            else:
+                info = path.stat()
+                if not stat.S_ISREG(info.st_mode):
+                    raise DevFlowError(f"Expected a regular run record: {relative}")
+                if info.st_size > limit:
+                    raise DevFlowError(f"Record exceeds {limit} bytes: {relative}")
+                with path.open("rb") as stream:
+                    data = stream.read(info.st_size + 1)
         except OSError as exc:
             raise DevFlowError(f"Cannot read the record {relative}: {exc}") from exc
+        if limit is not None and len(data) > limit:
+            raise DevFlowError(f"Record exceeds {limit} bytes: {relative}")
         if digest(data) != state["artifacts"][relative]:
             raise DevFlowError(f"Immutable artifact changed or is missing: {relative}; stop and investigate")
         return data
 
     def record_json(self, state: dict, relative: str):
         """A listed JSON record (see ``record``)."""
-        return parse_json(self.record(state, relative), relative)
+        return parse_json(self.record(state, relative, limit=JSON_LIMIT), relative)
 
     def verify_artifacts(self, state: dict) -> None:
         run = self.run_dir(state["run_id"])

@@ -26,7 +26,7 @@ from .common.hosts.diagnostics import MINIMUM_CLAUDE_CODE, claude_version, codex
 from .common.environment import python_errors, version_warnings
 from .common.errors import DevFlowError
 from .common.reviewers import readiness
-from .common.settings import validate_document
+from .common.settings import read_project_settings
 from .workflows import WORKFLOWS
 
 PLUGIN_ROOT = paths.PLUGIN_ROOT
@@ -102,9 +102,9 @@ def doctor(project: Path, host: str) -> dict:
     """Local project-settings readiness for every workflow, with each reviewer CLI checked in the
     project; changes nothing."""
     reports, cache, warnings = {}, {}, []
-    validate_document(project, WORKFLOWS)
+    documents = read_project_settings(project, host, WORKFLOWS)
     for name, workflow in WORKFLOWS.items():
-        config = workflow.load_config(project)
+        config = workflow.load_config(documents)
         reviewers = []
         for provider in config["reviewers"]:
             key = json.dumps({k: v for k, v in provider.items() if k != "timeout_seconds"}, sort_keys=True)
@@ -205,7 +205,7 @@ def main(argv=None) -> int:
             run_id = router.selected_run(project, args.session, command, args.run, host=host)
             if run_id is None:
                 # Without a run, an action reads the current project settings.
-                validate_document(project, WORKFLOWS)
+                args.settings_documents = read_project_settings(project, host, WORKFLOWS)
             emit_result(WORKFLOWS[command].run_command(args, project, run_id, args.session, host))
         return 0
     except Exception as exc:  # noqa: BLE001 - every failure is reported, never retried

@@ -12,8 +12,8 @@ from .config import diagnose
 def doctor(engine, args, run_id, session) -> dict:
     """Check settings and each reviewer CLI in the project, the directory plan reviews start it in;
     probe Codex only for the explicit session owning this run."""
-    frozen = engine.read_frozen_config(run_id) if run_id else None
-    report = diagnose(engine.project, engine.workflow, effective_config=frozen, host=engine.host)
+    config = engine.read_frozen_config(run_id) if run_id else engine.workflow.load_config(args.settings_documents)
+    report = diagnose(engine.project, config, host=engine.host, frozen=bool(run_id))
     reviewers = [readiness(provider, engine.project) for provider in report["config"]["reviewers"]]
     report.update(reviewers=reviewers, reviewer_cwd=str(engine.project),
                   ready=report["ready"] and all(item["ready"] for item in reviewers))

@@ -150,6 +150,17 @@ class WorkspaceStartTests(WorkspaceFixture):
         status = self.start("../feature worktree")
         self.assertTrue(same_path(status["workspace"]["path"], self.worktree))
 
+    def test_host_settings_are_resolved_from_the_project_even_for_a_separate_worktree(self):
+        shared = "devflow.config.claude.json"
+        local = "devflow.config.claude.local.json"
+        atomic_write_json(self.project / shared, {"max_reviews": 8})
+        atomic_write_json(self.project / local, {"max_reviews": 9})
+        (self.worktree / shared).write_text("must not read from the implementation worktree", encoding="utf-8")
+        (self.worktree / local).write_text("must not read from the implementation worktree", encoding="utf-8")
+        status = self.start(str(self.worktree))
+        self.assertEqual(status["config"]["max_reviews"], 9)
+        self.assertTrue(same_path(status["workspace"]["path"], self.worktree))
+
     def test_the_default_workspace_is_the_project(self):
         status = self.start()
         self.assertTrue(same_path(status["workspace"]["path"], self.project))

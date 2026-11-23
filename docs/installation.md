@@ -203,7 +203,7 @@ plugin は offline で動き自動ダウンロードしません。人間が Pyt
 
 ### 面接スキルが見つからない・呼び出せない
 
-`/devflow:doctor` の結果と、Claude Code から利用できるスキルの一覧を確認してください。既定の依存は `grilling` です。別の名前や plugin の名前空間が必要なら、実際に `Skill` ツールから呼べる名前を `devflow.config.json` の `plan.grill_skill` へ指定します。
+`/devflow:doctor` の結果と、Claude Code から利用できるスキルの一覧を確認してください。既定の依存は `grilling` です。別の名前や plugin の名前空間が必要なら、[設定の選択と優先順位](../README.md#プロジェクト設定) を確認し、選ばれた設定の `plan.grill_skill` に、実際に `Skill` ツールから呼べる名前を指定します。
 
 外部スキルに `disable-model-invocation: true` がある場合、DevFlow から自動呼び出しすることはできません。別の読み込み方法や手順の模倣で回避せず、人間が呼び出し可能なスキルを選びます。DevFlow は外部スキルの導入・書き換え・権限変更をしません。Implement だけを使う場合、この依存は不要です。
 
@@ -211,11 +211,11 @@ plugin は offline で動き自動ダウンロードしません。人間が Pyt
 
 ### レビュアーの CLI がフラグを持たないと言われる
 
-`doctor` や `review` が「lacks flags DevFlow passes」と報告した場合、その CLI の版に、DevFlow が渡すフラグがありません。CLI を更新するか、`devflow.config.json` の `command` で別の版を指定してください。この確認はレビューの枠を確保する前に行うので、回数は減りません。
+`doctor` や `review` が「lacks flags DevFlow passes」と報告した場合、その CLI の版に、DevFlow が渡すフラグがありません。CLI を更新するか、[設定の選択と優先順位](../README.md#プロジェクト設定) に従って、有効なレビュアー一覧を指定する設定ファイルの `command` を直し、新しい run を開始してください。この確認はレビューの枠を確保する前に行うので、回数は減りません。
 
 ### 設定の知らない項目のエラー
 
-`Invalid reviewer fields (unknown: …)` と表示された場合は、示された項目を `devflow.config.json` から消してください。0.4.0 でなくなった項目は、README の「0.4.0 への更新」にあります。
+`Invalid reviewer fields (unknown: …)` と表示された場合は、診断に表示された設定ファイルから該当項目を取り除いてください。0.4.0 でなくなった項目は、README の「0.4.0 への更新」にあります。
 
 ### テストが自動実行されない
 
@@ -246,7 +246,7 @@ error: uv trampoline failed to spawn Python child process
 
 影響はレビュアーが自分で Python を使って確かめるときだけです。`implement.checks` は DevFlow がサンドボックスの外で実行するので、影響を受けません。WSL2 の Codex は Linux のサンドボックスを使うので、この設定の影響を受けません。
 
-**対処（確認済み）**: プロジェクト直下の `devflow.config.local.json` で、DevFlow のレビュアーの Codex にだけ `unelevated` のサンドボックスを使います。対話で使う Codex の `sandbox = "elevated"` は、そのまま残せます。
+**対処（確認済み）**: プロジェクト直下で選ばれるローカル設定で、DevFlow のレビュアーの Codex にだけ `unelevated` のサンドボックスを使います。対話で使う Codex の `sandbox = "elevated"` は、そのまま残せます。
 
 ```json
 {
@@ -262,8 +262,8 @@ error: uv trampoline failed to spawn Python child process
 
 - `command` の後ろに DevFlow の引数（`exec …`）がつながります。Codex の `-c` は `exec` の前に置いても効きます。
 - `reviewers` の配列は丸ごと置き換わります。使うレビュアーをすべて書いてください。
-- ローカルの共通の `reviewers` は、共有の `devflow.config.json` の `implement.reviewers` より優先されます。Implement で別の顔ぶれを使うなら、ローカルの `implement.reviewers` にも同じように書きます。
-- 利用者自身で `.gitignore` に `/devflow.config.local.json` を加えてください。
+- ローカルの共通の `reviewers` は、選ばれた共有設定の `implement.reviewers` より優先されます。Implement で別の顔ぶれを使うなら、ローカルの `implement.reviewers` にも同じように書きます。
+- 利用者自身で、共通名と全ホスト専用ローカル名を `.gitignore` に追加してください。名前とスナップショット・配布の扱いは [ローカル設定の除外](../README.md#ローカル設定の除外) にあります。
 - `unelevated` は、利用者のアカウントから作った権限の低いトークンで動きます。OpenAI の資料では、`elevated` よりネットワークの隔離が弱く、読み取りを禁止する場所の指定も使えないとされています。
 
 **別の対処（未確認）**: Python を全ユーザーが読める場所に入れ直します。uv なら、管理者の PowerShell で次を実行し、新しいターミナルを開きます。これで `elevated` のまま動くかは、まだ確かめていません。
@@ -337,8 +337,7 @@ Claude レビュアーを使う場合は command: ["claude"], model: "opus", eff
 Windows では .cmd / .bat のレビュアーを起動しません。npm の claude.cmd ではなく
 ネイティブ版 Claude を導入してください。設定ファイルの例と優先順位は README を参照してください。
 
-ローカルの切り替えにはプロジェクト直下の devflow.config.local.json を使い、利用者自身で
-.gitignore に /devflow.config.local.json を加えます。POSIX は umask 077 / chmod 600、
+ローカルの切り替えにはプロジェクト直下で選ばれる共通名またはホスト専用名のローカル設定を使います。利用者自身で、共通名と全ホスト専用ローカル名を `.gitignore` に追加してください。[ローカル設定の除外](../README.md#ローカル設定の除外) を参照してください。POSIX は umask 077 / chmod 600、
 Windows は所有者だけのアクセス権を推奨します。利用者のファイルを自動作成・編集しません。
 
 0.8.0 は run 形式10・セッション形式3です。0.7.x の進行中 run は更新前に終えてください。

@@ -1,6 +1,7 @@
 """Implement workflow engine: only Claude edits project code; the runner keeps score."""
 from __future__ import annotations
 
+from itertools import chain
 from pathlib import Path, PurePosixPath
 
 import subprocess
@@ -41,6 +42,13 @@ def _plan_bytes(path: Path, limit: int) -> bytes:
     if not text.lstrip("\ufeff").strip() or "\x00" in text:
         raise DevFlowError("Input plan must be nonempty UTF-8 text without NUL")
     return data
+
+
+def _check_legacy_config_paths(paths) -> None:
+    for path in paths:
+        if snapshot.host_config_path(path):
+            raise DevFlowError(f"Prior snapshot scope contains newly excluded DevFlow settings: {path!r}. "
+                               "Preserve this run and its work, then cancel and restart as described in the README.")
 
 
 class Engine(RunEngine):
@@ -94,9 +102,10 @@ class Engine(RunEngine):
             self._require(state,{"implementing","ready_check","ready_review"})
             self._verify(state)
             summary = checked_text(self._draft(state, summary_file), 256*1024)
+            baseline = read_json(self._run(run_id)/"baseline.json")
+            _check_legacy_config_paths(chain(state["config"]["snapshot"]["context_paths"], baseline["files"]))
             workspace = self._workspace(state)
             current = snapshot.capture(workspace,state["config"])
-            baseline = read_json(self._run(run_id)/"baseline.json")
             # The changes and their diff are written once; no listing or contents are copied.
             record = snapshot.changes(baseline,current)
             diff = snapshot.diff(workspace,self._run(run_id),baseline,current,record)
@@ -189,10 +198,68 @@ class Engine(RunEngine):
             if state["check_attempts"] >= state["config"]["max_check_attempts"]:
                 self._escalate(state,"check_budget",["Checks continue to fail. Determine the cause and authorize another bounded attempt, or cancel."],"implementing","Check attempt limit reached")
 
-    def _packet(self,state,current,workspace,diff_path):
+    def _review_snapshot_records(self, state):
+        """Check the snapshot scope of every record whose content may be sent to a reviewer."""
+        candidate = state.get("candidate")
+        if not candidate:
+            raise DevFlowError("Create a checkpoint first")
+
+        artifacts = {"config.json", "plan.md", candidate["diff"], candidate["summary"], *state["reflections"]}
+        validation_path = (state.get("validation") or {}).get("path")
+        if validation_path:
+            artifacts.add(validation_path)
+
+        def read(relative):
+            value = self.store.record_json(state, relative)
+            artifacts.add(relative)
+            return value
+
+        def check(record):
+            _check_legacy_config_paths(change["path"] for change in record["changes"])
+
+        checkpoint_ids = {}
+
+        def checkpoint(path, expected_id):
+            record = read(path) if path not in checkpoint_ids else None
+            if record is not None:
+                checkpoint_ids[path] = record["snapshot_id"]
+            if checkpoint_ids[path] != expected_id:
+                raise DevFlowError(f"Checkpoint record does not match the referenced snapshot ID: {path}")
+            if record is not None:
+                check(record)
+            return record
+
+        baseline = read("baseline.json")
+        _check_legacy_config_paths(chain(state["config"]["snapshot"]["context_paths"], baseline["files"]))
+        start_commit = (baseline.get("git") or {}).get("head")
+        del baseline
+        record = checkpoint(candidate["path"], candidate["snapshot_id"])
+        for attempt in state["attempts"]:
+            # Reflections describe a review whose result is also sent in the packet.
+            if not attempt.get("review_path"):
+                continue
+            artifacts.add(attempt["review_path"])
+            checkpoint(attempt["snapshot_path"], attempt["snapshot_id"])
+
+        resolutions = [read(path) for path in state["resolutions"]]
+        pending = {item["snapshot_id"] for item in resolutions if item.get("snapshot_id") is not None}
+        pending.difference_update(checkpoint_ids.values())
+        for number in range(1, state["checkpoint_count"] + 1):
+            if not pending:
+                break
+            path = f"snapshots/{number:03}.json"
+            if path not in checkpoint_ids:
+                previous = read(path)
+                if previous["snapshot_id"] in pending:
+                    check(previous)
+                    pending.remove(previous["snapshot_id"])
+        if pending:
+            raise DevFlowError("Cannot verify the checkpoint for a prior human decision; stop and investigate.")
+        return start_commit, record, resolutions, {path: state["artifacts"][path] for path in artifacts}
+
+    def _packet(self,state,current,workspace,diff_path,start_commit,record,resolutions):
         """Review data only: the reviewer reads the code itself, from the workspace and the diff file."""
         run = self._run(state["run_id"])
-        record = read_json(run/state["candidate"]["path"])
         for path in state["config"]["snapshot"]["context_paths"]:
             if path not in current["files"] or current["files"][path].get("binary"):
                 raise DevFlowError(f"Context path must name an included text file: {path}")
@@ -207,7 +274,7 @@ class Engine(RunEngine):
         mode = state["config"]["snapshot"]["mode"]
         value = {"schema_version":2,"kind":"code_review","snapshot_id":current["snapshot_id"],
             "workspace":{"path":str(workspace),"mode":mode,"branch":branch(workspace,mode),
-                         "start_commit":(read_json(run/"baseline.json").get("git") or {}).get("head")},
+                         "start_commit":start_commit},
             "plan":(run/"plan.md").read_bytes().decode("utf-8"),"plan_path":str(run/"plan.md"),
             "plan_sha256":state["artifacts"]["plan.md"],"baseline_id":state["baseline_id"],
             "implementation_summary":checked_text(run/state["candidate"]["summary"]),
@@ -217,26 +284,33 @@ class Engine(RunEngine):
             "validation":state["validation"],"check_results":check_results,
             "binary_attestation":state.get("binary_attestation"),"previous_reviews":history,
             "reflections":[read_json(run/p) for p in state["reflections"]],
-            "human_resolutions":[read_json(run/p) for p in state["resolutions"]]}
+            "human_resolutions":resolutions}
         data = json_bytes(value)
         if len(data) > state["config"]["snapshot"]["max_packet_bytes"]:
             raise DevFlowError("Review packet exceeds configured limit. Do not silently truncate; narrow the plan/scope or explicitly configure a larger limit for a new run")
         return data
 
     def review(self,run_id,session_id):
-        state = self._state(run_id)
-        self._owner(state,session_id)
-        self._require(state,{"ready_review"})
+        initial = self._state(run_id)
+        self._owner(initial,session_id)
+        self._require(initial,{"ready_review"})
+        start_commit, record, resolutions, digests = self._review_snapshot_records(initial)
         # At the review limit no reviewer starts; the request asks the human instead.
-        provider = (next_reviewer(state["config"]["reviewers"],len(state["attempts"]),state["review_limit"])
-                    if len(state["attempts"]) < state["review_limit"] else None)
+        provider = (next_reviewer(initial["config"]["reviewers"],len(initial["attempts"]),initial["review_limit"])
+                    if len(initial["attempts"]) < initial["review_limit"] else None)
         # A missing or unsupported reviewer CLI must not consume an attempt. The CLI checks
         # the verified workspace, the directory the review starts it in; prepare verifies it
         # again under the lock.
-        probe = preflight(provider, cwd=self._workspace(state)) if provider else None
+        probe = preflight(provider, cwd=self._workspace(initial)) if provider else None
 
         def prepare(state):
             self._owner(state,session_id)
+            review_inputs = ("baseline_id", "candidate", "checkpoint_count", "attempts", "resolutions", "reflections",
+                             "validation", "config", "workspace", "review_limit")
+            if (any(state[key] != initial[key] for key in review_inputs)
+                    or any(state["artifacts"].get(path) != expected for path, expected in digests.items())):
+                raise DevFlowError("The run changed during the reviewer check; inspect status and retry "
+                                   "when the current checkpoint is ready for review")
             self._require(state,{"ready_review"})
             # The workspace is verified first, so the question names only approvals
             # of the code that is actually there.
@@ -256,7 +330,7 @@ class Engine(RunEngine):
             diff_path = self._run(run_id)/state["candidate"]["diff"]
             # _current has just verified the workspace.
             workspace = Path(state["workspace"]["path"])
-            packet = self._packet(state,current,workspace,diff_path)
+            packet = self._packet(state,current,workspace,diff_path,start_commit,record,resolutions)
             prepared = prepare_review(provider, packet, self._run(run_id)/"review-processes"/f"{number:02}",
                                       self.resources/"review.schema.json", self.resources/"reviewer.md", cwd=workspace,
                                       probe=probe)

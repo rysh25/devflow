@@ -1,11 +1,11 @@
 """Strict project configuration, frozen for the lifetime of a run."""
 from __future__ import annotations
 import copy
-from pathlib import Path
 from ..common.errors import DevFlowError
 from ..common.review import validate_limit
-from ..common.settings import load_workflow_config, validate_reviewers
+from ..common.settings import SettingsDocument, load_workflow_config, validate_reviewers
 from .checks import validate_checks
+from .snapshot import validate_patterns
 
 
 #: The snapshot settings; the scope's size is never limited.
@@ -35,7 +35,7 @@ def validate_config(value: dict) -> dict:
                            + (" (unknown: " + ", ".join(sorted(unknown)) + ")" if unknown else "")
                            + (" (missing: " + ", ".join(sorted(missing)) + ")" if missing else "")
                            + "; see the project settings in the DevFlow README")
-    if snapshot["mode"] not in {"git", "files"}:
+    if not isinstance(snapshot["mode"], str) or snapshot["mode"] not in {"git", "files"}:
         raise DevFlowError("snapshot.mode must explicitly be git or files")
     for field in ("include", "exclude", "context_paths"):
         if not isinstance(snapshot[field], list) or any(not isinstance(x, str) or not x or "\x00" in x for x in snapshot[field]):
@@ -50,5 +50,6 @@ def validate_config(value: dict) -> dict:
     return copy.deepcopy(value)
 
 
-def load_config(project: Path, workflow) -> dict:
-    return load_workflow_config(project, workflow, validate_config)
+def load_config(documents: tuple[SettingsDocument, ...], workflow) -> dict:
+    return load_workflow_config(documents, workflow, validate_config,
+                                validate_dedicated=lambda config: validate_patterns(config["snapshot"]))

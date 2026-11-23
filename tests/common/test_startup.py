@@ -1,6 +1,4 @@
 import copy
-from pathlib import Path
-import tempfile
 import unittest
 
 from devflow_core.common.errors import DevFlowError
@@ -11,8 +9,7 @@ from devflow_core.workflows import WORKFLOWS
 
 class StartupTests(unittest.TestCase):
     def config(self):
-        with tempfile.TemporaryDirectory() as folder:
-            return WORKFLOWS["plan"].load_config(Path(folder).resolve())
+        return WORKFLOWS["plan"].load_config(())
 
     def test_boundary_and_unicode_whitespace_preserve_plan_body(self):
         raw = '--reviewer claude opus high --reviewer codex gpt-6.1-sol xhigh --   REVIEW-42 を計画して  \n'
