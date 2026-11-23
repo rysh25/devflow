@@ -16,6 +16,7 @@ REVIEWER_KINDS = frozenset({"codex", "opencode", "claude", "devin"})
 REVIEWER_FIELDS = frozenset({"id", "kind", "command", "model", "effort", "timeout_seconds"})
 REVIEWER_REQUIRED = REVIEWER_FIELDS
 CONFIG_FILES = ("devflow.config.json", "devflow.config.local.json")
+SHARED_SETTINGS = ("reviewers", "max_reviews", "auto_accept_at_review_limit")
 
 
 def _host_config_names(host: str) -> tuple[str, str]:
@@ -46,7 +47,7 @@ def _check_writable(value) -> None:
 
 def read_project_settings(project: Path, host: str, workflows) -> tuple[SettingsDocument, ...]:
     """Select and validate one document per layer, shared first. The caller supplies the workflow registry."""
-    allowed = {"schema_version", "reviewers", "max_reviews", *workflows}
+    allowed = {"schema_version", *SHARED_SETTINGS, *workflows}
     documents = []
     for common, dedicated in zip(CONFIG_FILES, _host_config_names(validate_host(host))):
         for name in (dedicated, common):
@@ -84,7 +85,7 @@ def read_project_settings(project: Path, host: str, workflows) -> tuple[Settings
 
 
 def _layers(document: dict, workflow: str):
-    return ({key: document[key] for key in ("reviewers", "max_reviews") if key in document},
+    return ({key: document[key] for key in SHARED_SETTINGS if key in document},
             document.get(workflow, {}))
 
 

@@ -88,6 +88,7 @@ def run_bounded(argv: list[str], *, cwd: Path | None, timeout: float, env: dict 
     sinks = {"stdout": stdout, "stderr": stderr}
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     ended = {"stdout": threading.Event(), "stderr": threading.Event()}
+    fed = threading.Event()  # Set once the feeder has closed stdin; an interrupted join cannot fake it.
     chunks = {name: queue.SimpleQueue() for name, sink in sinks.items() if sink is not None}
     lock = threading.Lock()
     errors: list[str] = []
@@ -131,7 +132,16 @@ def run_bounded(argv: list[str], *, cwd: Path | None, timeout: float, env: dict 
         except (BrokenPipeError, OSError):
             pass
         finally:
-            process.stdin.close()
+            # Closing the buffered stream can retry the flush; an expected
+            # broken pipe there is not a retained pipe either. ``fed`` is set
+            # whatever happens, so the grace check never mistakes an exited
+            # feeder for a blocked one.
+            try:
+                process.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+            finally:
+                fed.set()
 
     timed_out = False
     readers: list[threading.Thread] = []
@@ -139,6 +149,7 @@ def run_bounded(argv: list[str], *, cwd: Path | None, timeout: float, env: dict 
     feeder = None
     reading = []  # Readers that started; an unstarted thread's ``ended`` event is never set.
     draining = []  # Writers that started; they get their queue's end and a join.
+    feeding = []  # The feeder once started; an unstarted one is never blocked on the pipe.
 
     def finish_writers() -> None:
         """Let started writers drain what arrived before the caller closes the logs."""
@@ -154,7 +165,18 @@ def run_bounded(argv: list[str], *, cwd: Path | None, timeout: float, env: dict 
         writers = {name: threading.Thread(target=write, args=(name,), daemon=True) for name in chunks}
         feeder = threading.Thread(target=feed, daemon=True) if data is not None else None
         for thread in [*readers, *writers.values(), *([feeder] if feeder else [])]:
-            thread.start()
+            if thread is feeder:
+                # Registered before start: an interrupt during startup can land
+                # after the feeder began writing, and it must still be checked.
+                feeding.append(thread)
+            try:
+                thread.start()
+            except BaseException:
+                if thread is feeder and feeder.ident is None:
+                    # start() raised before the worker began: nothing will feed
+                    # stdin or set the completion event, so it cannot hold a pipe.
+                    feeding.remove(thread)
+                raise
             if thread in readers:
                 reading.append("stdout" if thread is readers[0] else "stderr")
             elif thread is not feeder:
@@ -165,7 +187,41 @@ def run_bounded(argv: list[str], *, cwd: Path | None, timeout: float, env: dict 
                 stop_tree(process)
                 break
             time.sleep(0.01)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            stop_tree(process)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired as exc:
+                finish_writers()
+                raise ProcessCleanupError(
+                    "A child process did not terminate; stop it manually before continuing") from exc
+        # A descendant that keeps a pipe open is noticed by the pipe not ending,
+        # never by DevFlow's own writes being slow.
+        deadline = time.monotonic() + PIPE_GRACE_SECONDS
+        retained = not all(event.wait(max(0.0, deadline - time.monotonic())) for event in ended.values())
+        if feeder is not None:
+            retained = retained or not fed.wait(max(0.0, deadline - time.monotonic()))
+        if retained:
+            stop_tree(process)
+            for thread in [*readers, *([feeder] if feeder else [])]:
+                thread.join(timeout=1)
+        for name, writer in writers.items():
+            if not ended[name].is_set():
+                chunks[name].put(None)  # The pipe never ended even after the stop: write what arrived.
+            writer.join()
+        with lock:
+            out, err = bytes(buffers["stdout"]), bytes(buffers["stderr"])
+    except ProcessCleanupError:
+        # The inner did-not-terminate failure propagates exactly as before;
+        # the generic handler would otherwise clean up (and wait) a second time.
+        raise
     except BaseException as exc:
+        # The same cleanup covers everything after the launch: the monitor
+        # loop, the exit confirmation, the pipe/thread waits and the output
+        # collection. A confirmed stop re-raises the interrupt; without it a
+        # cleanup error keeps the interrupt as its cause.
         stop_tree(process)
         try:
             process.wait(timeout=5)
@@ -173,9 +229,12 @@ def run_bounded(argv: list[str], *, cwd: Path | None, timeout: float, env: dict 
             finish_writers()
             raise ProcessCleanupError(
                 "A child process did not terminate; stop it manually before continuing") from exc
-        # A descendant that keeps a pipe open is noticed by the pipe not ending.
+        # A descendant that keeps a pipe open is noticed by the pipe not ending;
+        # a feeder still writing to stdin counts the same way.
         deadline = time.monotonic() + PIPE_GRACE_SECONDS
         retained = not all(ended[name].wait(max(0.0, deadline - time.monotonic())) for name in reading)
+        if feeding:
+            retained = retained or not fed.wait(max(0.0, deadline - time.monotonic()))
         if retained:
             stop_tree(process)
         finish_writers()
@@ -184,34 +243,24 @@ def run_bounded(argv: list[str], *, cwd: Path | None, timeout: float, env: dict 
                 "A child process's descendants kept its output pipes open; "
                 "stop them manually before continuing") from exc
         raise
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        stop_tree(process)
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired as exc:
-            finish_writers()
-            raise ProcessCleanupError("A child process did not terminate; stop it manually before continuing") from exc
-    # A descendant that keeps a pipe open is noticed by the pipe not ending,
-    # never by DevFlow's own writes being slow.
-    deadline = time.monotonic() + PIPE_GRACE_SECONDS
-    retained = not all(event.wait(max(0.0, deadline - time.monotonic())) for event in ended.values())
-    if feeder is not None:
-        feeder.join(max(0.0, deadline - time.monotonic()))
-        retained = retained or feeder.is_alive()
-    if retained:
-        stop_tree(process)
-        for thread in [*readers, *([feeder] if feeder else [])]:
-            thread.join(timeout=1)
-    for name, writer in writers.items():
-        if not ended[name].is_set():
-            chunks[name].put(None)  # The pipe never ended even after the stop: write what arrived.
-        writer.join()
-    with lock:
-        out, err = bytes(buffers["stdout"]), bytes(buffers["stderr"])
     return Completed(process.returncode, out, err, timed_out, retained,
                      errors[0] if errors else None, round(time.monotonic() - started, 4))
+
+
+def cleanup_failure(exc: BaseException | None) -> ProcessCleanupError | None:
+    """The cleanup failure inside a wrapped error's cause chain, or None.
+
+    Wrappers (``run_git``, ``verify_workspace``) keep a ``ProcessCleanupError``
+    as a cause rather than changing their own type, so the check follows
+    ``__cause__`` and never compares messages.
+    """
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        if isinstance(exc, ProcessCleanupError):
+            return exc
+        seen.add(id(exc))
+        exc = exc.__cause__
+    return None
 
 
 def reraise_wrapped_cause(exc: ProcessCleanupError) -> None:

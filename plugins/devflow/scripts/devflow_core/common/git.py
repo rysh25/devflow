@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 import shutil
 
-from .errors import DevFlowError
+from .errors import DevFlowError, ProcessCleanupError
 from .process import run_bounded
 
 #: Arguments every call gets: no pager, no index refresh, no fsmonitor hook.
@@ -59,10 +59,17 @@ def run_git(root: Path, *args: str, ok_codes: tuple[int, ...] = (0,), timeout: f
     """
     command = [git_executable(), *BASE_ARGS, "-C", str(root), *args]
     result = run_bounded(command, cwd=Path(root), timeout=timeout, env=git_environment(), data=data)
+    # Retained pipes mean a descendant may still run: callers that need the
+    # distinction find a typed ProcessCleanupError in the cause, while every
+    # caller keeps the same DevFlowError and message — also when a timeout is
+    # reported alongside, which keeps the cleanup information too.
+    cleanup = (ProcessCleanupError("A child process's descendants kept its output pipes open; "
+                                   "stop them manually before continuing")
+               if result.retained_pipes else None)
     if result.timed_out:
-        raise DevFlowError(f"Cannot inspect Git repository: git exceeded {timeout:g} seconds")
+        raise DevFlowError(f"Cannot inspect Git repository: git exceeded {timeout:g} seconds") from cleanup
     if result.retained_pipes:
-        raise DevFlowError("Cannot inspect Git repository: a descendant retained output pipes")
+        raise DevFlowError("Cannot inspect Git repository: a descendant retained output pipes") from cleanup
     if result.output_error:
         raise DevFlowError("Cannot inspect Git repository: " + result.output_error)
     if result.exit_code not in ok_codes:

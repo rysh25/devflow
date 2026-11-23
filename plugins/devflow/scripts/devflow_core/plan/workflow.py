@@ -6,7 +6,8 @@ import re
 
 from ..common.errors import UsageError
 from ..common.hosts import host_profile
-from ..common.review import after_failed_review, check_review_budget, check_review_config, review_budget
+from ..common.review import (after_failed_review, check_auto_accepted, check_review_budget,
+                             check_review_config, review_budget)
 from ..common.runs import TERMINAL
 from ..common.settings import SettingsDocument
 from ..common.storage import json_bytes, now
@@ -82,6 +83,7 @@ class PlanWorkflow(Workflow):
     def check_state(self, state: dict) -> None:
         check_review_config(state["config"])
         check_review_budget(state, state["review_count"])
+        check_auto_accepted(state)
 
     def can_transfer(self, state: dict, session: str) -> str | None:
         unsealed = "interview.json" not in state["artifacts"]

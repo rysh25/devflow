@@ -1,5 +1,6 @@
 {
   "schema_version": 1,
+  "auto_accept_at_review_limit": false,
   "max_reviews": 6,
   "max_check_attempts": 3,
   "max_plan_bytes": 1048576,

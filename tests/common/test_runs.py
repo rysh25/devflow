@@ -387,6 +387,7 @@ class RunStoreTests(unittest.TestCase):
     def test_the_end_time_is_set_once_when_a_run_first_ends(self):
         self.assertIsNone(self.state["finished_at"])
         self.assertIn("accepted", runs.TERMINAL)
+        self.assertIn("auto_accepted", runs.TERMINAL)
         seen = {}
         # The end time is there before before_save, so a terminal report can use it.
         with patch.object(Toy, "before_save", lambda workflow, store, state: seen.update(at=state["finished_at"])):

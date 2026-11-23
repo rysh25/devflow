@@ -17,8 +17,9 @@ from unittest.mock import patch
 from devflow_core import router
 from devflow_core.common import sessions
 from devflow_core.common.errors import DevFlowError
+from devflow_core.common.review import AUTO_ACCEPTANCE, auto_acceptance
 from devflow_core.common.runs import TERMINAL, RunStore
-from devflow_core.common.storage import atomic_write_json, read_json
+from devflow_core.common.storage import atomic_write_json, json_bytes, read_json
 from devflow_core.implement import WORKFLOW
 from devflow_core.implement.engine import Engine
 from devflow_core.workflows import WORKFLOWS
@@ -125,6 +126,12 @@ class Fixture(unittest.TestCase):
             # A real run never leaves a terminal status; the fixture does, so its end time goes too.
             if status not in TERMINAL:
                 state["finished_at"] = None
+            elif status == "auto_accepted":
+                # What a real auto-accept commits with the status: the enabled
+                # frozen setting and its evidence record.
+                state["config"]["auto_accept_at_review_limit"] = True
+                self.store.stage(state, AUTO_ACCEPTANCE, json_bytes(
+                    auto_acceptance(state, len(state["attempts"]), "fixture-snapshot", False)))
             state["inflight"] = ({"kind": "check", "number": 1, "reviewer_id": None, "target": "fixture",
                                   "started_at": "2026-11-01T12:34:56+00:00"}
                                  if status in WORKFLOW.inflight_statuses else None)

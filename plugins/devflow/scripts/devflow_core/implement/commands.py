@@ -70,7 +70,7 @@ COMMANDS = (
     Command("checkpoint", "Freeze the current code and an implementation summary",
             lambda e, a, run, s: e.checkpoint(run, s, a.summary_file), (Option("--summary-file", "draft"),)),
     Command("check", "Run the frozen, pre-approved project checks once", lambda e, a, run, s: e.check(run, s)),
-    Command("review", "Dispatch the next reviewer and reserve one attempt; at the review limit, ask the human instead",
+    Command("review", "Dispatch the next reviewer and reserve one attempt; at the review limit, accept by the run's frozen setting or ask the human instead",
             lambda e, a, run, s: e.review(run, s)),
     Command("reflect", "Record a disposition for every finding of the last review",
             lambda e, a, run, s: e.reflect(run, s, a.decisions_file), (Option("--decisions-file", "draft"),)),

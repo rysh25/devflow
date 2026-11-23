@@ -11,8 +11,9 @@ from uuid import uuid4
 from ..common.errors import CaptureError, DevFlowError
 from ..common.hosts import host_profile
 from ..common.paths import path_key
-from ..common.review import (LIMIT_DECISIONS, REVIEW_BUDGET, after_review_failure, all_approved, ask_at_limit, decide_at_limit,
-                             next_reviewer)
+from ..common.review import (AUTO_ACCEPTANCE, LIMIT_DECISIONS, REVIEW_BUDGET, after_review_failure, all_approved,
+                             ask_at_limit, auto_acceptance, check_auto_accept, check_auto_acceptance,
+                             decide_at_limit, next_reviewer)
 from ..common.reviewers import preflight, prepare_review, recorded_cli_version, review_tokens, run_review
 from ..common.engine import RunEngine
 from ..common.runs import RUNNER_WAIT, TERMINAL, ensure_data_root, open_escalation
@@ -52,6 +53,9 @@ def count_lines(before: str, after: str) -> tuple[int, int]:
 
 ACCEPTED_WARNING = ("Accepted by the human at the review limit without approval from every reviewer. "
                     "Inspect remaining findings and whether the final revision was reviewed.")
+AUTO_ACCEPTED_WARNING = ("Accepted by configuration (auto_accept_at_review_limit) at the review limit "
+                         "without approval from every reviewer. "
+                         "Inspect remaining findings and whether the final revision was reviewed.")
 
 
 def _matches(path: Path, expected: str) -> bool:
@@ -101,6 +105,31 @@ def human_decisions(state: dict, read) -> tuple[list[dict], dict | None]:
             acceptance = {"event_ids": answer["event_ids"], "answer": answer["answer"], "version": answer.get("plan_hash"),
                           "accepted_at": answer.get("created_at"), "record": answer_path}
     return decisions, acceptance
+
+
+def _auto_acceptance_entry(state: dict, store) -> dict | None:
+    """The summary entry of a committed auto-acceptance record, verified, or None.
+
+    The record must still name the current plan and the same reviewed/unreviewed
+    fact the state holds — and the frozen config record and the registered
+    current-plan artifact must be exactly what was accepted. A record that
+    disagrees is reported through the caller, never presented as the basis of
+    acceptance.
+    """
+    if AUTO_ACCEPTANCE not in state["artifacts"]:
+        return None
+    record = check_auto_acceptance(state, state["review_count"], store.record_json(state, AUTO_ACCEPTANCE))
+    stored = store.record_json(state, "config.json")
+    check_auto_accept(stored)
+    current = state.get("current_plan")
+    if (stored != state["config"]
+            or not current or state["artifacts"].get(current) != state["plan_hash"]
+            or record["version"] != state["plan_hash"]
+            or record["version_reviewed"] != bool(state["final_plan_reviewed"])):
+        raise DevFlowError("Invalid or mismatched auto-acceptance record")
+    store.record(state, current)  # The registered current plan exists and hashes to the accepted version.
+    return {"record": AUTO_ACCEPTANCE, "source": record["source"], "version": record["version"],
+            "accepted_at": record["accepted_at"], "version_reviewed": record["version_reviewed"]}
 
 
 def summary_source(store, state: dict) -> dict:
@@ -161,7 +190,7 @@ def summary_source(store, state: dict) -> dict:
                        "timeout_seconds": r["timeout_seconds"]} for r in state["config"]["reviewers"]],
         "current_version": current, "latest_version_reviewed": bool(state["final_plan_reviewed"]),
         "approving_current": approving, "reviews": reviews, "human_decisions": decisions,
-        "human_acceptance": acceptance}
+        "human_acceptance": acceptance, "auto_acceptance": _auto_acceptance_entry(state, store)}
 
 
 class Engine(RunEngine):
@@ -307,7 +336,8 @@ class Engine(RunEngine):
             approved = {item["provider"] for item in state["passes"] if item["plan_hash"] == state["plan_hash"]}
             if ask_at_limit(state, state["review_count"], approved, state["plan_hash"],
                             lambda reason, questions: self._escalate(
-                                state, {"reason": reason, "questions": questions}, "ready", REVIEW_BUDGET)):
+                                state, {"reason": reason, "questions": questions}, "ready", REVIEW_BUDGET),
+                            auto_accept=lambda: self._auto_accept(state)):
                 return None
             if next_reviewer(state["config"]["reviewers"], state["review_count"], state["review_limit"]) != provider:
                 raise DevFlowError("The run changed during the reviewer check; inspect status and retry.")
@@ -327,6 +357,30 @@ class Engine(RunEngine):
         return self._dispatch(run_id, "reviewing", "review", prepare, execute,
                               lambda state, reservation, work, result, error:
                               self._finish_review(state, reservation, work["dir"], provider, result, error))
+
+    def _auto_accept(self, state: dict) -> bool:
+        """Whether this run ends itself at the review limit, as ``auto_accepted``.
+
+        Called inside the run lock during ``review`` preparation, only when the
+        frozen ``auto_accept_at_review_limit`` is set and the limit is reached.
+        Needs at least one finalized, hash-verified successful review, and the
+        current plan must be the verified immutable file its hash names — a
+        missing or mismatched plan is an error, publication enabled or not.
+        The final version may be unreviewed; the evidence records whether it was.
+        """
+        read = lambda relative: self.store.record_json(state, relative)
+        if not any(outcome == "succeeded" for _, _, outcome, _ in review_records(state, read)):
+            return False
+        current = state["current_plan"]
+        if not current or state["artifacts"].get(current) != state["plan_hash"]:
+            raise DevFlowError("The current plan record is missing or does not match the plan hash; "
+                               "configuration cannot accept it.")
+        self.store.record(state, current)  # Verified, hash-matched immutable bytes.
+        self._artifact(state, AUTO_ACCEPTANCE, json_bytes(
+            auto_acceptance(state, state["review_count"], state["plan_hash"],
+                            bool(state["final_plan_reviewed"]))))
+        state["status"] = "auto_accepted"
+        return True
 
     def _finish_review(self, state: dict, reservation: dict, relative_dir: str, provider: dict,
                        result: dict | None, error: BaseException | None) -> None:
@@ -539,8 +593,12 @@ class Engine(RunEngine):
                         and all_approved(state["config"]["reviewers"], approvals, state["plan_hash"]))
             accepted = (state["status"] == "accepted" and acceptance is not None
                         and acceptance["version"] == state["plan_hash"])
-            if not (reviewed or accepted):
+            auto = _auto_acceptance_entry(state, self.store)
+            auto_accepted = (state["status"] == "auto_accepted" and auto is not None
+                             and auto["version"] == state["plan_hash"])
+            if not (reviewed or accepted or auto_accepted):
                 raise DevFlowError("Only the identical plan approved by every reviewer, or the plan the human "
+                                   "accepted at the review limit, or the plan the run's frozen setting "
                                    "accepted at the review limit, can be published.")
             if not state["config"]["publish"]["enabled"]:
                 return self.status(run_id)
@@ -614,17 +672,21 @@ class Engine(RunEngine):
                         raise DevFlowError("The exported approval record changed during publication.")
                     # Whether a receipt exists is decided by the committed records, never by a
                     # file a stopped save may have left.
+                    basis = "reviewers" if reviewed else ("config" if auto_accepted else "human")
                     if "publication.json" in state["artifacts"]:
                         receipt = read_json(run / "publication.json")
                         if (receipt.get("path") != publication["path"] or receipt.get("plan_hash") != state["plan_hash"]
-                                or receipt.get("approval_path") != publication["approval_path"]):
+                                or receipt.get("approval_path") != publication["approval_path"]
+                                or receipt.get("approval") != basis):
                             raise DevFlowError("The existing publication receipt does not match this target.")
                     else:
                         receipt = {"schema_version": 2, "run_id": run_id, "path": publication["path"],
                                    "approval_path": publication["approval_path"], "plan_hash": state["plan_hash"],
                                    # The time written in the approval record.
                                    "published_at": publication["intent_at"],
-                                   "approval": "reviewers" if reviewed else "human"}
+                                   # Whether the current version saw a review before it was published.
+                                   "version_reviewed": bool(state["final_plan_reviewed"]),
+                                   "approval": basis}
                         self._artifact(state, "publication.json", json_bytes(receipt))
                     publication.update(status="published", published_at=receipt["published_at"])
                     publication.pop("error", None)
@@ -668,7 +730,10 @@ class Engine(RunEngine):
     def _approval_record(self, state: dict, publication: dict, acceptance: dict | None) -> str:
         """The approval record published beside the plan (fixed English Markdown)."""
         remaining = summary.build(summary_source(self.store, state), now())["remaining_findings"]["count"]
-        if state["status"] == "accepted":
+        if state["status"] == "auto_accepted":
+            approval = "config"
+            approved_by = "config (auto_accept_at_review_limit)"
+        elif state["status"] == "accepted":
             approval = "human"
             approved_by = f"human (AskUserQuestion answer event {', '.join(acceptance['event_ids'])})"
         else:
@@ -688,6 +753,9 @@ class Engine(RunEngine):
                  f"- Last version reviewed: {'yes' if state['final_plan_reviewed'] else 'no'}"]
         if approval == "human":
             lines.append("- Note: accepted by the human at the review limit, not approved by every reviewer.")
+        elif approval == "config":
+            lines.append("- Note: accepted by configuration (auto_accept_at_review_limit) at the review limit, "
+                         "not approved by every reviewer.")
         return "\n".join(lines) + "\n"
 
     def report(self, run_id: str) -> dict:
@@ -702,11 +770,15 @@ class Engine(RunEngine):
             data = None
             value.update(review_summary=None, review_summary_error=f"The review summary cannot be built: {exc}")
         value["human_acceptance"] = human_decisions(state, lambda relative: self.store.record_json(state, relative))[1]
+        value["auto_acceptance"] = _auto_acceptance_entry(state, self.store)
         value["converged"] = state["status"] == "completed"
         # Every warning that applies is kept, in this order, in the one warning string.
         warnings = []
         if state["status"] == "accepted":
             warnings.append(ACCEPTED_WARNING)
+        elif state["status"] == "auto_accepted":
+            warnings.append(AUTO_ACCEPTED_WARNING + ("" if state["final_plan_reviewed"]
+                                                     else " The accepted version was never reviewed."))
         elif not value["converged"]:
             warnings.append("Not a converged plan. Inspect remaining findings, errors, and whether the final revision was reviewed.")
         value["published_plan"] = None
@@ -726,7 +798,7 @@ class Engine(RunEngine):
             if not (value["published_plan_matches_at_report"] and value["published_approval_matches_at_report"]):
                 warnings.append("The plan was published, but its current file or approval record is missing or "
                                 "changed. Inspect before implementation.")
-        elif state["status"] in {"completed", "accepted"} and state["config"]["publish"]["enabled"]:
+        elif state["status"] in {"completed", "accepted", "auto_accepted"} and state["config"]["publish"]["enabled"]:
             warnings.append("Reviews completed, but no successful publication has been recorded. Run plan publish "
                             "or resolve the reported error.")
         value["warning"] = " ".join(warnings) or None

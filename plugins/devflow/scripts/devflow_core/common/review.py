@@ -4,6 +4,7 @@ from typing import Callable, Collection
 from .errors import DevFlowError, ProcessCleanupError, ReviewerError, shown_name
 from .hosts import host_profile
 from .runs import TERMINAL
+from .storage import now
 
 # The ceiling of both the configured max_reviews (the initial limit) and one
 # run's total: review records use two-digit numbers (reviews/NN).
@@ -32,6 +33,51 @@ def validate_limit(value: int) -> int:
     if type(value) is not int or not 1 <= value <= TOTAL_REVIEW_CEILING:
         raise DevFlowError(f"max_reviews must be an integer from 1 to {TOTAL_REVIEW_CEILING}")
     return value
+
+
+#: The run setting that lets a run end itself at the review limit: a JSON
+#: boolean, absent on runs frozen before it existed (read then as false).
+AUTO_ACCEPT_KEY = "auto_accept_at_review_limit"
+#: The evidence record staged and committed with an ``auto_accepted`` terminal state.
+AUTO_ACCEPTANCE = "auto-acceptance.json"
+AUTO_ACCEPTANCE_SOURCE = "config"
+
+
+def check_auto_accept(config: dict) -> None:
+    """``auto_accept_at_review_limit`` is a JSON boolean when present.
+
+    Python's ``True == 1`` makes a written 0/1 compare equal to a frozen
+    boolean, so a present key is strictly checked on both sides of every
+    frozen-configuration comparison (this and ``common.engine``'s).
+    """
+    if AUTO_ACCEPT_KEY in config and type(config[AUTO_ACCEPT_KEY]) is not bool:
+        raise DevFlowError("auto_accept_at_review_limit must be a boolean")
+
+
+def auto_acceptance(state: dict, used: int, version: str, version_reviewed: bool) -> dict:
+    """The immutable evidence of a configuration acceptance at the review limit."""
+    return {"schema_version": 1, "source": AUTO_ACCEPTANCE_SOURCE, AUTO_ACCEPT_KEY: True,
+            "version": version, "review_count": used, "review_limit": state["review_limit"],
+            "accepted_at": now(), "version_reviewed": bool(version_reviewed)}
+
+
+def check_auto_acceptance(state: dict, used: int, record: object) -> dict:
+    """Verify a stored auto-acceptance record against this run's frozen facts."""
+    if (not isinstance(record, dict) or record.get("schema_version") != 1
+            or record.get("source") != AUTO_ACCEPTANCE_SOURCE
+            or record.get(AUTO_ACCEPT_KEY) is not True
+            or type(record.get("version_reviewed")) is not bool
+            or record.get("review_count") != used or record.get("review_limit") != state["review_limit"]
+            or not isinstance(record.get("version"), str) or not isinstance(record.get("accepted_at"), str)):
+        raise DevFlowError("Invalid or mismatched auto-acceptance record")
+    return record
+
+
+def check_auto_accepted(state: dict) -> None:
+    """A run ended by configuration keeps its enabled frozen setting and evidence."""
+    if state["status"] == "auto_accepted" and (
+            state["config"].get(AUTO_ACCEPT_KEY) is not True or AUTO_ACCEPTANCE not in state["artifacts"]):
+        raise DevFlowError("An auto_accepted run needs the enabled frozen setting and its evidence record")
 
 
 def next_reviewer(reviewers: list, used: int, limit: int) -> dict:
@@ -100,19 +146,27 @@ def after_review_failure(used: int, state: dict, ready_status: str, reviewer_id:
 
 
 def ask_at_limit(state: dict, used: int, approved: Collection[str], version: str,
-                 escalate: Callable[[str, list[str]], None]) -> bool:
+                 escalate: Callable[[str, list[str]], None],
+                 auto_accept: Callable[[], bool] | None = None) -> bool:
     """At the review limit, ask the human whether to add one round of reviewers,
-    stop, or accept the current version.
+    stop, or accept the current version — or let the run's frozen setting
+    accept it.
 
-    Returns False while reviews remain. At the limit it calls ``escalate(reason,
-    questions)`` with the review_budget question, or ends the run as exhausted
-    when one more round would pass TOTAL_REVIEW_CEILING, and returns True.
+    Returns False while reviews remain. At the limit, when the frozen
+    ``auto_accept_at_review_limit`` is true, ``auto_accept()`` decides first:
+    it stages the evidence and sets ``auto_accepted`` (returning True), or
+    returns False and the conventional handling continues — the ceiling check,
+    then the review_budget question. It is never asked below the limit and its
+    result never adds reviews, reviewers or questions. The bare presence of an
+    earlier reviewer failure (``last_error``) is not part of the decision.
     ``approved`` holds the reviewers approving the current version, and
     ``version`` names that version (a plan hash or snapshot ID).
     """
     limit = state["review_limit"]
     if used < limit:
         return False
+    if (state["config"].get(AUTO_ACCEPT_KEY) and auto_accept is not None and auto_accept()):
+        return True
     reviewers = state["config"]["reviewers"]
     grant = len(reviewers)
     if limit + grant > TOTAL_REVIEW_CEILING:
@@ -182,6 +236,7 @@ def check_review_config(config: object) -> None:
     if not isinstance(config, dict):
         raise DevFlowError("Frozen run configuration must be an object")
     validate_limit(config.get("max_reviews"))
+    check_auto_accept(config)
     reviewers = config.get("reviewers")
     if (not isinstance(reviewers, list) or not reviewers
             or any(not isinstance(item, dict) or not isinstance(item.get("id"), str) for item in reviewers)):

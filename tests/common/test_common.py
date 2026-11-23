@@ -251,8 +251,8 @@ class SharedSettingsTests(unittest.TestCase):
         self.project = Path(temporary.name).resolve()
         self.path = self.project / "devflow.config.json"
 
-    def config(self, workflow):
-        return WORKFLOWS[workflow].load_config(read_project_settings(self.project, "claude", WORKFLOWS))
+    def config(self, workflow, host="claude"):
+        return WORKFLOWS[workflow].load_config(read_project_settings(self.project, host, WORKFLOWS))
 
     def test_empty_project_is_inert(self):
         self.assertEqual(self.config("plan")["max_reviews"], 6)
@@ -318,6 +318,41 @@ class SharedSettingsTests(unittest.TestCase):
             self.skipTest("Creating symlinks requires OS permission")
         with self.assertRaises(DevFlowError):
             self.config("implement")
+
+    def test_auto_accept_at_review_limit_layers_with_the_existing_precedence(self):
+        for flow in ("plan", "implement"):
+            with self.subTest(flow=flow):
+                self.assertFalse(self.config(flow)["auto_accept_at_review_limit"])
+        atomic_json(self.path, {"schema_version": 1, "auto_accept_at_review_limit": True,
+                                "plan": {"auto_accept_at_review_limit": False}})
+        self.assertFalse(self.config("plan")["auto_accept_at_review_limit"])
+        self.assertTrue(self.config("implement")["auto_accept_at_review_limit"])
+        atomic_json(self.project / "devflow.config.local.json",
+                    {"schema_version": 1, "auto_accept_at_review_limit": False})
+        self.assertFalse(self.config("implement")["auto_accept_at_review_limit"])
+        atomic_json(self.project / "devflow.config.local.json",
+                    {"schema_version": 1, "implement": {"auto_accept_at_review_limit": True}})
+        self.assertTrue(self.config("implement")["auto_accept_at_review_limit"])
+
+        atomic_json(self.project / "devflow.config.codex.local.json",
+                    {"schema_version": 1, "implement": {"auto_accept_at_review_limit": False}})
+        self.assertFalse(self.config("implement", host="codex")["auto_accept_at_review_limit"])
+        self.assertTrue(self.config("implement")["auto_accept_at_review_limit"])
+
+    def test_auto_accept_at_review_limit_accepts_only_a_boolean(self):
+        from devflow_core.plan.config import validate_config as plan_validate
+        from devflow_core.implement.config import validate_config as implement_validate
+        for flow, validate in (("plan", plan_validate), ("implement", implement_validate)):
+            base = self.config(flow)  # a complete config; only the new key goes bad
+            for bad in ("true", 1, 0, None):
+                with self.subTest(flow=flow, value=bad):
+                    with self.assertRaisesRegex(DevFlowError, "must be a boolean"):
+                        validate({**base, "auto_accept_at_review_limit": bad})
+        for bad in ("true", 1, 0):
+            with self.subTest(value=bad):
+                atomic_json(self.path, {"schema_version": 1, "auto_accept_at_review_limit": bad})
+                with self.assertRaises(DevFlowError):
+                    self.config("plan")
 
 
 class ReviewBudgetTests(unittest.TestCase):
