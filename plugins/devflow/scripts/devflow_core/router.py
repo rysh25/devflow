@@ -190,6 +190,10 @@ def _start(project: Path, session: str, flow: str, argument: str, payload: dict,
         raise DevFlowError("Finish or cancel this session's active workflow before starting another")
     args = workflow.normalize_args(parse_start(argument).body, project)
     documents = read_project_settings(project, all_stores[flow].host, WORKFLOWS)
+    if workflow.start_option is not None:
+        # The launch hook confirms the selected settings from the documents it just
+        # read; the actual start reads the files again and freezes its own values.
+        workflow.load_config(documents)
     pending = {"flow": flow, "run_id": new_run_id(), "args": args, "event": make_event(payload, "prompt"),
                "created_at": now()}
     record = dict(record, run=None, pending_start=pending)

@@ -54,10 +54,14 @@ def validate_relative(relative: str) -> str:
 
 
 def validate_patterns(settings: dict) -> None:
-    for pattern in [*settings["include"], *settings["exclude"]]:
+    """Check the pattern syntax of whichever of the three arrays ``settings`` carries.
+
+    Called both on a fully resolved snapshot object and on one document layer's
+    ``snapshot`` diff, whose absent members mean "keep the inherited value"."""
+    for pattern in [*settings.get("include", []), *settings.get("exclude", [])]:
         if pattern.startswith("/") or "\\" in pattern or ":" in pattern or ".." in pattern.split("/") or any(ord(c) < 32 for c in pattern):
             raise DevFlowError(f"Unsafe snapshot glob: {pattern!r}")
-    for context in settings["context_paths"]:
+    for context in settings.get("context_paths", []):
         validate_relative(context)
 
 

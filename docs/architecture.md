@@ -55,7 +55,7 @@ Python コードは `plugins/devflow/scripts/devflow_core/` の1つのパッケ�
 | `reviewers.py` | Codex / OpenCode / Claude / Devin の事前確認、`prepare_review` による入力準備、`run_review(PreparedReview, validate)` による予約後の実行、出力の検査。CLI ごとの違いは `CLI` のサブクラスに集める。トークン数の読み取りと、回の CLI の版もここ |
 | `summary.py` | レビューの要約：各フローが自分の記録を直した共通の形（`source`）から、データを作る `build` と、決まった英語の短い Markdown を作る `render`。データはすべてを持ち（レビュアーごとの合計 `reviewer_totals` を含む）、Markdown は判断に要るもの（1 回 1 行の表、レビュアーごとの 1 行、失敗、残っている指摘、人間の決定）だけを出す。表のセルには決まった値だけを入れ、自由な文は表の下の一覧に置く。上限の確認で待っている間と run が終わったあとに、`status` と最終レポートに入る |
 | `counts.py` | 前もって知らない名前（出来事の種類、ツールの名前）の、上限付きの数え方 |
-| `settings.py` | 共有・ローカル設定の検査と重ね合わせ、レビュアー設定の共通規則 |
+| `settings.py` | 共有・ローカル設定と `hosts` の検査と重ね合わせ、レビュアー設定の共通規則 |
 | `operations.py` | ホスト別の5操作の検出と、生の引数・本文の境界 |
 | `startup.py` | 起動時の指定（`--reviewer`・`--max-reviews`）の解析と、最終設定への反映 |
 | `arguments.py` | 終了やヘルプ表示を例外として扱う共通 argparse パーサー |

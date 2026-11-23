@@ -103,7 +103,11 @@ class SnapshotTests(unittest.TestCase):
         self.init_git()
         self.write("app.py", "start\n")
         self.commit_all()
-        names = [f"nested/{name.upper()}" for name in sorted(HOST_CONFIG_FILES)]
+        # The six historical names, written out so the fixture does not depend on
+        # the constant whose protection this test verifies.
+        names = [f"nested/devflow.config.{host}{suffix}".upper()
+                 for host in ("claude", "codex", "devin")
+                 for suffix in (".json", ".local.json")]
         for name in names:
             self.write(name, "private fixture\n")
         self.git("add", "--all")  # Also exercise tracked settings in git mode.
@@ -121,7 +125,9 @@ class SnapshotTests(unittest.TestCase):
         self.write("app.py", "commit\n")
         self.commit_all()
         original_project = self.project
-        config_paths = [f"nested/{name.upper()}" for name in sorted(HOST_CONFIG_FILES)]
+        config_paths = [f"nested/devflow.config.{host}{suffix}".upper()
+                        for host in ("claude", "codex", "devin")
+                        for suffix in (".json", ".local.json")]
         for mode in ("git", "files"):
             with self.subTest(mode=mode):
                 self.project = original_project

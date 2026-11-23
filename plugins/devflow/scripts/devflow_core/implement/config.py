@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 from ..common.errors import DevFlowError
 from ..common.review import check_auto_accept, validate_limit
-from ..common.settings import SettingsDocument, load_workflow_config, validate_reviewers
+from ..common.settings import SettingsDocument, load_workflow_config, validate_reviewer_list, validate_reviewers
 from .checks import validate_checks
 from .snapshot import validate_patterns
 
@@ -18,6 +18,16 @@ def _integer(value, low, high, name):
 
 
 def validate_config(value: dict) -> dict:
+    return _validate(value, match_reviewer_limit=True)
+
+
+def validate_stage(value: dict) -> dict:
+    """Every ``validate_config`` check but the reviewer-count/review-limit match,
+    which applies to a document's effective value, not mid-layer combinations."""
+    return _validate(value, match_reviewer_limit=False)
+
+
+def _validate(value: dict, *, match_reviewer_limit: bool) -> dict:
     fields = {"schema_version", "max_reviews", "max_check_attempts", "max_plan_bytes", "allow_dirty", "snapshot",
               "reviewers", "checks", "auto_accept_at_review_limit"}
     # auto_accept_at_review_limit is the only optional field: runs frozen before
@@ -49,7 +59,10 @@ def validate_config(value: dict) -> dict:
     if not snapshot["include"]:
         raise DevFlowError("At least one snapshot include pattern is required")
     _integer(snapshot["max_packet_bytes"], 1024, 16 * 1024 * 1024, "snapshot.max_packet_bytes")
-    validate_reviewers(value["reviewers"], value["max_reviews"])
+    if match_reviewer_limit:
+        validate_reviewers(value["reviewers"], value["max_reviews"])
+    else:
+        validate_reviewer_list(value["reviewers"])
     validate_checks(value["checks"])
     if value["checks"] and not any(check.get("required", True) for check in value["checks"]):
         raise DevFlowError("Configure at least one required check; optional-only diagnostics are not a validation gate")
@@ -57,5 +70,5 @@ def validate_config(value: dict) -> dict:
 
 
 def load_config(documents: tuple[SettingsDocument, ...], workflow) -> dict:
-    return load_workflow_config(documents, workflow, validate_config,
-                                validate_dedicated=lambda config: validate_patterns(config["snapshot"]))
+    return load_workflow_config(documents, workflow, validate_config, validate_stage=validate_stage,
+                                validate_host_layer=lambda layer: validate_patterns(layer.get("snapshot", {})))

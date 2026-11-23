@@ -229,7 +229,13 @@ class ImplementWorkflow(Workflow):
         from .config import load_config
         return load_config(documents, self)
 
-    def doctor(self, project: Path, config: dict, *, host: str) -> dict:
+    def doctor(self, project: Path, config: dict, *, host: str, frozen: bool = False) -> dict:
+        # Diagnostics over current project settings (a pending start included) report
+        # invalid snapshot syntax surviving in the resolved config; a selected run's
+        # doctor keeps its own frozen-config comparison.
+        if not frozen:
+            from .snapshot import validate_patterns
+            validate_patterns(config["snapshot"])
         return {"warnings": ([] if config["checks"] else
                              ["No implementation checks configured; every revised snapshot requires actual human validation"])}
 

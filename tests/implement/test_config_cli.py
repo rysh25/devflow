@@ -112,10 +112,10 @@ class ConfigCliTests(unittest.TestCase):
     def test_settings_removed_in_0_6_0_are_errors_that_name_them(self):
         cases = (
             ({"implement": {"snapshot": {"max_files": 9, "max_file_bytes": 9, "max_total_bytes": 9}}},
-             r"^devflow.config.json: Invalid snapshot fields \(unknown: max_file_bytes, max_files, max_total_bytes\); "
+             r"^devflow.config.json: implement: Invalid snapshot fields \(unknown: max_file_bytes, max_files, max_total_bytes\); "
              r"see the project settings in the DevFlow README$"),
             ({"implement": {"checks": [{"id": "tests", "argv": [sys.executable], "max_output_bytes": 1024}]}},
-             r"^devflow.config.json: Invalid check fields \(unknown: max_output_bytes\); see the project settings in the DevFlow README$"),
+             r"^devflow.config.json: implement: Invalid check fields \(unknown: max_output_bytes\); see the project settings in the DevFlow README$"),
             ({"reviewers": [{**reviewer, "max_output_bytes": 1024} for reviewer in self.config["reviewers"]]},
              r"unknown: max_output_bytes\).*README"),
         )
@@ -171,12 +171,12 @@ class ConfigCliTests(unittest.TestCase):
         self.assertIn("Unknown devflow.config.json keys", output)
 
     def test_selected_document_errors_are_reported_on_utf8_stdout(self):
-        dedicated = "devflow.config.codex.json"
         nested = "[" * 700 + "0" + "]" * 700
         cases = (
-            (dedicated, r'{"\ud800": 1, "\ud800": 2}', "Duplicate JSON key"),
-            (dedicated, '{"implement": {"snapshot": {"include": ' + nested + '}}}', "nested too deeply"),
-            ("devflow.config.json", r'{"\ud800": 1}', "Unknown devflow.config.json keys"),
+            ("devflow.config.json", r'{"\ud800": 1, "\ud800": 2}', "Duplicate JSON key"),
+            ("devflow.config.local.json", '{"implement": {"snapshot": {"include": ' + nested + '}}}',
+             "nested too deeply"),
+            ("devflow.config.local.json", r'{"\ud800": 1}', "UTF-8"),
         )
         runner = PLUGIN.parents[1] / "devflow.py"
         for name, document, error in cases:
