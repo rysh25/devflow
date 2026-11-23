@@ -15,6 +15,7 @@ from typing import Any, Callable
 from .environment import review_timeout_ms
 from .errors import DevFlowError
 from .sessions import require_caller
+from .settings import SettingsDocument
 
 RESOURCES = ("defaults.json", "reviewer.md", "review.schema.json")
 OPTION_KINDS = frozenset({"draft", "hash", "event", "decision", "text", "int", "confirm"})
@@ -95,11 +96,12 @@ class Workflow:
         raise NotImplementedError
 
     def build_start(self, project: Path, pending: dict, options: dict,
-                    scratch: Path) -> tuple[dict, dict[str, bytes | Path]]:
+                    scratch: Path, *, project_config: dict) -> tuple[dict, dict[str, bytes | Path]]:
         """Return the workflow fields (including ``status``) and initial artifacts.
 
         ``options`` holds the values of ``extra_start_options`` (by
         ``option_name``); it is empty when the run starts inside the hook.
+        ``project_config`` has the settings resolved before startup overrides.
         An artifact is bytes, or a file written with ``write_new`` in
         ``scratch`` (a private directory next to the runs), which is moved
         into the run, so large start records never pass through memory.
@@ -160,7 +162,7 @@ class Workflow:
                 return {"review": review_timeout_ms(reviewer["timeout_seconds"])}
         return {}
 
-    def load_config(self, project: Path) -> dict:
+    def load_config(self, documents: tuple[SettingsDocument, ...]) -> dict:
         raise NotImplementedError
 
     def doctor(self, project: Path, config: dict, *, host: str) -> dict:

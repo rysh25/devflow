@@ -18,7 +18,7 @@ def doctor(engine, args, run_id, session) -> dict:
     verified workspace, or the project when no run is selected (``start`` checks the workspace
     it chooses)."""
     workflow = engine.workflow
-    config = engine.read_frozen_config(run_id) if run_id else workflow.load_config(engine.project)
+    config = engine.read_frozen_config(run_id) if run_id else workflow.load_config(args.settings_documents)
     source = "frozen_run" if run_id else "project_settings"
     if not run_id and session:
         from ..common.startup import apply_startup, parse_start

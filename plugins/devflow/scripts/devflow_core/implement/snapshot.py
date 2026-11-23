@@ -23,6 +23,7 @@ import stat
 
 from ..common.git import content_timeout, run_git
 from ..common.errors import DevFlowError
+from ..common.settings import CONFIG_FILES, HOST_CONFIG_FILES
 from ..common.storage import write_new
 
 #: How much of a file is read at a time.
@@ -30,13 +31,13 @@ CHUNK = 64 * 1024
 
 
 DEFAULT_EXCLUDES = [
-    ".git/", ".devflow/", "devflow.config.json", "devflow.config.local.json", ".env", ".env.*",
+    ".git/", ".devflow/", ".env", ".env.*",
     ".ssh/", ".aws/", ".azure/", "secrets/", "*.pem", "*.key",
     "*.p12", "*.pfx", "node_modules/", ".venv/", "venv/", "__pycache__/",
     ".pytest_cache/", ".mypy_cache/", ".ruff_cache/", ".next/", ".nuxt/",
     "Library/", "Temp/", "Obj/", "Logs/", "UserSettings/", "bin/", "obj/",
 ]
-_ALWAYS_EXCLUDED = {".git", ".devflow", "devflow.config.json", "devflow.config.local.json"}
+_ALWAYS_EXCLUDED = {".git", ".devflow", *CONFIG_FILES, *HOST_CONFIG_FILES}
 _RESERVED = re.compile(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$", re.I)
 
 
@@ -52,6 +53,14 @@ def validate_relative(relative: str) -> str:
     return relative
 
 
+def validate_patterns(settings: dict) -> None:
+    for pattern in [*settings["include"], *settings["exclude"]]:
+        if pattern.startswith("/") or "\\" in pattern or ":" in pattern or ".." in pattern.split("/") or any(ord(c) < 32 for c in pattern):
+            raise DevFlowError(f"Unsafe snapshot glob: {pattern!r}")
+    for context in settings["context_paths"]:
+        validate_relative(context)
+
+
 def _settings(config: dict) -> dict:
     value = config.get("snapshot", config)
     if not isinstance(value, dict):
@@ -65,11 +74,7 @@ def _settings(config: dict) -> dict:
             raise DevFlowError(f"snapshot.{name} must be an array of nonempty strings.")
     if not result["include"]:
         raise DevFlowError("snapshot.include cannot be empty.")
-    for pattern in [*result["include"], *result["exclude"]]:
-        if pattern.startswith("/") or "\\" in pattern or ":" in pattern or ".." in pattern.split("/") or any(ord(c) < 32 for c in pattern):
-            raise DevFlowError(f"Unsafe snapshot glob: {pattern!r}")
-    for context in result["context_paths"]:
-        validate_relative(context)
+    validate_patterns(result)
     if type(result["max_packet_bytes"]) is not int or result["max_packet_bytes"] < 1:
         raise DevFlowError("snapshot.max_packet_bytes must be a positive integer.")
     return result
@@ -96,6 +101,10 @@ def _matches(path: str, pattern: str, *, insensitive: bool = False) -> bool:
     if pattern.startswith("**/"):
         return _matches(path, pattern[3:])
     return False
+
+
+def host_config_path(relative: str) -> bool:
+    return any(part.casefold() in HOST_CONFIG_FILES for part in relative.split("/"))
 
 
 def _excluded_reason(relative: str, settings: dict) -> str | None:

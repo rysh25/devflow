@@ -6,6 +6,7 @@ import subprocess
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from devflow_core.common.hosts.codex import read_conversation
@@ -203,7 +204,7 @@ class HistoryTests(RuntimeFixture):
                     patch.object(engine.workflow, 'doctor', return_value={'warnings':[]}), \
                     patch.object(plan_commands, 'python_errors', return_value=[]), \
                     patch.object(plan_commands, 'diagnose_conversation', return_value=probe, create=True) as check:
-                report = plan_commands.doctor(engine, None, None, 'actual-session')
+                report = plan_commands.doctor(engine, SimpleNamespace(settings_documents=()), None, 'actual-session')
                 check.assert_called_once_with(self.project, 'actual-session')
                 self.assertEqual(report['ready'], ready)
                 self.assertEqual(report['conversation_api'], probe)

@@ -210,7 +210,7 @@ class InterviewInspectionTests(InterviewFixture):
 
     def test_missing_skill_makes_component_doctor_not_ready(self):
         with patch("devflow_core.plan.config.shutil.which", return_value="/fixture/tool"):
-            report = diagnose(self.project, WORKFLOWS["plan"], host="claude")
+            report = diagnose(self.project, WORKFLOWS["plan"].load_config(()), host="claude")
         self.assertEqual(report["configuration_source"], "project_settings")
         self.assertFalse(report["ready"])
         self.assertEqual(report["interview_skill"]["status"], "missing")

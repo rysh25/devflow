@@ -10,9 +10,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 
 from devflow_core.common.environment import review_timeout_ms
+from devflow_core.common.settings import HOST_CONFIG_FILES
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("devflow_packaging", ROOT / "tools" / "package.py")
@@ -116,7 +118,9 @@ class DistributionTests(unittest.TestCase):
                     self.assertIn("`{}` / `{}`".format(reviewer["model"], reviewer["effort"]), readme)
 
     def test_user_documents_only_describe_current_single_plugin(self):
-        paths = [ROOT / "README.md"] + sorted((ROOT / "docs").rglob("*.md")) + sorted((ROOT / "examples").rglob("*.md"))
+        docs = ROOT / "docs"
+        user_docs = sorted(path for path in docs.rglob("*.md") if not path.is_relative_to(docs / "plans"))
+        paths = [ROOT / "README.md", *user_docs, *sorted((ROOT / "examples").rglob("*.md"))]
         old_names = ("plan" + "flow", "build" + "flow")
         # Upgrade instructions are required for 0.8.0's host/record changes;
         # the generic term must not be confused with the removed plugins.
@@ -415,6 +419,40 @@ class DistributionTests(unittest.TestCase):
         with zipfile.ZipFile(archive_path) as archive:
             self.assertFalse(any(name.endswith("devflow.config.local.json") for name in archive.namelist()))
             self.assertNotIn(b"devflow.config.local.json", archive.read("devflow/SHA256SUMS"))
+
+    def test_host_local_names_are_protected_in_collection_and_final_validation(self):
+        host_local = {name for name in HOST_CONFIG_FILES if name.endswith(".local.json")}
+        self.assertEqual(package.LOCAL_CONFIG_FILES, {"devflow.config.local.json", *host_local})
+        distribution = package._collect(ROOT)
+        read_bytes = Path.read_bytes
+        for name in sorted(host_local):
+            with self.subTest(name=name):
+                root = Path(tempfile.mkdtemp(dir=self.base))
+                local = root / name
+                local.write_bytes(b"private fixture, not valid JSON")
+                shared = name.removesuffix(".local.json") + ".json"
+                (root / shared).write_bytes(b"{}")
+
+                def read(path):
+                    self.assertNotEqual(path, local, "Package collection must skip the local file before reading")
+                    return read_bytes(path)
+
+                with patch.object(Path, "read_bytes", autospec=True, side_effect=read):
+                    files = package._collect(root)
+                self.assertEqual(files, {shared: b"{}"})
+                distribution.update(files)
+                local.unlink()  # Case-only names can refer to the same path on Windows.
+                for relative in (f"nested/{name}", name.upper()):
+                    path = root / relative
+                    path.parent.mkdir(exist_ok=True)
+                    path.write_bytes(b"{}")
+                    with self.assertRaisesRegex(package.PackagingError, "Potential secret"):
+                        package._collect(root)
+                    path.unlink()
+                for relative in (name, f"nested/{name.upper()}"):
+                    with self.assertRaisesRegex(package.PackagingError, "Potential secret"):
+                        package._validate_files({relative: b"{}"})
+        package._validate_files(distribution)
 
     def test_extracted_plugin_runs_without_repository_shared(self):
         archive_path = package.build(ROOT, self.base / "release.zip")

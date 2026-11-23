@@ -8,6 +8,7 @@ from ..common.errors import UsageError
 from ..common.hosts import host_profile
 from ..common.review import after_failed_review, check_review_budget, check_review_config, review_budget
 from ..common.runs import TERMINAL
+from ..common.settings import SettingsDocument
 from ..common.storage import json_bytes, now
 from ..common.operations import public_command
 from ..common.startup import apply_startup, parse_start
@@ -50,9 +51,9 @@ class PlanWorkflow(Workflow):
         return request
 
     def build_start(self, project: Path, pending: dict, options: dict,
-                    scratch: Path) -> tuple[dict, dict[str, bytes]]:
+                    scratch: Path, *, project_config: dict) -> tuple[dict, dict[str, bytes]]:
         # Plan starts inside the prompt hook and has no extra start options; ``options`` is unused.
-        from .config import load_config, validate_config
+        from .config import validate_config
         payload = pending["event"]["payload"]
         prompt = payload["prompt"]
         # Keep the request byte-exact apart from the command itself.
@@ -61,7 +62,7 @@ class PlanWorkflow(Workflow):
             raise UsageError("Codex Plan requires the actual start turn ID from its hook; do not guess")
         startup = parse_start(public_command(prompt, host)[1])
         request = startup.body
-        config = validate_config(apply_startup(load_config(project, self), startup))
+        config = validate_config(apply_startup(project_config, startup))
         fields = {
             "status": "interview", "review_count": 0, "review_limit": config["max_reviews"],
             "plan_version": None, "plan_hash": None,
@@ -128,9 +129,9 @@ class PlanWorkflow(Workflow):
     def frozen_config(self, state: dict) -> dict:
         return state["config"]
 
-    def load_config(self, project: Path) -> dict:
+    def load_config(self, documents: tuple[SettingsDocument, ...]) -> dict:
         from .config import load_config
-        return load_config(project, self)
+        return load_config(documents, self)
 
     def doctor(self, project: Path, config: dict, *, host: str) -> dict:
         from .interview import inspect_interview_skill
