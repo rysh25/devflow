@@ -4,49 +4,88 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 import re
+import stat
+from typing import NamedTuple
 
 from .errors import DevFlowError
-from .storage import no_symlinks, read_json
+from .hosts import HOSTS, validate_host
+from .storage import read_json, writable, writable_text
 
 
 REVIEWER_KINDS = frozenset({"codex", "opencode", "claude", "devin"})
 REVIEWER_FIELDS = frozenset({"id", "kind", "command", "model", "effort", "timeout_seconds"})
 REVIEWER_REQUIRED = REVIEWER_FIELDS
 CONFIG_FILES = ("devflow.config.json", "devflow.config.local.json")
+SHARED_SETTINGS = ("reviewers", "max_reviews", "auto_accept_at_review_limit")
 
 
-def _documents(project: Path):
-    for name in CONFIG_FILES:
-        path = Path(project) / name
-        try:
-            no_symlinks(path)
-            if not path.exists():
+def _host_config_names(host: str) -> tuple[str, str]:
+    return f"devflow.config.{host}.json", f"devflow.config.{host}.local.json"
+
+
+HOST_CONFIG_FILES = frozenset(name for host in HOSTS for name in _host_config_names(host))
+
+
+class SettingsDocument(NamedTuple):
+    name: str
+    data: dict
+    dedicated: bool
+
+
+def _check_writable(value) -> None:
+    if isinstance(value, str):
+        if not writable(value):
+            raise DevFlowError("Settings must contain only strings that can be written as UTF-8")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _check_writable(key)
+            _check_writable(item)
+    elif isinstance(value, list):
+        for item in value:
+            _check_writable(item)
+
+
+def read_project_settings(project: Path, host: str, workflows) -> tuple[SettingsDocument, ...]:
+    """Select and validate one document per layer, shared first. The caller supplies the workflow registry."""
+    allowed = {"schema_version", *SHARED_SETTINGS, *workflows}
+    documents = []
+    for common, dedicated in zip(CONFIG_FILES, _host_config_names(validate_host(host))):
+        for name in (dedicated, common):
+            path = Path(project) / name
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
                 continue
-            document = read_json(path)
-            version = document.get("schema_version", 1)
-            if type(version) is not int or version != 1:
-                raise DevFlowError("Unsupported schema_version; expected 1")
-        except DevFlowError as exc:
-            raise DevFlowError(f"{name}: {exc}") from exc
-        yield name, document
+            except OSError as exc:
+                raise DevFlowError(f"{name}: Cannot inspect settings: {writable_text(str(exc))}") from exc
+            try:
+                if (not stat.S_ISREG(info.st_mode)
+                        or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+                    raise DevFlowError("Settings must be a regular file without symlinks or reparse points")
+                document = read_json(path)
+                if name == dedicated:
+                    _check_writable(document)
+                version = document.get("schema_version", 1)
+                if type(version) is not int or version != 1:
+                    raise DevFlowError("Unsupported schema_version; expected 1")
+            except DevFlowError as exc:
+                raise DevFlowError(f"{name}: {writable_text(str(exc))}") from exc
+            except RecursionError as exc:
+                raise DevFlowError(f"{name}: Settings are nested too deeply") from exc
+            unknown = set(document) - allowed
+            if unknown:
+                keys = writable_text(", ".join(sorted(unknown)))
+                raise DevFlowError(f"Unknown {name} keys: {keys}")
+            for workflow in workflows:
+                if workflow in document and not isinstance(document[workflow], dict):
+                    raise DevFlowError(f"{name} {workflow} must contain an object")
+            documents.append(SettingsDocument(name, document, name == dedicated))
+            break
+    return tuple(documents)
 
 
-def validate_document(project: Path, workflows) -> None:
-    """Reject unknown top-level keys; the caller passes the registered workflow names."""
-    allowed = {"schema_version", "reviewers", "max_reviews", "auto_accept_at_review_limit", *workflows}
-    for name, document in _documents(project):
-        if set(document) - allowed:
-            raise DevFlowError(f"Unknown {name} keys: " + ", ".join(sorted(set(document) - allowed)))
-        for workflow in workflows:
-            if workflow in document and not isinstance(document[workflow], dict):
-                raise DevFlowError(f"{name} {workflow} must contain an object")
-
-
-def _layers(name: str, document: dict, workflow: str):
-    if workflow in document and not isinstance(document[workflow], dict):
-        raise DevFlowError(f"{name} {workflow} must contain an object")
-    return ({key: document[key] for key in ("reviewers", "max_reviews", "auto_accept_at_review_limit")
-             if key in document},
+def _layers(document: dict, workflow: str):
+    return ({key: document[key] for key in SHARED_SETTINGS if key in document},
             document.get(workflow, {}))
 
 
@@ -61,20 +100,24 @@ def _merge(value: dict, overlay: dict) -> dict:
     return value
 
 
-def load_workflow_config(project: Path, workflow, validate) -> dict:
-    """Resolve both files without allowing a later file to hide an invalid one."""
+def load_workflow_config(documents: tuple[SettingsDocument, ...], workflow, validate, *, validate_dedicated=None) -> dict:
+    """Resolve the selected documents without allowing an overlay to hide an invalid setting."""
     defaults = read_json(workflow.resource("defaults.json"))
     result = defaults
-    for name, document in _documents(project):
+    for name, document, dedicated in documents:
         try:
             standalone = defaults
-            for layer in _layers(name, document, workflow.name):
+            for layer in _layers(document, workflow.name):
                 standalone = _merge(standalone, layer)
                 validate(standalone)
                 result = _merge(result, layer)
+            if dedicated and validate_dedicated is not None:
+                validate_dedicated(standalone)
             validate(result)
         except DevFlowError as exc:
-            raise DevFlowError(f"{name}: {exc}") from exc
+            raise DevFlowError(f"{name}: {writable_text(str(exc))}") from exc
+        except RecursionError as exc:
+            raise DevFlowError(f"{name}: Settings are nested too deeply") from exc
     return validate(result)
 
 
@@ -108,7 +151,7 @@ def validate_reviewer(reviewer: object) -> dict:
     identifier = reviewer["id"]
     if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", identifier):
         raise DevFlowError("Reviewer IDs must be unique lowercase names")
-    if reviewer["kind"] not in REVIEWER_KINDS:
+    if not isinstance(reviewer["kind"], str) or reviewer["kind"] not in REVIEWER_KINDS:
         raise DevFlowError("Unsupported reviewer kind; implement an explicit adapter first")
     command = reviewer["command"]
     if (not isinstance(command, list) or not command or len(command) > 128

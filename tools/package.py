@@ -28,9 +28,14 @@ COMMON_RESOURCES = ("reviewer-rules.md", "answer-follow-up.md")
 COORDINATORS = ("router", "cli", "workflows")
 SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv", "node_modules", "dist", ".devflow"}
 SKIP_SUFFIXES = {".pyc", ".pyo", ".zip", ".log", ".tmp"}
-# Files skipped by their path from the package root: the generated checksum list and
-# the Git-ignored local settings (.gitignore: /devflow.config.local.json).
-SKIP_FILES = {"SHA256SUMS", "devflow.config.local.json"}
+# Keep collection independent of the plugin code it is about to inspect.
+LOCAL_CONFIG_FILES = frozenset({
+    "devflow.config.local.json",
+    "devflow.config.claude.local.json",
+    "devflow.config.codex.local.json",
+    "devflow.config.devin.local.json",
+})
+SKIP_FILES = {"SHA256SUMS", *LOCAL_CONFIG_FILES}
 MAX_BYTES = 64 * 1024 * 1024
 
 
@@ -86,7 +91,7 @@ def _collect(root: Path) -> dict[str, bytes]:
                 continue
             if name == ".DS_Store" or name.casefold() == "thumbs.db":
                 continue
-            _require(not name.startswith(".env") and name.casefold() != "devflow.config.local.json"
+            _require(not name.startswith(".env") and name.casefold() not in LOCAL_CONFIG_FILES
                      and path.suffix.lower() not in {".pem", ".key", ".p12", ".pfx"}, f"Potential secret must not be included in distribution: {relative}")
             before = _no_link(path)
             _require(stat.S_ISREG(before.st_mode), f"Not a regular package file: {relative}")
@@ -104,8 +109,9 @@ def _collect(root: Path) -> dict[str, bytes]:
 
 
 def _validate_files(files: dict[str, bytes]) -> dict:
-    _require(not any(Path(path).name.casefold() == "devflow.config.local.json" for path in files),
-             "Potential secret must not be included in distribution: devflow.config.local.json")
+    for path in files:
+        _require(Path(path).name.casefold() not in LOCAL_CONFIG_FILES,
+                 f"Potential secret must not be included in distribution: {path}")
     def document(name):
         _require(name in files, f"Missing package file: {name}")
         value = _json(files[name], name)

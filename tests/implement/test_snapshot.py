@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 from devflow_core.common.git import content_timeout
+from devflow_core.common.settings import HOST_CONFIG_FILES
 from devflow_core.implement.snapshot import between, capture, changes, diff, packet_changes, path_in_scope, validate_relative
 from devflow_core.implement import snapshot as snapshot_module
 from devflow_core.common.errors import DevFlowError
@@ -97,6 +98,66 @@ class SnapshotTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 captured = capture(self.project, {"snapshot": {"mode": mode, "exclude": []}})
                 self.assertEqual(set(captured["files"]), {"keep.txt"})
+
+    def test_host_settings_cannot_enter_either_snapshot_mode(self):
+        self.init_git()
+        self.write("app.py", "start\n")
+        self.commit_all()
+        names = [f"nested/{name.upper()}" for name in sorted(HOST_CONFIG_FILES)]
+        for name in names:
+            self.write(name, "private fixture\n")
+        self.git("add", "--all")  # Also exercise tracked settings in git mode.
+        for mode in ("git", "files"):
+            with self.subTest(mode=mode):
+                settings = {"mode": mode, "include": ["app.py", *names]}
+                self.assertEqual(set(self.snapshot(**settings)["files"]), {"app.py"})
+                for name in names:
+                    self.assertFalse(path_in_scope(name, settings))
+                    with self.assertRaisesRegex(DevFlowError, "Requested context file is not in the captured scope"):
+                        self.snapshot(**settings, context_paths=[name])
+
+    def test_restarting_from_restored_base_preserves_unreviewed_changes(self):
+        self.init_git()
+        self.write("app.py", "commit\n")
+        self.commit_all()
+        original_project = self.project
+        config_paths = [f"nested/{name.upper()}" for name in sorted(HOST_CONFIG_FILES)]
+        for mode in ("git", "files"):
+            with self.subTest(mode=mode):
+                self.project = original_project
+                config = {"snapshot": {"mode": mode}}
+                self.write("app.py", "pre-existing work\n")
+                for name in config_paths[:-1]:
+                    self.write(name, "private fixture\n")
+                legacy_exclusions = snapshot_module._ALWAYS_EXCLUDED - HOST_CONFIG_FILES
+                with mock.patch.object(snapshot_module, "_ALWAYS_EXCLUDED", legacy_exclusions):
+                    original = capture(self.project, config)
+                self.assertTrue(set(config_paths[:-1]) <= original["files"].keys())
+                self.write("app.py", "unreviewed implementation\n")
+                saved = (self.project / "app.py").read_bytes()
+                if mode == "git":
+                    worktree = self.base / "recovered-worktree"
+                    self.git("worktree", "add", "--quiet", "--detach", str(worktree), "HEAD")
+                    self.project = worktree
+                self.write("app.py", "pre-existing work\n")
+                for name in config_paths[:-1]:
+                    self.write(name, "private fixture\n")
+                self.run_dir = self.base / f"restart-{mode}"
+                self.run_dir.mkdir()
+                baseline = self.start(config)
+                restored = {name: (info["sha256"], info["mode"]) for name, info in baseline["files"].items()}
+                expected = {name: (info["sha256"], info["mode"]) for name, info in original["files"].items()
+                            if not snapshot_module.host_config_path(name)}
+                self.assertEqual(restored, expected)
+
+                self.write("app.py", saved)
+                self.write(config_paths[0], "private edit\n")
+                (self.project / config_paths[1]).unlink()
+                self.write(config_paths[-1], "private addition\n")
+                record, text = self.checkpoint(baseline, config)
+                self.assertEqual([item["path"] for item in record["changes"]], ["app.py"])
+                self.assertIn("-pre-existing work\n+unreviewed implementation\n", text)
+                self.assertNotIn("private", text)
 
     def test_added_deleted_modified_without_contents(self):
         self.write("modify.txt", "old\n")

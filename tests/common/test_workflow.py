@@ -58,7 +58,7 @@ class StartContractTests(unittest.TestCase):
         for workflow in WORKFLOWS.values():
             with self.subTest(workflow=workflow.name):
                 parameters = list(inspect.signature(workflow.build_start).parameters)
-                self.assertEqual(parameters, ["project", "pending", "options", "scratch"])
+                self.assertEqual(parameters, ["project", "pending", "options", "scratch", "project_config"])
 
     def test_start_options_come_only_from_the_declared_extra_options(self):
         parser = cli.parser()

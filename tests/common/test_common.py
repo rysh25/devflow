@@ -13,7 +13,7 @@ from devflow_core.common.review import (REVIEW_LIMIT_REASON, REPEATED_FAILURE_RE
                                         all_approved, ask_at_limit, check_fields,
                                         check_review_budget, decide_at_limit, next_reviewer, review_budget,
                                         validate_limit)
-from devflow_core.common.settings import validate_document
+from devflow_core.common.settings import read_project_settings
 from devflow_core.workflows import WORKFLOWS
 from devflow_core.common.environment import (GIT_FACT_SECONDS, PROBE_SECONDS, REVIEW_SETUP_SECONDS, bash_timeout_ms,
                                               python_errors, review_timeout_ms)
@@ -251,45 +251,48 @@ class SharedSettingsTests(unittest.TestCase):
         self.project = Path(temporary.name).resolve()
         self.path = self.project / "devflow.config.json"
 
+    def config(self, workflow, host="claude"):
+        return WORKFLOWS[workflow].load_config(read_project_settings(self.project, host, WORKFLOWS))
+
     def test_empty_project_is_inert(self):
-        self.assertEqual(WORKFLOWS["plan"].load_config(self.project)["max_reviews"], 6)
-        self.assertEqual(WORKFLOWS["implement"].load_config(self.project)["max_reviews"], 6)
+        self.assertEqual(self.config("plan")["max_reviews"], 6)
+        self.assertEqual(self.config("implement")["max_reviews"], 6)
         self.assertEqual(list(self.project.iterdir()), [])
 
     def test_legacy_configuration_is_not_implicitly_imported(self):
         # Files named after the former standalone components are ignored.
         for name in ("plan" + "flow", "build" + "flow"):
             atomic_json(self.project / (name + ".config.json"), {"max_reviews": 2})
-        self.assertEqual(WORKFLOWS["plan"].load_config(self.project)["max_reviews"], 6)
-        self.assertEqual(WORKFLOWS["implement"].load_config(self.project)["max_reviews"], 6)
+        self.assertEqual(self.config("plan")["max_reviews"], 6)
+        self.assertEqual(self.config("implement")["max_reviews"], 6)
 
     def test_common_values_and_workflow_override_are_separate(self):
-        reviewers = WORKFLOWS["plan"].load_config(self.project)["reviewers"]
+        reviewers = self.config("plan")["reviewers"]
         reviewers[0]["id"] = "synthetic"
         atomic_json(self.path, {"schema_version": 1, "max_reviews": 6,
                               "reviewers": reviewers,
                               "plan": {"max_reviews": 4, "grill_skill": "interview"},
                               "implement": {"checks": []}})
-        plan = WORKFLOWS["plan"].load_config(self.project)
-        implement = WORKFLOWS["implement"].load_config(self.project)
+        plan = self.config("plan")
+        implement = self.config("implement")
         self.assertEqual(plan["max_reviews"], 4)
         self.assertEqual(implement["max_reviews"], 6)
         self.assertNotIn("checks", plan)
         self.assertNotIn("grill_skill", implement)
         plan["reviewers"][0]["id"] = "changed"
         self.assertEqual(implement["reviewers"][0]["id"], "synthetic")
-        self.assertEqual(WORKFLOWS["plan"].load_config(self.project)["reviewers"][0]["id"], "synthetic")
+        self.assertEqual(self.config("plan")["reviewers"][0]["id"], "synthetic")
 
     def test_each_flow_sets_its_own_review_count_from_1_to_99(self):
         atomic_json(self.path, {"schema_version": 1, "max_reviews": 6,
                                 "plan": {"max_reviews": 3}, "implement": {"max_reviews": 50}})
-        self.assertEqual(WORKFLOWS["plan"].load_config(self.project)["max_reviews"], 3)
-        self.assertEqual(WORKFLOWS["implement"].load_config(self.project)["max_reviews"], 50)
+        self.assertEqual(self.config("plan")["max_reviews"], 3)
+        self.assertEqual(self.config("implement")["max_reviews"], 50)
         for value in (0, 100):
             with self.subTest(value=value):
                 atomic_json(self.path, {"schema_version": 1, "implement": {"max_reviews": value}})
                 with self.assertRaisesRegex(DevFlowError, "from 1 to 99"):
-                    WORKFLOWS["implement"].load_config(self.project)
+                    self.config("implement")
 
     def test_unknown_top_level_and_schema_versions_fail(self):
         names = ("plan", "implement")
@@ -298,15 +301,13 @@ class SharedSettingsTests(unittest.TestCase):
             with self.subTest(value=value):
                 atomic_json(self.path, value)
                 with self.assertRaises(DevFlowError):
-                    validate_document(self.project, names)
-                    WORKFLOWS["plan"].load_config(self.project)
-                    WORKFLOWS["implement"].load_config(self.project)
+                    read_project_settings(self.project, "claude", names)
 
     def test_top_level_keys_come_from_the_caller_registry(self):
         atomic_json(self.path, {"schema_version": 1, "deploy": {}})
         with self.assertRaisesRegex(DevFlowError, "deploy"):
-            validate_document(self.project, ("plan", "implement"))
-        validate_document(self.project, ("plan", "implement", "deploy"))
+            read_project_settings(self.project, "claude", ("plan", "implement"))
+        read_project_settings(self.project, "claude", ("plan", "implement", "deploy"))
 
     def test_symlink_configuration_is_rejected(self):
         target = self.project / "other.json"
@@ -316,28 +317,33 @@ class SharedSettingsTests(unittest.TestCase):
         except (OSError, NotImplementedError):
             self.skipTest("Creating symlinks requires OS permission")
         with self.assertRaises(DevFlowError):
-            WORKFLOWS["implement"].load_config(self.project)
+            self.config("implement")
 
     def test_auto_accept_at_review_limit_layers_with_the_existing_precedence(self):
         for flow in ("plan", "implement"):
             with self.subTest(flow=flow):
-                self.assertFalse(WORKFLOWS[flow].load_config(self.project)["auto_accept_at_review_limit"])
+                self.assertFalse(self.config(flow)["auto_accept_at_review_limit"])
         atomic_json(self.path, {"schema_version": 1, "auto_accept_at_review_limit": True,
                                 "plan": {"auto_accept_at_review_limit": False}})
-        self.assertFalse(WORKFLOWS["plan"].load_config(self.project)["auto_accept_at_review_limit"])
-        self.assertTrue(WORKFLOWS["implement"].load_config(self.project)["auto_accept_at_review_limit"])
+        self.assertFalse(self.config("plan")["auto_accept_at_review_limit"])
+        self.assertTrue(self.config("implement")["auto_accept_at_review_limit"])
         atomic_json(self.project / "devflow.config.local.json",
                     {"schema_version": 1, "auto_accept_at_review_limit": False})
-        self.assertFalse(WORKFLOWS["implement"].load_config(self.project)["auto_accept_at_review_limit"])
+        self.assertFalse(self.config("implement")["auto_accept_at_review_limit"])
         atomic_json(self.project / "devflow.config.local.json",
                     {"schema_version": 1, "implement": {"auto_accept_at_review_limit": True}})
-        self.assertTrue(WORKFLOWS["implement"].load_config(self.project)["auto_accept_at_review_limit"])
+        self.assertTrue(self.config("implement")["auto_accept_at_review_limit"])
+
+        atomic_json(self.project / "devflow.config.codex.local.json",
+                    {"schema_version": 1, "implement": {"auto_accept_at_review_limit": False}})
+        self.assertFalse(self.config("implement", host="codex")["auto_accept_at_review_limit"])
+        self.assertTrue(self.config("implement")["auto_accept_at_review_limit"])
 
     def test_auto_accept_at_review_limit_accepts_only_a_boolean(self):
         from devflow_core.plan.config import validate_config as plan_validate
         from devflow_core.implement.config import validate_config as implement_validate
         for flow, validate in (("plan", plan_validate), ("implement", implement_validate)):
-            base = WORKFLOWS[flow].load_config(self.project)  # a complete config; only the new key goes bad
+            base = self.config(flow)  # a complete config; only the new key goes bad
             for bad in ("true", 1, 0, None):
                 with self.subTest(flow=flow, value=bad):
                     with self.assertRaisesRegex(DevFlowError, "must be a boolean"):
@@ -346,7 +352,7 @@ class SharedSettingsTests(unittest.TestCase):
             with self.subTest(value=bad):
                 atomic_json(self.path, {"schema_version": 1, "auto_accept_at_review_limit": bad})
                 with self.assertRaises(DevFlowError):
-                    WORKFLOWS["plan"].load_config(self.project)
+                    self.config("plan")
 
 
 class ReviewBudgetTests(unittest.TestCase):

@@ -257,6 +257,195 @@ class EngineFixture(unittest.TestCase):
         self.assertEqual(digest(path.read_bytes()), self.state()["artifacts"][status["report_path"]])
 
 
+class HostSettingsUpgradeTests(EngineFixture):
+    settings_path = "nested/DEVFLOW.CONFIG.DEVIN.LOCAL.JSON"
+
+    def old_scope(self):
+        snapshot = engine_module.snapshot
+        return patch.multiple(snapshot, _ALWAYS_EXCLUDED=snapshot._ALWAYS_EXCLUDED - snapshot.HOST_CONFIG_FILES,
+                              HOST_CONFIG_FILES=frozenset())
+
+    def add_settings(self):
+        path = self.project / self.settings_path
+        path.parent.mkdir(exist_ok=True)
+        path.write_text("private fixture\n", encoding="utf-8")
+        return path
+
+    def assert_blocked_before_review(self, attempts):
+        self.preflight.reset_mock()
+        self.reviewer.reset_mock()
+        with self.assertRaisesRegex(DevFlowError, f"{self.settings_path}.*cancel and restart"):
+            self.review()
+        self.preflight.assert_not_called()
+        self.reviewer.assert_not_called()
+        self.assertEqual(len(self.state()["attempts"]), attempts)
+
+    def test_legacy_baseline_is_blocked_before_capture_and_diff(self):
+        self.add_settings()
+        with self.old_scope():
+            self.start()
+        with patch.object(engine_module.snapshot, "capture") as capture:
+            with self.assertRaisesRegex(DevFlowError, f"{self.settings_path}.*cancel and restart"):
+                self.checkpoint()
+        capture.assert_not_called()
+        self.assertEqual(self.state()["checkpoint_count"], 0)
+
+    def test_legacy_context_path_gets_the_migration_error_before_capture(self):
+        self.add_settings()
+        self.config["snapshot"]["context_paths"] = [self.settings_path]
+        self.write_config()
+        with self.old_scope():
+            self.start()
+        with self.assertRaisesRegex(DevFlowError, f"{self.settings_path}.*cancel and restart"):
+            self.checkpoint()
+        self.assertEqual(self.state()["checkpoint_count"], 0)
+
+    def test_current_legacy_candidate_is_blocked_before_reviewer_probe(self):
+        with self.old_scope():
+            self.start()
+            self.add_settings()
+            self.assertEqual(self.ready()["status"], "ready_review")
+        self.assert_blocked_before_review(attempts=0)
+
+    def assert_unchanged_legacy_setting_blocks_review(self, context_paths):
+        self.add_settings()
+        self.config["snapshot"]["context_paths"] = context_paths
+        self.write_config()
+        with self.old_scope():
+            self.start()
+            self.assertEqual(self.ready()["status"], "ready_review")
+        candidate = read_json(self.run / self.state()["candidate"]["path"])
+        self.assertEqual([change["path"] for change in candidate["changes"]], ["module.py"])
+        with patch.object(engine_module.snapshot, "capture") as capture:
+            self.assert_blocked_before_review(attempts=0)
+        capture.assert_not_called()
+
+    def test_unchanged_legacy_baseline_setting_blocks_review_before_capture(self):
+        self.assert_unchanged_legacy_setting_blocks_review([])
+
+    def test_unchanged_legacy_context_path_blocks_review_before_capture(self):
+        self.assert_unchanged_legacy_setting_blocks_review([self.settings_path])
+
+    def test_prior_review_history_is_blocked_even_after_settings_are_deleted(self):
+        with self.old_scope():
+            self.start()
+            settings = self.add_settings()
+            self.assertEqual(self.ready()["status"], "ready_review")
+            self.assertEqual(self.review()["status"], "ready_review")
+        settings.unlink()
+        self.assertEqual(self.ready(2)["status"], "ready_review")
+        self.assert_blocked_before_review(attempts=1)
+
+    def test_prior_human_validation_without_a_review_is_checked(self):
+        self.config["checks"] = []
+        self.write_config()
+
+        def validate(value):
+            self.assertEqual(self.ready(value)["status"], "awaiting_human")
+            result = self.engine.resolve(self.run_id, self.session, self.answer(), "continue",
+                                         "The fixture was manually checked.")
+            self.assertEqual(result["status"], "ready_review")
+
+        with self.old_scope():
+            self.start()
+            settings = self.add_settings()
+            validate(1)
+        settings.unlink()
+        validate(2)
+        self.assert_blocked_before_review(attempts=0)
+
+    def test_candidate_must_name_the_snapshot_in_its_record(self):
+        self.start()
+        self.assertEqual(self.ready()["status"], "ready_review")
+        with self.engine._lock(self.run_id):
+            state = self.engine._state(self.run_id)
+            state["candidate"]["snapshot_id"] = "0" * 64
+            self.engine._save(state)
+        with self.assertRaisesRegex(DevFlowError, "record does not match the referenced snapshot ID"):
+            self.review()
+        self.preflight.assert_not_called()
+        self.assertEqual(self.state()["attempts"], [])
+
+    def test_prior_attempt_snapshot_id_is_checked_even_for_a_cached_record(self):
+        self.start()
+        self.assertEqual(self.ready()["status"], "ready_review")
+        self.assertEqual(self.review()["status"], "ready_review")
+        self.assertEqual(self.ready(2)["status"], "ready_review")
+        with self.engine._lock(self.run_id):
+            state = self.engine._state(self.run_id)
+            state["attempts"][0]["snapshot_path"] = state["candidate"]["path"]
+            self.engine._save(state)
+        self.preflight.reset_mock()
+        with self.assertRaisesRegex(DevFlowError, "record does not match the referenced snapshot ID"):
+            self.review()
+        self.preflight.assert_not_called()
+        self.assertEqual(len(self.state()["attempts"]), 1)
+
+    def test_oversized_baseline_is_detected_before_opening_it_for_review(self):
+        self.start()
+        self.assertEqual(self.ready()["status"], "ready_review")
+        baseline = self.run / "baseline.json"
+        baseline.write_bytes(b"x" * 1025)
+        opening = Path.open
+
+        def open_record(path, *args, **kwargs):
+            self.assertNotEqual(path, baseline)
+            return opening(path, *args, **kwargs)
+
+        with patch.object(runs, "JSON_LIMIT", 1024), patch.object(Path, "open", autospec=True, side_effect=open_record):
+            with self.assertRaisesRegex(DevFlowError, "Record exceeds 1024 bytes: baseline.json"):
+                self.review()
+        self.preflight.assert_not_called()
+        self.assertEqual(self.state()["attempts"], [])
+
+    def test_changed_checkpoint_during_probe_is_not_reserved(self):
+        self.start()
+        self.assertEqual(self.ready()["status"], "ready_review")
+        probe = self.preflight.return_value
+
+        def preflight(*_, **__):
+            self.assertEqual(self.ready(2)["status"], "ready_review")
+            return probe
+
+        self.preflight.side_effect = preflight
+        with self.assertRaisesRegex(DevFlowError, "run changed during the reviewer check"):
+            self.review()
+        self.reviewer.assert_not_called()
+        self.assertEqual(self.state()["attempts"], [])
+
+    def test_new_unchecked_checkpoint_during_probe_has_retry_guidance(self):
+        self.start()
+        self.assertEqual(self.ready()["status"], "ready_review")
+        probe = self.preflight.return_value
+
+        def preflight(*_, **__):
+            self.source.write_text("VALUE = 2\n", encoding="utf-8")
+            self.assertEqual(self.checkpoint()["status"], "ready_check")
+            return probe
+
+        self.preflight.side_effect = preflight
+        with self.assertRaisesRegex(DevFlowError, "retry when the current checkpoint is ready for review"):
+            self.review()
+        self.reviewer.assert_not_called()
+        self.assertEqual(self.state()["attempts"], [])
+
+    def test_prompt_during_probe_does_not_change_review_inputs(self):
+        self.start()
+        self.assertEqual(self.ready()["status"], "ready_review")
+        probe = self.preflight.return_value
+        revision = self.state()["state_revision"]
+
+        def preflight(*_, **__):
+            self.assertIsNotNone(self.prompt("When will this review finish?"))
+            self.assertGreater(self.state()["state_revision"], revision)
+            return probe
+
+        self.preflight.side_effect = preflight
+        result = self.review()
+        self.assertEqual(result["attempts"][0]["status"], "succeeded")
+        self.reviewer.assert_called_once()
+
+
 class EngineFlowTests(EngineFixture):
     def test_start_preflights_every_reviewer_in_the_workspace(self):
         # Each reviewer is checked once, in the workspace, before the baseline is captured.

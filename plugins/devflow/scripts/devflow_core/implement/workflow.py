@@ -11,6 +11,7 @@ from ..common.review import (after_failed_review, check_auto_accepted, check_rev
                              check_review_config, review_budget)
 from ..common.runs import TERMINAL
 from ..common.sessions import prefilled_question_events
+from ..common.settings import SettingsDocument
 from ..common.operations import public_command
 from ..common.startup import apply_startup, parse_start
 from ..common.storage import check_json_size, digest, json_bytes, no_symlinks, now
@@ -67,9 +68,9 @@ class ImplementWorkflow(Workflow):
         return os.path.normpath(str(path))
 
     def build_start(self, project: Path, pending: dict, options: dict,
-                    scratch: Path) -> tuple[dict, dict[str, bytes | Path]]:
+                    scratch: Path, *, project_config: dict) -> tuple[dict, dict[str, bytes | Path]]:
         from . import snapshot
-        from .config import load_config, validate_config
+        from .config import validate_config
         from ..common.reviewers import preflight
         from .engine import _plan_bytes
         from .workspace import resolve_workspace, verify_workspace
@@ -77,7 +78,7 @@ class ImplementWorkflow(Workflow):
         no_symlinks(plan)
         payload = pending["event"]["payload"]
         startup = parse_start(public_command(payload["prompt"], payload["host"])[1])
-        config = validate_config(apply_startup(load_config(project, self), startup))
+        config = validate_config(apply_startup(project_config, startup))
         if plan.suffix.lower() not in {".md", ".markdown"}:
             raise DevFlowError("The input plan must be a UTF-8 Markdown file")
         # The workspace is decided once, before anything is created, and frozen.
@@ -224,9 +225,9 @@ class ImplementWorkflow(Workflow):
     def frozen_config(self, state: dict) -> dict:
         return state["config"]
 
-    def load_config(self, project: Path) -> dict:
+    def load_config(self, documents: tuple[SettingsDocument, ...]) -> dict:
         from .config import load_config
-        return load_config(project, self)
+        return load_config(documents, self)
 
     def doctor(self, project: Path, config: dict, *, host: str) -> dict:
         return {"warnings": ([] if config["checks"] else

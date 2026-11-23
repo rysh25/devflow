@@ -13,10 +13,11 @@ from devflow_core.common import git as git_module
 from devflow_core.common.errors import DevFlowError, ProcessCleanupError
 from devflow_core.common.process import Completed
 from devflow_core.common.review import AUTO_ACCEPTANCE, REVIEW_LIMIT_REASON
+from devflow_core.common.settings import read_project_settings
 from devflow_core.common.storage import atomic_write_json, digest, read_json
 from devflow_core.implement.config import load_config, validate_config
-from devflow_core.implement import WORKFLOW
 from devflow_core.implement.engine import Engine
+from devflow_core.workflows import WORKFLOWS
 from tests.implement.test_engine import EngineFixture
 
 
@@ -24,7 +25,7 @@ class ConfigLayeringTests(EngineFixture):
     """The shared setting's precedence and strict boolean validation for Implement."""
 
     def load(self):
-        return load_config(self.project, WORKFLOW)
+        return load_config(read_project_settings(self.project, "claude", WORKFLOWS), WORKFLOWS["implement"])
 
     def test_defaults_to_false(self):
         self.assertFalse(self.load()["auto_accept_at_review_limit"])

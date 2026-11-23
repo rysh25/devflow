@@ -9,7 +9,7 @@ from unittest.mock import patch
 from devflow_core import cli, router
 from devflow_core.common import sessions
 from devflow_core.common.errors import DevFlowError
-from devflow_core.common.hosts import canonical_payload, question_context
+from devflow_core.common.hosts import HOSTS, canonical_payload, question_context
 from devflow_core.common.runs import RunStore, make_event, open_escalation
 from devflow_core.common.storage import atomic_json, read_json
 from devflow_core.workflows import WORKFLOWS
@@ -20,6 +20,128 @@ FIXTURES = Path(__file__).resolve().parents[1] / 'fixtures' / 'codex_host_0_166_
 
 def fixture(name):
     return json.loads((FIXTURES / name).read_text())
+
+
+class HostSettingsTests(RuntimeFixture):
+    def submit(self, host, project, session, operation, argument, cwd=None):
+        profile = HOSTS[host]
+        payload = self.payload(session=session, prompt=f"{profile.command_prefix}{operation} {argument}",
+                               cwd=str(cwd or project), turn_id="fixture-turn")
+        environ = {profile.project_variable: str(project)} if profile.project_variable else {}
+        if host == "devin":
+            del payload["cwd"]
+        return router.handle_hook(payload, PLUGIN, environ=environ, host=host)
+
+    def cli_result(self, host, project, *args, code=0):
+        output = io.StringIO()
+        with redirect_stdout(output), patch("devflow_core.cli.host_version",
+                                           return_value={"version": None, "supported": True}):
+            result = cli.main(["--host", host, "--project", str(project), *args])
+        self.assertEqual(result, code, output.getvalue())
+        return json.loads(output.getvalue())
+
+    def test_native_starts_and_each_doctor_use_the_host_and_freeze_configuration(self):
+        for index, host in enumerate(HOSTS):
+            with self.subTest(host=host):
+                project = self.base / host
+                project.mkdir()
+                atomic_json(project / "devflow.config.json", {})
+                shared = project / f"devflow.config.{host}.json"
+                local = project / f"devflow.config.{host}.local.json"
+                atomic_json(shared, {"max_reviews": 12, "implement": {"snapshot": {"mode": "files"}}})
+                atomic_json(local, {"max_reviews": 21 + index, "plan": {"publish": {"directory": f"plans-{host}"}},
+                                    "implement": {"max_reviews": 31 + index, "max_check_attempts": 5 + index}})
+                child = project / "nested"
+                child.mkdir()
+                (child / shared.name).write_text("ignored", encoding="utf-8")
+                (project / "feature.md").write_text("# Feature\n", encoding="utf-8")
+                global_report = self.cli_result(host, child, "doctor")
+                self.assertEqual(global_report["workflows"]["plan"]["config"]["max_reviews"], 21 + index)
+                self.assertEqual(global_report["workflows"]["implement"]["config"]["max_reviews"], 31 + index)
+                for flow, expected in (("plan", 21 + index), ("implement", 31 + index)):
+                    self.assertEqual(self.cli_result(host, child, flow, "doctor")["config"]["max_reviews"], expected)
+
+                plan_session, impl_session = f"{host}-plan", f"{host}-implement"
+                self.submit(host, project, plan_session, "plan", "--max-reviews 51 -- request", cwd=child)
+                plan_run = sessions.read_record(project, plan_session, WORKFLOWS, host)["run"]["run_id"]
+                plan_config = read_json(project / ".devflow" / "runs" / "plan" / plan_run / "config.json")
+                self.assertEqual(plan_config["publish"]["directory"], f"plans-{host}")
+                self.submit(host, project, impl_session, "implement", "--max-reviews 52 -- feature.md", cwd=child)
+                pending = self.cli_result(host, project, "--session", impl_session, "implement", "doctor")
+                self.assertEqual((pending["configuration_source"], pending["config"]["max_reviews"]),
+                                 ("pending_start", 52))
+                started = router.runner_start(project, impl_session, "implement", "feature.md", host=host)
+                self.assertEqual((started["owner_host"], started["config"]["max_reviews"]), (host, 52))
+                self.assertEqual(started["config"]["max_check_attempts"], 5 + index)
+
+                shared.write_text("broken", encoding="utf-8")
+                local.unlink()
+                (project / "devflow.config.json").write_text("broken", encoding="utf-8")
+                for flow, session, run, expected in (("plan", plan_session, plan_run, 51),
+                                                      ("implement", impl_session, started["run_id"], 52)):
+                    self.submit(host, project, session, "resume", run, cwd=child)
+                    report = self.cli_result(host, project, "--run", run, flow, "doctor")
+                    self.assertEqual((report["configuration_source"], report["config"]["max_reviews"]),
+                                     ("frozen_run", expected))
+                self.assertIn(shared.name, self.cli_result(host, project, "doctor", code=2)["message"])
+
+    def test_selected_document_is_read_once_per_start_or_global_doctor(self):
+        path = self.project / "devflow.config.codex.json"
+        state = {"max_reviews": 17, "implement": {"snapshot": {"mode": "files"}}}
+
+        def read_and_replace(path_read):
+            value = read_json(path_read)
+            if path_read == path:
+                atomic_json(path, {"unknown": 1})
+            return value
+
+        plan_session = "codex-file-once"
+        for command in ("plan", "doctor", "implement"):
+            atomic_json(path, state)
+            if command == "implement":
+                self.submit("codex", self.project, self.session, "implement", "feature.md")
+            with patch("devflow_core.common.settings.read_json", side_effect=read_and_replace) as reading:
+                if command == "plan":
+                    self.submit("codex", self.project, plan_session, "plan", "request")
+                    plan_run = sessions.read_record(self.project, plan_session, WORKFLOWS, "codex")["run"]["run_id"]
+                    config = read_json(self.run_dir("plan", plan_run) / "config.json")
+                    self.assertEqual(config["max_reviews"], 17)
+                elif command == "doctor":
+                    report = self.cli_result("codex", self.project, "doctor")
+                    self.assertTrue(all(item["config"]["max_reviews"] == 17
+                                        for item in report["workflows"].values()))
+                else:
+                    started = router.runner_start(self.project, self.session, "implement", "feature.md", host="codex")
+                    self.assertEqual(started["config"]["max_reviews"], 17)
+                self.assertEqual(sum(call.args == (path,) for call in reading.call_args_list), 1, command)
+
+    def test_implement_start_revalidates_the_file_selected_after_the_hook(self):
+        path = self.project / "devflow.config.codex.json"
+        self.submit("codex", self.project, self.session, "implement", "feature.md")
+        atomic_json(path, {"unknown": 1})
+        with self.assertRaisesRegex(DevFlowError, f"Unknown {path.name} keys"):
+            router.runner_start(self.project, self.session, "implement", "feature.md", host="codex")
+        root = self.project / ".devflow" / "runs" / "implement"
+        self.assertFalse(any(root.glob("*/state.json")))
+
+    def test_selected_dedicated_snapshot_syntax_is_checked_at_doctor_and_start(self):
+        shared = self.project / "devflow.config.codex.json"
+        local = self.project / "devflow.config.codex.local.json"
+        cases = (
+            ("include", ["../outside/**"], ["**"], "Unsafe snapshot glob"),
+            ("context_paths", ["../outside.py"], [], "Non-portable file path"),
+        )
+        for field, bad, override, error in cases:
+            with self.subTest(field=field):
+                atomic_json(shared, {"implement": {"snapshot": {field: bad}}})
+                atomic_json(local, {"implement": {"snapshot": {field: override}}})
+                self.submit("codex", self.project, self.session, "implement", "feature.md")
+                doctor = self.cli_result("codex", self.project, "--session", self.session, "implement", "doctor", code=2)
+                self.assertIn(f"{shared.name}: {error}", doctor["message"])
+                with self.assertRaisesRegex(DevFlowError, f"{shared.name}: {error}"):
+                    router.runner_start(self.project, self.session, "implement", "feature.md", host="codex")
+                root = self.project / ".devflow" / "runs" / "implement"
+                self.assertFalse(any(root.glob("*/state.json")))
 
 
 class HostTests(RuntimeFixture):

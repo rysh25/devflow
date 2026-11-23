@@ -12,7 +12,7 @@ from ..common.hosts import executable_name, host_profile
 from ..common.errors import DevFlowError
 from .interview import INTERVIEW_NAME_PATTERN, inspect_interview_skill
 from ..common.review import check_auto_accept, validate_limit
-from ..common.settings import load_workflow_config, validate_reviewers
+from ..common.settings import SettingsDocument, load_workflow_config, validate_reviewers
 
 
 # The published plan's name: a template whose only values are {run_id} and {ticket}.
@@ -88,12 +88,12 @@ def validate_config(config: dict) -> dict:
     return copy.deepcopy(config)
 
 
-def load_config(project: Path, workflow) -> dict:
-    return load_workflow_config(project, workflow, validate_config)
+def load_config(documents: tuple[SettingsDocument, ...], workflow) -> dict:
+    return load_workflow_config(documents, workflow, validate_config)
 
 
-def diagnose(project: Path, workflow, effective_config: dict | None = None, *, host: str) -> dict:
-    config = load_config(project, workflow) if effective_config is None else validate_config(effective_config)
+def diagnose(project: Path, config: dict, *, host: str, frozen: bool = False) -> dict:
+    config = validate_config(config)
     interview = inspect_interview_skill(project, config["grill_skill"], host=host)
     binaries = {}
     for name in ("uv", executable_name(host), *[p["command"][0] for p in config["reviewers"]]):
@@ -102,7 +102,7 @@ def diagnose(project: Path, workflow, effective_config: dict | None = None, *, h
     return {
         "schema_version": 1,
         "config": config,
-        "configuration_source": "project_settings" if effective_config is None else "frozen_run",
+        "configuration_source": "frozen_run" if frozen else "project_settings",
         "binaries": binaries,
         "interview_skill": interview,
         "ready": interview["static_ready"] and all(item["found"] for item in binaries.values()),

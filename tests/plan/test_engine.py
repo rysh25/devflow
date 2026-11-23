@@ -17,6 +17,7 @@ from devflow_core.common import paths, sessions
 from devflow_core.common import runs as runs_module
 from devflow_core.common.errors import DevFlowError, ProcessCleanupError, ReviewerError
 from devflow_core.common.review import AUTO_ACCEPTANCE, REVIEW_LIMIT_REASON, ask_at_limit
+from devflow_core.common.settings import read_project_settings
 from devflow_core.common.storage import atomic_write_json, digest, file_lock, json_bytes, read_json
 from devflow_core.plan import engine as engine_module
 from devflow_core.plan import config as config_module
@@ -1755,7 +1756,7 @@ class EngineTests(unittest.TestCase):
             (self.project / "devflow.config.json").write_text(json.dumps({"plan": {"publish": {"filename": value}}}),
                                                               encoding="utf-8")
             with self.subTest(value=value):
-                self.assertEqual(load_config(self.project, WORKFLOWS["plan"])["publish"]["filename"], value)
+                self.assertEqual(load_config(read_project_settings(self.project, "claude", WORKFLOWS), WORKFLOWS["plan"])["publish"]["filename"], value)
 
     def start_before_filename(self, request):
         """A run started before 0.7.3: its frozen configuration has no publish.filename."""
@@ -1787,7 +1788,7 @@ class EngineTests(unittest.TestCase):
 
     def test_default_filename_is_the_default_setting(self):
         self.assertEqual(FILENAME_DEFAULT, read_json(RESOURCES / "defaults.json")["publish"]["filename"])
-        self.assertEqual(load_config(self.project, WORKFLOWS["plan"])["publish"]["filename"], FILENAME_DEFAULT)
+        self.assertEqual(load_config(read_project_settings(self.project, "claude", WORKFLOWS), WORKFLOWS["plan"])["publish"]["filename"], FILENAME_DEFAULT)
 
     # -- stopped saves: a save that stops before state.json is replaced is not committed --
     def stop_commit(self, when=lambda value: True):

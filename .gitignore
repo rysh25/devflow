@@ -9,6 +9,9 @@ node_modules/
 dist/
 .devflow/
 /devflow.config.local.json
+/devflow.config.claude.local.json
+/devflow.config.codex.local.json
+/devflow.config.devin.local.json
 docs/plans/
 .env
 .env.*

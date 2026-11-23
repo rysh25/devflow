@@ -14,10 +14,12 @@ PLUGIN = Path(__file__).resolve().parents[2] / "plugins" / "devflow" / "scripts"
 
 from devflow_core.cli import main
 from devflow_core.common.errors import DevFlowError
+from devflow_core.common.settings import read_project_settings
 from devflow_core.common.storage import atomic_write_json, read_json
 from devflow_core.implement import WORKFLOW
 from devflow_core.implement import WORKFLOW
-from devflow_core.implement.config import load_config, validate_config
+from devflow_core.implement.config import validate_config
+from devflow_core.workflows import WORKFLOWS
 
 
 class ConfigCliTests(unittest.TestCase):
@@ -29,6 +31,9 @@ class ConfigCliTests(unittest.TestCase):
         self.config = read_json(PLUGIN / "defaults.json")
         # An explicit root avoids inheriting any unrelated temp-parent state.
         (self.project / ".git").mkdir()
+
+    def load_config(self):
+        return WORKFLOW.load_config(read_project_settings(self.project, "claude", WORKFLOWS))
 
     def invoke(self, *args):
         stdout, stderr = io.StringIO(), io.StringIO()
@@ -97,7 +102,7 @@ class ConfigCliTests(unittest.TestCase):
             {"id": "tests", "argv": [sys.executable, "-m", "unittest"]}]}
         atomic_write_json(self.project / "devflow.config.json", {"schema_version": 1, "implement": overlay})
         with patch("subprocess.Popen") as processes:
-            config = load_config(self.project, WORKFLOW)
+            config = self.load_config()
         processes.assert_not_called()
         self.assertEqual(config["snapshot"]["mode"], "files")
         self.assertEqual(config["snapshot"]["max_packet_bytes"], self.config["snapshot"]["max_packet_bytes"])
@@ -118,7 +123,7 @@ class ConfigCliTests(unittest.TestCase):
             with self.subTest(document=document):
                 atomic_write_json(self.project / "devflow.config.json", {"schema_version": 1, **document})
                 with self.assertRaisesRegex(DevFlowError, message):
-                    load_config(self.project, WORKFLOW)
+                    self.load_config()
 
     def test_a_snapshot_mode_other_than_git_or_files_is_named(self):
         with self.assertRaisesRegex(DevFlowError, r"^snapshot.mode must explicitly be git or files$"):
@@ -143,7 +148,7 @@ class ConfigCliTests(unittest.TestCase):
             "plan": {"grill_skill": "some-independent-interview", "publish": {"enabled": False}},
             "implement": {"snapshot": {"mode": "files"}, "max_check_attempts": 2},
         })
-        result = load_config(self.project, WORKFLOW)
+        result = self.load_config()
         self.assertEqual(result["reviewers"], reviewers)
         self.assertEqual(result["max_reviews"], 4)
         self.assertEqual(result["max_check_attempts"], 2)
@@ -154,7 +159,7 @@ class ConfigCliTests(unittest.TestCase):
         atomic_write_json(self.project / ("build" + "flow.config.json"), {
             "snapshot": {"mode": "files"}, "max_reviews": 1,
         })
-        self.assertEqual(load_config(self.project, WORKFLOW), self.config)
+        self.assertEqual(self.load_config(), self.config)
 
     def test_unknown_top_level_unified_config_field_is_rejected(self):
         atomic_write_json(self.project / "devflow.config.json", {
@@ -165,10 +170,35 @@ class ConfigCliTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("Unknown devflow.config.json keys", output)
 
+    def test_selected_document_errors_are_reported_on_utf8_stdout(self):
+        dedicated = "devflow.config.codex.json"
+        nested = "[" * 700 + "0" + "]" * 700
+        cases = (
+            (dedicated, r'{"\ud800": 1, "\ud800": 2}', "Duplicate JSON key"),
+            (dedicated, '{"implement": {"snapshot": {"include": ' + nested + '}}}', "nested too deeply"),
+            ("devflow.config.json", r'{"\ud800": 1}', "Unknown devflow.config.json keys"),
+        )
+        runner = PLUGIN.parents[1] / "devflow.py"
+        for name, document, error in cases:
+            with self.subTest(error=error):
+                path = self.project / name
+                path.write_text(document, encoding="utf-8")
+                try:
+                    result = subprocess.run(
+                        [sys.executable, str(runner), "--host", "codex", "--project", str(self.project),
+                         "implement", "doctor"], capture_output=True, timeout=30)
+                finally:
+                    path.unlink()
+                self.assertEqual((result.returncode, result.stderr), (2, b""))
+                diagnostic = json.loads(result.stdout.decode("utf-8"))
+                self.assertEqual(diagnostic["error"], "DevFlowError")
+                self.assertIn(name, diagnostic["message"])
+                self.assertIn(error, diagnostic["message"])
+
     def test_workflow_review_budget_stays_bounded_when_inherited(self):
         atomic_write_json(self.project / "devflow.config.json", {"schema_version": 1, "max_reviews": 100})
         with self.assertRaises(DevFlowError):
-            load_config(self.project, WORKFLOW)
+            self.load_config()
 
     def started_run(self, session="claude-cli-session"):
         """A real files-mode run started through the hook and the runner (reviewer checks mocked)."""

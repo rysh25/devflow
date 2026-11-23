@@ -122,8 +122,20 @@ class RunBoundedTests(unittest.TestCase):
         # The feeder is registered before ``Thread.start`` returns, so an interrupt
         # during startup still waits on it: the stop cannot be confirmed and the
         # interrupt is kept as the cleanup error's cause.
+        real_popen = subprocess.Popen
         real_start = threading.Thread.start
         starts = {"n": 0}
+
+        def reap_child(child):
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+
+        def spawn(*args, **kwargs):
+            child = real_popen(*args, **kwargs)
+            # Reap the child before the fixture removes its working directory.
+            self.addCleanup(reap_child, child)
+            return child
 
         def flaky_start(thread):
             real_start(thread)
@@ -131,7 +143,8 @@ class RunBoundedTests(unittest.TestCase):
             if starts["n"] == 3:  # the two stream readers, then the stdin feeder
                 raise KeyboardInterrupt()
 
-        with patch.object(process_module, "stop_tree", lambda process: None):
+        with (patch.object(process_module, "stop_tree", lambda process: None),
+              patch.object(process_module.subprocess, "Popen", spawn)):
             with patch.object(threading.Thread, "start", flaky_start):
                 with self.assertRaises(ProcessCleanupError) as caught:
                     self.python("import time; time.sleep(12)", timeout=20, data=b"data")

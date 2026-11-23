@@ -29,6 +29,7 @@ PLAN_PLUGIN = SCRIPTS / "devflow_core" / "plan"
 from devflow_core import cli, router  # noqa: E402
 from devflow_core.common import sessions  # noqa: E402
 from devflow_core.common.errors import DevFlowError  # noqa: E402
+from devflow_core.common.settings import read_project_settings  # noqa: E402
 from devflow_core.common.storage import read_json  # noqa: E402
 from devflow_core.implement.config import validate_config, load_config as load_build_config  # noqa: E402
 from devflow_core.implement.engine import Engine as BuildEngine  # noqa: E402
@@ -162,8 +163,9 @@ class BundleContractTests(unittest.TestCase):
             for path in examples:
                 with self.subTest(example=path.name):
                     write_json(project / "devflow.config.json", read_json(path))
-                    plan = load_plan_config(project, PLAN_WORKFLOW)
-                    implement = load_build_config(project, BUILD_WORKFLOW)
+                    documents = read_project_settings(project, "claude", ("plan", "implement"))
+                    plan = load_plan_config(documents, PLAN_WORKFLOW)
+                    implement = load_build_config(documents, BUILD_WORKFLOW)
                     self.assertEqual(plan["max_reviews"], 6)
                     self.assertEqual(implement["max_reviews"], 6)
                     self.assertNotIn("checks", plan)
