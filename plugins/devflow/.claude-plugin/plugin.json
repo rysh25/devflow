@@ -1,6 +1,6 @@
 {
   "name": "devflow",
-  "version": "0.12.13",
+  "version": "0.12.14",
   "description": "Human-first planning and plan-driven implementation with bounded independent reviews.",
   "hooks": "./hooks/claude.json"
 }
