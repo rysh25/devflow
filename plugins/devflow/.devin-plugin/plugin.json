@@ -1,6 +1,6 @@
 {
   "name": "devflow",
-  "version": "0.12.14",
+  "version": "0.12.15",
   "description": "Planning and implementation with bounded independent reviews.",
   "skills": "./devin-skills/",
   "platforms": [

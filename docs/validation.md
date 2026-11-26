@@ -1,4 +1,4 @@
-# DevFlow 0.12.14 の検証範囲
+# DevFlow 0.12.15 の検証範囲
 
 ## 再実行方法
 
@@ -2008,3 +2008,162 @@ plan-devin のセッションはエージェントが Claude Code の対話 TUI 
 操作して進めました（最初の質問は操作の都合で「辞退」になり、その後メッセージで
 「計画の内容は上のとおりで変えない」と答え、完了確認の質問で「進める」を
 選びました）。
+
+## 0.12.15 の検証（2026-11-27）
+
+0.12.15 は、レビューの上限の質問（`review_budget`）のおすすめの基準を定義し直しました。基準は
+レビュアーに渡している重大度の定義（`common/reviewer-rules.md` の「What to report」）から導き、
+既定では「続ける」か「受け入れて終える」を勧めます。受け入れの条件は、critical・high が残って
+いない（採用した直しは後の成功したレビューがその直しを含む版を見ている）こと、成功したレビューが
+1 回以上あること、人間の判断が要る問題が残っていないこと、Implement では今のチェックポイントの
+チェックが通っているか人間が検証を認めたことです。「やめる」は、受け入れの条件を満たさず、前提が
+崩れていて run の外で依頼（Implement ではプラン）からやり直す必要があるときだけ勧めます。
+medium・low は何件残っていても受け入れを妨げず、指摘の数の推移は使いません。続ける回数に上限は
+設けません。同じレビュアーが続けて失敗しても判断の順は変えず、失敗の事実を添えます。人間の判断が
+残るときは「続ける」を勧め、続けた後、次のレビューの前にその判断を聞きます（再開したときも
+レビューと採否の記録から特定します）。Plan では、本文に入っていない人間の答えが残ったまま終わると、
+Handoff でその答えを伝え、実装コマンドを案内しません（3 つのホストの Plan スキルはこの条件を
+手引きの Handoff の節で指します）。実機の確かめのあと、人間の判断で、両方の手引きの「Recommendations to
+the human」の節に、おすすめ（上限の質問では要約も）は質問ツールを呼ぶ前のメッセージの本文に書き、考えの
+中にだけある文は人間に見えない、という一文を足しました（下の 15〜17 回目）。ランナーの Python コード（版の番号を除く）、記録の形式、指摘の
+スキーマ、上限の質問の文と選択肢の名前・順は変えていません。
+
+変えたファイル: `references/plan-workflow.md`、`references/implement-workflow.md`、
+`skills/plan/SKILL.md`、`codex-skills/plan/SKILL.md`、`devin-skills/plan/SKILL.md`、3 つのホストの
+`plugin.json`、`devflow_core/__init__.py`（0.12.15）、`README.md`、`docs/architecture.md`、
+`docs/installation.md`、この `docs/validation.md`、テスト（版を確かめる `tests/test_distribution.py`
+の 4 か所と `tests/router/test_entrypoint.py` の 3 か所）。
+
+自動テスト（1221 件、skip 2 件）と配布物の検査（`python tools/package.py --validate-only`）を
+通しました。
+
+### 実機の確かめ
+
+Linux / WSL2 で、devflow の外の `/tmp/devflow-verify-budget-0.12.15` に使い捨ての Git の
+プロジェクトを場面ごとに作りました。中身は `textstats.py`（`count_words` は
+`len(text.split(" "))`）、`test_textstats.py`（unittest）、`devflow.config.json`（レビュアーは
+偽のレビュアー 2 つで、1 回目と 2 回目で別のレビュアー、Implement のチェックは
+`python3 -m unittest`）です。Implement の場面では、最小のプラン `plan.md`（`len(text.split())` への
+直しと、空文字列と連続した空白のテストを足す）も入れて commit しました。偽のレビュアーは
+Claude Code の形（`kind: claude`）で答える Python のスクリプトで、`--version` と `--help` に
+Claude Code のように答え、場面ごとに決まった指摘を `changes_required` で返します（どの指摘も
+`requires_human: false`）。上限はどの回も `--max-reviews 2` です。人間役は、利用者の指示で
+Claude（この実装のホスト）が tmux の上で各ホストの対話の画面を操作して務めました。インタビューは
+おすすめどおりに答えました（8 回目だけ下の注のとおり）。
+
+ホストに作業ツリーのプラグイン（0.12.15）を読み込ませた方法は次のとおりです。
+
+- Claude Code 2.1.332（ホストのモデルは Opus 5.5、high）：`--plugin-dir`（作業ツリーの
+  `plugins/devflow`）と、入れてある devflow を止める `--settings`。ランナーと読むだけのコマンドを
+  `--allowedTools` で許し、`--permission-mode acceptEdits` で起動しました。`/devflow:doctor` の
+  1 行目は `DevFlow 0.12.15` でした。
+- Codex CLI 0.172.0（GPT-6.2-Sol、high）：所有者だけが使える検証用の `CODEX_HOME`（`auth.json` と、
+  `config.toml` のモデルと承認の設定の行だけを写した）で `codex plugin marketplace add
+  <作業ツリー>` と `codex plugin add devflow@devflow-marketplace --json`（`version` は 0.12.15）。
+  `codex --enable default_mode_request_user_input` で起動し、背景のサーバーの設定が合わないという
+  確認では「Run without daemon this time」を選び、起動時のフックの確認ですべて信頼しました。
+  ホストが呼んだランナーのパスがすべて `.../devflow/0.12.15/` だったことで版を確かめました。
+- Devin CLI 3000.15.14（SWE-2 High）：計画どおり `devin plugins install --local` で入れ、
+  プロジェクトの `.devin/config.json` に repo スコープの `forbiddenPlugins` を置いて試しましたが、
+  この版では個人プラグインの devflow と名前がぶつかり、作業ツリーの devflow のスキルが
+  `/plugins/devflow:*` という名前になりました（`/devflow:doctor` は「Unknown command」）。
+  `/plugins/devflow:doctor` で動かしたスキルは手引きのファイルを見つけられず、ファイルシステムを
+  探し始めたので止めました。そこで計画から方法を変え、検証用のデータディレクトリ
+  （`XDG_DATA_HOME` に所有者だけが使えるディレクトリを渡し、`credentials.toml` を写した）で
+  `devin plugins install --local -y <作業ツリー>/plugins/devflow` を行い、Devin もその
+  `XDG_DATA_HOME` で起動しました。そこでは devflow 0.12.15 だけが `devflow` の名前で入り、
+  `/devflow:doctor` の 1 行目は `DevFlow 0.12.15` でした。
+
+場面は次のとおりです。
+
+- (a) 1 回目に high 1 件、2 回目に別の high 1 件と medium 1 件（指摘は 1 件から 2 件に増え、
+  high は 1 件のまま）。2 回目の high を採用して直すと、その直しは未レビューのまま上限に達する。
+  期待は「続ける」（0.12.14 の規則では「やめる」）。
+- (b) 1 回目に high 1 件と low 1 件、2 回目に medium 2 件と low 1 件。期待は「受け入れて終える」。
+- (c) 1 回目に low 1 件、2 回目に人間の選択が要るという medium 1 件。期待は「続ける」で、続けた後、
+  次のレビューの前にその判断を聞くこと。
+
+| 回 | ホストと場面 | run | 記録された採否と版 | 画面に出たおすすめ | 人間の答え |
+|---|---|---|---|---|---|
+| 1 | Claude Code Implement (b) | `20261126T155451Z-7d87809feb0e` | 1 回目の high と low は already_addressed（今のコードで U+3000 を 2 語と数えると確かめた）、2 回目は medium 2 件を accept・low を reject（直しはチェックポイント 3 で未レビュー）、`checks/003.json` は passed | 受け入れて終える（唯一の high は根拠つきで already_addressed、medium・low は続ける理由にならない、チェックが通過、作業ツリーがチェックポイントのままかは確かめられないと明記） | 受け入れて終える |
+| 2 | Claude Code Plan (a) | `20261126T160936Z-9c6a6f525c67` | 1 回目の high を accept（v001）、2 回目は v001 を見た high（U+200B）を、インタビューの決定（`str.split()` に従う）と食い違うとして reject、medium は already_addressed | 受け入れて終える（場面が成り立たなかった） | 受け入れて終える |
+| 3 | Claude Code Plan (a) のやり直し 1（2 回目の high を U+00A0 のテストに変更） | `20261126T161932Z-81db3710431b` | 1 回目の high を accept（v001）、2 回目は high を「入力の多くが HTML という前提に根拠がない」として reject | 受け入れて終える（場面が成り立たなかった） | 受け入れて終える |
+| 4 | Claude Code Plan (a) のやり直し 2（2 回目の high を、種類の違う空白が続く場合のテストに変更） | `20261126T162426Z-46ada40297b7` | 1 回目の high は already_addressed、2 回目は v000 を見た high を accept（v001 は未レビュー） | 続ける（採用した high の直しを後の成功したレビューが見ていない） | やめる |
+| 5 | Claude Code Plan (b) | `20261126T162809Z-4b796a8d2b1e` | 1 回目の high は already_addressed・low は accept（v001）、2 回目は v001 を見て medium 2 件を accept・low を reject（v002 は未レビュー） | 受け入れて終える | 受け入れて終える |
+| 6 | Claude Code Plan (c) | `20261126T163217Z-c7e76adcc9dd` | 1 回目の low を accept（v001）、2 回目の medium（ハイフンでつないだ語の数え方）は、インタビューの決定（`str.split()`、句読点は範囲外）で決まっているとして already_addressed | なし（下の「確かめられなかったこと」） | 受け入れて終える |
+| 7 | Claude Code Plan (c) のやり直し 1（2 回目の medium を、大きな入力でメモリを抑える必要があるかに変更） | `20261126T163710Z-5f973e6fb292` | 1 回目の low を accept（v001）、2 回目の medium はインタビューの決定で決まっているとして reject | 受け入れて終える（場面が成り立たなかった） | 受け入れて終える |
+| 8 | Claude Code Plan (c) のやり直し 2（人間役がインタビューでメモリの扱いを未決と答えた） | `20261126T164140Z-1e1e1947d79d` | 1 回目の low を accept（v001）、2 回目の medium は人間の答え（今は決めず `split()` で進め、未決事項としてプランに書く）で決まっているとして already_addressed | なし（6 回目と同じ） | 受け入れて終える |
+| 9 | Codex Plan (a) | `20261126T164735Z-4fe91a19e20d` | 1 回目の high は already_addressed、2 回目は v000 を見た high を accept（v001 は未レビュー） | 続ける（high の直しを確認したレビューがない） | やめる |
+| 10 | Codex Plan (b) | `20261126T165354Z-86b4c1d4e4e3` | 1 回目の high は already_addressed・low は accept（v001）、2 回目は v001 を見て medium 2 件を accept・low を reject（v002 は未レビュー） | 受け入れて終える | 受け入れて終える |
+| 11 | Codex Plan (c) | `20261126T165531Z-27859d02285b` | 1 回目の low を reject、2 回目の medium を accept（メモリの要件を未決としてプランに書いた。改訂の中のエスカレーションはなし、v001 は未レビュー）。続けた後、3 回目は v001 を見て、メモリの要件の答えはその改訂で v002 に入り、4 回目が v002 を見た | 1 回目の上限では続ける（人間の判断が未解決）。2 回目の上限（4 回）では受け入れて終える（判断はプランに反映済み、v002 はレビュー済み） | 続ける、（`pause` の質問に）含めない、受け入れて終える |
+| 12 | Devin Plan (a) | `20261126T170825Z-231b6e9dbe9a` | 1 回目の high を accept（v001）、2 回目は v001 を見て high と medium を accept（v002 は未レビュー） | 続ける（2 回目の high の直しは v002 で未レビュー、1 回目の high の直しは v001 で 2 回目が見た） | やめる |
+| 13 | Devin Plan (b) | `20261126T171047Z-02d62e89d007` | 1 回目の high を accept・low は already_addressed（v001）、2 回目は v001 を見て medium 1 件を accept・1 件を already_addressed・low を reject（v002 は未レビュー） | 受け入れて終える（high の直しは v001 で 2 回目が見た） | 受け入れて終える |
+| 14 | Devin Plan (c) | `20261126T171416Z-8a9e8d86415b` | 1 回目の low を accept（v001）、2 回目の medium は根拠がなくインタビューの決定と食い違うとして reject | 受け入れて終える（場面が成り立たなかった） | 受け入れて終える |
+| 15 | Claude Code Plan (c)（一文を足した後の確かめ 1） | `20261126T175405Z-f8efbfd5c051` | 1 回目の low を accept（v001）、2 回目の medium はインタビューの決定で決まっているとして reject | 受け入れて終える（要約とおすすめを画面に出した） | 受け入れて終える |
+| 16 | Claude Code Plan (c)（同じく確かめ 2） | `20261126T175406Z-34968bc11c59` | 15 回目と同じ（v002 は未レビュー） | 受け入れて終える（同じ） | 受け入れて終える |
+| 17 | Claude Code Plan (c)（同じく確かめ 3） | `20261126T175407Z-269d53f849ac` | 15 回目と同じ | 受け入れて終える（同じ） | 受け入れて終える |
+
+- 場面 (a) は 3 つのホストで、0.12.14 の規則との違い（指摘も high も減っていないが「続ける」）が
+  出ました（4・9・12 回目）。Claude Code では、2 回目の high が採用されず 2 回やり直しました。
+  ホストは、インタビューの決定と食い違う指摘と、根拠のない前提に立つ指摘を退けました。退けた回の
+  おすすめは、記録の上では受け入れの条件を満たしていて、手引きどおりでした（2・3 回目）。
+- 場面 (b) は 3 つのホストと Implement で「受け入れて終える」でした（1・5・10・13 回目）。Devin の
+  13 回目は、high を採用した直しを後のレビューが見たことを根拠にした、計画どおりの道でした。
+  ほかの回は 1 回目の high を already_addressed にしていて、その道は通っていません。1 回目は、今の
+  チェックポイントが未レビューでチェックが通っているときの「受け入れて終える」です（0.12.10 で
+  確かめられなかった場面）。
+- 場面 (c) が成り立ったのは Codex だけでした（11 回目）。上限で「続ける」を勧め、「続ける」の
+  答えを記録したあと、次の `review` の前に `pause` でメモリの要件を聞きました。答えはプランに
+  反映され、2 回目の上限では「受け入れて終える」を勧めました。Claude Code（3 回）と Devin（1 回）は、
+  人間の選択が要るという指摘を、インタビューの決定や人間の答えで決まっているとして自分で決着
+  させ、エスカレーションしませんでした。計画書の決まりどおり、場面が成り立たなかった回として記録
+  しました。
+- おすすめが画面に出た 15 回は、どれも要約、おすすめ、質問の順に出て、レビューを足す時間と
+  トークンは人間が決めるという一言がありました。質問の文、選択肢の名前（continue、stop、accept and
+  finish）と順は変わらず、「(Recommended)」もほかの印も付いていませんでした。
+- `exhausted` で終わった 3 回（4・9・12 回目）は、どのホストも実装コマンドを案内しませんでした。
+  `accepted` で終わった Plan の回は案内しました。
+- Codex は、インタビューの質問に「auto-resolves in 43s」のような時間切れの表示を出しました。
+  上限の質問と `pause` の質問には出ませんでした。
+
+### 確かめられなかったこと
+
+- 6 回目と 8 回目（Claude Code の Plan (c)）では、ホストが上限の `review` と `status` を呼んだあと、
+  要約もおすすめも画面に書かずに AskUserQuestion を出しました。おすすめ（受け入れて終える）は
+  考えの中（画面には考えの要約の 1 行）にだけありました。0.12.10 の 5 回目と同じ現象です。人間の判断で、
+  両方の手引きの「Recommendations to the human」の節に、おすすめと（上限の質問では）要約は質問ツールを
+  呼ぶ前のメッセージの本文に書き、考えの中にだけある文は人間に見えない、という一文を足しました。
+  足したあとの Claude Code の Plan (c) 3 回（15〜17 回目）では、3 回とも要約とおすすめがメッセージの
+  本文として画面に出ました（会話の記録でも確かめました）。前は 8 回のうち 2 回で起きたので、3 回とも
+  出たことは直ったことの証明ではありません。ホストが偽の指摘を退けた回については、人間の判断で
+  手引きを変えていません。
+- 場面 (c) の、改訂の中のエスカレーションと暫定の答えは、どのホストでも起きませんでした。
+  Claude Code と Devin での「続ける」の後の質問も起きていません。続けた後に再開したとき、記録から
+  未解決の判断を特定する道も動かしていません。
+- Implement の「続ける」の後のエスカレーションと、Implement の (a)・(c) は、計画の範囲外として
+  動かしていません。
+- 前提が崩れたときの「やめる」（S2）、`review_summary_error`・`events_error` の例外、人間の決定との
+  食い違い、同じレビュアーの続けた失敗は、実機では起こしていません。
+- 本文に入っていない人間の答えが残ったまま Plan が終わり、Handoff で実装コマンドを案内しない
+  場面は起きていません（11 回目は答えが v002 に入り、レビューされました）。
+
+### 片付け
+
+- 17 の run はすべて終わっていました（`accepted` 14 件、`exhausted` 3 件）。15〜17 回目は、同じ場所に
+  使い捨てのプロジェクトを作り直して動かし、同じように片付けました。各ホストのセッションを
+  終えたあと、偽のレビュアーとチェックの子プロセスが残っていないことを `ps` で確かめました。
+- 検証用の `CODEX_HOME` から起動していた Codex の app-server のプロセス（2 つ）を止めました。
+- `/tmp/devflow-verify-budget-0.12.15`（使い捨てのプロジェクト、偽のレビュアー、検証用の
+  `CODEX_HOME` と写した `auth.json`、Devin の検証用のデータディレクトリと写した
+  `credentials.toml`、画面の記録）を消しました。
+- Devin の最初の試み（利用者のデータディレクトリでの `--local` の導入）は
+  `devin plugins remove plugins/devflow --local` で外し、`devin plugins list` と
+  `devin plugins info devflow` で、個人プラグインの devflow v0.12.14（取得元
+  `https://github.com/rysh25/devflow#plugins/devflow`）と devin-playbooks だけが残ったことを
+  確かめました。Devin の `trusted_workspaces.json`（`~/.local/share/devin/cli/`）からは、その試みで
+  足された `/tmp/devflow-verify-budget-0.12.15/devin-plan-a` の 1 件だけを消しました。消す前の写しと
+  比べ、ほかの信頼の設定は変えていないことを確かめました（Devin が書き直したときに順が変わり、
+  ファイルは 2 文字の字下げで書き直されています）。
+- Claude Code のセッションの記録（`~/.claude/projects/-tmp-devflow-verify-budget-0-12-15-*` の 11 個）
+  と、Claude Code の設定（`~/.claude.json`）にある 11 個の検証用フォルダーの信頼の記録は残して
+  います。
