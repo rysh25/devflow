@@ -127,6 +127,13 @@ class Workflow:
     def check_state(self, state: dict) -> None:
         """Reject workflow fields that violate an invariant (raise DevFlowError)."""
 
+    #: The form of this workflow's question IDs (a regular expression).
+    escalation_id_pattern: str = ""
+
+    def limit_auto_question(self, state: dict, escalation_id: str) -> str:
+        """The record path of the question with this ID (an automatic decision names it)."""
+        raise NotImplementedError
+
     def on_recover(self, store: Any, state: dict) -> None:
         """Set the status after a human-confirmed interruption (inflight is cleared for you)."""
         raise NotImplementedError

@@ -11,9 +11,9 @@ from uuid import uuid4
 from ..common.errors import CaptureError, DevFlowError
 from ..common.hosts import host_profile
 from ..common.paths import path_key
-from ..common.review import (AUTO_ACCEPTANCE, LIMIT_DECISIONS, REVIEW_BUDGET, after_review_failure, all_approved,
-                             ask_at_limit, auto_acceptance, check_auto_accept, check_auto_acceptance,
-                             decide_at_limit, next_reviewer)
+from ..common.review import (LIMIT_AUTO_KEY, LIMIT_AUTO_SOURCE, LIMIT_DECISIONS, REVIEW_BUDGET, accept_entry,
+                             after_review_failure, all_approved, ask_at_limit, automatic_decisions, check_limit_auto,
+                             check_no_serious_reviewers, decide_at_limit, limit_auto_records, next_reviewer)
 from ..common.reviewers import preflight, prepare_review, recorded_cli_version, review_tokens, run_review
 from ..common.engine import RunEngine
 from ..common.runs import RUNNER_WAIT, TERMINAL, ensure_data_root, open_escalation
@@ -53,8 +53,8 @@ def count_lines(before: str, after: str) -> tuple[int, int]:
 
 ACCEPTED_WARNING = ("Accepted by the human at the review limit without approval from every reviewer. "
                     "Inspect remaining findings and whether the final revision was reviewed.")
-AUTO_ACCEPTED_WARNING = ("Accepted by configuration (auto_accept_at_review_limit) at the review limit "
-                         "without approval from every reviewer. "
+AUTO_ACCEPTED_WARNING = ("Accepted at the review limit by the run's review_limit_auto setting following the host's "
+                         "recommendation, without approval from every reviewer. "
                          "Inspect remaining findings and whether the final revision was reviewed.")
 
 
@@ -107,8 +107,8 @@ def human_decisions(state: dict, read) -> tuple[list[dict], dict | None]:
     return decisions, acceptance
 
 
-def _auto_acceptance_entry(state: dict, store) -> dict | None:
-    """The summary entry of a committed auto-acceptance record, verified, or None.
+def _auto_acceptance_entry(state: dict, store, entries: list[tuple[str, dict]] | None = None) -> dict | None:
+    """The summary entry of the committed automatic accept record, verified, or None.
 
     The record must still name the current plan and the same reviewed/unreviewed
     fact the state holds — and the frozen config record and the registered
@@ -116,20 +116,23 @@ def _auto_acceptance_entry(state: dict, store) -> dict | None:
     disagrees is reported through the caller, never presented as the basis of
     acceptance.
     """
-    if AUTO_ACCEPTANCE not in state["artifacts"]:
+    found = accept_entry(limit_auto_records(state, store) if entries is None else entries)
+    if found is None:
         return None
-    record = check_auto_acceptance(state, state["review_count"], store.record_json(state, AUTO_ACCEPTANCE))
+    name, record = found
     stored = store.record_json(state, "config.json")
-    check_auto_accept(stored)
+    check_limit_auto(stored)
+    check_limit_auto(state["config"])
     current = state.get("current_plan")
     if (stored != state["config"]
             or not current or state["artifacts"].get(current) != state["plan_hash"]
             or record["version"] != state["plan_hash"]
             or record["version_reviewed"] != bool(state["final_plan_reviewed"])):
-        raise DevFlowError("Invalid or mismatched auto-acceptance record")
+        raise DevFlowError(f"Invalid or mismatched automatic accept record: {name}")
     store.record(state, current)  # The registered current plan exists and hashes to the accepted version.
-    return {"record": AUTO_ACCEPTANCE, "source": record["source"], "version": record["version"],
-            "accepted_at": record["accepted_at"], "version_reviewed": record["version_reviewed"]}
+    return {"record": name, "source": LIMIT_AUTO_SOURCE, "version": record["version"],
+            "accepted_at": record["decided_at"], "version_reviewed": record["version_reviewed"],
+            "recommendation": record["recommendation"]}
 
 
 def summary_source(store, state: dict) -> dict:
@@ -176,6 +179,7 @@ def summary_source(store, state: dict) -> dict:
                 entry["fix"] = {"summary": reflection["summary"], "version_change": change, "file_changes": None}
         reviews.append(entry)
     decisions, acceptance = human_decisions(state, read)
+    automatic = limit_auto_records(state, store)
     if state["plan_version"] is None:
         current, approving = {"id": None, "label": "none (no plan yet)"}, []
     else:
@@ -190,7 +194,8 @@ def summary_source(store, state: dict) -> dict:
                        "timeout_seconds": r["timeout_seconds"]} for r in state["config"]["reviewers"]],
         "current_version": current, "latest_version_reviewed": bool(state["final_plan_reviewed"]),
         "approving_current": approving, "reviews": reviews, "human_decisions": decisions,
-        "human_acceptance": acceptance, "auto_acceptance": _auto_acceptance_entry(state, store)}
+        "human_acceptance": acceptance, "automatic_decisions": automatic_decisions(automatic),
+        "auto_acceptance": _auto_acceptance_entry(state, store, automatic)}
 
 
 class Engine(RunEngine):
@@ -201,6 +206,9 @@ class Engine(RunEngine):
 
     def _before_dispatch(self, state):
         state["last_error"] = None
+
+    def _check_auto_acceptance(self, state, entries):
+        _auto_acceptance_entry(state, self.store, entries)
 
     def _status_details(self, state: dict, result: dict) -> None:
         result.pop("transcript_marker", None)
@@ -336,8 +344,7 @@ class Engine(RunEngine):
             approved = {item["provider"] for item in state["passes"] if item["plan_hash"] == state["plan_hash"]}
             if ask_at_limit(state, state["review_count"], approved, state["plan_hash"],
                             lambda reason, questions: self._escalate(
-                                state, {"reason": reason, "questions": questions}, "ready", REVIEW_BUDGET),
-                            auto_accept=lambda: self._auto_accept(state)):
+                                state, {"reason": reason, "questions": questions}, "ready", REVIEW_BUDGET)):
                 return None
             if next_reviewer(state["config"]["reviewers"], state["review_count"], state["review_limit"]) != provider:
                 raise DevFlowError("The run changed during the reviewer check; inspect status and retry.")
@@ -357,30 +364,6 @@ class Engine(RunEngine):
         return self._dispatch(run_id, "reviewing", "review", prepare, execute,
                               lambda state, reservation, work, result, error:
                               self._finish_review(state, reservation, work["dir"], provider, result, error))
-
-    def _auto_accept(self, state: dict) -> bool:
-        """Whether this run ends itself at the review limit, as ``auto_accepted``.
-
-        Called inside the run lock during ``review`` preparation, only when the
-        frozen ``auto_accept_at_review_limit`` is set and the limit is reached.
-        Needs at least one finalized, hash-verified successful review, and the
-        current plan must be the verified immutable file its hash names — a
-        missing or mismatched plan is an error, publication enabled or not.
-        The final version may be unreviewed; the evidence records whether it was.
-        """
-        read = lambda relative: self.store.record_json(state, relative)
-        if not any(outcome == "succeeded" for _, _, outcome, _ in review_records(state, read)):
-            return False
-        current = state["current_plan"]
-        if not current or state["artifacts"].get(current) != state["plan_hash"]:
-            raise DevFlowError("The current plan record is missing or does not match the plan hash; "
-                               "configuration cannot accept it.")
-        self.store.record(state, current)  # Verified, hash-matched immutable bytes.
-        self._artifact(state, AUTO_ACCEPTANCE, json_bytes(
-            auto_acceptance(state, state["review_count"], state["plan_hash"],
-                            bool(state["final_plan_reviewed"]))))
-        state["status"] = "auto_accepted"
-        return True
 
     def _finish_review(self, state: dict, reservation: dict, relative_dir: str, provider: dict,
                        result: dict | None, error: BaseException | None) -> None:
@@ -552,6 +535,38 @@ class Engine(RunEngine):
             self._save(state)
         return self.status(run_id)
 
+    def limit_auto(self, run_id: str, escalation_id: str, decision: str, recommendation_file: Path,
+                   session: str | None = None) -> dict:
+        """Apply the host's recommendation (continue or accept) to the open review limit
+        question when the run's frozen review_limit_auto setting allows it.
+
+        Never a human answer: the decision and the recommendation are recorded in
+        ``limit-auto/``, not as a resolved escalation. Any refusal leaves the run
+        and its question unchanged.
+        """
+        with self._lock(run_id):
+            state = self._state(run_id)
+            if session != state["owner_session"]:
+                raise DevFlowError("Only the session that owns the run may apply its review limit setting.")
+            escalation = self._limit_auto_request(state, escalation_id, decision)
+            recommendation = checked_text(self._draft(run_id, recommendation_file))
+            self._verify(state)
+            if decision == "accept":
+                read = lambda relative: self.store.record_json(state, relative)
+                if not any(outcome == "succeeded" for _, _, outcome, _ in review_records(state, read)):
+                    raise DevFlowError("Cannot accept automatically: no review succeeded. "
+                                       "Ask the human the review limit question.")
+                current = state["current_plan"]
+                if not current or state["artifacts"].get(current) != state["plan_hash"]:
+                    raise DevFlowError("The current plan record is missing or does not match the plan hash; "
+                                       "the setting cannot accept it.")
+                self.store.record(state, current)  # Verified, hash-matched immutable bytes.
+                check_no_serious_reviewers(summary_source(self.store, state))
+            self._apply_limit_auto(state, escalation, decision, recommendation, state["plan_hash"],
+                                   bool(state["final_plan_reviewed"]), session)
+            self._save(state)
+        return self.status(run_id)
+
     def recover(self, run_id: str, confirmed: bool = False, expect=None, *, expected_review: int | None = None) -> dict:
         """Explicit operator recovery of the exact interrupted review (human only)."""
         def exact(state: dict) -> None:
@@ -598,8 +613,8 @@ class Engine(RunEngine):
                              and auto["version"] == state["plan_hash"])
             if not (reviewed or accepted or auto_accepted):
                 raise DevFlowError("Only the identical plan approved by every reviewer, or the plan the human "
-                                   "accepted at the review limit, or the plan the run's frozen setting "
-                                   "accepted at the review limit, can be published.")
+                                   "accepted at the review limit, or the plan the run's review_limit_auto setting "
+                                   "accepted at the review limit following the host's recommendation, can be published.")
             if not state["config"]["publish"]["enabled"]:
                 return self.status(run_id)
             publication = dict(state.get("publication", {}))
@@ -641,7 +656,8 @@ class Engine(RunEngine):
                         state["publication"] = publication
                         # The approval record is made once, with the intent, before anything is written
                         # outside the run; a resumed publication writes the same bytes.
-                        self._artifact(state, "approval.md", self._approval_record(state, publication, acceptance).encode("utf-8"))
+                        self._artifact(state, "approval.md",
+                                       self._approval_record(state, publication, acceptance, auto).encode("utf-8"))
                         # Persist intent before writing outside the run directory.
                         self._save(state)
                     no_symlinks(target)
@@ -672,7 +688,7 @@ class Engine(RunEngine):
                         raise DevFlowError("The exported approval record changed during publication.")
                     # Whether a receipt exists is decided by the committed records, never by a
                     # file a stopped save may have left.
-                    basis = "reviewers" if reviewed else ("config" if auto_accepted else "human")
+                    basis = "reviewers" if reviewed else ("config_recommendation" if auto_accepted else "human")
                     if "publication.json" in state["artifacts"]:
                         receipt = read_json(run / "publication.json")
                         if (receipt.get("path") != publication["path"] or receipt.get("plan_hash") != state["plan_hash"]
@@ -727,12 +743,13 @@ class Engine(RunEngine):
                         continue
         return taken
 
-    def _approval_record(self, state: dict, publication: dict, acceptance: dict | None) -> str:
+    def _approval_record(self, state: dict, publication: dict, acceptance: dict | None, auto: dict | None) -> str:
         """The approval record published beside the plan (fixed English Markdown)."""
         remaining = summary.build(summary_source(self.store, state), now())["remaining_findings"]["count"]
         if state["status"] == "auto_accepted":
-            approval = "config"
-            approved_by = "config (auto_accept_at_review_limit)"
+            approval = "config_recommendation"
+            approved_by = (f"config ({LIMIT_AUTO_KEY}: {state['config'][LIMIT_AUTO_KEY]}) following the host's "
+                           f"recommendation (record {auto['record']})")
         elif state["status"] == "accepted":
             approval = "human"
             approved_by = f"human (AskUserQuestion answer event {', '.join(acceptance['event_ids'])})"
@@ -753,9 +770,9 @@ class Engine(RunEngine):
                  f"- Last version reviewed: {'yes' if state['final_plan_reviewed'] else 'no'}"]
         if approval == "human":
             lines.append("- Note: accepted by the human at the review limit, not approved by every reviewer.")
-        elif approval == "config":
-            lines.append("- Note: accepted by configuration (auto_accept_at_review_limit) at the review limit, "
-                         "not approved by every reviewer.")
+        elif approval == "config_recommendation":
+            lines.append("- Note: accepted at the review limit by the run's review_limit_auto setting following "
+                         "the host's recommendation, not approved by every reviewer.")
         return "\n".join(lines) + "\n"
 
     def report(self, run_id: str) -> dict:

@@ -24,7 +24,11 @@ about what the provider ran.
                   "tokens", "tool_call_count", "record"}],
      "human_decisions": [{"at", "review_number", "question_kind", "questions", "answer",
                           "decision", "interpretation", "event_ids"}],
-     "human_acceptance": {"event_ids", "answer", "version", "accepted_at", "record"} | None}
+     "human_acceptance": {"event_ids", "answer", "version", "accepted_at", "record"} | None,
+     "automatic_decisions": [{"at", "review_number", "decision", "setting",
+                              "review_limit_before", "review_limit_after", "recommendation", "record"}],
+     "auto_acceptance": {"record", "source", "version", "accepted_at", "version_reviewed",
+                         "recommendation"} | None}
 
 A review's ``status`` is ``succeeded``, ``failed`` or ``in_progress``; a missing
 disposition (``action``/``reason``) is None, shown as undecided. ``cli_version`` comes
@@ -32,13 +36,17 @@ from the attempt's process record named by ``cli_version_source``, which is not 
 hashed run record. ``tool_call_count`` is None when the reviewer did not run to the
 end. A human decision's ``review_number`` is the number of reviews when the question
 was asked and ``question_kind`` the kind the question was recorded with (None when
-an older record has neither).
+an older record has neither). ``automatic_decisions`` are the review limit decisions
+the run's ``review_limit_auto`` setting applied following the host's recommendation
+(never human answers), each with the host's recommendation text it recorded, shown
+as a quote under its line so that the human reads it even when the host did not
+show it before the decision; ``auto_acceptance`` is the verified accept among them.
 """
 from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from .review import REVIEW_BUDGET
+from .review import REVIEW_BUDGET, serious_reviewers
 from .storage import json_bytes
 
 SCHEMA_VERSION = 1
@@ -49,8 +57,8 @@ SEVERITIES = ("critical", "high", "medium", "low")
 STATUS_TEXT = {
     "completed": "completed — every reviewer approved the same version",
     "accepted": "accepted — accepted by the human at the review limit, not approved by every reviewer",
-    "auto_accepted": "auto_accepted — accepted by configuration at the review limit, "
-                     "not approved by every reviewer",
+    "auto_accepted": "auto_accepted — accepted at the review limit by the run's review_limit_auto setting "
+                     "following the host's recommendation, not approved by every reviewer",
     "exhausted": "exhausted — ended without approval from every reviewer",
     "cancelled": "cancelled",
 }
@@ -125,6 +133,7 @@ def build(source: dict, now: str) -> dict:
             remaining.append({"reviewer_id": reviewer["id"], "review_number": latest["number"],
                               "finding_ids": identifiers})
             count += len(identifiers)
+    serious, never = serious_reviewers(source["reviewers"], reviews)
     durations = [entry["duration_seconds"] for entry in reviews]
     return {
         "schema_version": SCHEMA_VERSION, "flow": source["flow"], "run_id": source["run_id"],
@@ -142,8 +151,10 @@ def build(source: dict, now: str) -> dict:
             "human_acceptance": source["human_acceptance"],
             "auto_acceptance": source.get("auto_acceptance")},
         "remaining_findings": {"count": count, "items": remaining},
+        "serious_findings": {"reviewers": serious, "never_succeeded": never},
         "reviewer_totals": totals,
         "human_decisions": source["human_decisions"],
+        "automatic_decisions": source["automatic_decisions"],
         "time": {"run_elapsed_seconds": _seconds(source["created_at"], source["finished_at"] or now),
                  "review_seconds_total": sum(value for value in durations if value is not None),
                  "reviews_without_time": sum(1 for value in durations if value is None)},
@@ -203,8 +214,9 @@ def render(summary: dict) -> str:
                  f"{'reviewed' if approval['latest_version_reviewed'] else 'not reviewed'}; approvals: {approvals}")
     auto = approval.get("auto_acceptance")
     if auto:
-        lines.append(f"- Auto-accepted by configuration at the review limit (record: {auto['record']}; "
-                     f"accepted version {'reviewed' if auto['version_reviewed'] else 'not reviewed'})")
+        lines.append(f"- Auto-accepted by the review_limit_auto setting following the host's recommendation "
+                     f"(record: {auto['record']}; accepted version "
+                     f"{'reviewed' if auto['version_reviewed'] else 'not reviewed'})")
 
     lines.append("")
     if reviews:
@@ -249,6 +261,11 @@ def render(summary: dict) -> str:
                              f"{finding['location']}: {finding['recommendation']}")
     else:
         lines.append("- Remaining findings: none")
+    serious = summary["serious_findings"]
+    lines.append("- Latest succeeded review with critical/high: "
+                 + (", ".join(f"{item['reviewer_id']} (review {item['review_number']})"
+                              for item in serious["reviewers"]) or "none")
+                 + "; never succeeded: " + (", ".join(serious["never_succeeded"]) or "none"))
 
     if summary["human_decisions"]:
         lines.append("- Human decisions:")
@@ -261,4 +278,13 @@ def render(summary: dict) -> str:
             lines.append(f"  - {after}, {kind}: {choice} ({_known(decision['at'])})")
     else:
         lines.append("- Human decisions: none")
+    if summary["automatic_decisions"]:
+        lines.append("- Automatic decisions (review_limit_auto, not human answers):")
+        for decision in summary["automatic_decisions"]:
+            limits = (f" (limit {decision['review_limit_before']} → {decision['review_limit_after']})"
+                      if decision["decision"] == "continue" else "")
+            lines.append(f"  - After {_count(decision['review_number'], 'review')}, {REVIEW_BUDGET}: "
+                         f"{decision['decision']} by setting {decision['setting']}{limits} ({_known(decision['at'])})")
+            lines.append("    Host's recommendation:")
+            lines += [f"    > {line}".rstrip() for line in decision["recommendation"].strip().splitlines()]
     return "\n".join(lines) + "\n"

@@ -17,7 +17,13 @@ REVIEWER_KINDS = frozenset({"codex", "opencode", "claude", "devin"})
 REVIEWER_FIELDS = frozenset({"id", "kind", "command", "model", "effort", "timeout_seconds"})
 REVIEWER_REQUIRED = REVIEWER_FIELDS
 CONFIG_FILES = ("devflow.config.json", "devflow.config.local.json")
-SHARED_SETTINGS = ("reviewers", "max_reviews", "auto_accept_at_review_limit")
+SHARED_SETTINGS = ("reviewers", "max_reviews", "review_limit_auto", "review_limit_auto_extra_reviews")
+#: Settings that no longer exist, with the guidance their error gives.
+REMOVED_SETTINGS = {
+    "auto_accept_at_review_limit": ("auto_accept_at_review_limit was removed in DevFlow 0.13.0; use review_limit_auto "
+                                    '("continue_accept" continues and accepts at the review limit following the '
+                                    "host's recommendation; see the README update notes)"),
+}
 HOSTS_KEY = "hosts"
 
 
@@ -96,6 +102,25 @@ def _check_hosts(document: dict, name: str, workflows) -> None:
                 raise _error(name, where, "schema_version is not allowed under hosts")
 
 
+def _check_removed(document: dict, name: str, workflows) -> None:
+    """A removed setting anywhere settings are read (every host block, launched or not,
+    so a shared file gives the same guidance on every host) is an error naming its place."""
+    blocks = [("", document)]
+    blocks += [(workflow, document[workflow]) for workflow in workflows if isinstance(document.get(workflow), dict)]
+    hosts = document.get(HOSTS_KEY)
+    for host_name, block in (hosts.items() if isinstance(hosts, dict) else ()):
+        if not isinstance(block, dict):
+            continue
+        position = f"{HOSTS_KEY}.{host_name}"
+        blocks.append((position, block))
+        blocks += [(f"{position}.{workflow}", block[workflow]) for workflow in workflows
+                   if isinstance(block.get(workflow), dict)]
+    for position, block in blocks:
+        for key, guidance in REMOVED_SETTINGS.items():
+            if key in block:
+                raise _error(name, position, guidance)
+
+
 def read_project_settings(project: Path, host: str, workflows) -> tuple[SettingsDocument, ...]:
     """Read the shared then the local settings file once each, shared first.
 
@@ -126,6 +151,7 @@ def read_project_settings(project: Path, host: str, workflows) -> tuple[Settings
             raise DevFlowError(f"{name}: {writable_text(str(exc))}") from exc
         except RecursionError as exc:
             raise DevFlowError(f"{name}: Settings are nested too deeply") from exc
+        _check_removed(document, name, workflows)
         unknown = set(document) - allowed
         if unknown:
             keys = writable_text(", ".join(sorted(unknown)))

@@ -25,18 +25,19 @@ from .hosts import HOSTS, CanonicalEvent, canonical_payload
 from .storage import (JSON_LIMIT, atomic_json, check_json_file, check_json_size, digest, digest_file, file_lock, json_bytes,
                       no_symlinks, now, parse_json, read_json, replace_file, within, write_new)
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 # Older run formats and the releases that wrote them; they are never continued.
 # A format that was never released has no name and is shown generically.
-RELEASES = {1: "0.1.x", 2: "0.2.x", 3: "0.3.x", 6: "0.4.x", 7: "0.5.x", 8: "0.6.x", 9: "0.7.x"}
+RELEASES = {1: "0.1.x", 2: "0.2.x", 3: "0.3.x", 6: "0.4.x", 7: "0.5.x", 8: "0.6.x", 9: "0.7.x", 10: "0.8.x–0.12.x"}
 
 
 def release_name(version: int) -> str:
     return RELEASES.get(version, f"an older version (run format {version})")
 #: How a run ends. ``completed`` only when every reviewer approved the same version;
 #: ``accepted`` when the human accepted the current version at the review limit;
-#: ``auto_accepted`` when the run's frozen ``auto_accept_at_review_limit`` setting
-#: accepted it at the review limit (evidence: ``auto-acceptance.json``).
+#: ``auto_accepted`` when the run's frozen ``review_limit_auto`` setting applied the
+#: host's recommendation to accept at the review limit (evidence:
+#: ``limit-auto/<question id>-accept.json``).
 TERMINAL = frozenset({"completed", "exhausted", "cancelled", "accepted", "auto_accepted"})
 RUN_ID = re.compile(r"[0-9]{8}T[0-9]{6}Z-[a-f0-9]{12}\Z")
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}\Z")
@@ -143,7 +144,10 @@ class RunInfo:
     def public(self) -> dict:
         value = {"flow": self.flow, "run_id": self.run_id, "format": self.format}
         if self.state is not None:
-            value["owner_host"] = "claude" if self.format == "unsupported" else self.state["owner_host"]
+            owner = self.state.get("owner_host")
+            # Formats before 10 had no host field (or only Claude); format 10 records the host.
+            value["owner_host"] = (owner if self.format != "unsupported"
+                                   or (isinstance(owner, str) and owner in HOSTS) else "claude")
         if self.error:
             value["error"] = self.error
         if self.format == "unsupported":

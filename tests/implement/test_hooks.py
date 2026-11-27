@@ -17,7 +17,7 @@ from unittest.mock import patch
 from devflow_core import router
 from devflow_core.common import sessions
 from devflow_core.common.errors import DevFlowError
-from devflow_core.common.review import AUTO_ACCEPTANCE, auto_acceptance
+from devflow_core.common.review import REVIEW_BUDGET, limit_auto_record
 from devflow_core.common.runs import TERMINAL, RunStore
 from devflow_core.common.storage import atomic_write_json, json_bytes, read_json
 from devflow_core.implement import WORKFLOW
@@ -126,12 +126,18 @@ class Fixture(unittest.TestCase):
             # A real run never leaves a terminal status; the fixture does, so its end time goes too.
             if status not in TERMINAL:
                 state["finished_at"] = None
-            elif status == "auto_accepted":
-                # What a real auto-accept commits with the status: the enabled
-                # frozen setting and its evidence record.
-                state["config"]["auto_accept_at_review_limit"] = True
-                self.store.stage(state, AUTO_ACCEPTANCE, json_bytes(
-                    auto_acceptance(state, len(state["attempts"]), "fixture-snapshot", False)))
+            if status != "auto_accepted":
+                # Only an auto_accepted run holds an automatic accept record.
+                state["artifacts"].pop("limit-auto/E001-accept.json", None)
+            elif "limit-auto/E001-accept.json" not in state["artifacts"]:
+                # What a real automatic accept commits with the status: the frozen
+                # continue_accept and its record of the closed review limit question.
+                state["config"]["review_limit_auto"] = "continue_accept"
+                escalation = {"id": "E001", "detail": {"kind": REVIEW_BUDGET, "review_number": len(state["attempts"])}}
+                self.store.stage(state, "escalations/001.json", json_bytes(escalation))
+                state["escalations"] = ["escalations/001.json"]
+                self.store.stage(state, "limit-auto/E001-accept.json", json_bytes(limit_auto_record(
+                    state, escalation, "accept", "Fixture recommendation.", "fixture-snapshot", False, state["owner_session"])))
             state["inflight"] = ({"kind": "check", "number": 1, "reviewer_id": None, "target": "fixture",
                                   "started_at": "2026-11-01T12:34:56+00:00"}
                                  if status in WORKFLOW.inflight_statuses else None)

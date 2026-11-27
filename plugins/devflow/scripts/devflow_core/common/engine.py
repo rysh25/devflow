@@ -11,10 +11,12 @@ from typing import Any, Callable
 
 from . import summary
 from .errors import DevFlowError
-from .review import REVIEW_BUDGET, check_auto_accept
+from .review import (REVIEW_BUDGET, auto_continue_fits, check_limit_auto, check_limit_auto_record, decide_at_limit,
+                     limit_auto_allows, limit_auto_decisions, limit_auto_name, limit_auto_record,
+                     limit_auto_records)
 from .runs import RUNNER_WAIT, TERMINAL, RunStore
 from .sessions import approval_evidence, prefilled_question_events
-from .storage import now, read_json, writable_text
+from .storage import json_bytes, now, read_json, writable_text
 
 
 class RunEngine:
@@ -72,10 +74,10 @@ class RunEngine:
         config = self.workflow.frozen_config(state)
         if config is not None:
             stored = read_json(self._run(state["run_id"]) / "config.json")
-            # A written 0/1 equals the frozen boolean in a dict comparison:
-            # check the key's type on both sides before comparing.
-            check_auto_accept(config)
-            check_auto_accept(stored)
+            # A written true equals a frozen 1 (and 6.0 equals 6) in a dict
+            # comparison: check the keys' types on both sides before comparing.
+            check_limit_auto(config)
+            check_limit_auto(stored)
             if stored != config:
                 raise DevFlowError("Run configuration changed; never replace frozen configuration during a run.")
         return config
@@ -83,6 +85,51 @@ class RunEngine:
     def _verify(self, state: dict) -> None:
         self.store.verify_artifacts(state)
         self._check_frozen_config(state)
+
+    # -- automatic decisions at the review limit -------------------------------------------
+    def _limit_auto_request(self, state: dict, escalation_id: str, decision: str) -> dict:
+        """The checks of ``limit-auto`` that read no records, in order; returns the question.
+
+        The open question must be this review limit question, no human answer may
+        be recorded after it (a human answer always comes first, whatever question
+        it answers), the frozen setting must allow the decision, and an automatic
+        continuation must stay within review_limit_auto_extra_reviews.
+        """
+        escalation = state["escalation"] or {}
+        if (state["status"] != "awaiting_human" or (escalation.get("detail") or {}).get("kind") != REVIEW_BUDGET
+                or escalation.get("id") != escalation_id):
+            raise DevFlowError("There is no pending review limit question with this ID; read status again")
+        if approval_evidence(state, self._events(state))[0]:
+            raise DevFlowError("A human answer is recorded after this question; ask the review limit question as usual")
+        config = state["config"]
+        if decision not in ("continue", "accept"):
+            raise DevFlowError("limit-auto takes --decision continue or accept; ask the human for any other answer")
+        if not limit_auto_allows(config, decision):
+            raise DevFlowError(f'The run\'s review_limit_auto is "{config["review_limit_auto"]}"; it does not '
+                               f"{decision} automatically. Ask the human the review limit question.")
+        if decision == "continue" and not auto_continue_fits(state):
+            limit = state["review_limit"] + len(config["reviewers"])
+            raise DevFlowError(f"Continuing automatically would make the limit {limit}, "
+                               f"{limit - config['max_reviews']} over max_reviews {config['max_reviews']}, beyond "
+                               f"review_limit_auto_extra_reviews {config['review_limit_auto_extra_reviews']}. "
+                               "Ask the human the review limit question.")
+        return escalation
+
+    def _apply_limit_auto(self, state: dict, escalation: dict, decision: str, recommendation: str,
+                          version: str, version_reviewed: bool, session: str) -> None:
+        """Record the automatic decision and apply it as the human's answer would be
+        applied, without recording a human answer (the caller saves once)."""
+        record = limit_auto_record(state, escalation, decision, recommendation, version, version_reviewed, session)
+        name = limit_auto_name(escalation["id"], decision)
+        # The record passes the same check that presents it later, before anything changes.
+        check_limit_auto_record(state, record, name, lambda relative: self.store.record_json(state, relative),
+                                self.workflow)
+        self._artifact(state, name, json_bytes(record))
+        state["escalation"] = None
+        decide_at_limit(state, decision, escalation["return_status"], accepted_status="auto_accepted")
+
+    def _check_auto_acceptance(self, state: dict, entries: list[tuple[str, dict]]) -> None:
+        """Verify an automatic accept record against the flow's accepted version (optional)."""
 
     def read_frozen_config(self, run_id: str) -> dict | None:
         """The run's frozen configuration (None if its workflow has none); changes nothing."""
@@ -149,6 +196,14 @@ class RunEngine:
         except (DevFlowError, OSError, ValueError) as exc:
             result.update(human_events=[], excluded_human_events=[], prefilled_questions=None,
                           events_error=f"Human event records cannot be read: {exc}")
+        # Status only displays: an automatic decision record that fails verification is reported.
+        try:
+            entries = limit_auto_records(state, self.store)
+            self._check_auto_acceptance(state, entries)
+            result.update(limit_auto_decisions=limit_auto_decisions(entries), limit_auto_decisions_error=None)
+        except (DevFlowError, OSError, ValueError, KeyError, TypeError) as exc:
+            result.update(limit_auto_decisions=None,
+                          limit_auto_decisions_error=f"The automatic decision records cannot be verified: {exc}")
         self._review_summary(state, result)
         self._status_details(state, result)
         return result

@@ -73,7 +73,8 @@ COMMANDS = (
     Command("checkpoint", "Freeze the current code and an implementation summary",
             lambda e, a, run, s: e.checkpoint(run, s, a.summary_file), (Option("--summary-file", "draft"),)),
     Command("check", "Run the frozen, pre-approved project checks once", lambda e, a, run, s: e.check(run, s)),
-    Command("review", "Dispatch the next reviewer and reserve one attempt; at the review limit, accept by the run's frozen setting or ask the human instead",
+    Command("review", "Dispatch the next reviewer and reserve one attempt; at the review limit, ask the human "
+            "(or end as exhausted when another round would pass 99 reviews)",
             lambda e, a, run, s: e.review(run, s)),
     Command("reflect", "Record a disposition for every finding of the last review",
             lambda e, a, run, s: e.reflect(run, s, a.decisions_file), (Option("--decisions-file", "draft"),)),
@@ -83,6 +84,11 @@ COMMANDS = (
             "(continue/stop/accept for the review limit question, continue/cancel otherwise)",
             lambda e, a, run, s: e.resolve(run, s, a.event_id, a.decision, a.reason),
             (Option("--event-id", "event"), Option("--decision", "decision"), Option("--reason", "text"))),
+    Command("limit-auto", "At the review limit, apply the host's recommendation (continue or accept) when the "
+            "run's review_limit_auto setting allows it; never a human answer",
+            lambda e, a, run, s: e.limit_auto(run, s, a.escalation_id, a.decision, a.recommendation_file),
+            (Option("--escalation-id", "text"), Option("--decision", "decision"),
+             Option("--recommendation-file", "draft"))),
     Command("cancel", "Keep all audit data and stop the run",
             lambda e, a, run, s: e.cancel(run, s, a.reason), (Option("--reason", "text"),)),
     Command("recover", "HUMAN ONLY: after confirming no associated process remains alive, mark it stopped",

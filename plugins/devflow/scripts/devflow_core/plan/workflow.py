@@ -6,7 +6,7 @@ import re
 
 from ..common.errors import UsageError
 from ..common.hosts import host_profile
-from ..common.review import (after_failed_review, check_auto_accepted, check_review_budget,
+from ..common.review import (after_failed_review, check_limit_auto_names, check_review_budget,
                              check_review_config, review_budget)
 from ..common.runs import TERMINAL
 from ..common.settings import SettingsDocument
@@ -83,7 +83,13 @@ class PlanWorkflow(Workflow):
     def check_state(self, state: dict) -> None:
         check_review_config(state["config"])
         check_review_budget(state, state["review_count"])
-        check_auto_accepted(state)
+        check_limit_auto_names(state, self.escalation_id_pattern)
+
+    #: Plan question IDs are ``uuid4().hex`` (``engine._escalate``).
+    escalation_id_pattern = "[0-9a-f]{32}"
+
+    def limit_auto_question(self, state: dict, escalation_id: str) -> str:
+        return f"escalations/{escalation_id}.json"
 
     def can_transfer(self, state: dict, session: str) -> str | None:
         unsealed = "interview.json" not in state["artifacts"]

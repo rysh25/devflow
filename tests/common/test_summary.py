@@ -30,7 +30,7 @@ def source(reviews, **extra):
              "finished_at": "2026-11-05T03:05:44+00:00", "review_count": len(reviews), "review_limit": 6,
              "reviewers": REVIEWERS, "current_version": {"id": "hash9", "label": "v005"},
              "latest_version_reviewed": False, "approving_current": [], "reviews": reviews,
-             "human_decisions": [], "human_acceptance": None}
+             "human_decisions": [], "human_acceptance": None, "automatic_decisions": [], "auto_acceptance": None}
     value.update(extra)
     return value
 
@@ -143,14 +143,48 @@ class RenderTests(unittest.TestCase):
                    finished_at=None, record=None)]
         return summary.render(summary.build(source(reviews, **extra), "2026-11-05T09:00:00+00:00"))
 
-    def test_an_auto_accepted_run_renders_its_own_status_and_record(self):
+    def test_an_auto_accepted_run_renders_its_own_status_record_and_decisions(self):
+        record = "limit-auto/0123456789abcdef0123456789abcdef-accept.json"
         text = self.render(status="auto_accepted", auto_acceptance={
-            "record": "auto-acceptance.json", "source": "config", "version": "hash9",
-            "accepted_at": "2026-11-05T03:05:44+00:00", "version_reviewed": False})
-        self.assertIn("- Status: auto_accepted — accepted by configuration at the review limit, "
-                      "not approved by every reviewer", text)
-        self.assertIn("- Auto-accepted by configuration at the review limit (record: auto-acceptance.json; "
-                      "accepted version not reviewed)", text)
+            "record": record, "source": "review_limit_auto", "version": "hash9",
+            "accepted_at": "2026-11-05T03:05:44+00:00", "version_reviewed": False, "recommendation": "Accept."},
+            human_decisions=[decision(2, "review_budget", "continue")], automatic_decisions=[
+                {"at": "2026-11-05T02:00:00+00:00", "review_number": 4, "decision": "continue",
+                 "setting": "continue_accept", "review_limit_before": 4, "review_limit_after": 6,
+                 "recommendation": "Continue: codex's high finding is unreviewed.\n\n- F1 is fixed in v002.\n",
+                 "record": "limit-auto/a-continue.json"},
+                {"at": "2026-11-05T03:05:44+00:00", "review_number": 6, "decision": "accept",
+                 "setting": "continue_accept", "review_limit_before": 6, "review_limit_after": 6,
+                 "recommendation": "Accept.", "record": record}])
+        self.assertIn("- Status: auto_accepted — accepted at the review limit by the run's review_limit_auto setting "
+                      "following the host's recommendation, not approved by every reviewer", text)
+        self.assertIn(f"- Auto-accepted by the review_limit_auto setting following the host's recommendation "
+                      f"(record: {record}; accepted version not reviewed)", text)
+        # The automatic decisions are listed apart from the human's, after them, each with
+        # the recorded recommendation quoted line by line (a blank line stays a bare ">").
+        self.assertTrue(text.endswith(
+            "- Human decisions:\n"
+            "  - After 2 reviews, review_budget: continue (2026-11-05T03:05:44+00:00)\n"
+            "- Automatic decisions (review_limit_auto, not human answers):\n"
+            "  - After 4 reviews, review_budget: continue by setting continue_accept (limit 4 → 6) "
+            "(2026-11-05T02:00:00+00:00)\n"
+            "    Host's recommendation:\n"
+            "    > Continue: codex's high finding is unreviewed.\n"
+            "    >\n"
+            "    > - F1 is fixed in v002.\n"
+            "  - After 6 reviews, review_budget: accept by setting continue_accept (2026-11-05T03:05:44+00:00)\n"
+            "    Host's recommendation:\n"
+            "    > Accept.\n"))
+
+    def test_the_serious_findings_line(self):
+        data = summary.build(source([review(1, "codex", findings=[finding("F1", "high", action="reject")]),
+                                     review(2, "opencode", status="failed", error="timed out")]), "now")
+        self.assertEqual(data["serious_findings"], {"reviewers": [{"reviewer_id": "codex", "review_number": 1}],
+                                                    "never_succeeded": ["opencode"]})
+        self.assertIn("- Latest succeeded review with critical/high: codex (review 1); never succeeded: opencode\n",
+                      summary.render(data))
+        self.assertIn("- Latest succeeded review with critical/high: none; never succeeded: none\n",
+                      self.render(reviews=[review(1, "codex", "pass"), review(2, "opencode", "pass")]))
 
     def test_the_fixed_form(self):
         text = self.render(status="accepted", human_acceptance={
@@ -171,6 +205,7 @@ class RenderTests(unittest.TestCase):
             "  - Review 2 (opencode): opencode exited with 1",
             "- Remaining findings (1):",
             "  - codex, review 1: F1 [high] correctness — plan.md:5: Do the right thing.\nOn two lines.",
+            "- Latest succeeded review with critical/high: codex (review 1); never succeeded: opencode",
             "- Human decisions:",
             "  - After 2 reviews, review_budget: accept (2026-11-05T03:05:44+00:00)"]) + "\n")
 
@@ -192,7 +227,9 @@ class RenderTests(unittest.TestCase):
         self.assertIn("| 1 | codex | v000 | pass | none | unknown | 0:23:05 of 0:30:00 |", text)
         self.assertIn("- codex: gpt-x, xhigh (requested), cli 1.0; tokens: unknown (1 review without token counts)\n"
                       "- opencode: deep, high (requested), CLI unknown; tokens: unknown\n"
-                      "- Failures: none\n- Remaining findings: none\n- Human decisions: none\n", text)
+                      "- Failures: none\n- Remaining findings: none\n"
+                      "- Latest succeeded review with critical/high: none; never succeeded: opencode\n"
+                      "- Human decisions: none\n", text)
         no_reviews = summary.render(summary.build(source([], current_version={"id": None, "label": "none (no plan yet)"}),
                                                   "now"))
         self.assertIn("- Current version: none (no plan yet), not reviewed; approvals: codex no, opencode no\n\n"

@@ -2,7 +2,7 @@
 from __future__ import annotations
 import copy
 from ..common.errors import DevFlowError
-from ..common.review import check_auto_accept, validate_limit
+from ..common.review import check_limit_auto, validate_limit
 from ..common.settings import SettingsDocument, load_workflow_config, validate_reviewer_list, validate_reviewers
 from .checks import validate_checks
 from .snapshot import validate_patterns
@@ -29,14 +29,11 @@ def validate_stage(value: dict) -> dict:
 
 def _validate(value: dict, *, match_reviewer_limit: bool) -> dict:
     fields = {"schema_version", "max_reviews", "max_check_attempts", "max_plan_bytes", "allow_dirty", "snapshot",
-              "reviewers", "checks", "auto_accept_at_review_limit"}
-    # auto_accept_at_review_limit is the only optional field: runs frozen before
-    # it existed keep a config without it (read then as false, never backfilled).
-    required = fields - {"auto_accept_at_review_limit"}
-    if (not isinstance(value, dict) or set(value) - fields or required - set(value)
+              "reviewers", "checks", "review_limit_auto", "review_limit_auto_extra_reviews"}
+    if (not isinstance(value, dict) or set(value) != fields
             or type(value.get("schema_version")) is not int or value.get("schema_version") != 1):
         raise DevFlowError("Invalid configuration fields or schema_version; compare config/defaults.json")
-    check_auto_accept(value)
+    check_limit_auto(value)
     validate_limit(value["max_reviews"])
     _integer(value["max_check_attempts"], 1, 10, "max_check_attempts")
     _integer(value["max_plan_bytes"], 1024, 8 * 1024 * 1024, "max_plan_bytes")
