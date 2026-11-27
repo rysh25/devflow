@@ -16,7 +16,7 @@ from devflow_core import cli, router
 from devflow_core.common import paths, sessions
 from devflow_core.common import runs as runs_module
 from devflow_core.common.errors import DevFlowError, ProcessCleanupError, ReviewerError
-from devflow_core.common.review import AUTO_ACCEPTANCE, REVIEW_LIMIT_REASON, ask_at_limit
+from devflow_core.common.review import REVIEW_LIMIT_REASON
 from devflow_core.common.settings import read_project_settings
 from devflow_core.common.storage import atomic_write_json, digest, file_lock, json_bytes, read_json
 from devflow_core.plan import engine as engine_module
@@ -2459,249 +2459,536 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(cancelled["status"], "cancelled")
         json.dumps(self.engine.report(self.run_id), ensure_ascii=False).encode("utf-8")
 
-    # auto_accept_at_review_limit: configuration acceptance at the review limit.
+    # review_limit_auto: the host's recommendation applied at the review limit by limit-auto.
 
-    def auto_accept_config(self, value, max_reviews=2, reviewers=None):
+    def limit_config(self, mode=None, extra=None, max_reviews=2, reviewers=None, plan=None):
         document = {"schema_version": 1, "max_reviews": max_reviews}
-        if value is not None:
-            document["auto_accept_at_review_limit"] = value
+        if mode is not None:
+            document["review_limit_auto"] = mode
+        if extra is not None:
+            document["review_limit_auto_extra_reviews"] = extra
         if reviewers is not None:
             document["reviewers"] = reviewers
+        if plan is not None:
+            document["plan"] = plan
         atomic_write_json(self.project / "devflow.config.json", document)
 
-    def auto_to_limit(self, verdict="changes_required"):
-        """Two handled reviews at max_reviews 2; ready with the limit reached."""
-        self.ready()
-        for _ in range(2):
-            self.reflect(self.submit(review_value(verdict)))
+    def handled(self, severity="medium", action="accept"):
+        """One reviewed round with one finding of ``severity``, handled with ``action``."""
+        reviewed = self.submit(review_value("changes_required", severity=severity))
+        return self.reflect(reviewed, action=action, change=action == "accept")
 
-    def frozen_without_key(self):
-        """Drop the key from this run's frozen copies, as a run frozen before it
-        existed has them: the immutable files of an old-format run."""
-        config = read_json(self.run / "config.json")
-        config.pop("auto_accept_at_review_limit", None)
-        data = json_bytes(config)
-        (self.run / "config.json").write_bytes(data)
-        state = read_json(self.run / "state.json")
-        state["config"].pop("auto_accept_at_review_limit", None)
-        state["artifacts"]["config.json"] = digest(data)
-        atomic_write_json(self.run / "state.json", state)
+    def limit_to_question(self, severities=("medium", "medium"), request=None):
+        """Handled reviews up to the limit, then the review limit question."""
+        self.ready(request=request)
+        for severity in severities:
+            self.handled(severity)
+        asked = self.ask_at_limit()
+        self.assertEqual(asked["status"], "awaiting_human")
+        self.assertEqual(asked["escalation"]["detail"]["kind"], "review_budget")
+        return asked
 
-    def test_auto_accept_enabled_ends_as_auto_accepted_with_committed_evidence(self):
-        self.auto_accept_config(True)
-        self.auto_to_limit()
-        self.preflight.reset_mock()
+    def limit_auto(self, decision, text="Recommendation: continue; codex's high finding was not re-reviewed.",
+                   escalation_id=None, session=None, path=None):
+        escalation_id = escalation_id or self.engine.status(self.run_id)["escalation"]["id"]
+        path = path or self.draft("recommendation.md", text)
+        return self.engine.limit_auto(self.run_id, escalation_id, decision, path, session or self.session)
+
+    def limit_records(self):
+        return sorted(name for name in read_json(self.run / "state.json")["artifacts"] if name.startswith("limit-auto/"))
+
+    def assertRefusedUnchanged(self, call, pattern):
+        before = (self.run / "state.json").read_bytes()
+        with self.assertRaisesRegex(DevFlowError, pattern):
+            call()
+        self.assertEqual((self.run / "state.json").read_bytes(), before)
+
+    def test_ask_keeps_the_human_question_and_refuses_limit_auto(self):
+        for mode in (None, "ask"):
+            with self.subTest(mode=mode):
+                self.limit_config(mode)
+                asked = self.limit_to_question()
+                self.assertEqual(read_json(self.run / "config.json")["review_limit_auto"], "ask")
+                self.assertEqual(asked["limit_auto_decisions"], [])
+                for decision in ("continue", "accept"):
+                    self.assertRefusedUnchanged(lambda: self.limit_auto(decision), 'review_limit_auto is "ask"')
+                self.assertEqual(self.at_limit("accept")["status"], "accepted")
+
+    def test_continue_adds_one_round_without_a_review_or_a_human_answer(self):
+        self.limit_config("continue")
+        asked = self.limit_to_question()
         with patch(RUN_REVIEW) as call:
-            result = self.engine.review(self.run_id)
-        call.assert_not_called()  # no reviewer starts, no question opens
-        self.preflight.assert_not_called()
+            result = self.limit_auto("continue")
+        call.assert_not_called()
+        self.assertEqual((result["status"], result["review_limit"], result["review_count"]), ("ready", 4, 2))
+        self.assertIsNone(result["escalation"])
+        self.assertEqual(result["resolved_escalations"], [])
+        name = f"limit-auto/{asked['escalation']['id']}-continue.json"
+        self.assertEqual(self.limit_records(), [name])
+        record = read_json(self.run / name)
+        self.assertEqual({key: record[key] for key in ("schema_version", "source", "escalation_id", "decision",
+                                                       "review_limit_auto", "review_limit_auto_extra_reviews",
+                                                       "review_number", "review_limit_before", "review_limit_after",
+                                                       "version", "version_reviewed", "host", "session")},
+                         {"schema_version": 1, "source": "review_limit_auto", "escalation_id": asked["escalation"]["id"],
+                          "decision": "continue", "review_limit_auto": "continue",
+                          "review_limit_auto_extra_reviews": 6, "review_number": 2, "review_limit_before": 2,
+                          "review_limit_after": 4, "version": asked["plan_hash"], "version_reviewed": False,
+                          "host": "claude", "session": self.session})
+        self.assertIn("codex's high finding", record["recommendation"])
+        self.assertEqual(result["limit_auto_decisions"], [{"escalation_id": asked["escalation"]["id"],
+                                                           "review_number": 2, "decision": "continue",
+                                                           "record": name}])
+        # The next review runs the next reviewer; the decision shows in the summary as automatic.
+        self.handled()
+        self.handled()
+        text = self.ask_at_limit()["review_summary_markdown"]
+        self.assertIn("- Human decisions: none", text)
+        self.assertIn("- Automatic decisions (review_limit_auto, not human answers):", text)
+        self.assertIn("  - After 2 reviews, review_budget: continue by setting continue (limit 2 → 4)", text)
+        self.assertIn("    Host's recommendation:\n", text)
+        self.assertIn("codex's high finding", text.split("Host's recommendation:", 1)[1])
+        # The run's continue setting never accepts.
+        self.assertRefusedUnchanged(lambda: self.limit_auto("accept"), "does not accept automatically")
+
+    def test_continue_accept_accepts_and_publishes_with_the_setting_as_basis(self):
+        self.limit_config("continue_accept")
+        asked = self.limit_to_question()
+        result = self.limit_auto("accept", "Recommendation: accept and finish; no serious issue remains.")
         self.assertEqual(result["status"], "auto_accepted")
-        state = read_json(self.run / "state.json")
-        self.assertIn(AUTO_ACCEPTANCE, state["artifacts"])
-        record = read_json(self.run / AUTO_ACCEPTANCE)
-        self.assertEqual((record["schema_version"], record["source"],
-                          record["auto_accept_at_review_limit"]), (1, "config", True))
-        self.assertEqual(record["version"], state["plan_hash"])
-        self.assertEqual((record["review_count"], record["review_limit"]), (2, 2))
-        self.assertFalse(record["version_reviewed"])  # the final revision was never reviewed
-        # A duplicate review request cannot end it again or dispatch a reviewer.
-        with self.assertRaises(DevFlowError):
-            self.engine.review(self.run_id)
-
-    def test_auto_accept_disabled_keeps_the_human_question(self):
-        self.auto_accept_config(False)
-        self.auto_to_limit()
-        result = self.ask_at_limit()
-        self.assertEqual(result["status"], "awaiting_human")
-        self.assertEqual(self.at_limit("accept")["status"], "accepted")
-
-    def test_a_run_frozen_without_the_key_keeps_the_human_question(self):
-        self.auto_accept_config(True)
-        self.auto_to_limit()
-        self.frozen_without_key()
-        result = self.ask_at_limit()
-        self.assertEqual(result["status"], "awaiting_human")
-        self.assertNotIn("auto_accept_at_review_limit", read_json(self.run / "config.json"))
-
-    def test_auto_accept_zero_successful_reviews_keeps_the_question(self):
-        self.auto_accept_config(True)
-        self.ready()
-        with patch(RUN_REVIEW, side_effect=RuntimeError("provider down")):
-            self.engine.review(self.run_id)  # codex fails once
-            self.engine.review(self.run_id)  # opencode fails once
-        result = self.ask_at_limit()
-        self.assertEqual(result["status"], "awaiting_human")
-        self.assertNotIn(AUTO_ACCEPTANCE, read_json(self.run / "state.json")["artifacts"])
-
-    def test_auto_accept_a_single_reviewer_auto_accepts(self):
-        self.auto_accept_config(True, reviewers=[{"id": "codex", "kind": "codex", "command": ["fixture", "--go"],
-                                                  "model": "fixture-model", "effort": "high", "timeout_seconds": 30}])
-        self.auto_to_limit()
-        result = self.engine.review(self.run_id)
-        self.assertEqual(result["status"], "auto_accepted")
-
-    def test_auto_accept_unanimous_approval_at_the_last_slot_still_completes(self):
-        self.auto_accept_config(True)
-        self.ready()
-        self.submit(review_value())
-        result = self.submit(review_value())
-        self.assertEqual(result["status"], "completed")
-        self.assertNotIn(AUTO_ACCEPTANCE, read_json(self.run / "state.json")["artifacts"])
-
-    def test_auto_accept_is_decided_before_the_ceiling(self):
-        state = {"review_limit": 98, "status": "ready",
-                 "config": {"auto_accept_at_review_limit": True, "reviewers": [{}, {}]}}
-        escalate = lambda reason, questions: self.fail("the human question must not open")
-        self.assertTrue(ask_at_limit(state, 98, set(), "v", escalate, auto_accept=lambda: True))
-        self.assertEqual(state["status"], "ready")
-        self.assertTrue(ask_at_limit(state, 98, set(), "v", escalate, auto_accept=lambda: False))
-        self.assertEqual(state["status"], "exhausted")
-
-    def test_auto_accept_report_and_summary_show_the_configuration_basis(self):
-        self.auto_accept_config(True)
-        self.auto_to_limit()
-        self.engine.review(self.run_id)
+        name = f"limit-auto/{asked['escalation']['id']}-accept.json"
+        self.assertEqual(self.limit_records(), [name])
+        record = read_json(self.run / name)
+        self.assertEqual((record["decision"], record["review_limit_before"], record["review_limit_after"],
+                          record["version_reviewed"]), ("accept", 2, 2, False))
+        self.assertEqual(result["resolved_escalations"], [])
         report = self.engine.report(self.run_id)
-        self.assertEqual(report["status"], "auto_accepted")
         self.assertIsNone(report["human_acceptance"])
         self.assertFalse(report["converged"])
         auto = report["auto_acceptance"]
-        self.assertEqual((auto["record"], auto["source"]), (AUTO_ACCEPTANCE, "config"))
-        self.assertFalse(auto["version_reviewed"])
-        self.assertIn("auto_accept_at_review_limit", report["warning"])
+        self.assertEqual((auto["record"], auto["source"], auto["version_reviewed"]), (name, "review_limit_auto", False))
+        self.assertIn("review_limit_auto setting following the host's recommendation", report["warning"])
         self.assertIn("never reviewed", report["warning"])
-        self.assertIn("Auto-accepted by configuration", report["review_summary_markdown"])
-
-    def test_auto_accept_publication_records_the_configuration_basis(self):
-        self.auto_accept_config(True)
-        self.auto_to_limit()
-        self.engine.review(self.run_id)
+        text = report["review_summary_markdown"]
+        self.assertIn("- Status: auto_accepted — accepted at the review limit by the run's review_limit_auto "
+                      "setting following the host's recommendation, not approved by every reviewer", text)
+        self.assertIn(f"- Auto-accepted by the review_limit_auto setting following the host's recommendation "
+                      f"(record: {name}; accepted version not reviewed)", text)
+        self.assertIn("  - After 2 reviews, review_budget: accept by setting continue_accept (", text)
         published = self.engine.publish(self.run_id)["publication"]
-        self.assertEqual(published["status"], "published")
         receipt = read_json(self.run / "publication.json")
-        self.assertEqual(receipt["approval"], "config")
-        self.assertFalse(receipt["version_reviewed"])
+        self.assertEqual((receipt["approval"], receipt["version_reviewed"]), ("config_recommendation", False))
         approval = (self.project / published["approval_path"]).read_text(encoding="utf-8")
-        self.assertIn("- Approval: config", approval)
-        self.assertIn("auto_accept_at_review_limit", approval)
-        # A second publish keeps the same reservation and files.
-        again = self.engine.publish(self.run_id)["publication"]
-        self.assertEqual(again["path"], published["path"])
-
-    def test_auto_accept_a_modified_acceptance_record_invalidates_the_basis(self):
-        self.auto_accept_config(True)
-        self.auto_to_limit()
-        self.engine.review(self.run_id)
-        record = read_json(self.run / AUTO_ACCEPTANCE)
-        record["version"] = "tampered"
-        atomic_write_json(self.run / AUTO_ACCEPTANCE, record)
-        with self.assertRaises(DevFlowError):
-            self.engine.store.verify_artifacts(self.engine.store.read(self.run_id))
-        with self.assertRaises(DevFlowError):
-            self.engine.publish(self.run_id)
-
-    def test_auto_accept_the_frozen_setting_keeps_an_edited_project_config_out(self):
-        self.auto_accept_config(False)
-        self.auto_to_limit()
-        self.auto_accept_config(True)  # editing the project file during the run changes nothing
-        result = self.ask_at_limit()
-        self.assertEqual(result["status"], "awaiting_human")
-
-    def test_auto_accept_a_resume_keeps_the_terminal_state_and_evidence(self):
-        self.auto_accept_config(True)
-        self.auto_to_limit()
-        self.engine.review(self.run_id)
+        self.assertIn("- Approval: config_recommendation", approval)
+        self.assertIn(f"- Approved by: config (review_limit_auto: continue_accept) following the host's "
+                      f"recommendation (record {name})", approval)
+        self.assertIn("- Last version reviewed: no", approval)
+        self.assertIn("- Note: accepted at the review limit by the run's review_limit_auto setting following "
+                      "the host's recommendation, not approved by every reviewer.", approval)
+        # A resumed run stays accepted and publishable with the same files.
         resumed = self.resume("another-session")
         self.assertEqual(resumed["status"], "auto_accepted")
-        self.assertIn(AUTO_ACCEPTANCE, read_json(self.run / "state.json")["artifacts"])
+        self.assertEqual(self.engine.publish(self.run_id)["publication"]["path"], published["path"])
 
-    def test_auto_accept_a_plan_hash_mismatch_is_an_error_not_acceptance(self):
-        self.auto_accept_config(True)
-        self.auto_to_limit()
-        state = read_json(self.run / "state.json")
-        state["plan_hash"] = "0" * 64  # the artifact no longer is what the hash names
-        atomic_write_json(self.run / "state.json", state)
-        with self.assertRaises(DevFlowError):
-            self.engine.review(self.run_id)
-        state = read_json(self.run / "state.json")
-        self.assertNotIn(AUTO_ACCEPTANCE, state["artifacts"])
-        self.assertNotEqual(state["status"], "auto_accepted")
-
-    def test_auto_accept_a_numeric_frozen_value_is_rejected_on_read(self):
-        self.auto_accept_config(True)
-        self.auto_to_limit()
-        self.engine.review(self.run_id)
-        # A frozen config file holding 1 for the boolean is never "true".
-        config = read_json(self.run / "config.json")
-        config["auto_accept_at_review_limit"] = 1
-        data = json_bytes(config)
-        (self.run / "config.json").write_bytes(data)
-        state = read_json(self.run / "state.json")
-        state["artifacts"]["config.json"] = digest(data)
-        atomic_write_json(self.run / "state.json", state)
-        with self.assertRaises(DevFlowError):
-            self.engine.read_frozen_config(self.run_id)
-
-    def test_auto_accept_a_numeric_zero_for_a_frozen_false_is_rejected_on_read(self):
-        self.auto_accept_config(False)
+    def test_a_reviewed_last_version_is_published_as_reviewed(self):
+        self.limit_config("continue_accept")
         self.ready()
-        # ``False == 0`` in Python: only the strict type check catches the swap.
+        self.handled()
+        self.handled(action="reject")  # The last review's finding is rejected: the plan stays reviewed.
+        self.ask_at_limit()
+        self.limit_auto("accept", "Recommendation: accept and finish.")
+        published = self.engine.publish(self.run_id)["publication"]
+        self.assertTrue(read_json(self.run / "publication.json")["version_reviewed"])
+        self.assertIn("- Last version reviewed: yes", (self.project / published["approval_path"]).read_text())
+
+    def test_continue_accept_continues_and_never_stops_or_cancels(self):
+        self.limit_config("continue_accept")
+        self.limit_to_question()
+        for decision in ("stop", "cancel"):
+            self.assertRefusedUnchanged(lambda: self.limit_auto(decision), "continue or accept")
+        self.assertEqual(self.limit_auto("continue")["status"], "ready")
+
+    def test_refusals_leave_the_run_and_its_question_unchanged(self):
+        self.limit_config("continue_accept")
+        self.ready()
+        self.handled()
+        # No question is open while reviews remain.
+        self.assertRefusedUnchanged(lambda: self.limit_auto("continue", escalation_id="0" * 32),
+                                    "no pending review limit question")
+        self.handled()
+        asked = self.ask_at_limit()
+        identifier = asked["escalation"]["id"]
+        self.assertRefusedUnchanged(lambda: self.limit_auto("continue", escalation_id="f" * 32),
+                                    "no pending review limit question")
+        self.assertRefusedUnchanged(lambda: self.limit_auto("continue", session="another-session"),
+                                    "session that owns the run")
+        self.assertRefusedUnchanged(lambda: self.limit_auto("continue", text="   \n"), "nonempty text")
+        outside = self.project / "recommendation.md"
+        outside.write_text("Recommendation: continue.", encoding="utf-8")
+        self.assertRefusedUnchanged(lambda: self.limit_auto("continue", path=outside), "")
+        # Another session's caller is refused by the runner command before the engine.
+        code, value = self.runner("--session", "another-session", "--run", self.run_id, "plan", "limit-auto",
+                                  "--escalation-id", identifier, "--decision", "continue",
+                                  "--recommendation-file", str(self.draft("r.md", "Recommendation: continue.")))
+        self.assertNotEqual(code, 0)
+        # A frozen copy changed after the question opened (with its registered digest).
         config = read_json(self.run / "config.json")
-        config["auto_accept_at_review_limit"] = 0
+        config["review_limit_auto"] = "continue"
         data = json_bytes(config)
+        original = (self.run / "config.json").read_bytes()
         (self.run / "config.json").write_bytes(data)
+        state_bytes = (self.run / "state.json").read_bytes()
         state = read_json(self.run / "state.json")
         state["artifacts"]["config.json"] = digest(data)
         atomic_write_json(self.run / "state.json", state)
-        with self.assertRaises(DevFlowError):
-            self.engine.read_frozen_config(self.run_id)
+        with self.assertRaisesRegex(DevFlowError, "configuration changed"):
+            self.limit_auto("continue")
+        (self.run / "config.json").write_bytes(original)
+        (self.run / "state.json").write_bytes(state_bytes)
+        self.assertEqual(self.limit_records(), [])
+        self.assertEqual(self.engine.status(self.run_id)["escalation"]["id"], identifier)
+        # Any answer recorded after the question comes first, even one to another question.
+        self.record(self.question("An answer to another question.", tool_use_id="another-question"))
+        self.assertRefusedUnchanged(lambda: self.limit_auto("continue"), "human answer is recorded")
+        self.assertEqual(self.at_limit("continue")["review_limit"], 4)
 
-    def test_auto_accept_publish_disabled_stays_disabled(self):
-        atomic_write_json(self.project / "devflow.config.json",
-                          {"schema_version": 1, "max_reviews": 2,
-                           "auto_accept_at_review_limit": True,
-                           "plan": {"publish": {"enabled": False}}})
-        self.auto_to_limit()
-        self.engine.review(self.run_id)
+    def test_a_stale_id_another_kind_of_question_and_an_answer_before_a_transfer(self):
+        self.limit_config("continue_accept")
+        first = self.limit_to_question()["escalation"]["id"]
+        self.limit_auto("continue")
+        # A question of another kind is open: limit-auto answers no other question.
+        paused = self.engine.pause(self.run_id, self.draft("pause.json", {
+            "reason": "A scope question.", "questions": ["Include the rollback?"]}))
+        self.assertEqual(paused["escalation"]["detail"]["kind"], "plan_decision")
+        self.assertRefusedUnchanged(lambda: self.limit_auto("continue", escalation_id=paused["escalation"]["id"]),
+                                    "no pending review limit question")
+        answer = self.limit_answer("Include it.")
+        self.resolve(self.draft("answer.json", {"answer": answer["answer_text"], "event_ids": [answer["event_id"]]}))
+        self.handled()
+        self.handled()
+        second = self.ask_at_limit()["escalation"]["id"]
+        self.assertNotEqual(first, second)
+        # A delayed call with the previous review limit question's ID is refused.
+        self.assertRefusedUnchanged(lambda: self.limit_auto("continue", escalation_id=first),
+                                    "no pending review limit question")
+        # An answer recorded before the run moved to another session is not the new owner's answer.
+        self.record(self.question("An answer before the transfer.", tool_use_id="before-transfer"))
+        self.assertRefusedUnchanged(lambda: self.limit_auto("continue"), "human answer is recorded")
+        self.assertEqual(self.resume("another-session")["human_events"], [])
+        self.session = "another-session"
+        self.assertEqual(self.limit_auto("continue")["review_limit"], 6)
+
+    def test_an_inconsistent_question_record_refuses_before_any_change(self):
+        for decision in ("continue", "accept"):
+            with self.subTest(decision=decision):
+                self.limit_config("continue_accept")
+                asked = self.limit_to_question()
+                # The question record (with its registered digest) disagrees with the review count.
+                self.tamper(f"escalations/{asked['escalation']['id']}.json",
+                            lambda question: question["detail"].update(review_number=1))
+                self.assertRefusedUnchanged(lambda: self.limit_auto(decision),
+                                            "Invalid or mismatched automatic decision record")
+                self.assertEqual(self.limit_records(), [])
+                self.engine.cancel(self.run_id)
+
+    def test_the_reported_bug_continues_until_the_reviewer_reviews_again(self):
+        # Review 1: codex reports a high, accepted and fixed; review 2: opencode only a medium.
+        self.limit_config("continue_accept")
+        asked = self.limit_to_question(("high", "medium"))
+        serious = asked["review_summary"]["serious_findings"]
+        self.assertEqual(serious, {"reviewers": [{"reviewer_id": "codex", "review_number": 1}],
+                                   "never_succeeded": []})
+        self.assertIn("- Latest succeeded review with critical/high: codex (review 1); never succeeded: none",
+                      asked["review_summary_markdown"])
+        self.assertRefusedUnchanged(lambda: self.limit_auto("accept"),
+                                    r"codex's latest succeeded review \(review 1\) has a critical or high finding")
+        self.assertEqual(self.limit_auto("continue")["review_limit"], 4)
+        self.handled("medium")  # codex reviews the fixed plan: only a medium
+        self.handled("medium")  # opencode: only a medium (neither passes, so the run does not complete)
+        asked = self.ask_at_limit()
+        self.assertEqual(asked["review_summary"]["serious_findings"]["reviewers"], [])
+        self.assertEqual(self.limit_auto("accept", "Recommendation: accept.")["status"], "auto_accepted")
+
+    def test_a_rejected_high_still_blocks_and_a_reviewer_that_never_succeeded_is_named(self):
+        self.limit_config("continue_accept")
+        self.ready()
+        self.handled("high", action="reject")
+        self.handled("medium")
+        self.ask_at_limit()
+        self.assertRefusedUnchanged(lambda: self.limit_auto("accept"), "codex's latest succeeded review")
+
+    def test_a_reviewer_that_never_succeeded_does_not_block(self):
+        self.limit_config("continue_accept")
+        self.ready()
+        with patch(RUN_REVIEW, side_effect=RuntimeError("provider down")):
+            self.engine.review(self.run_id)  # codex fails
+        self.handled("medium")  # opencode
+        asked = self.ask_at_limit()
+        self.assertEqual(asked["review_summary"]["serious_findings"],
+                         {"reviewers": [], "never_succeeded": ["codex"]})
+        self.assertIn("never succeeded: codex", asked["review_summary_markdown"])
+        self.assertEqual(self.limit_auto("accept")["status"], "auto_accepted")
+
+    def test_accept_needs_a_succeeded_review_and_the_current_plan(self):
+        self.limit_config("continue_accept")
+        self.ready()
+        with patch(RUN_REVIEW, side_effect=RuntimeError("provider down")):
+            self.engine.review(self.run_id)
+            self.engine.review(self.run_id)
+        self.ask_at_limit()
+        self.assertRefusedUnchanged(lambda: self.limit_auto("accept"), "no review succeeded")
+        self.assertEqual(self.limit_auto("continue")["status"], "ready")
+        self.handled()
+        self.handled()
+        self.ask_at_limit()
+        state = read_json(self.run / "state.json")
+        state["plan_hash"] = "0" * 64  # The registered plan no longer is what the hash names.
+        atomic_write_json(self.run / "state.json", state)
+        with self.assertRaisesRegex(DevFlowError, "current plan record"):
+            self.limit_auto("accept")
+        self.assertNotIn("auto_accepted", read_json(self.run / "state.json")["status"])
+
+    def test_automatic_continuation_stops_at_the_extra_reviews(self):
+        # max_reviews 4, extra 4, two reviewers: 4 → 6 → 8 automatically, never 10.
+        self.limit_config("continue_accept", extra=4, max_reviews=4)
+        self.limit_to_question(("medium",) * 4)
+        self.assertEqual(self.limit_auto("continue")["review_limit"], 6)
+        self.handled()
+        self.handled()
+        self.ask_at_limit()
+        self.assertEqual(self.limit_auto("continue")["review_limit"], 8)
+        self.handled()
+        self.handled()
+        self.ask_at_limit()
+        self.assertRefusedUnchanged(lambda: self.limit_auto("continue"),
+                                    "would make the limit 10, 6 over max_reviews 4, beyond "
+                                    "review_limit_auto_extra_reviews 4")
+        self.assertEqual(self.at_limit("continue")["review_limit"], 10)  # the human may still continue
+        self.handled()
+        self.handled()
+        self.ask_at_limit()
+        self.assertRefusedUnchanged(lambda: self.limit_auto("continue"), "beyond review_limit_auto_extra_reviews")
+        # Accepting is not limited by the extra reviews.
+        self.assertEqual(self.limit_auto("accept")["status"], "auto_accepted")
+        decisions = self.engine.status(self.run_id)["limit_auto_decisions"]
+        self.assertEqual([(item["review_number"], item["decision"]) for item in decisions],
+                         [(4, "continue"), (6, "continue"), (10, "accept")])
+
+    def test_a_value_the_reviewers_do_not_divide_stops_the_last_round(self):
+        self.limit_config("continue", extra=5, max_reviews=4)
+        self.limit_to_question(("medium",) * 4)
+        for _ in range(2):  # 4 → 6 and 6 → 8 fit (2 and 4 over); 8 → 10 would be 6 over
+            self.limit_auto("continue")
+            self.handled()
+            self.handled()
+            self.ask_at_limit()
+        self.assertRefusedUnchanged(lambda: self.limit_auto("continue"), "would make the limit 10, 6 over")
+        # Without the value written, the default 6 applies.
+        self.limit_config("continue", max_reviews=4)
+        self.assertEqual(load_config(read_project_settings(self.project, "claude", WORKFLOWS),
+                                     WORKFLOWS["plan"])["review_limit_auto_extra_reviews"], 6)
+
+    def test_the_frozen_setting_keeps_an_edited_project_config_out(self):
+        self.limit_config("ask")
+        self.limit_to_question()
+        self.limit_config("continue_accept")  # editing the project file during the run changes nothing
+        self.assertRefusedUnchanged(lambda: self.limit_auto("continue"), 'review_limit_auto is "ask"')
+        self.resume("another-session")
+        self.session = "another-session"
+        self.assertRefusedUnchanged(lambda: self.limit_auto("continue"), 'review_limit_auto is "ask"')
+
+    def test_a_typed_frozen_value_is_checked_on_both_sides(self):
+        key = "review_limit_auto_extra_reviews"
+        for frozen, copy, value in ((6, "config.json", 6.0), (6, "state.json", 6.0),
+                                    (1, "config.json", True), (1, "state.json", True)):
+            with self.subTest(frozen=frozen, copy=copy, value=value):
+                self.limit_config("continue", extra=frozen, max_reviews=2)
+                self.ready()
+                self.assertEqual(read_json(self.run / "state.json")["config"][key], frozen)
+                original = (self.run / "config.json").read_bytes(), (self.run / "state.json").read_bytes()
+                state = read_json(self.run / "state.json")
+                if copy == "config.json":
+                    config = read_json(self.run / "config.json")
+                    config[key] = value  # Equal to the frozen value in Python, but not the same JSON value.
+                    data = json_bytes(config)
+                    (self.run / "config.json").write_bytes(data)
+                    state["artifacts"]["config.json"] = digest(data)
+                else:
+                    state["config"][key] = value
+                atomic_write_json(self.run / "state.json", state)
+                with self.assertRaisesRegex(DevFlowError, "review_limit_auto_extra_reviews must be an integer"):
+                    self.engine.read_frozen_config(self.run_id)
+                (self.run / "config.json").write_bytes(original[0])
+                (self.run / "state.json").write_bytes(original[1])
+                self.engine.cancel(self.run_id)
+
+    def tamper(self, name, change):
+        """Change one record and register its new digest, so only the content checks can find it."""
+        record = read_json(self.run / name)
+        change(record)
+        data = json_bytes(record)
+        (self.run / name).write_bytes(data)
+        state = read_json(self.run / "state.json")
+        state["artifacts"][name] = digest(data)
+        atomic_write_json(self.run / "state.json", state)
+
+    def test_changed_records_are_detected_and_never_shown_as_the_basis(self):
+        cases = {
+            "version_reviewed": lambda record: record.update(version_reviewed=0),
+            "setting": lambda record: record.update(review_limit_auto="continue"),
+            "review_number": lambda record: record.update(review_number=1),
+            "escalation_id": lambda record: record.update(escalation_id="0" * 32),
+            "source": lambda record: record.update(source="human"),
+            "schema_version": lambda record: record.update(schema_version=True),  # true == 1 in Python
+            # The accepted version must still be the current plan (the flow's evidence check).
+            "version": lambda record: record.update(version="0" * 64),
+        }
+        for label, change in cases.items():
+            with self.subTest(change=label):
+                self.limit_config("continue_accept")
+                asked = self.limit_to_question()
+                self.limit_auto("accept")
+                name = f"limit-auto/{asked['escalation']['id']}-accept.json"
+                self.tamper(name, change)
+                status = self.engine.status(self.run_id)
+                self.assertIsNone(status["limit_auto_decisions"])
+                self.assertIn("cannot be verified", status["limit_auto_decisions_error"])
+                self.assertIsNone(status["review_summary"])
+                self.assertRegex(status["review_summary_error"], "automatic (decision|accept) record")
+                with self.assertRaises(DevFlowError):
+                    self.engine.publish(self.run_id)
+                with self.assertRaisesRegex(DevFlowError, "automatic (decision|accept) record"):
+                    self.engine.report(self.run_id)
+
+    def test_an_accept_record_changed_without_its_digest_is_refused(self):
+        self.limit_config("continue_accept")
+        asked = self.limit_to_question()
+        self.limit_auto("accept")
+        name = f"limit-auto/{asked['escalation']['id']}-accept.json"
+        record = read_json(self.run / name)
+        record["recommendation"] = "Recommendation: accept; another reason."
+        (self.run / name).write_bytes(json_bytes(record))  # a valid record whose digest no longer matches
+        status = self.engine.status(self.run_id)
+        self.assertIsNone(status["limit_auto_decisions"])
+        self.assertIn("changed or is missing", status["limit_auto_decisions_error"])
+        self.assertIsNone(status["review_summary"])
+        with self.assertRaises(DevFlowError):
+            self.engine.publish(self.run_id)
+        with self.assertRaises(DevFlowError):
+            self.engine.report(self.run_id)
+
+    def test_a_numeric_reviewed_flag_is_not_a_boolean(self):
+        self.limit_config("continue_accept")
+        self.ready()
+        self.handled()
+        self.handled(action="reject")
+        asked = self.ask_at_limit()
+        self.limit_auto("accept")
+        self.tamper(f"limit-auto/{asked['escalation']['id']}-accept.json",
+                    lambda record: record.update(version_reviewed=1))  # 1 == True in Python
+        with self.assertRaises(DevFlowError):
+            self.engine.publish(self.run_id)
+        self.assertIsNone(self.engine.status(self.run_id)["limit_auto_decisions"])
+
+    def test_a_changed_continue_record_and_the_state_invariant(self):
+        self.limit_config("continue_accept")
+        asked = self.limit_to_question()
+        self.limit_auto("continue")
+        name = f"limit-auto/{asked['escalation']['id']}-continue.json"
+        # A digest-registered record whose limits disagree with the question it closed.
+        self.tamper(name, lambda record: record.update(review_limit_before=10, review_limit_after=12))
+        self.assertIn("Invalid or mismatched", self.engine.status(self.run_id)["limit_auto_decisions_error"])
+        record = read_json(self.run / name)
+        record["review_limit_after"] = 6
+        atomic_write_json(self.run / name, record)  # digest mismatch
+        status = self.engine.status(self.run_id)
+        self.assertIn("changed or is missing", status["limit_auto_decisions_error"])
+        with self.assertRaises(DevFlowError):
+            self.engine.store.verify_artifacts(self.engine.store.read(self.run_id))
+        # An auto_accepted state without an accept record (or with ask frozen) is invalid.
+        state = read_json(self.run / "state.json")
+        state.update(status="auto_accepted", finished_at=state["updated_at"], escalation=None)
+        atomic_write_json(self.run / "state.json", state)
+        with self.assertRaisesRegex(DevFlowError, "exactly one automatic accept record"):
+            self.engine.store.read(self.run_id)
+        state["status"] = "ready"
+        state["finished_at"] = None
+        state["artifacts"]["limit-auto/not-an-id-accept.json"] = "0" * 64
+        atomic_write_json(self.run / "state.json", state)
+        with self.assertRaisesRegex(DevFlowError, "Invalid automatic decision record name"):
+            self.engine.store.read(self.run_id)
+
+    def test_an_auto_accepted_run_needs_continue_accept_frozen(self):
+        for mode in ("ask", "continue"):
+            with self.subTest(mode=mode):
+                self.limit_config("continue_accept")
+                self.limit_to_question()
+                self.limit_auto("accept")
+                original = (self.run / "state.json").read_bytes()
+                state = read_json(self.run / "state.json")
+                state["config"]["review_limit_auto"] = mode  # the accept record stays registered
+                atomic_write_json(self.run / "state.json", state)
+                for call in (lambda: self.engine.status(self.run_id), lambda: self.engine.report(self.run_id),
+                             lambda: self.engine.publish(self.run_id)):
+                    with self.assertRaisesRegex(DevFlowError, "needs review_limit_auto continue_accept"):
+                        call()
+                self.assertFalse((self.project / "docs").exists())
+                (self.run / "state.json").write_bytes(original)
+
+    def test_an_interrupted_save_keeps_the_question_and_applies_once_on_retry(self):
+        for decision in ("continue", "accept"):
+            with self.subTest(decision=decision):
+                self.limit_config("continue_accept")
+                asked = self.limit_to_question()
+                original, tripped = runs_module.atomic_json, {"hit": False}
+
+                def flaky(path, value):
+                    if Path(path).name == "state.json" and not tripped["hit"]:
+                        tripped["hit"] = True
+                        raise OSError("simulated interrupted state replacement")
+                    return original(path, value)
+
+                with patch.object(runs_module, "atomic_json", flaky):
+                    with self.assertRaises(OSError):
+                        self.limit_auto(decision)
+                name = f"limit-auto/{asked['escalation']['id']}-{decision}.json"
+                self.assertTrue((self.run / name).exists())  # written, never committed
+                status = self.engine.status(self.run_id)
+                self.assertEqual((status["status"], status["review_limit"]), ("awaiting_human", 2))
+                self.assertEqual(status["escalation"]["id"], asked["escalation"]["id"])
+                self.assertEqual(status["limit_auto_decisions"], [])
+                result = self.limit_auto(decision)
+                self.assertEqual(result["status"], "ready" if decision == "continue" else "auto_accepted")
+                self.assertEqual(self.limit_records(), [name])
+                self.engine.cancel(self.run_id)
+
+    def test_the_ceiling_ends_the_run_before_any_question(self):
+        # With continue_accept the review request at the ceiling still ends the run:
+        # no question opens, nothing is decided automatically, and limit-auto is refused.
+        self.limit_config("continue_accept")
+        self.ready()
+        stored = read_json(self.run / "state.json")
+        atomic_write_json(self.run / "state.json", dict(stored, review_count=98, review_limit=98))
+        ended = self.ask_at_limit()
+        self.assertEqual((ended["status"], ended["escalation"]), ("exhausted", None))
+        self.assertEqual(self.limit_records(), [])
+        for decision in ("continue", "accept"):
+            self.assertRefusedUnchanged(
+                lambda: self.limit_auto(decision, escalation_id="0123456789abcdef0123456789abcdef"),
+                "no pending review limit question")
+
+    def test_publish_disabled_stays_disabled(self):
+        self.limit_config("continue_accept", plan={"publish": {"enabled": False}})
+        self.limit_to_question()
+        self.limit_auto("accept")
         result = self.engine.publish(self.run_id)
         self.assertEqual(result["publication"]["status"], "disabled")
         self.assertFalse((self.project / "docs").exists())
-        self.assertIsNone(self.engine.report(self.run_id)["published_plan"])
 
-    def test_auto_accept_a_collision_at_publish_uses_the_run_suffix(self):
-        self.auto_accept_config(True)
-        self.ready(request="/devflow:plan REVIEW-10")
-        for _ in range(2):
-            self.reflect(self.submit(review_value("changes_required")))
-        self.assertEqual(self.engine.review(self.run_id)["status"], "auto_accepted")
-        target = self.project / "docs" / "plans" / "REVIEW-10.md"
-        target.parent.mkdir(parents=True)
-        target.write_bytes(b"Human-owned existing plan\n")
-        result = self.engine.publish(self.run_id)
-        self.assertEqual(target.read_bytes(), b"Human-owned existing plan\n")
-        self.assertEqual(result["publication"]["path"], f"docs/plans/REVIEW-10-{self.run_id}.md")
-        receipt = read_json(self.run / "publication.json")
-        self.assertEqual(receipt["approval"], "config")
-
-    def test_auto_accept_a_resume_keeps_the_run_publishable(self):
-        self.auto_accept_config(True)
-        self.auto_to_limit()
-        self.engine.review(self.run_id)
-        resumed = self.resume("another-session")
-        self.assertEqual(resumed["publication"]["status"], "pending")
-        published = self.engine.publish(self.run_id)["publication"]
-        self.assertEqual(published["status"], "published")
-        receipt = read_json(self.run / "publication.json")
-        self.assertEqual(receipt["approval"], "config")
-        again = self.engine.publish(self.run_id)["publication"]
-        self.assertEqual(again["path"], published["path"])
-
-    def test_auto_accept_an_interrupted_publication_resumes_its_intent(self):
-        self.auto_accept_config(True)
-        self.ready(request="/devflow:plan REVIEW-10")
-        for _ in range(2):
-            self.reflect(self.submit(review_value("changes_required")))
-        self.engine.review(self.run_id)
+    def test_an_interrupted_publication_resumes_its_intent(self):
+        self.limit_config("continue_accept")
+        self.limit_to_question(request="/devflow:plan REVIEW-10")
+        self.limit_auto("accept")
         original = self.engine._artifact
         def crash_before_receipt(state, relative, data):
             if relative == "publication.json":
@@ -2713,39 +3000,11 @@ class EngineTests(unittest.TestCase):
         target = self.project / "docs" / "plans" / "REVIEW-10.md"
         approval = target.with_name("REVIEW-10.approval.md")
         before, before_approval = target.read_bytes(), approval.read_bytes()
-        self.assertEqual(self.engine.status(self.run_id)["publication"]["status"], "publishing")
-        # After a session change the saved intent is reused: the same target and bytes.
         self.resume("another-session")
         recovered = Engine(self.project, host="claude").publish(self.run_id)
-        self.assertEqual((recovered["publication"]["path"], recovered["publication"]["approval_path"]),
-                         ("docs/plans/REVIEW-10.md", "docs/plans/REVIEW-10.approval.md"))
+        self.assertEqual(recovered["publication"]["path"], "docs/plans/REVIEW-10.md")
         self.assertEqual((target.read_bytes(), approval.read_bytes()), (before, before_approval))
-        receipt = read_json(self.run / "publication.json")
-        self.assertEqual(receipt["approval"], "config")
-
-    def test_auto_accept_an_interrupted_terminal_commit_retries(self):
-        # The acceptance artifact reached disk but the terminal state
-        # replacement failed: the committed state still governs and the next
-        # review retries the acceptance cleanly.
-        self.auto_accept_config(True)
-        self.auto_to_limit()
-        original, tripped = self.engine.store.save, {"hit": False}
-
-        def flaky(state):
-            if state.get("status") == "auto_accepted" and not tripped["hit"]:
-                tripped["hit"] = True
-                raise OSError("simulated interrupted terminal commit")
-            return original(state)
-
-        with patch.object(self.engine.store, "save", flaky):
-            with self.assertRaises(OSError):
-                self.engine.review(self.run_id)
-        state = read_json(self.run / "state.json")  # the committed state governs
-        self.assertEqual(state["status"], "ready")
-        self.assertNotIn(AUTO_ACCEPTANCE, state["artifacts"])
-        result = self.engine.review(self.run_id)
-        self.assertEqual(result["status"], "auto_accepted")
-        self.assertIn(AUTO_ACCEPTANCE, read_json(self.run / "state.json")["artifacts"])
+        self.assertEqual(read_json(self.run / "publication.json")["approval"], "config_recommendation")
 
 
 class PublishNameTests(unittest.TestCase):

@@ -597,6 +597,45 @@ class RunFormatTests(RuntimeFixture):
                     self.engine("plan").cancel(current)
                     self.assertTrue(self.run_dir(flow, identifier).exists())
 
+    def test_format_10_runs_of_0_12_are_unsupported_with_their_recorded_host(self):
+        # 0.8.x–0.12.x wrote format 10 with its owner host; a 0.12.15 frozen config
+        # still holds auto_accept_at_review_limit, and some ended auto_accepted.
+        config = {"max_reviews": 6, "auto_accept_at_review_limit": False}
+        for number, (flow, host, status) in enumerate((("plan", "claude", "auto_accepted"),
+                                                       ("plan", "codex", "reviewing"),
+                                                       ("implement", "devin", "auto_accepted"),
+                                                       ("implement", "claude", "ready_review"))):
+            with self.subTest(flow=flow, host=host, status=status):
+                identifier = f"20261101T12345{number}Z-c23456abcdef"
+                self.raw_run(flow, identifier, status=status, schema_version=10, owner_host=host,
+                             owner_session="old-session", config=config)
+                before = (self.run_dir(flow, identifier) / "state.json").read_bytes()
+                info = RunStore(self.project, WORKFLOWS[flow], host="claude").inspect(identifier)
+                self.assertEqual((info.format, info.schema_version), ("unsupported", 10))
+                message = "Started with DevFlow 0.8.x–0.12.x; this version cannot continue it"
+                selected = runtime.status(self.project, None, identifier, host="claude")
+                self.assertEqual((selected["format"], selected["owner_host"], selected["status"],
+                                  selected["message"]), ("unsupported", host, status, message))
+                listed = [run for run in runtime.status(self.project, self.session, None, host="claude")["runs"]
+                          if run["run_id"] == identifier]
+                self.assertEqual((listed[0]["format"], listed[0]["owner_host"], listed[0]["message"]),
+                                 ("unsupported", host, message))
+                code, output, _ = self.invoke("--run", identifier, flow, "status")
+                self.assertEqual(code, 2)
+                self.assertIn("0.8.x–0.12.x", json.loads(output)["message"])
+                self.assert_not_accepted(self.prompt("/devflow:resume " + identifier),
+                                         f"Run {identifier} was started with DevFlow 0.8.x–0.12.x")
+                # It never blocks a new start of either flow (an unfinished Implement run
+                # in the same workspace included), and nothing above rewrote it.
+                current = self.plan_start(session=f"new-{number}")
+                self.engine("plan").cancel(current)
+                current = self.implement_start(session=f"new-implement-{number}")
+                self.engine("implement").cancel(current, f"new-implement-{number}", "test")
+                self.assertEqual((self.run_dir(flow, identifier) / "state.json").read_bytes(), before)
+        # Format 9 and earlier had no host field: they still show claude.
+        identifier = self.raw_run("plan", "20261101T123459Z-d23456abcdef", status="reviewing", schema_version=9)
+        self.assertEqual(runtime.status(self.project, None, identifier, host="claude")["owner_host"], "claude")
+
     def test_session_bound_to_a_0_2_run_reports_unsupported_until_released(self):
         identifier = self.bind_to_old_run()
         value = runtime.status(self.project, self.session, None, host="claude")

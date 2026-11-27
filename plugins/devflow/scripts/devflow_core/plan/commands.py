@@ -52,7 +52,8 @@ COMMANDS = (
             (Option("--decisions-file", "draft"),)),
     Command("plan", "Commit the initial plan from the draft directory",
             lambda e, a, run, s: e.plan(run, a.file), (Option("--file", "draft"),)),
-    Command("review", "Dispatch the next reviewer and reserve one attempt; at the review limit, accept by the run's frozen setting or ask the human instead",
+    Command("review", "Dispatch the next reviewer and reserve one attempt; at the review limit, ask the human "
+            "(or end as exhausted when another round would pass 99 reviews)",
             lambda e, a, run, s: e.review(run)),
     Command("apply", "Commit this review's finding dispositions and the updated plan",
             lambda e, a, run, s: e.apply(run, a.plan_file, a.decisions_file, a.expected_hash),
@@ -62,6 +63,11 @@ COMMANDS = (
     Command("resolve", "Resolve with exact status.human_events answer_text and event_id values "
             "(and decision continue/stop/accept for the review limit question)",
             lambda e, a, run, s: e.resolve(run, a.answer_file, s), (Option("--answer-file", "draft"),)),
+    Command("limit-auto", "At the review limit, apply the host's recommendation (continue or accept) when the "
+            "run's review_limit_auto setting allows it; never a human answer",
+            lambda e, a, run, s: e.limit_auto(run, a.escalation_id, a.decision, a.recommendation_file, s),
+            (Option("--escalation-id", "text"), Option("--decision", "decision"),
+             Option("--recommendation-file", "draft"))),
     Command("cancel", "Keep all audit data and stop the run", lambda e, a, run, s: e.cancel(run)),
     Command("report", "Verify artifacts and produce a JSON handoff report", lambda e, a, run, s: e.report(run)),
     Command("publish", "Export the exact approved plan without overwriting any existing file",

@@ -1,6 +1,6 @@
 ---
 name: implement
-description: Implement an explicitly selected Markdown plan, run approved project checks, and review with each configured reviewer in turn up to max_reviews attempts, which only the human can raise at the limit. Use only when the user invokes /devflow:implement with a plan file.
+description: Implement an explicitly selected Markdown plan, run approved project checks, and review with each configured reviewer in turn up to max_reviews attempts, which only the human, or the run's review_limit_auto setting following the host's recommendation, can raise at the limit. Use only when the user invokes /devflow:implement with a plan file.
 argument-hint: "[--max-reviews N] [--reviewer AGENT MODEL EFFORT ...] -- <plan-file>"
 disable-model-invocation: true
 allowed-tools: Bash(uv --no-cache run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *) PowerShell(uv --no-cache run --offline --no-project --no-config --no-python-downloads "${CLAUDE_PLUGIN_ROOT}/scripts/devflow.py" *)
@@ -36,7 +36,7 @@ DevFlow records and verifies; it does not limit tools. It assumes you follow the
 - Preserve all pre-existing changes. Write runner input files in the run's draft directory. Do not edit the input plan, any DevFlow project settings file (shared `devflow.config.json` or local `devflow.config.local.json`), or DevFlow's run records and counters; the runner manages them and stops the run when they do not match.
 - You may run tests, builds and other commands while implementing. Only the runner's `check` results count as validation evidence; never invent results. If no checks are configured, human validation is required; when the runner asks for it, recommend an answer as the Recommendations to the human section of the implement workflow reference says, treating configuring checks before a fresh run as one of the options.
 - Ask the human before pushing, publishing, deploying, adding dependencies or running irreversible migrations, unless the human explicitly asked for it or the project's rules (`CLAUDE.md`, `AGENTS.md` and the like) say how to handle it. Committing is not limited.
-- Source code changes invalidate prior approvals; the runner owns that decision. Never reset or replace a run to obtain additional reviews; at the review limit the runner decides from its frozen configuration: an eligible run ends `auto_accepted`, an impossible round ends `exhausted`, and only a pending `review_budget` escalation asks the human.
+- Source code changes invalidate prior approvals; the runner owns that decision. Never reset or replace a run to obtain additional reviews; at the review limit the runner ends a run `exhausted` when another round cannot fit, and otherwise opens a pending `review_budget` escalation. Handle it as the review limit steps of the implement workflow reference say: the run's frozen `review_limit_auto` setting may let your recommendation continue or accept with `implement limit-auto` (an accepted run ends `auto_accepted`, which is neither a human answer nor approval by every reviewer); otherwise ask the human.
 - `recover` is for a human who has confirmed that no reviewer or check process remains. Do not run it yourself.
 - A plugin is not a background daemon. If the session or permissions stop progress, explain the blocker and the exact resume command.
 

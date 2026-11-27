@@ -7,7 +7,7 @@ from pathlib import Path
 from ..common import summary
 from ..common.errors import DevFlowError, UsageError
 from ..common.environment import bash_timeout_ms
-from ..common.review import (after_failed_review, check_auto_accepted, check_review_budget,
+from ..common.review import (after_failed_review, check_limit_auto_names, check_review_budget,
                              check_review_config, review_budget)
 from ..common.runs import TERMINAL
 from ..common.sessions import prefilled_question_events
@@ -141,7 +141,17 @@ class ImplementWorkflow(Workflow):
         if not isinstance(state["attempts"], list):
             raise DevFlowError("Incompatible/corrupt run state; never reset the review count")
         check_review_budget(state, len(state["attempts"]))
-        check_auto_accepted(state)
+        check_limit_auto_names(state, self.escalation_id_pattern)
+
+    #: Implement question IDs are ``E{index:03}`` (``engine._escalate``), four digits from the 1000th.
+    escalation_id_pattern = "E[0-9]{3,}"
+
+    def limit_auto_question(self, state: dict, escalation_id: str) -> str:
+        """``E004`` is ``escalations/004.json``, which the run must list."""
+        path = f"escalations/{int(escalation_id[1:]):03}.json"
+        if path not in state["escalations"]:
+            raise DevFlowError(f"No recorded question {escalation_id}")
+        return path
 
     def on_recover(self, store, state: dict) -> None:
         if state["status"] == "checking":
@@ -171,8 +181,7 @@ class ImplementWorkflow(Workflow):
     def before_save(self, store, state: dict) -> None:
         if state["status"] in TERMINAL:
             # An auto_accepted run keeps the report finalized with its acceptance:
-            # later saves (status reads, an explicit resume) reuse it and never
-            # recapture the workspace.
+            # later saves (an explicit resume) reuse it and never recapture the workspace.
             if state["status"] == "auto_accepted" and state["report_path"]:
                 return
             from .engine import _auto_acceptance_entry, terminal_report
@@ -186,14 +195,13 @@ class ImplementWorkflow(Workflow):
                 observed, observed_error = None, str(exc)
             verified = None
             if state["status"] == "auto_accepted":
-                # The acceptance and its report share the snapshot _current
-                # verified during preparation; a second capture could fail and
-                # lose the pause, and could disagree about the target. The full
-                # entry check — frozen config record, candidate and reviewed
-                # facts — runs before the terminal state commits: a verification
-                # failure propagates and leaves the prior state in effect.
-                evidence = _auto_acceptance_entry(
-                    state, lambda relative: store.record_json(state, relative))
+                # The acceptance and its report share the snapshot _accept_current
+                # verified in limit-auto; a second capture could disagree about
+                # the target. The full entry check — the decision record, the
+                # frozen config record, candidate and reviewed facts — runs before
+                # the terminal state commits: a verification failure propagates
+                # and leaves the prior state in effect.
+                evidence = _auto_acceptance_entry(state, store)
                 verified = {"snapshot_id": evidence["version"], "reviewed": evidence["version_reviewed"]}
             report = terminal_report(store, state, observed, observed_error, verified)
             data = json_bytes(report)

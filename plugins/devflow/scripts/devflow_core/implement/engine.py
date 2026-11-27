@@ -11,9 +11,10 @@ from .review import validate_review
 from .workspace import branch, verify_workspace
 from ..common.errors import DevFlowError, ProcessCleanupError
 from ..common.process import cleanup_failure, reraise_wrapped_cause
-from ..common.review import (AUTO_ACCEPTANCE, AUTO_ACCEPT_KEY, LIMIT_DECISIONS, REVIEW_BUDGET, after_review_failure,
-                             all_approved, ask_at_limit, auto_acceptance, check_auto_accept, check_auto_acceptance,
-                             decide_at_limit, next_reviewer)
+from ..common.review import (LIMIT_AUTO_DIR, LIMIT_AUTO_KEY, LIMIT_AUTO_SOURCE, LIMIT_DECISIONS, REVIEW_BUDGET,
+                             accept_entry, after_review_failure, all_approved, ask_at_limit, automatic_decisions,
+                             check_limit_auto, check_no_serious_reviewers, decide_at_limit, limit_auto_records,
+                             next_reviewer)
 from ..common import summary
 from ..common.reviewers import preflight, prepare_review, recorded_cli_version, review_tokens, run_review
 from ..common.engine import RunEngine
@@ -57,6 +58,9 @@ class Engine(RunEngine):
                  session: str | None = None, *, host: str):
         from .workflow import WORKFLOW
         super().__init__(project, WORKFLOW, resources, lock_wait, session, host=host)
+
+    def _check_auto_acceptance(self, state, entries):
+        _auto_acceptance_entry(state, self.store, entries)
 
     def _verify(self, state, source=True):
         super()._verify(state)
@@ -318,12 +322,13 @@ class Engine(RunEngine):
                 current = self._current(state)
             except (DevFlowError, OSError) as exc:
                 cleanup = cleanup_failure(exc)
-                # With the setting enabled and the limit reached, a cleanup failure in
-                # the workspace identity/snapshot check is a technical pause: no reviewer
-                # starts, no acceptance or report is recorded and no attempt is consumed.
-                # A cleanup failure that wrapped an interrupt keeps it: the pause is
-                # saved first, then the interrupt propagates.
-                if (cleanup is None or not state["config"].get(AUTO_ACCEPT_KEY)
+                # With an automatic review_limit_auto and the limit reached, a cleanup
+                # failure in the workspace identity/snapshot check is a technical pause:
+                # no reviewer starts, no question opens (the host could decide it before
+                # a human checks the processes) and no attempt is consumed. A cleanup
+                # failure that wrapped an interrupt keeps it: the pause is saved first,
+                # then the interrupt propagates.
+                if (cleanup is None or state["config"][LIMIT_AUTO_KEY] == "ask"
                         or len(state["attempts"]) < state["review_limit"]):
                     raise
                 state.update(status="paused_error",resume_status="ready_review",
@@ -339,7 +344,7 @@ class Engine(RunEngine):
                 # verify_workspace re-raises it, with the failure as context.
                 # Find the failure there; the same limit pause is saved first.
                 cleanup = cleanup_failure(exc.__context__)
-                if (cleanup is None or not state["config"].get(AUTO_ACCEPT_KEY)
+                if (cleanup is None or state["config"][LIMIT_AUTO_KEY] == "ask"
                         or len(state["attempts"]) < state["review_limit"]):
                     raise
                 state.update(status="paused_error",resume_status="ready_review",
@@ -349,8 +354,7 @@ class Engine(RunEngine):
             approved = {reviewer for reviewer, snapshot_id in state["approvals"].items()
                         if snapshot_id == current["snapshot_id"]}
             if ask_at_limit(state,len(state["attempts"]),approved,current["snapshot_id"],
-                            lambda reason, questions: self._escalate(state,REVIEW_BUDGET,questions,"ready_review",reason),
-                            auto_accept=lambda: self._auto_accept(state,current)):
+                            lambda reason, questions: self._escalate(state,REVIEW_BUDGET,questions,"ready_review",reason)):
                 return None
             if not validated_for(state, current["snapshot_id"]):
                 raise DevFlowError("Fresh successful checks or explicit human validation are required")
@@ -382,32 +386,6 @@ class Engine(RunEngine):
 
         return self._dispatch(run_id, "reviewing", "review", prepare, execute, finish)
 
-    def _auto_accept(self,state,current) -> bool:
-        """Whether this run ends itself at the review limit, as ``auto_accepted``.
-
-        Called inside the run lock during ``review`` preparation, only when the
-        frozen ``auto_accept_at_review_limit`` is set and the limit is reached.
-        It never starts a reviewer, opens the budget question or adds reviews.
-        Without the current checkpoint validated for the exact workspace
-        snapshot (passed checks or human attestation — the binary attestation
-        and manual-validation gates on the way here are never bypassed), or
-        without one finalized successful review with its recorded verdict, the
-        conventional human question applies. The final snapshot may be
-        unreviewed; the evidence records whether it was.
-        """
-        if not validated_for(state, current["snapshot_id"]):
-            return False
-        if not any(attempt["status"] == "succeeded"
-                   and self.store.record(state,attempt["review_path"]) is not None
-                   for attempt in state["attempts"]):
-            return False
-        reviewed = any(attempt["status"] == "succeeded" and attempt["snapshot_id"] == current["snapshot_id"]
-                       for attempt in state["attempts"])
-        self._artifact(state,AUTO_ACCEPTANCE,json_bytes(
-            auto_acceptance(state,len(state["attempts"]),current["snapshot_id"],reviewed)))
-        state["status"] = "auto_accepted"
-        return True
-
     def _finish_review(self,state,reservation,provider,result,error):
         number = reservation["number"]
         review = result["review"] if error is None else None
@@ -427,12 +405,12 @@ class Engine(RunEngine):
             # the snapshot capture still counts as the content not matching.
             change_error = exc
         content_changed = change_error is not None
-        # With the run's own-acceptance setting enabled, a cleanup failure in the
-        # workspace identification/snapshot capture after the review is a technical
-        # pause even at the limit; disabled, the existing content-changed transition
-        # applies. Either way the dispatched attempt stays consumed.
+        # With an automatic review_limit_auto, a cleanup failure in the workspace
+        # identification/snapshot capture after the review is a technical pause even
+        # at the limit; with ask, the existing content-changed transition applies.
+        # Either way the dispatched attempt stays consumed.
         cleanup = cleanup_failure(review_error)
-        if cleanup is None and state["config"].get(AUTO_ACCEPT_KEY):
+        if cleanup is None and state["config"][LIMIT_AUTO_KEY] != "ask":
             cleanup = cleanup_failure(change_error)
         if review_error is None:
             error = change_error
@@ -562,6 +540,36 @@ class Engine(RunEngine):
             self._save(state)
         return self.status(run_id)
 
+    def limit_auto(self,run_id,session_id,escalation_id,decision,recommendation_file):
+        """Apply the host's recommendation (continue or accept) to the open review limit
+        question when the run's frozen review_limit_auto setting allows it.
+
+        Never a human answer: the decision is recorded in ``limit-auto/``, not in
+        ``resolutions``. Any refusal leaves the run and its question unchanged.
+        """
+        with self._lock(run_id):
+            state = self._state(run_id)
+            self._owner(state,session_id)
+            escalation = self._limit_auto_request(state,escalation_id,decision)
+            recommendation = checked_text(self._draft(state,recommendation_file))
+            if decision == "continue":
+                self._verify(state)
+                version = (state.get("candidate") or {}).get("snapshot_id")
+                reviewed = any(a["status"] == "succeeded" and a["snapshot_id"] == version for a in state["attempts"])
+            else:
+                # Verify before holding new immutable artifacts (as resolve does).
+                current = self._accept_current(state)
+                version = current["snapshot_id"]
+                if not any(a["status"] == "succeeded" and self.store.record(state,a["review_path"]) is not None
+                           for a in state["attempts"]):
+                    raise DevFlowError("Cannot accept automatically: no review succeeded. "
+                                       "Ask the human the review limit question.")
+                check_no_serious_reviewers(summary_source(self.store,state))
+                reviewed = any(a["status"] == "succeeded" and a["snapshot_id"] == version for a in state["attempts"])
+            self._apply_limit_auto(state,escalation,decision,recommendation,version or "",reviewed,session_id)
+            self._save(state)
+        return self.status(run_id)
+
     def cancel(self,run_id,session_id,reason):
         with self._lock(run_id):
             state = self._state(run_id)
@@ -585,28 +593,39 @@ class Engine(RunEngine):
             if digest(report_path.read_bytes()) != state["artifacts"][state["report_path"]]:
                 raise DevFlowError("The recorded terminal report was modified")
             report = read_json(report_path)
-            if report.get("auto_acceptance") is not None or AUTO_ACCEPTANCE in state["artifacts"]:
+            saved = [item.get("record") for item in
+                     ((report.get("review_summary") or {}).get("automatic_decisions") or [])]
+            if report.get("auto_acceptance") is not None or saved or any(
+                    name.startswith(LIMIT_AUTO_DIR) for name in state["artifacts"]):
                 # The saved report stays immutable; what it presents as the
-                # acceptance basis is re-verified against the evidence record.
+                # acceptance basis and the automatic decisions are re-verified
+                # against their records.
                 try:
-                    auto, auto_error = _auto_acceptance_entry(
-                        state, lambda relative: self.store.record_json(state, relative)), None
+                    auto, auto_error = _auto_acceptance_entry(state, self.store), None
                 except (DevFlowError, OSError, ValueError, KeyError, TypeError) as exc:
-                    auto, auto_error = None, f"The auto-acceptance record cannot be read: {exc}"
+                    auto, auto_error = None, f"The automatic accept record cannot be verified: {exc}"
                 report = {**report, "auto_acceptance": auto, "auto_acceptance_error": auto_error}
-                embedded = report.get("review_summary")
-                approval = embedded.get("approval") if isinstance(embedded, dict) else None
-                if auto is None and isinstance(approval, dict) and approval.get("auto_acceptance") is not None:
-                    # The summary embedded in the report must not keep showing a basis that failed re-verification.
-                    report["review_summary"] = {**embedded, "approval": {**approval, "auto_acceptance": None}}
-                    report["review_summary_error"] = report.get("review_summary_error") or auto_error
+                failure = result.get("limit_auto_decisions_error") or auto_error
+                # The saved summary must present the verified decisions and acceptance
+                # basis exactly (record names, recommendations, limits). A report saved
+                # without its summary (too large, or not buildable) keeps its own error.
+                shown = report.get("review_summary")
+                if not failure and shown is not None and (
+                        shown.get("automatic_decisions") != automatic_decisions(limit_auto_records(state, self.store))
+                        or (shown.get("approval") or {}).get("auto_acceptance") != auto):
+                    failure = "The saved report's automatic decisions differ from the run's verified records"
+                if failure:
+                    # The summary embedded in the report must not keep showing
+                    # decisions or a basis that failed re-verification.
+                    report["review_summary"] = None
+                    report["review_summary_error"] = failure
             result["report"] = report
 
 def validated_for(state: dict, snapshot_id: str) -> bool:
     """The exact workspace snapshot has passing checks or human attestation.
 
     One predicate shared by the human's acceptance, the review dispatch and the
-    configuration's acceptance, so the two acceptance paths cannot disagree.
+    automatic acceptance, so the acceptance paths cannot disagree.
     """
     validation = state.get("validation") or {}
     return (validation.get("snapshot_id") == snapshot_id
@@ -629,31 +648,34 @@ def verify_source(state):
 
 
 ACCEPTED_WARNING = "Accepted by the human at the review limit without approval from every reviewer."
-AUTO_ACCEPTED_WARNING = ("Accepted by configuration (auto_accept_at_review_limit) at the review limit "
-                         "without approval from every reviewer.")
+AUTO_ACCEPTED_WARNING = ("Accepted at the review limit by the run's review_limit_auto setting following the host's "
+                         "recommendation, without approval from every reviewer.")
 
 
-def _auto_acceptance_entry(state: dict, read) -> dict | None:
-    """The summary/report entry of a committed auto-acceptance record, verified, or None.
+def _auto_acceptance_entry(state: dict, store, entries: list[tuple[str, dict]] | None = None) -> dict | None:
+    """The summary/report entry of the committed automatic accept record, verified, or None.
 
     The record must still name the candidate it accepted and the same
-    reviewed/unreviewed fact the attempts show — a record that disagrees with
-    the committed state is reported through the caller, never presented as the
-    basis of acceptance.
+    reviewed/unreviewed fact the attempts show, and the frozen config record
+    must equal the state's — a record that disagrees with the committed state is
+    reported through the caller, never presented as the basis of acceptance.
     """
-    if AUTO_ACCEPTANCE not in state["artifacts"]:
+    found = accept_entry(limit_auto_records(state, store) if entries is None else entries)
+    if found is None:
         return None
-    record = check_auto_acceptance(state, len(state["attempts"]), read(AUTO_ACCEPTANCE))
-    stored = read("config.json")
-    check_auto_accept(stored)
+    name, record = found
+    stored = store.record_json(state, "config.json")
+    check_limit_auto(stored)
+    check_limit_auto(state["config"])
     reviewed = any(a["status"] == "succeeded" and a["snapshot_id"] == record["version"]
                    for a in state["attempts"])
     if (stored != state["config"]
             or record["version"] != (state.get("candidate") or {}).get("snapshot_id")
             or record["version_reviewed"] != reviewed):
-        raise DevFlowError("Invalid or mismatched auto-acceptance record")
-    return {"record": AUTO_ACCEPTANCE, "source": record["source"], "version": record["version"],
-            "accepted_at": record["accepted_at"], "version_reviewed": record["version_reviewed"]}
+        raise DevFlowError(f"Invalid or mismatched automatic accept record: {name}")
+    return {"record": name, "source": LIMIT_AUTO_SOURCE, "version": record["version"],
+            "accepted_at": record["decided_at"], "version_reviewed": record["version_reviewed"],
+            "recommendation": record["recommendation"]}
 
 
 def _checkpoint_label(path: object) -> str:
@@ -734,6 +756,7 @@ def summary_source(store, state: dict, workspace: dict | None = None) -> dict:
                 entry["fix"] = {"summary": reflection["summary"], "version_change": None, "file_changes": files}
         reviews.append(entry)
     decisions, acceptance = human_decisions(state, read)
+    automatic = limit_auto_records(state, store)
     approvals = state["approvals"]
     if state["status"] in TERMINAL:
         if workspace is None:
@@ -764,7 +787,8 @@ def summary_source(store, state: dict, workspace: dict | None = None) -> dict:
                        "timeout_seconds": r["timeout_seconds"]} for r in state["config"]["reviewers"]],
         "current_version": current, "latest_version_reviewed": reviewed, "approving_current": approving,
         "reviews": reviews, "human_decisions": decisions, "human_acceptance": acceptance,
-        "auto_acceptance": _auto_acceptance_entry(state, read)}
+        "automatic_decisions": automatic_decisions(automatic),
+        "auto_acceptance": _auto_acceptance_entry(state, store, automatic)}
 
 
 def terminal_report(store, state, observed=(), observed_error=None, verified=None):
@@ -772,9 +796,9 @@ def terminal_report(store, state, observed=(), observed_error=None, verified=Non
 
     ``observed`` holds the prefilled question events (None: unreadable, with
     ``observed_error``). The review summary is built from the same workspace
-    capture as ``final_snapshot_reviewed``. With ``verified`` — an auto-accept's
-    ``snapshot_id`` and ``reviewed`` — the workspace is not captured again: the
-    report describes the snapshot the acceptance verified during preparation.
+    capture as ``final_snapshot_reviewed``. With ``verified`` — an automatic
+    accept's ``snapshot_id`` and ``reviewed`` — the workspace is not captured
+    again: the report describes the snapshot ``limit-auto`` verified.
     """
     project = store.project
     candidate = state.get("candidate") or {}
@@ -807,9 +831,9 @@ def terminal_report(store, state, observed=(), observed_error=None, verified=Non
     except (DevFlowError, OSError, ValueError, KeyError, TypeError) as exc:
         acceptance, acceptance_error = None, f"The human decisions cannot be read: {exc}"
     try:
-        auto, auto_error = _auto_acceptance_entry(state, read), None
+        auto, auto_error = _auto_acceptance_entry(state, store), None
     except (DevFlowError, OSError, ValueError, KeyError, TypeError) as exc:
-        auto, auto_error = None, f"The auto-acceptance record cannot be read: {exc}"
+        auto, auto_error = None, f"The automatic accept record cannot be verified: {exc}"
     warnings = []
     if state["status"] == "accepted":
         warnings.append(ACCEPTED_WARNING)

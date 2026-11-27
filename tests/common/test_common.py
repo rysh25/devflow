@@ -319,42 +319,147 @@ class SharedSettingsTests(unittest.TestCase):
         with self.assertRaises(DevFlowError):
             self.config("implement")
 
-    def test_auto_accept_at_review_limit_layers_with_the_existing_precedence(self):
+    def test_review_limit_auto_layers_with_the_existing_precedence(self):
+        keys = ("review_limit_auto", "review_limit_auto_extra_reviews")
+        local = self.project / "devflow.config.local.json"
+        modes = ("continue", "continue_accept", "ask")
         for flow in ("plan", "implement"):
             with self.subTest(flow=flow):
-                self.assertFalse(self.config(flow)["auto_accept_at_review_limit"])
-        atomic_json(self.path, {"schema_version": 1, "auto_accept_at_review_limit": True,
-                                "plan": {"auto_accept_at_review_limit": False}})
-        self.assertFalse(self.config("plan")["auto_accept_at_review_limit"])
-        self.assertTrue(self.config("implement")["auto_accept_at_review_limit"])
-        atomic_json(self.project / "devflow.config.local.json",
-                    {"schema_version": 1, "auto_accept_at_review_limit": False})
-        self.assertFalse(self.config("implement")["auto_accept_at_review_limit"])
-        atomic_json(self.project / "devflow.config.local.json",
-                    {"schema_version": 1, "implement": {"auto_accept_at_review_limit": True}})
-        self.assertTrue(self.config("implement")["auto_accept_at_review_limit"])
+                self.assertEqual(tuple(self.config(flow)[key] for key in keys), ("ask", 6))
+                # Every layer sets both keys, in the order the README gives (earliest first).
+                layers = [(self.path, ()), (self.path, (flow,)), (self.path, ("hosts", "claude")),
+                          (self.path, ("hosts", "claude", flow)), (local, ()), (local, (flow,)),
+                          (local, ("hosts", "claude")), (local, ("hosts", "claude", flow))]
+                documents = {self.path: {"schema_version": 1}, local: {"schema_version": 1}}
+                values = []
+                for number, (path, names) in enumerate(layers):
+                    holder = documents[path]
+                    for name in names:
+                        holder = holder.setdefault(name, {})
+                    value = (modes[number % 3], number + 1)
+                    holder.update(zip(keys, value))
+                    values.append(value)
+                for path, document in documents.items():
+                    atomic_json(path, document)
+                # Remove the layers from the last to the first; the next earlier one takes over both keys.
+                for (path, names), value in reversed(list(zip(layers, values))):
+                    self.assertEqual(tuple(self.config(flow)[key] for key in keys), value)
+                    holder = documents[path]
+                    for name in names:
+                        holder = holder[name]
+                    for key in keys:
+                        del holder[key]
+                    atomic_json(path, documents[path])
+                self.assertEqual(tuple(self.config(flow)[key] for key in keys), ("ask", 6))
+                # Another launch host's block never applies.
+                atomic_json(self.path, {"schema_version": 1, "hosts": {"codex": {"review_limit_auto": "continue"}}})
+                local.unlink()
+                self.assertEqual(self.config(flow)["review_limit_auto"], "ask")
+                self.assertEqual(self.config(flow, host="codex")["review_limit_auto"], "continue")
+                self.path.unlink()
 
-        # The launch host's own block inside the common local file applies to it alone.
-        atomic_json(self.project / "devflow.config.local.json",
-                    {"schema_version": 1, "hosts": {"codex": {"implement": {"auto_accept_at_review_limit": False}}}})
-        self.assertFalse(self.config("implement", host="codex")["auto_accept_at_review_limit"])
-        self.assertTrue(self.config("implement")["auto_accept_at_review_limit"])
-        self.assertTrue(self.config("implement", host="devin")["auto_accept_at_review_limit"])
-
-    def test_auto_accept_at_review_limit_accepts_only_a_boolean(self):
+    def test_review_limit_auto_values_are_strict(self):
         from devflow_core.plan.config import validate_config as plan_validate
         from devflow_core.implement.config import validate_config as implement_validate
+        bad_values = {"review_limit_auto": ("auto", True, 1, None, ""),
+                      "review_limit_auto_extra_reviews": (0, -1, 1.5, 6.0, "6", True, None)}
         for flow, validate in (("plan", plan_validate), ("implement", implement_validate)):
-            base = self.config(flow)  # a complete config; only the new key goes bad
-            for bad in ("true", 1, 0, None):
-                with self.subTest(flow=flow, value=bad):
-                    with self.assertRaisesRegex(DevFlowError, "must be a boolean"):
-                        validate({**base, "auto_accept_at_review_limit": bad})
-        for bad in ("true", 1, 0):
-            with self.subTest(value=bad):
-                atomic_json(self.path, {"schema_version": 1, "auto_accept_at_review_limit": bad})
-                with self.assertRaises(DevFlowError):
-                    self.config("plan")
+            base = self.config(flow)  # a complete config; only one key goes bad
+            for key, values in bad_values.items():
+                for bad in values:
+                    with self.subTest(flow=flow, key=key, value=bad):
+                        with self.assertRaisesRegex(DevFlowError, key + " must be"):
+                            validate({**base, key: bad})
+            with self.assertRaises(DevFlowError):
+                validate({key: value for key, value in base.items() if key != "review_limit_auto"})
+        for key, values in bad_values.items():
+            for bad in values:
+                with self.subTest(key=key, value=bad):
+                    atomic_json(self.path, {"schema_version": 1, key: bad})
+                    with self.assertRaisesRegex(DevFlowError, key + " must be"):
+                        self.config("plan")
+        atomic_json(self.path, {"schema_version": 1, "review_limit_auto_extra_reviews": 500})
+        self.assertEqual(self.config("plan")["review_limit_auto_extra_reviews"], 500)  # no upper bound
+
+    def test_the_removed_setting_names_its_place_and_its_replacement(self):
+        local = self.project / "devflow.config.local.json"
+        places = {"": {"auto_accept_at_review_limit": True},
+                  "plan": {"plan": {"auto_accept_at_review_limit": False}},
+                  "implement": {"implement": {"auto_accept_at_review_limit": True}},
+                  "hosts.claude": {"hosts": {"claude": {"auto_accept_at_review_limit": True}}},
+                  "hosts.claude.plan": {"hosts": {"claude": {"plan": {"auto_accept_at_review_limit": True}}}},
+                  "hosts.codex.implement": {"hosts": {"codex": {"implement": {"auto_accept_at_review_limit": True}}}},
+                  "hosts.devin": {"hosts": {"devin": {"auto_accept_at_review_limit": False}}}}
+        for path in (self.path, local):
+            for position, document in places.items():
+                with self.subTest(file=path.name, position=position):
+                    atomic_json(path, {"schema_version": 1, **document})
+                    where = f"{path.name}: " + (f"{position}: " if position else "")
+                    for flow, host in (("plan", "claude"), ("implement", "codex")):
+                        with self.assertRaises(DevFlowError) as caught:
+                            self.config(flow, host=host)
+                        self.assertTrue(str(caught.exception).startswith(
+                            where + "auto_accept_at_review_limit was removed in DevFlow 0.13.0; use review_limit_auto"),
+                            str(caught.exception))
+                        self.assertIn('"continue_accept"', str(caught.exception))
+                    path.unlink()
+
+
+class LimitAutoRuleTests(unittest.TestCase):
+    """The mechanical rules of review_limit_auto in common.review and common.engine."""
+
+    def test_the_setting_allows_continue_and_accept_by_mode(self):
+        from devflow_core.common.review import limit_auto_allows
+        table = {"ask": (False, False), "continue": (True, False), "continue_accept": (True, True)}
+        for mode, (cont, accept) in table.items():
+            with self.subTest(mode=mode):
+                config = {"review_limit_auto": mode}
+                self.assertEqual((limit_auto_allows(config, "continue"), limit_auto_allows(config, "accept"),
+                                  limit_auto_allows(config, "stop")), (cont, accept, False))
+
+    def test_automatic_continuation_fits_within_the_extra_reviews(self):
+        from devflow_core.common.review import auto_continue_fits
+        def state(limit, extra, reviewers=2, max_reviews=4):
+            return {"review_limit": limit, "config": {"max_reviews": max_reviews, "reviewers": [{}] * reviewers,
+                                                      "review_limit_auto_extra_reviews": extra}}
+        # Decision 5's example: 4 → 6 → 8 automatically, never 10.
+        self.assertEqual([auto_continue_fits(state(limit, 4)) for limit in (4, 6, 8, 10)], [True, True, False, False])
+        # Four reviewers and the default 6: the first round fits, the second does not.
+        self.assertEqual([auto_continue_fits(state(limit, 6, 4)) for limit in (4, 8)], [True, False])
+
+    def test_serious_reviewers_read_each_reviewers_latest_succeeded_review(self):
+        from devflow_core.common.review import serious_reviewers
+        reviewers = [{"id": "a"}, {"id": "b"}, {"id": "c"}]
+        def review(number, reviewer, status="succeeded", *severities):
+            return {"number": number, "reviewer_id": reviewer, "status": status,
+                    "findings": [{"severity": severity} for severity in severities]}
+        reviews = [review(1, "a", "succeeded", "high"), review(2, "b", "succeeded", "critical"),
+                   review(3, "a", "succeeded", "medium"), review(4, "b", "failed"), review(5, "c", "failed")]
+        self.assertEqual(serious_reviewers(reviewers, reviews),
+                         ([{"reviewer_id": "b", "review_number": 2}], ["c"]))
+        self.assertEqual(serious_reviewers(reviewers, []), ([], ["a", "b", "c"]))
+
+    def test_any_recorded_answer_comes_first_in_every_host_format(self):
+        """A Codex answer keys its text by the question's ID, not its words: any candidate refuses."""
+        from types import SimpleNamespace
+        from devflow_core.common.engine import RunEngine
+        from devflow_core.common.hosts import canonical_payload
+        from devflow_core.common.runs import make_event
+        from tests.router.test_hosts import fixture
+        pre = canonical_payload({**fixture("question_answered_pre.json"), "host": "codex", "agent_scope": "main"},
+                                "observation")
+        post = canonical_payload({**fixture("question_answered_post.json"), "host": "codex", "agent_scope": "main"},
+                                 "question")
+        events = [make_event(pre, "observation"), make_event(post, "question")]
+        state = {"owner_host": "codex", "owner_session": post["session_id"], "event_ids": [], "status": "awaiting_human",
+                 "config": {"review_limit_auto": "continue_accept", "review_limit_auto_extra_reviews": 6,
+                            "max_reviews": 2, "reviewers": [{}, {}]}, "review_limit": 2,
+                 "escalation": {"id": "E001", "boundary": 0, "detail": {"kind": "review_budget"}}}
+        engine = SimpleNamespace(_events=lambda state: events)
+        with self.assertRaisesRegex(DevFlowError, "human answer is recorded"):
+            RunEngine._limit_auto_request(engine, state, "E001", "continue")
+        engine = SimpleNamespace(_events=lambda state: [])
+        self.assertEqual(RunEngine._limit_auto_request(engine, state, "E001", "continue")["id"], "E001")
 
 
 class ReviewBudgetTests(unittest.TestCase):
@@ -569,15 +674,16 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(git.call_args.kwargs["timeout"], GIT_FACT_SECONDS)
 
     def test_released_run_formats_have_names_and_unreleased_ones_are_generic(self):
-        self.assertEqual(runs.RELEASES, {1: "0.1.x", 2: "0.2.x", 3: "0.3.x", 6: "0.4.x", 7: "0.5.x", 8: "0.6.x", 9: "0.7.x"})
+        self.assertEqual(runs.RELEASES, {1: "0.1.x", 2: "0.2.x", 3: "0.3.x", 6: "0.4.x", 7: "0.5.x", 8: "0.6.x",
+                                         9: "0.7.x", 10: "0.8.x–0.12.x"})
         for version, release in runs.RELEASES.items():
             with self.subTest(version=version):
                 self.assertEqual(runs.release_name(version), release)
         # Formats 4 and 5 were never released (0.4.0 development); they are named generically.
-        self.assertGreater(runs.SCHEMA_VERSION, 8)
+        self.assertEqual(runs.SCHEMA_VERSION, 11)
         self.assertEqual(runs.release_name(4), "an older version (run format 4)")
         self.assertEqual(runs.release_name(5), "an older version (run format 5)")
-        self.assertEqual(runs.release_name(10), "an older version (run format 10)")
+        self.assertEqual(runs.release_name(12), "an older version (run format 12)")
 
 
 class AfterReviewFailureTests(unittest.TestCase):

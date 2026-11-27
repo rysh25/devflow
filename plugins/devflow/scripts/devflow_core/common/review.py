@@ -1,4 +1,5 @@
 """Shared budget, approval and verdict mechanics; domain policy remains in each flow."""
+import re
 from typing import Callable, Collection
 
 from .errors import DevFlowError, ProcessCleanupError, ReviewerError, shown_name
@@ -35,49 +36,207 @@ def validate_limit(value: int) -> int:
     return value
 
 
-#: The run setting that lets a run end itself at the review limit: a JSON
-#: boolean, absent on runs frozen before it existed (read then as false).
-AUTO_ACCEPT_KEY = "auto_accept_at_review_limit"
-#: The evidence record staged and committed with an ``auto_accepted`` terminal state.
-AUTO_ACCEPTANCE = "auto-acceptance.json"
-AUTO_ACCEPTANCE_SOURCE = "config"
+#: How the run handles the review limit question: ``ask`` (every time the human),
+#: ``continue`` (the host's recommendation to continue is applied by ``limit-auto``)
+#: or ``continue_accept`` (also its recommendation to accept). Frozen at start.
+LIMIT_AUTO_KEY = "review_limit_auto"
+LIMIT_AUTO_MODES = ("ask", "continue", "continue_accept")
+#: How many reviews automatic continuation may add beyond the frozen max_reviews.
+LIMIT_AUTO_EXTRA_KEY = "review_limit_auto_extra_reviews"
+#: The immutable records of automatic decisions: ``limit-auto/<question id>-<decision>.json``.
+LIMIT_AUTO_DIR = "limit-auto/"
+LIMIT_AUTO_SOURCE = "review_limit_auto"
+LIMIT_AUTO_DECISIONS = ("continue", "accept")
 
 
-def check_auto_accept(config: dict) -> None:
-    """``auto_accept_at_review_limit`` is a JSON boolean when present.
+def check_limit_auto(config: dict) -> None:
+    """Both review limit settings are present with their exact JSON types.
 
-    Python's ``True == 1`` makes a written 0/1 compare equal to a frozen
-    boolean, so a present key is strictly checked on both sides of every
-    frozen-configuration comparison (this and ``common.engine``'s).
+    Python's ``True == 1`` makes a written ``true`` equal to a frozen 1 (and
+    ``6.0`` to 6), so this runs on both sides of every frozen-configuration
+    comparison (this and ``common.engine``'s). No upper bound: a value past the
+    99-review ceiling works as the ceiling.
     """
-    if AUTO_ACCEPT_KEY in config and type(config[AUTO_ACCEPT_KEY]) is not bool:
-        raise DevFlowError("auto_accept_at_review_limit must be a boolean")
+    mode = config.get(LIMIT_AUTO_KEY)
+    if type(mode) is not str or mode not in LIMIT_AUTO_MODES:
+        raise DevFlowError('review_limit_auto must be "ask", "continue" or "continue_accept"')
+    extra = config.get(LIMIT_AUTO_EXTRA_KEY)
+    if type(extra) is not int or extra < 1:
+        raise DevFlowError("review_limit_auto_extra_reviews must be an integer of at least 1")
 
 
-def auto_acceptance(state: dict, used: int, version: str, version_reviewed: bool) -> dict:
-    """The immutable evidence of a configuration acceptance at the review limit."""
-    return {"schema_version": 1, "source": AUTO_ACCEPTANCE_SOURCE, AUTO_ACCEPT_KEY: True,
-            "version": version, "review_count": used, "review_limit": state["review_limit"],
-            "accepted_at": now(), "version_reviewed": bool(version_reviewed)}
+def limit_auto_allows(config: dict, decision: str) -> bool:
+    """Whether the frozen setting lets ``limit-auto`` apply this decision."""
+    mode = config[LIMIT_AUTO_KEY]
+    if decision == "continue":
+        return mode in ("continue", "continue_accept")
+    return decision == "accept" and mode == "continue_accept"
 
 
-def check_auto_acceptance(state: dict, used: int, record: object) -> dict:
-    """Verify a stored auto-acceptance record against this run's frozen facts."""
-    if (not isinstance(record, dict) or record.get("schema_version") != 1
-            or record.get("source") != AUTO_ACCEPTANCE_SOURCE
-            or record.get(AUTO_ACCEPT_KEY) is not True
-            or type(record.get("version_reviewed")) is not bool
-            or record.get("review_count") != used or record.get("review_limit") != state["review_limit"]
-            or not isinstance(record.get("version"), str) or not isinstance(record.get("accepted_at"), str)):
-        raise DevFlowError("Invalid or mismatched auto-acceptance record")
+def auto_continue_fits(state: dict) -> bool:
+    """Whether one more round of reviewers stays within review_limit_auto_extra_reviews
+    beyond the frozen max_reviews (reviews a human added count too).
+
+    The 99-review ceiling is not checked here: the question is open only when
+    ``ask_at_limit`` found that one more round fits under it.
+    """
+    config = state["config"]
+    return (state["review_limit"] + len(config["reviewers"]) - config["max_reviews"]
+            <= config[LIMIT_AUTO_EXTRA_KEY])
+
+
+def serious_reviewers(reviewers: list, reviews: list) -> tuple[list[dict], list[str]]:
+    """The configured reviewers whose latest succeeded review holds a critical or
+    high finding, whatever its disposition (``[{"reviewer_id", "review_number"}]``,
+    in configured order), and the reviewers with no succeeded review in the run.
+
+    ``reviews`` holds the summary source's entries (``reviewer_id``, ``number``,
+    ``status``, ``findings`` with ``severity``). The one mechanical part of the
+    acceptance criterion: the summary shows it and ``limit-auto`` accept requires
+    the first list to be empty.
+    """
+    serious, never = [], []
+    for reviewer in reviewers:
+        latest = next((entry for entry in reversed(reviews)
+                       if entry["reviewer_id"] == reviewer["id"] and entry["status"] == "succeeded"), None)
+        if latest is None:
+            never.append(reviewer["id"])
+        elif any(finding["severity"] in ("critical", "high") for finding in latest["findings"]):
+            serious.append({"reviewer_id": reviewer["id"], "review_number": latest["number"]})
+    return serious, never
+
+
+def check_no_serious_reviewers(source: dict) -> None:
+    """Refuse an automatic accept while a configured reviewer's latest succeeded
+    review holds a critical or high finding (``source``: a summary source)."""
+    serious = serious_reviewers(source["reviewers"], source["reviews"])[0]
+    if serious:
+        named = "; ".join(f"{item['reviewer_id']}'s latest succeeded review (review {item['review_number']})"
+                          for item in serious)
+        raise DevFlowError(f"Cannot accept automatically: {named} has a critical or high finding. "
+                           "Ask the human the review limit question.")
+
+
+def limit_auto_name(escalation_id: str, decision: str) -> str:
+    return f"{LIMIT_AUTO_DIR}{escalation_id}-{decision}.json"
+
+
+def limit_auto_record(state: dict, escalation: dict, decision: str, recommendation: str,
+                      version: str, version_reviewed: bool, session: str) -> dict:
+    """The immutable record of one automatic decision, made before the state changes."""
+    config, before = state["config"], state["review_limit"]
+    return {"schema_version": 1, "source": LIMIT_AUTO_SOURCE, "escalation_id": escalation["id"],
+            "decision": decision, LIMIT_AUTO_KEY: config[LIMIT_AUTO_KEY],
+            LIMIT_AUTO_EXTRA_KEY: config[LIMIT_AUTO_EXTRA_KEY],
+            "review_number": escalation["detail"]["review_number"], "review_limit_before": before,
+            "review_limit_after": before + len(config["reviewers"]) if decision == "continue" else before,
+            "version": version, "version_reviewed": bool(version_reviewed), "recommendation": recommendation,
+            "decided_at": now(), "host": state["owner_host"], "session": session}
+
+
+def check_limit_auto_names(state: dict, id_pattern: str) -> None:
+    """The state-only invariant of automatic decisions (records are not read).
+
+    Every ``limit-auto/`` record name holds a question ID of the flow's form
+    and a decision; an ``auto_accepted`` run has the frozen ``continue_accept``
+    and exactly one accept record, and no other status has one.
+    """
+    accepts = 0
+    for name in state["artifacts"]:
+        if not name.startswith(LIMIT_AUTO_DIR):
+            continue
+        match = re.fullmatch(re.escape(LIMIT_AUTO_DIR) + f"({id_pattern})-(continue|accept)\\.json", name)
+        if not match:
+            raise DevFlowError(f"Invalid automatic decision record name: {name}")
+        accepts += match.group(2) == "accept"
+    if state["status"] == "auto_accepted":
+        if state["config"][LIMIT_AUTO_KEY] != "continue_accept" or accepts != 1:
+            raise DevFlowError("An auto_accepted run needs review_limit_auto continue_accept "
+                               "and exactly one automatic accept record")
+    elif accepts:
+        raise DevFlowError("Only an auto_accepted run may hold an automatic accept record")
+
+
+def check_limit_auto_record(state: dict, record: object, name: str, read, workflow) -> dict:
+    """Verify one automatic decision record against the run's frozen facts.
+
+    ``read(relative)`` reads a digest-verified record (the question it closed);
+    ``workflow`` gives the flow's question record path and review count. Called
+    when the decision is made and whenever a summary, report, publication or
+    status presents it.
+    """
+    match = re.fullmatch(re.escape(LIMIT_AUTO_DIR) + r"(.+)-(continue|accept)\.json", name)
+    config = state["config"]
+    try:
+        if not match or not isinstance(record, dict) or set(record) != LIMIT_AUTO_FIELDS:
+            raise DevFlowError("fields")
+        escalation_id, decision = match.groups()
+        question = read(workflow.limit_auto_question(state, escalation_id))
+        detail = question.get("detail") if isinstance(question, dict) else None
+        before, after, number = (record["review_limit_before"], record["review_limit_after"],
+                                 record["review_number"])
+        if (type(record["schema_version"]) is not int or record["schema_version"] != 1
+                or record["source"] != LIMIT_AUTO_SOURCE
+                or record["decision"] != decision or record["escalation_id"] != escalation_id
+                or question.get("id") != escalation_id or not isinstance(detail, dict)
+                or detail.get("kind") != REVIEW_BUDGET
+                or any(type(value) is not int for value in (before, after, number))
+                or number != detail.get("review_number")
+                # The question opens when the review count reaches the limit.
+                or before != number
+                or type(record[LIMIT_AUTO_KEY]) is not str or record[LIMIT_AUTO_KEY] != config[LIMIT_AUTO_KEY]
+                or type(record[LIMIT_AUTO_EXTRA_KEY]) is not int
+                or record[LIMIT_AUTO_EXTRA_KEY] != config[LIMIT_AUTO_EXTRA_KEY]
+                or type(record["version_reviewed"]) is not bool
+                or any(not isinstance(record[key], str) for key in
+                       ("version", "decided_at", "host", "session", "recommendation"))
+                or not record["recommendation"].strip()):
+            raise DevFlowError("values")
+        if decision == "continue":
+            if after != before + len(config["reviewers"]):
+                raise DevFlowError("limit")
+        elif (before != after or after != state["review_limit"]
+              or number != workflow.summary(state)["review_count"]):
+            raise DevFlowError("limit")
+    except (DevFlowError, KeyError, TypeError, AttributeError, ValueError) as exc:
+        raise DevFlowError(f"Invalid or mismatched automatic decision record: {name}: {exc}") from exc
     return record
 
 
-def check_auto_accepted(state: dict) -> None:
-    """A run ended by configuration keeps its enabled frozen setting and evidence."""
-    if state["status"] == "auto_accepted" and (
-            state["config"].get(AUTO_ACCEPT_KEY) is not True or AUTO_ACCEPTANCE not in state["artifacts"]):
-        raise DevFlowError("An auto_accepted run needs the enabled frozen setting and its evidence record")
+LIMIT_AUTO_FIELDS = frozenset({"schema_version", "source", "escalation_id", "decision", LIMIT_AUTO_KEY,
+                               LIMIT_AUTO_EXTRA_KEY, "review_number", "review_limit_before",
+                               "review_limit_after", "version", "version_reviewed", "recommendation",
+                               "decided_at", "host", "session"})
+
+
+def limit_auto_records(state: dict, store) -> list[tuple[str, dict]]:
+    """Every automatic decision record of the run, verified, in review order.
+
+    Records are read through the run store's digest-checked reader."""
+    def read(relative: str) -> dict:
+        return store.record_json(state, relative)
+    entries = [(name, check_limit_auto_record(state, read(name), name, read, store.workflow))
+               for name in state["artifacts"] if name.startswith(LIMIT_AUTO_DIR)]
+    return sorted(entries, key=lambda item: item[1]["review_number"])
+
+
+def limit_auto_decisions(entries: list[tuple[str, dict]]) -> list[dict]:
+    """The ``status`` view of the automatic decisions."""
+    return [{"escalation_id": record["escalation_id"], "review_number": record["review_number"],
+             "decision": record["decision"], "record": name} for name, record in entries]
+
+
+def automatic_decisions(entries: list[tuple[str, dict]]) -> list[dict]:
+    """The summary source's view of the automatic decisions."""
+    return [{"at": record["decided_at"], "review_number": record["review_number"], "decision": record["decision"],
+             "setting": record[LIMIT_AUTO_KEY], "review_limit_before": record["review_limit_before"],
+             "review_limit_after": record["review_limit_after"], "recommendation": record["recommendation"],
+             "record": name} for name, record in entries]
+
+
+def accept_entry(entries: list[tuple[str, dict]]) -> tuple[str, dict] | None:
+    """The run's automatic accept record, if any (``check_limit_auto_names`` allows one)."""
+    return next(((name, record) for name, record in entries if record["decision"] == "accept"), None)
 
 
 def next_reviewer(reviewers: list, used: int, limit: int) -> dict:
@@ -146,27 +305,21 @@ def after_review_failure(used: int, state: dict, ready_status: str, reviewer_id:
 
 
 def ask_at_limit(state: dict, used: int, approved: Collection[str], version: str,
-                 escalate: Callable[[str, list[str]], None],
-                 auto_accept: Callable[[], bool] | None = None) -> bool:
+                 escalate: Callable[[str, list[str]], None]) -> bool:
     """At the review limit, ask the human whether to add one round of reviewers,
-    stop, or accept the current version — or let the run's frozen setting
-    accept it.
+    stop, or accept the current version.
 
-    Returns False while reviews remain. At the limit, when the frozen
-    ``auto_accept_at_review_limit`` is true, ``auto_accept()`` decides first:
-    it stages the evidence and sets ``auto_accepted`` (returning True), or
-    returns False and the conventional handling continues — the ceiling check,
-    then the review_budget question. It is never asked below the limit and its
-    result never adds reviews, reviewers or questions. The bare presence of an
-    earlier reviewer failure (``last_error``) is not part of the decision.
-    ``approved`` holds the reviewers approving the current version, and
-    ``version`` names that version (a plan hash or snapshot ID).
+    Returns False while reviews remain. At the limit, when one more round would
+    pass the ceiling the run ends as exhausted without a question; otherwise the
+    review_budget question opens (``limit-auto`` may answer it for the run's
+    frozen review_limit_auto setting). The bare presence of an earlier reviewer
+    failure (``last_error``) is not part of the decision. ``approved`` holds the
+    reviewers approving the current version, and ``version`` names that version
+    (a plan hash or snapshot ID).
     """
     limit = state["review_limit"]
     if used < limit:
         return False
-    if (state["config"].get(AUTO_ACCEPT_KEY) and auto_accept is not None and auto_accept()):
-        return True
     reviewers = state["config"]["reviewers"]
     grant = len(reviewers)
     if limit + grant > TOTAL_REVIEW_CEILING:
@@ -180,17 +333,18 @@ def ask_at_limit(state: dict, used: int, approved: Collection[str], version: str
     return True
 
 
-def decide_at_limit(state: dict, decision: str, return_status: str) -> None:
-    """Apply the human's answer to the review_budget question: continue adds one
-    round of reviewers and returns to ``return_status``; stop ends as exhausted;
-    accept ends as accepted. Stop and accept change neither the limit nor approvals."""
+def decide_at_limit(state: dict, decision: str, return_status: str, accepted_status: str = "accepted") -> None:
+    """Apply an answer to the review_budget question: continue adds one round of
+    reviewers and returns to ``return_status``; stop ends as exhausted; accept ends
+    as ``accepted_status`` (``auto_accepted`` for ``limit-auto``). Stop and accept
+    change neither the limit nor approvals."""
     if decision == "continue":
         state["review_limit"] += len(state["config"]["reviewers"])
         state["status"] = return_status
     elif decision == "stop":
         state["status"] = "exhausted"
     elif decision == "accept":
-        state["status"] = "accepted"
+        state["status"] = accepted_status
     else:
         raise DevFlowError("The review limit question takes continue, stop or accept")
 
@@ -236,7 +390,7 @@ def check_review_config(config: object) -> None:
     if not isinstance(config, dict):
         raise DevFlowError("Frozen run configuration must be an object")
     validate_limit(config.get("max_reviews"))
-    check_auto_accept(config)
+    check_limit_auto(config)
     reviewers = config.get("reviewers")
     if (not isinstance(reviewers, list) or not reviewers
             or any(not isinstance(item, dict) or not isinstance(item.get("id"), str) for item in reviewers)):
