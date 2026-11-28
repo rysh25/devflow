@@ -2328,8 +2328,14 @@ Claude（この実装のホスト）が tmux の上で各ホストの対話の�
 廃止しました。また、自動で続けてよい回数を使い切った上限で、設定が受け入れて終える
 `review_limit_auto_final`（`ask`・`accept`。既定は `ask`）を加えました。
 
-自動テスト（1290 件、skip 2 件）と配布物の検査（`python tools/package.py --validate-only`）を
+自動テスト（1291 件、skip 2 件）と配布物の検査（`python tools/package.py --validate-only`）を
 通しました。実装は DevFlow の Implement の run `20261127T165833Z-f3802f14c087` で行いました。
+
+その run が `accepted` で終わった後、PR の CI（Linux・Python 3.13）で、つなぎ開始の試験 1 件が
+タイミングによって落ちました。原因は以前からある `file_lock` の競合でした。待つ側がロックの作成に
+失敗した直後に持ち主がロックを外すと、待たずに「Run is locked」で失敗していました（会話のフックでは、
+その入力が記録されません）。ロックが取られていたための失敗なら、待つ時間の内でやり直すように直し、
+試験を 1 件足しました。この直しは DevFlow のレビューの外です。
 
 ### 実機の確かめ
 

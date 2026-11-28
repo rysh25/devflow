@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from devflow_core.common.storage import (DevFlowError, atomic_json, checked_text, digest,
     file_lock, json_bytes, no_symlinks, read_json, within, writable, writable_text, write_new)
+from devflow_core.common import storage
 from devflow_core.common.counts import MAX_NAMES, tally
 from devflow_core.common.errors import ProcessCleanupError, ReviewerError
 from devflow_core.common.review import (REVIEW_LIMIT_REASON, REPEATED_FAILURE_REASON, after_review_failure,
@@ -120,6 +121,21 @@ class SharedStorageTests(unittest.TestCase):
             with file_lock(path):
                 self.fail("Existing lock unexpectedly removed")
         self.assertEqual(read_json(path), stale)
+
+    def test_a_lock_released_right_after_a_failed_attempt_is_taken_on_retry(self):
+        path = self.root / "state.lock"
+        original, attempts = storage.write_new, []
+
+        def released_after_the_attempt(target, data):
+            attempts.append(target)
+            if len(attempts) == 1:  # Taken at this attempt, gone before the waiter looks again.
+                raise DevFlowError("taken") from FileExistsError(target)
+            return original(target, data)
+
+        with patch.object(storage, "write_new", side_effect=released_after_the_attempt):
+            with file_lock(path, wait=5):
+                self.assertTrue(path.exists())
+        self.assertEqual(len(attempts), 2)
 
 
 class WritableTextTests(unittest.TestCase):

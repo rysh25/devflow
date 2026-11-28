@@ -200,7 +200,8 @@ def file_lock(path: Path, wait: float = 0.0):
             write_new(path, record)
             break
         except DevFlowError as exc:
-            if not path.exists() or time.monotonic() >= deadline:
+            # Only a taken lock is waited for; it may have been released since this attempt.
+            if not isinstance(exc.__cause__, FileExistsError) or time.monotonic() >= deadline:
                 raise DevFlowError(f"Run is locked: {path}. Verify the owning process before human recovery.") from exc
             time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
             delay = min(delay * 2, 0.25)
