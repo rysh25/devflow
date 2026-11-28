@@ -637,6 +637,30 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(record["path"], "new.txt")
         self.assertEqual(record["source"], "old.txt")
 
+    def test_existing_changes_show_renames_across_the_scope_and_code_spans(self):
+        """The start's ``existing_changes`` from the captured Git status (plan 4.6)."""
+        from devflow_core.workflows import WORKFLOWS
+        self.init_git()
+        self.write("notes/old.txt", "hello")
+        self.commit_all()
+        self.git("mv", "notes/old.txt", "new.txt")  # From outside the scope into it.
+        self.write("[notes](report.md), current.txt", "x")
+        self.write("a`b``c.txt", "x")
+        config = {"snapshot": {"mode": "git", "exclude": ["notes/"]}}
+        baseline = capture(self.project, config)
+
+        class Store:
+            def record_json(self, state, relative):
+                return {"git": baseline["git"]}
+
+        fields = WORKFLOWS["implement"].start_fields(Store(), {})["existing_changes"]
+        self.assertEqual(sorted(fields["paths"]),
+                         sorted(["notes/old.txt -> new.txt", "[notes](report.md), current.txt", "a`b``c.txt"]))
+        self.assertEqual(fields["count"], 3)
+        self.assertIn("`notes/old.txt` -> `new.txt`", fields["warning"])
+        self.assertIn("`[notes](report.md), current.txt`", fields["warning"])
+        self.assertIn("```a`b``c.txt```", fields["warning"])
+
     def test_git_deleted_file_is_absent_and_diff_records_deletion(self):
         self.init_git()
         self.write("gone.txt", "hello")

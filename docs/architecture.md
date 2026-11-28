@@ -2,19 +2,22 @@
 
 ## 一つの配布と独立したワークフロー
 
-DevFlow 0.13.0 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
+DevFlow 0.14.0 は一つのプラグイン内に Plan と Implement を配置します。`dependencies` による兄弟プラグイン導入はありません。共通エントリーポイントと hooks が現在のセッションを対応するフローへ振り分けますが、Plan のエンジンが Implement を直接呼ぶ構成ではありません。
 
 ```mermaid
 flowchart TD
     D[DevFlow Plugin] --> P[Plan]
     D --> B[Implement]
-    P -->|全員の承認か人間の受け入れの後に保存（横に承認の記録）| F[Markdown計画ファイル]
-    F -->|人間がパスを明示指定| B
+    P -->|全員の承認、人間の受け入れか設定による受け入れの後に保存（横に承認の記録）| F[Markdown計画ファイル]
+    F -->|人間がパスを明示指定（/devflow:implement）| B
+    F -->|/devflow:flow で始めた Plan：router のつなぎ開始| B
 ```
+
+`/devflow:flow` で始めた Plan では、公開したプランから Implement へつなぐのは router です（下の「開始」）。この経路でも Plan のエンジンは Implement を呼びません。
 
 Plan を使わずに作成した Markdown ファイルも Implement へ渡せます。Implement は Plan の run ID・状態ファイル・Python モジュールを理解する必要がありません。
 
-1つのセッションで進める run は1つです。同一セッション内で2つのフローを重ねて使うことはサポートしません。一方を完了・キャンセルしてから、次のユーザー入力で他方を開始します。セッションを分ければ、Plan は何本でも並行できます。Implement は作業場所を占有するワークフロー（`Workflow.occupies_workspace`）で、実装場所（プロジェクトか同じリポジトリの worktree）ごとに未完了の run を1つまで持てます。router はワークフローごとの分岐を持たず、各ワークフローが宣言した占有の有無と `Workflow.workspace(state)` だけで判定します。この制約が及ぶのは、同じ `.devflow` を持つプロジェクトルートの中だけです（worktree の中で始めた会話は worktree 側の `.devflow` を使います）。
+1つのセッションで進める run は1つです。同一セッション内で2つのフローを重ねて使うことはサポートしません。手で始めるときは、一方を完了・キャンセルしてから、次のユーザー入力で他方を開始します。`/devflow:flow` のつなぎ開始は、Plan が終わった同じターンで Implement を始めます（Plan の終わりの後に人間の入力があったときは、手で始めます）。どちらの経路でも、進める run は1つです。セッションを分ければ、Plan は何本でも並行できます。Implement は作業場所を占有するワークフロー（`Workflow.occupies_workspace`）で、実装場所（プロジェクトか同じリポジトリの worktree）ごとに未完了の run を1つまで持てます。router はワークフローごとの分岐を持たず、各ワークフローが宣言した占有の有無と `Workflow.workspace(state)` だけで判定します。この制約が及ぶのは、同じ `.devflow` を持つプロジェクトルートの中だけです（worktree の中で始めた会話は worktree 側の `.devflow` を使います）。
 
 ## 制限せず、記録と確認をする
 
@@ -33,8 +36,8 @@ Python コードは `plugins/devflow/scripts/devflow_core/` の1つのパッケ�
 | 場所 | 役割 |
 |---|---|
 | `skills/` | 人間の明示操作を受け、Claude Code へ状態に応じた作業を指示 |
-| `codex-skills/` | Codex の5つの明示操作。共通の起動・待機手順は `references/codex-runner.md` を参照 |
-| `devin-skills/` | Devin の5つの明示操作（`triggers: [user]`）。共通の起動・待機手順は `references/devin-runner.md` を参照 |
+| `codex-skills/` | Codex の6つの明示操作。共通の起動・待機手順は `references/codex-runner.md` を参照 |
+| `devin-skills/` | Devin の6つの明示操作（`triggers: [user]`）。共通の起動・待機手順は `references/devin-runner.md` を参照 |
 | `hooks/claude.json`、`hooks/codex.json`、`hooks.json` | 各ホストのフック。Devin はプラグインのルートの `hooks.json` だけを読む |
 | `scripts/devflow.py` | 唯一の起動点 |
 | `devflow_core/cli.py` | 登録表から組み立てる1つの argparse。hook を除くコマンドの結果（エラーを含む）は JSON で、一番上に予約の項目 `plugin` と `version` が付く。hook の失敗は標準エラーと終了コード 1 |
@@ -56,7 +59,7 @@ Python コードは `plugins/devflow/scripts/devflow_core/` の1つのパッケ�
 | `summary.py` | レビューの要約：各フローが自分の記録を直した共通の形（`source`）から、データを作る `build` と、決まった英語の短い Markdown を作る `render`。データはすべてを持ち（レビュアーごとの合計 `reviewer_totals` を含む）、Markdown は判断に要るもの（1 回 1 行の表、レビュアーごとの 1 行、失敗、残っている指摘、人間の決定）だけを出す。表のセルには決まった値だけを入れ、自由な文は表の下の一覧に置く。上限の確認で待っている間と run が終わったあとに、`status` と最終レポートに入る |
 | `counts.py` | 前もって知らない名前（出来事の種類、ツールの名前）の、上限付きの数え方 |
 | `settings.py` | 共有・ローカル設定と `hosts` の検査と重ね合わせ、レビュアー設定の共通規則 |
-| `operations.py` | ホスト別の5操作の検出と、生の引数・本文の境界 |
+| `operations.py` | ホスト別の6操作の検出と、生の引数・本文の境界 |
 | `startup.py` | 起動時の指定（`--reviewer`・`--max-reviews`）の解析と、最終設定への反映 |
 | `arguments.py` | 終了やヘルプ表示を例外として扱う共通 argparse パーサー |
 | `hosts/` | ホストの表（`Host`：表示名、実行ファイル名、質問ツール名、操作の接頭辞、プロジェクトの環境変数、面接の読み方など）、ホスト別の主会話判定、正規化、スキル探索場所、ネイティブ会話取得と診断。Plan の面接組み立ては含めない |
@@ -74,13 +77,13 @@ import の向きは一方向です。`common` はフローや router を import 
 
 面接の記録は、Claude Code の会話の記録（transcript）とフックの記録から作ります。人間の発言は `UserPromptSubmit` の記録と照合し、`AskUserQuestion` の回答は `PostToolUse` の記録から取ります。会話の記録の知らない行・添付・ブロックの種類は読み飛ばして数え、`coverage.unknown_types` に種類ごとに出します。質問の回答が読めない形のときも、読み飛ばして数えます。会話の記録とフックの記録のどちらかで読めればその回答を使い、どちらでも読めなければ、その質問は回答なしとして残します。知っていて面接に入れない行（サブエージェントの記録、圧縮の境界と要約、自動の知らせなど）は、`coverage.ignored_records` に合わせて数えます。自動の知らせ（タスクの知らせ、サブエージェントの報告）は `UserPromptSubmit` にも届くので、同じプロンプトの ID の、なければ同じ文のものが1件だけのときのフックの発言と結び付け、人間の発言から除きます。どれか決められないときは、その文の発言を出どころ不明として残し、人間の回答に数えません。人間の発言を会話の記録の中に置けないとき、また会話の記録がないとき（Claude Code がパスを渡さない、ファイルが書かれていない）は、フックの記録だけで順番どおりの面接を作り、そのことを `coverage.mode` と `reason` に示します。このとき、フックの記録にない人間の文と質問は捨てず、最後に会話の記録の順で残します。会話の記録がないときは、自動の知らせと見分けられないので、元の依頼より後の発言を人間の回答に数えません（数えるのは質問の回答だけです）。止まるのは、記録が壊れているとわかるとき（JSONL の破損、同じ UUID で違う中身、質問のフックと会話の記録の食い違い）と、会話が Rewind で巻き戻されたとわかるときだけです。巻き戻しの判定（`common/rewinds.py`）は、会話の記録の `uuid`/`parentUuid` のつながりを追い、新しい分岐の先頭が、Claude の返事を含むそれまでの分岐を置き換えたときだけ巻き戻しとします。取り下げた発言（会話の記録に残ったままの分岐）では止まりません。添付や進捗、写しだけの記録は対話ではないので、それだけの範囲の置き換えは巻き戻しにしません。Claude の返事を含まない範囲の置き換えも同様です。親が null の新しい分岐（ファイルの最初の記録より前まで戻した場合）は巻き戻しと分からないので検知しません。読み取った範囲の最初の記録より前まで戻した分岐は、捨てた範囲が範囲の先頭から数えられるので、返事があれば検知します。会話の記録がないときは確かめられないので、フックの記録だけの面接のまま進みます。また、Claude Code の Rewind は次の発言が書かれるまで会話の記録に現れないことがあり、その間は検知できません。
 
-`interview` → `planning` → `ready` → `reviewing` と進みます。通常の指摘は `awaiting_revision`、人間の判断は `awaiting_human`、技術的な停止は `paused_error` です。設定したレビュアー全員が同一ハッシュを承認したときだけ `completed` となります。レビュアーの実行が失敗した回は `ready` に戻り、次の `review` が設定の順で次のレビュアーを実行します（0.12.11 から）。`paused_error` に止まるのは、同じレビュアーの直前の回も失敗だったとき、レビューの最中にプランが変わったとき、レビュアーの子プロセスを完全には終わらせられなかった可能性があるときだけです（子プロセスの失敗はレビューの上限でも止まり、ほかの失敗は上限の質問を出すために `ready` に戻ります）。レビューの上限に達して承認が揃っていないと、次の `review` はレビュアーを起動せずに人間に確認します（`awaiting_human`、確認の種類は `review_budget`）。続ければ `ready` に戻り、やめれば `exhausted`、受け入れれば `accepted` です。`accepted` は、人間がその時点のプラン（最後のレビューのあとに直した、まだレビューしていない版でもよい）を受け入れたことで、`completed` とは別の終わり方です。答えの記録（`escalations/<id>-answer.json`）に、受け入れた版のハッシュが残ります。計画中のソースの変化は追いません。人数分を足すと合計 99 回を超えるときは、確認を出さずに `exhausted` で終わります。run の固定設定 `review_limit_auto`（`ask`・`continue`・`continue_accept`）が許すときは、確認を出した後、ホストが手引きの基準で決めたおすすめ（続ける・受け入れる）を `plan limit-auto` で渡し、ランナーが確かめてから進めます（0.13.0 から）。確かめるのは、開いている上限の確認の id、確認の後に人間の答えが記録されていないこと、所有セッション、設定がその選択を許すこと、続けるなら延ばした後の上限と `max_reviews` の差が `review_limit_auto_extra_reviews` 以内であること、受け入れるなら確定した成功レビューが1回以上あり、今のプランが記録と一致し、設定したレビュアーの直近の成功したレビューに critical・high がないこと（`common/review.py` の `serious_reviewers`）です。続けると上限をレビュアーの人数分上げて `ready` に戻り（レビューは始めません）、受け入れると `auto_accepted` で終わります。どちらも人間の回答ではなく、`resolved_escalations` にも入りません。決定・設定の値・回数・上限の前後・版・その版がレビュー済みか・ホストのおすすめの文を不変記録 `limit-auto/<質問の id>-continue.json` か `-accept.json` に残します。確かめに通らなければ state は変わらず、確認は開いたまま人間に聞きます。
+`interview` → `planning` → `ready` → `reviewing` と進みます。通常の指摘は `awaiting_revision`、人間の判断は `awaiting_human`、技術的な停止は `paused_error` です。設定したレビュアー全員が同一ハッシュを承認したときだけ `completed` となります。レビュアーの実行が失敗した回は `ready` に戻り、次の `review` が設定の順で次のレビュアーを実行します（0.12.11 から）。`paused_error` に止まるのは、同じレビュアーの直前の回も失敗だったとき、レビューの最中にプランが変わったとき、レビュアーの子プロセスを完全には終わらせられなかった可能性があるときだけです（子プロセスの失敗はレビューの上限でも止まり、ほかの失敗は上限の質問を出すために `ready` に戻ります）。レビューの上限に達して承認が揃っていないと、次の `review` はレビュアーを起動せずに人間に確認します（`awaiting_human`、確認の種類は `review_budget`）。続ければ `ready` に戻り、やめれば `exhausted`、受け入れれば `accepted` です。`accepted` は、人間がその時点のプラン（最後のレビューのあとに直した、まだレビューしていない版でもよい）を受け入れたことで、`completed` とは別の終わり方です。答えの記録（`escalations/<id>-answer.json`）に、受け入れた版のハッシュが残ります。計画中のソースの変化は追いません。人数分を足すと合計 99 回を超えるときは、確認を出さずに `exhausted` で終わります。run の固定設定 `review_limit_auto`（`ask`・`continue`・`continue_accept`）が許すときは、確認を出した後、ホストが手引きの基準で決めたおすすめ（続ける・受け入れる）を `plan limit-auto` で渡し、ランナーが確かめてから進めます（0.13.0 から）。確かめるのは、開いている上限の確認の id、確認の後に人間の答えが記録されていないこと、所有セッション、設定がその選択を許すこと、続けるなら延ばした後の上限と `max_reviews` の差が `review_limit_auto_extra_reviews` 以内であること、受け入れるなら確定した成功レビューが1回以上あり、今のプランが記録と一致し、設定したレビュアーの直近の成功したレビューに critical・high がないこと（`common/review.py` の `serious_reviewers`）です。続けると上限をレビュアーの人数分上げて `ready` に戻り（レビューは始めません）、受け入れると `auto_accepted` で終わります。どちらも人間の回答ではなく、`resolved_escalations` にも入りません。決定・設定の値・回数・上限の前後・版・その版がレビュー済みか・ホストのおすすめの文を不変記録 `limit-auto/<質問の id>-continue.json` か `-accept.json` に残します。確かめに通らなければ state は変わらず、確認は開いたまま人間に聞きます。固定設定 `review_limit_auto_final` が `accept` の run で（`continue` との組み合わせは設定の誤りで、`ask` と組み合わせても効きません）、もう一巡足すと `review_limit_auto_extra_reviews` を超える上限では、おすすめが続けるなら、またはおすすめが受け入れるで critical・high が残っているなら、critical・high の条件を外して受け入れ、その記録を `schema_version` 2（ホストのおすすめ `recommended` と設定の値を足したもの）にします（0.14.0 から）。おすすめが受け入れるで critical・high が残っていなければ、ふつうの自動の受け入れで、記録は今までどおりです。
 
 `completed`・`accepted`・`auto_accepted` では、スキルが `plan publish` と `plan report` を呼びます。ほかの終わり方（`exhausted`、`cancelled`）でも `plan report` を呼び、レビューの要約を見せます。出版状態 `publication.status` は `pending` / `publishing` / `published` / `error` / `disabled` を区別します。`completed` や `accepted` だけでは正式ファイルの保存成功を意味しません。
 
 既定保存先は `docs/plans/` です。ファイル名は設定 `publish.filename` のテンプレートに `.md` を付けたもので、テンプレートで使える値は `{run_id}` と `{ticket}`（依頼中の最初の `REVIEW-10` のようなチケット識別子）です。既定の `"{ticket}"` では、チケット識別子があればその識別子、なければ `plan-<run-id>` で、0.7.2 までと同じ名前です。テンプレートに `{ticket}` があって依頼にチケット識別子がなければ、名前全体を `plan-<run-id>` にします。テンプレートは run の開始時に検査します。値をいちばん長い見本（チケット識別子 45 文字、run ID 29 文字）に置き換え、保存先のディレクトリの各部分と同じ安全な名前の規則と 128 文字の上限を当てます。実際の値は安全な文字だけでできていて、見本より長くならず、予約名にもならない（必ず `-` を含む）ので、公開のときには検査し直しません。固定した設定に `filename` がない run（0.7.3 より前に開始）は、既定の規則で公開します。公開するプランの横に、人が読める承認の記録 `<名前>.approval.md` を置きます。プランと承認の記録の両方の名前が空いている候補を、`<名前>`、`<名前>-<run-id>` の順に選び、どちらも使えなければ上書きせず止まります。正式ファイルはレビュー済み（`accepted` では人間が受け入れた）のバイト列と同じです。公開時に見出しやメタデータを付加して未レビューの変更を混ぜません。承認の情報は、横の承認の記録と `publication.json` にだけ書きます。
 
-承認の記録の中身は、決まった英語の言葉で、プランのファイル名、承認の種類（`reviewers` か `human` か `config_recommendation`）、承認した者（レビュアーの id、人間と `AskUserQuestion` の答えの event ID、または run の `review_limit_auto` 設定によるおすすめどおりの受け入れとその記録 `limit-auto/<質問の id>-accept.json`）、承認した版のハッシュ、run ID、承認した時刻（run の `finished_at`）、公開した時刻、レビューの回数と上限、残っている指摘の数、最後の版がレビュー済みかです。中身は公開の予定と一緒に run の記録 `approval.md` として一度だけ作り、それを外へ写すので、途中で止まった公開を再開しても同じバイト列になります。受領 `publication.json`（`schema_version` 2）は、`approval`（`reviewers` か `human` か `config_recommendation`）、`approval_path`、公開の予定の時刻と同じ `published_at` を持ちます。`plan report` は、公開したプランと承認の記録の両方が今もそのバイト列か（`published_plan_matches_at_report`、`published_approval_matches_at_report`）を確かめます。
+承認の記録の中身は、決まった英語の言葉で、プランのファイル名、承認の種類（`reviewers` か `human` か `config_recommendation` か `config_final`）、承認した者（レビュアーの id、人間と `AskUserQuestion` の答えの event ID、run の `review_limit_auto` 設定によるおすすめどおりの受け入れとその記録 `limit-auto/<質問の id>-accept.json`、または自動で続ける回数を使い切った後の `review_limit_auto_final` 設定による受け入れとホストのおすすめとその記録。`config_final` では、直近の成功したレビューに残った critical・high の行も付く）、承認した版のハッシュ、run ID、承認した時刻（run の `finished_at`）、公開した時刻、レビューの回数と上限、残っている指摘の数、最後の版がレビュー済みかです。中身は公開の予定と一緒に run の記録 `approval.md` として一度だけ作り、それを外へ写すので、途中で止まった公開を再開しても同じバイト列になります。受領 `publication.json`（`schema_version` 2）は、`approval`（`reviewers` か `human` か `config_recommendation` か `config_final`）、`approval_path`、公開の予定の時刻と同じ `published_at` を持ちます。`plan report` は、公開したプランと承認の記録の両方が今もそのバイト列か（`published_plan_matches_at_report`、`published_approval_matches_at_report`）を確かめます。
 
 `exhausted` / `awaiting_human` / `paused_error` のプランを自動的に正式採用しません。
 
@@ -102,7 +105,7 @@ flowchart TD
     R -->|上限到達| H
     H -->|続ける| R
     H -->|設定でおすすめどおり自動で続ける（limit-auto）| R
-    H -->|設定でおすすめどおり自動で受け入れ（limit-auto）| AA[auto_accepted]
+    H -->|設定でおすすめどおり、または review_limit_auto_final で自動で受け入れ（limit-auto）| AA[auto_accepted]
     H -->|やめる| E[exhausted]
     H -->|受け入れて終える| A[accepted]
 ```
@@ -172,10 +175,11 @@ checkpoint では、開始時からの変更の一覧（`snapshots/NNN.json`）�
 
 対象プロジェクトの `.devflow/runs/plan/RUN_ID/` と `.devflow/runs/implement/RUN_ID/` に、計画、設定、ベースライン、スナップショット、チェック、レビュー、採否、人間の発言を保存します。確定記録は上書きしません。レビュアーへの入力、ログ、生の出力は、両フローとも `review-processes/NN/` に置きます。受け付けたレビューの `reviews/NN/review.json` は、フローで形が違います。Implement はレビューの答えそのもの（レビュアーと動きの数は state の `attempts` に記録）、Plan は答え（`result`）を、レビュアー（`provider`）、プランのハッシュとレビューした版の番号（`plan_version`）、動きの数（`activity`）、トークン数（`tokens`）、時刻（`started_at`・`finished_at`）と一緒に包んだもの（`schema_version` 2）です。Plan の失敗した回の `error.json` と回復した回の `recovery.json` にも、時刻、トークン数、版の番号が入ります。直しの記録 `reflection.json` は、前後の版の番号と、足した行と消した行の数（直したときに1回だけ数える）を持ちます。
 
-- **run の state**（`schema_version` 10）は、全フロー共通の枠（`owner_host`、`owner_session`、`event_ids`、`inflight`、`escalation`、run が初めて終わった時刻 `finished_at` など）と、各フローが宣言した項目だけを持ちます。処理中の状態（チェック中・レビュー中）と `inflight` は必ず一致します。それより古い形式（0.1.x の 1、0.2.x の 2、0.3.x の 3、0.4.0 の開発中の 4 と 5、0.4.x の 6、0.5.x の 7、0.6.x の 8、0.7.x の 9）の run は `unsupported`、読めない run は `invalid` として扱います。`unsupported` の run は開始を止めません。読めない Implement の run は、実装場所が分からないので Implement の開始と再開だけを止めます。読めない Plan の run、読めないセッション記録、run ID の形でない名前は開始を止めず、doctor の警告に出ます（警告と判定は、同じ `RunStore.scan` の記録と同じ関数 `blocks_workspace_check` を使います）。
+- **run の state**（`schema_version` 11）は、全フロー共通の枠（`owner_host`、`owner_session`、`event_ids`、`inflight`、`escalation`、run が初めて終わった時刻 `finished_at` など）と、各フローが宣言した項目だけを持ちます。処理中の状態（チェック中・レビュー中）と `inflight` は必ず一致します。それより古い形式（0.1.x の 1、0.2.x の 2、0.3.x の 3、0.4.0 の開発中の 4 と 5、0.4.x の 6、0.5.x の 7、0.6.x の 8、0.7.x の 9、0.8.x〜0.12.x の 10）の run は `unsupported`、読めない run は `invalid` として扱います。`unsupported` の run は開始を止めません。読めない Implement の run は、実装場所が分からないので Implement の開始と再開だけを止めます。読めない Plan の run、読めないセッション記録、run ID の形でない名前は開始を止めず、doctor の警告に出ます（警告と判定は、同じ `RunStore.scan` の記録と同じ関数 `blocks_workspace_check` を使います）。
 - **所有者**は run の `(owner_host, owner_session)` で決まります。セッション記録（`.devflow/sessions/<ハッシュ>.json`）は、そのセッションが見ている run か、開始待ちのどちらか一方だけを持ちます。終わった run と `unsupported` の run への紐付けは、次の通常入力（バックグラウンドの処理の終わりの知らせを含む）で外します。status / doctor では外しません。そのため Claude は、run ができたあとの操作に `--run RUN_ID` を付けます。
 - **run を変える操作**は、`--session` に所有者のセッションを渡したときだけ受け付けます（`Command.needs_owner`）。Claude Code ではさらに、`CLAUDE_CODE_SESSION_ID` が呼び出し元の会話を名指せるとき、その値とも一致する必要があります（`common/sessions.py` の `require_caller`）。会話が Rewind やフォーク（Orca の rewind、`--fork-session` など）で別のセッションに代わったあと、古い `--session` のままの操作は止まります。環境変数がないとき（人間が外の端末から動かすとき）は今までどおりです。`status`、`doctor`、人間専用の `recover` は所有者を問いません。
 - **開始**は「開始待ちの記録 → run の作成 → 紐付け」の3段階です。run は一時ディレクトリに全部作ってから rename で置くので、途中の状態の run は現れません。途中で止まった場合、次の入力で、作成済みなら紐付けを完了し、未作成なら開始待ちを取り消します。runner の `start`（Implement）は、開始待ちと引数を dispatch ロックの中で確かめた後、ロックを外してスナップショットと開始の記録を一時ディレクトリ（`.creating-<run_id>.start`）に準備し、ロックを取り直して、開始待ちが同じことと作業場所が空いていることを確かめてから run を作ります。status / doctor はロックを取らないので、準備中の一時ディレクトリも作りかけとして表示します。
+- **つなぎ開始**（`implement start --from-plan PLAN_RUN_ID`、0.14.0 から）は、`/devflow:flow` で始めた Plan の後にホストが呼びます。router は、Plan の run をその会話が所有すること、flow の印（Plan の `request.json` の `raw_prompt` が flow コマンド）、終わり方（`completed`・`accepted`・`auto_accepted`）、公開済みで公開の記録のハッシュが承認したプランと一致すること、終わった後に再開されていないことを確かめてから、手で始める開始と同じ開始待ち・準備・確定の前の照合・作成の流れで Implement の run を作ります。開始待ちの最初のイベントは Plan の run の最後の prompt イベントの写しで、起動オプションは読まず、`request.json` の `intent` は `start_from_plan`（Plan の run の ID、プランのハッシュ、公開したプランと承認の記録のパス）です。確定の前に、Plan の run のロックの中で確認をやり直します。同じ Plan から呼び直すと、その Plan からつないだ run（この会話の終わっていない run）を `already_started` 付きで返し、新しい run は作りません。手で始める `start` は、開始待ちのイベントが `/devflow:implement` の入力であることも確かめます。
 - **resume** はフックの中で行います。紐付けを先に書き、その後で所有者の変更・resume の依頼の記録・回答の境界の更新を1回で確定します。
 - **人間の発言**（`events/<ID>.json`）はフックの入力そのものを保存します。
 - 状態の更新は、新しい記録を本来の場所に書いてから、最後に `state.json` を一時ファイルから置き換えて確定します。`state.json` が指す記録は、どの瞬間もディスクにあります。置き換えの前に止まった保存はなかったことになり、その操作をもう一度実行します（チェックやレビュアーの後の保存なら、処理の途中で止まったときと同じく `recover` で終えます）。確定した記録は書き換えず、どの記録の一覧にもない前の残りのファイルだけを置き換えます。`status` などの表示は何も変えません。

@@ -26,9 +26,12 @@ about what the provider ran.
                           "decision", "interpretation", "event_ids"}],
      "human_acceptance": {"event_ids", "answer", "version", "accepted_at", "record"} | None,
      "automatic_decisions": [{"at", "review_number", "decision", "setting",
-                              "review_limit_before", "review_limit_after", "recommendation", "record"}],
+                              "review_limit_before", "review_limit_after", "recommendation", "record",
+                              ["recommended", "extra_reviews"]}],
+     "chained_from": {"plan_run_id", "plan_path", "plan_hash"} | None,
+     "existing_changes": [entry] | None,
      "auto_acceptance": {"record", "source", "version", "accepted_at", "version_reviewed",
-                         "recommendation"} | None}
+                         "recommendation", ["recommended", "extra_reviews"]} | None}
 
 A review's ``status`` is ``succeeded``, ``failed`` or ``in_progress``; a missing
 disposition (``action``/``reason``) is None, shown as undecided. ``cli_version`` comes
@@ -41,12 +44,18 @@ the run's ``review_limit_auto`` setting applied following the host's recommendat
 (never human answers), each with the host's recommendation text it recorded, shown
 as a quote under its line so that the human reads it even when the host did not
 show it before the decision; ``auto_acceptance`` is the verified accept among them.
+An accept by the run's ``review_limit_auto_final`` setting (once another round would
+pass review_limit_auto_extra_reviews) also holds ``recommended`` (the host's
+recommendation, continue or accept) and ``extra_reviews``; the others never do.
+``chained_from`` names the flow Plan run an Implement run was chained from, and
+``existing_changes`` lists, as code spans, the uncommitted changes in the snapshot scope
+when an Implement run started (both are absent from a Plan source).
 """
 from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from .review import REVIEW_BUDGET, serious_reviewers
+from .review import REVIEW_BUDGET, code_span, serious_findings_text, serious_reviewers
 from .storage import json_bytes
 
 SCHEMA_VERSION = 1
@@ -138,6 +147,7 @@ def build(source: dict, now: str) -> dict:
     return {
         "schema_version": SCHEMA_VERSION, "flow": source["flow"], "run_id": source["run_id"],
         "status": source["status"], "pending_question": source["pending_question"],
+        "chained_from": source.get("chained_from"), "existing_changes": source.get("existing_changes"),
         "review_count": source["review_count"], "review_limit": source["review_limit"],
         "reviews": reviews,
         "finding_trend": [{"number": entry["number"], "reviewer_id": entry["reviewer_id"], "status": entry["status"],
@@ -178,6 +188,11 @@ def _status(summary: dict) -> str:
     status = summary["status"]
     if status == "awaiting_human" and summary["pending_question"] == REVIEW_BUDGET:
         return "awaiting_human (review limit question)"
+    auto = summary["approval"].get("auto_acceptance")
+    if status == "auto_accepted" and auto and "recommended" in auto:
+        return ("auto_accepted — accepted at the review limit by the run's review_limit_auto_final setting because "
+                f"another round would exceed review_limit_auto_extra_reviews {auto['extra_reviews']}, not approved "
+                "by every reviewer")
     return STATUS_TEXT.get(status, status)
 
 
@@ -204,6 +219,13 @@ def render(summary: dict) -> str:
     approval, time, reviews = summary["approval"], summary["time"], summary["reviews"]
     lines = [f"## DevFlow review summary — {summary['flow']} run {summary['run_id']}", ""]
     lines.append(f"- Status: {_status(summary)}")
+    chained, changes = summary.get("chained_from"), summary.get("existing_changes")
+    if chained:
+        lines.append(f"- Chained from Plan run {chained['plan_run_id']} by flow (published plan "
+                     f"{code_span(chained['plan_path'])}, SHA-256 {chained['plan_hash']})")
+    if changes:
+        lines.append(f"- Existing changes at start: {len(changes)} touching the snapshot scope (part of the "
+                     f"baseline, not reviewed): {', '.join(changes)}")
     missing = time["reviews_without_time"]
     lines.append(f"- Reviews: {summary['review_count']} of limit {summary['review_limit']}; "
                  f"time: run {_duration(time['run_elapsed_seconds'])}, reviews {_duration(time['review_seconds_total'])}"
@@ -214,8 +236,13 @@ def render(summary: dict) -> str:
                  f"{'reviewed' if approval['latest_version_reviewed'] else 'not reviewed'}; approvals: {approvals}")
     auto = approval.get("auto_acceptance")
     if auto:
-        lines.append(f"- Auto-accepted by the review_limit_auto setting following the host's recommendation "
-                     f"(record: {auto['record']}; accepted version "
+        basis = "the review_limit_auto setting following the host's recommendation"
+        if "recommended" in auto:
+            serious = serious_findings_text(summary["serious_findings"]["reviewers"], reviews)
+            basis = (f"the review_limit_auto_final setting because another round would exceed "
+                     f"review_limit_auto_extra_reviews {auto['extra_reviews']}; the host recommended "
+                     f"{auto['recommended']}; critical/high in the latest succeeded reviews: {serious}")
+        lines.append(f"- Auto-accepted by {basis} (record: {auto['record']}; accepted version "
                      f"{'reviewed' if auto['version_reviewed'] else 'not reviewed'})")
 
     lines.append("")
@@ -283,6 +310,10 @@ def render(summary: dict) -> str:
         for decision in summary["automatic_decisions"]:
             limits = (f" (limit {decision['review_limit_before']} → {decision['review_limit_after']})"
                       if decision["decision"] == "continue" else "")
+            if "recommended" in decision:
+                limits = (f" with review_limit_auto_final accept (another round would exceed "
+                          f"review_limit_auto_extra_reviews {decision['extra_reviews']}; the host recommended "
+                          f"{decision['recommended']})")
             lines.append(f"  - After {_count(decision['review_number'], 'review')}, {REVIEW_BUDGET}: "
                          f"{decision['decision']} by setting {decision['setting']}{limits} ({_known(decision['at'])})")
             lines.append("    Host's recommendation:")

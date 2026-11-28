@@ -13,11 +13,12 @@ from ..common.errors import DevFlowError, ProcessCleanupError
 from ..common.process import cleanup_failure, reraise_wrapped_cause
 from ..common.review import (LIMIT_AUTO_DIR, LIMIT_AUTO_KEY, LIMIT_AUTO_SOURCE, LIMIT_DECISIONS, REVIEW_BUDGET,
                              accept_entry, after_review_failure, all_approved, ask_at_limit, automatic_decisions,
-                             check_limit_auto, check_no_serious_reviewers, decide_at_limit, limit_auto_records,
-                             next_reviewer)
+                             check_auto_accept, check_limit_auto, decide_at_limit, final_accept_warning, final_fields,
+                             limit_auto_records, next_reviewer)
 from ..common import summary
 from ..common.reviewers import preflight, prepare_review, recorded_cli_version, review_tokens, run_review
 from ..common.engine import RunEngine
+from ..common.operations import CHAINED
 from ..common.runs import RUNNER_WAIT, TERMINAL, open_escalation
 from ..common.sessions import approval_evidence
 from ..common.storage import checked_text, digest, json_bytes, no_symlinks, now, read_json, within, writable_text
@@ -545,14 +546,18 @@ class Engine(RunEngine):
         question when the run's frozen review_limit_auto setting allows it.
 
         Never a human answer: the decision is recorded in ``limit-auto/``, not in
-        ``resolutions``. Any refusal leaves the run and its question unchanged.
+        ``resolutions``. Once the automatic extra reviews are used up,
+        review_limit_auto_final ``accept`` accepts a recommendation to continue or
+        accept (``check_auto_accept``). Any refusal leaves the run and its question
+        unchanged.
         """
         with self._lock(run_id):
             state = self._state(run_id)
             self._owner(state,session_id)
-            escalation = self._limit_auto_request(state,escalation_id,decision)
+            escalation, applied, final_eligible = self._limit_auto_request(state,escalation_id,decision)
             recommendation = checked_text(self._draft(state,recommendation_file))
-            if decision == "continue":
+            recommended = None
+            if applied == "continue":
                 self._verify(state)
                 version = (state.get("candidate") or {}).get("snapshot_id")
                 reviewed = any(a["status"] == "succeeded" and a["snapshot_id"] == version for a in state["attempts"])
@@ -564,9 +569,10 @@ class Engine(RunEngine):
                            for a in state["attempts"]):
                     raise DevFlowError("Cannot accept automatically: no review succeeded. "
                                        "Ask the human the review limit question.")
-                check_no_serious_reviewers(summary_source(self.store,state))
+                recommended = check_auto_accept(summary_source(self.store,state),decision,final_eligible)
                 reviewed = any(a["status"] == "succeeded" and a["snapshot_id"] == version for a in state["attempts"])
-            self._apply_limit_auto(state,escalation,decision,recommendation,version or "",reviewed,session_id)
+            self._apply_limit_auto(state,escalation,applied,recommendation,version or "",reviewed,session_id,
+                                   recommended)
             self._save(state)
         return self.status(run_id)
 
@@ -675,7 +681,7 @@ def _auto_acceptance_entry(state: dict, store, entries: list[tuple[str, dict]] |
         raise DevFlowError(f"Invalid or mismatched automatic accept record: {name}")
     return {"record": name, "source": LIMIT_AUTO_SOURCE, "version": record["version"],
             "accepted_at": record["decided_at"], "version_reviewed": record["version_reviewed"],
-            "recommendation": record["recommendation"]}
+            "recommendation": record["recommendation"], **final_fields(record)}
 
 
 def _checkpoint_label(path: object) -> str:
@@ -778,9 +784,14 @@ def summary_source(store, state: dict, workspace: dict | None = None) -> dict:
         approving = [reviewer for reviewer, snapshot_id in approvals.items() if snapshot_id == candidate["snapshot_id"]]
     else:
         current, reviewed, approving = {"id": None, "label": "none (no checkpoint yet)"}, False, []
+    intent = read("request.json")["intent"]
+    changes = store.workflow.existing_changes(store, state)
     return {
         "flow": "implement", "run_id": state["run_id"], "status": state["status"],
         "pending_question": ((state["escalation"] or {}).get("detail") or {}).get("kind"),
+        "chained_from": ({key: intent[key] for key in ("plan_run_id", "plan_path", "plan_hash")}
+                         if intent.get("action") == CHAINED else None),
+        "existing_changes": changes[1] if changes else None,
         "created_at": state["created_at"], "finished_at": state["finished_at"],
         "review_count": len(attempts), "review_limit": state["review_limit"],
         "reviewers": [{"id": r["id"], "requested_model": r["model"], "requested_effort": r["effort"],
@@ -838,7 +849,8 @@ def terminal_report(store, state, observed=(), observed_error=None, verified=Non
     if state["status"] == "accepted":
         warnings.append(ACCEPTED_WARNING)
     elif state["status"] == "auto_accepted":
-        warnings.append(AUTO_ACCEPTED_WARNING)
+        warnings.append(final_accept_warning(auto, review_summary) if auto and "recommended" in auto
+                        else AUTO_ACCEPTED_WARNING)
         if not reviewed:
             warnings.append("The accepted snapshot was never reviewed.")
     return {"run_id":state["run_id"],"status":state["status"],"review_count":len(state["attempts"]),

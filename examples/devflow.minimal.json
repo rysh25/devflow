@@ -9,7 +9,6 @@
     }
   },
   "implement": {
-    "allow_dirty": false,
     "max_check_attempts": 3,
     "snapshot": {
       "mode": "git"

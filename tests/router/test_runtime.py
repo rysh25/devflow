@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+import dataclasses
 import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -19,6 +22,8 @@ from devflow_core.common.errors import DevFlowError
 from devflow_core.common.runs import SCHEMA_VERSION, RunStore, make_event
 from devflow_core.common.storage import atomic_json, read_json, write_new
 from devflow_core.workflows import WORKFLOWS
+from devflow_core.common.settings import read_project_settings
+from tests.plan.test_engine import RUN_REVIEW, PlanRunFixture, review_value
 from tests.start_checks import skip_reviewer_checks
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1176,6 +1181,31 @@ class RegistryTests(RuntimeFixture):
             self.assertIn("dummy", runtime.stores(self.project, host="claude"))
             self.assertEqual(runtime.status(self.project, self.session, None, host="claude")["runs"], [])
 
+    def test_a_registered_workflow_with_a_deferred_start_reaches_its_build_start(self):
+        """Its start command's event has no ``operation`` (that list is fixed); only a workflow
+        that can be chained requires one, so this start is not refused."""
+        from devflow_core.common.workflow import Workflow
+
+        class Deferred(Workflow):
+            name = "deferred"
+            statuses = frozenset({"working", "completed", "exhausted", "cancelled", "accepted"})
+            start_option = "--target"
+
+            def normalize_args(self, raw, project):
+                return raw.strip()
+
+            def load_config(self, documents):
+                return {}
+
+            def build_start(self, project, pending, options, scratch, *, project_config):
+                raise RuntimeError("reached build_start")
+
+        with patch.dict(WORKFLOWS, {"deferred": Deferred()}):
+            self.prompt("/devflow:deferred go")
+            self.assertEqual(self.record()["pending_start"]["event"]["payload"].get("operation"), None)
+            with self.assertRaisesRegex(RuntimeError, "reached build_start"):
+                runtime.runner_start(self.project, self.session, "deferred", "go", host="claude")
+
 
 
 class ParallelRunTests(RuntimeFixture):
@@ -1401,6 +1431,559 @@ class CallerSessionTests(RuntimeFixture):
         with self.transcript.open("a", encoding="utf-8", newline="\n") as stream:
             stream.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+
+class FlowStartTests(RuntimeFixture):
+    """The flow command starts a Plan run marked by its own request.json (plan 4.2, 4.3)."""
+
+    def flow_run(self, text, session=None, host="claude"):
+        session = session or self.session
+        if host == "claude":
+            self.prompt(text, session=session)
+        else:
+            from devflow_core.common.hosts import HOSTS
+            profile = HOSTS[host]
+            payload = dict(self.payload(session=session, prompt=text, turn_id="flow-turn"), host=host)
+            environ = {profile.project_variable: str(self.project)} if profile.project_variable else {}
+            runtime.handle_hook(payload, PLUGIN, environ=environ, host=host)
+        record = sessions.read_record(self.project, session, WORKFLOWS, host)
+        self.assertEqual(record["run"]["flow"], "plan")
+        return record["run"]["run_id"]
+
+    def test_flow_starts_a_marked_plan_run_and_plan_does_not(self):
+        raw = "/devflow:flow -- 依頼"
+        run_id = self.flow_run(raw)
+        request = read_json(self.run_dir("plan", run_id) / "request.json")
+        self.assertEqual((request["request"], request["raw_prompt"]), ("依頼", raw))
+        status = self.engine("plan").status(run_id)
+        self.assertIs(status["continues_to_implement"], True)
+        self.assertNotIn("flow_marker_error", status)
+        plain = self.plan_start(session="plain-plan")
+        self.assertIs(self.engine("plan").status(plain)["continues_to_implement"], False)
+
+    def test_codex_flow_command_marks_its_run(self):
+        run_id = self.flow_run("$devflow:flow 依頼", session="codex-flow", host="codex")
+        engine = WORKFLOWS["plan"].engine(self.project, host="codex")
+        self.assertIs(engine.status(run_id)["continues_to_implement"], True)
+
+    def test_startup_options_of_flow_apply_to_plan(self):
+        run_id = self.flow_run("/devflow:flow --max-reviews 2 -- 依頼")
+        self.assertEqual(read_json(self.run_dir("plan", run_id) / "config.json")["max_reviews"], 2)
+        self.assertEqual(read_json(self.run_dir("plan", run_id) / "request.json")["request"], "依頼")
+
+    def test_an_unverifiable_marker_keeps_status_context_and_doctor(self):
+        run_id = self.flow_run("/devflow:flow -- 依頼")
+        (self.run_dir("plan", run_id) / "request.json").write_text('{"raw_prompt":"/devflow:flow x"}',
+                                                                   encoding="utf-8")
+        status = self.engine("plan").status(run_id)
+        self.assertEqual(status["status"], "interview")
+        self.assertIsNone(status["continues_to_implement"])
+        self.assertIn("cannot be verified", status["flow_marker_error"])
+        context = self.prompt("ordinary message during the interview")
+        text = context["hookSpecificOutput"]["additionalContext"]
+        fields = json.JSONDecoder().raw_decode(text, text.index('{"run_id"'))[0]
+        self.assertIsNone(fields["continues_to_implement"])
+        self.assertIn("cannot be verified", fields["flow_marker_error"])
+        for args in (("--run", run_id, "plan", "doctor"), ("--session", self.session, "plan", "doctor")):
+            with self.subTest(args=args), patch("devflow_core.cli.host_version",
+                                                return_value={"version": None, "supported": True}):
+                code, output, _ = self.invoke(*args)
+                self.assertEqual(code, 0, output)
+                report = json.loads(output)
+                self.assertIn("cannot be verified", report["flow_marker_error"])
+                self.assertNotIn("flow_warnings", report)
+        with self.assertRaisesRegex(DevFlowError, "cannot be verified|Immutable artifact"):
+            runtime.runner_start_from_plan(self.project, self.session, run_id, {}, host="claude")
+        self.assertFalse((self.project / ".devflow" / "runs" / "implement").exists())
+
+
+
+class ChainedStartTests(PlanRunFixture):
+    """``implement start --from-plan``: a flow's Implement run, chained from its Plan run (plan 4.4)."""
+    BEFORE, AFTER = "2026-11-28T00:00:00+00:00", "2026-11-28T00:00:01+00:00"
+    FLOW = ("/devflow:flow --reviewer codex flow-model low --reviewer opencode flow-model low --max-reviews 2 "
+            "-- 移行計画を作る。")
+
+    def setUp(self):
+        super().setUp()
+        skip_reviewer_checks(self)
+        self.settings({})
+        # The Plan run's last prompt and its ending fall in different seconds (check 6 compares seconds).
+        self.time = self.BEFORE
+        clock = patch("devflow_core.common.runs.now", side_effect=lambda: self.time)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def settings(self, plan, mode="files"):
+        atomic_json(self.project / "devflow.config.json",
+                    {"schema_version": 1, "plan": plan, "implement": {"snapshot": {"mode": mode}}})
+
+    def ended(self, status="completed", request=None, publish=True):
+        """A Plan run ended ``status`` one second after its last prompt (published unless told not to)."""
+        if status == "auto_accepted":
+            self.settings({"review_limit_auto": "continue_accept"})
+        self.ready(request=request or self.FLOW)
+        if status == "completed":
+            self.submit(review_value())
+            self.time = self.AFTER
+            self.submit(review_value())
+        else:
+            for _ in range(2):
+                self.reflect(self.submit(review_value("changes_required")))
+            self.assertEqual(self.ask_at_limit()["status"], "awaiting_human")
+            self.time = self.AFTER
+            if status == "accepted":
+                self.at_limit("accept")
+            else:
+                self.engine.limit_auto(self.run_id, self.engine.status(self.run_id)["escalation"]["id"], "accept",
+                                       self.draft("recommendation.md", "Recommendation: accept."), self.session)
+        self.assertEqual(self.engine.status(self.run_id)["status"], status)
+        if publish:
+            self.engine.publish(self.run_id)
+        return self.engine.status(self.run_id)
+
+    def git_baseline(self):
+        """Commit the project as it is (a Git repository on first use). The caller's ``GIT_*``
+        variables are dropped (``git_environment``), and its global and system Git configuration
+        is off for the rest of the test, so the runner's own Git reads ignore it too."""
+        from devflow_core.common.git import git_environment
+        isolated = patch.dict(os.environ, {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull})
+        isolated.start()
+        self.addCleanup(isolated.stop)
+        environment = git_environment()
+        if not any((self.project / ".git").iterdir()):
+            (self.project / ".git").rmdir()
+            subprocess.run(["git", "init", "--quiet"], cwd=self.project, env=environment, check=True,
+                           capture_output=True)
+        for args in (("add", "--all"),
+                     ("-c", "user.name=DevFlow offline tests", "-c", "user.email=tests@example.invalid",
+                      "commit", "--quiet", "--allow-empty", "-m", "Fixture baseline")):
+            subprocess.run(["git", *args], cwd=self.project, env=environment, check=True, capture_output=True)
+
+    def start_chained(self, session=None, plan_run_id=None):
+        return runtime.runner_start_from_plan(self.project, session or self.session, plan_run_id or self.run_id,
+                                             {}, host="claude")
+
+    def implement_runs(self):
+        folder = self.project / ".devflow" / "runs" / "implement"
+        return sorted(path.name for path in folder.iterdir() if path.is_dir()) if folder.exists() else []
+
+    def assertRefused(self, pattern, session=None):
+        before = self.implement_runs()
+        with self.assertRaisesRegex(DevFlowError, pattern):
+            self.start_chained(session)
+        self.assertEqual(self.implement_runs(), before)
+
+    def pending(self, session=None):
+        record = sessions.read_record(self.project, session or self.session, WORKFLOWS, host="claude")
+        return record["pending_start"] if record else None
+
+    # -- test 2: success ---------------------------------------------------------------------
+    def assert_chains(self, status):
+        plan = self.ended(status)
+        # A format-10 Implement run of 0.12 is skipped, never read as a chained run (F12).
+        atomic_json(self.project / ".devflow" / "runs" / "implement" / "20261101T123450Z-c23456abcdef" / "state.json",
+                    {"schema_version": 10, "flow": "implement", "run_id": "20261101T123450Z-c23456abcdef",
+                     "status": "ready_review", "project": str(self.project), "owner_host": "claude",
+                     "owner_session": "old-session", "config": {"max_reviews": 6}})
+        # An ordinary prompt after the end (a background completion notice) only releases the binding.
+        self.hook(self.event(prompt="Background command finished."))
+        store = runtime.stores(self.project, host="claude")
+        last_prompt = [event for event in store["plan"].events(store["plan"].read(self.run_id))
+                       if event["kind"] == "prompt"][-1]
+        started = self.start_chained()
+        self.assertEqual((started["flow"], started["status"]), ("implement", "implementing"))
+        self.assertNotIn("already_started", started)
+        run = Path(started["run_dir"])
+        publication = plan["publication"]
+        self.assertEqual(read_json(run / "request.json")["intent"], {
+            "action": "start_from_plan", "args": str(self.project / publication["path"]), "workspace": None,
+            "plan_run_id": self.run_id, "plan_hash": plan["plan_hash"], "plan_path": publication["path"],
+            "approval_path": publication["approval_path"]})
+        state = store["implement"].read(started["run_id"])
+        self.assertEqual(store["implement"].events(state)[0], last_prompt)
+        self.assertEqual(self.bound_run(), started["run_id"])
+        self.assertIsNone(self.pending())
+        # The flow's startup options are Plan's: Implement uses the project settings.
+        expected = WORKFLOWS["implement"].load_config(read_project_settings(self.project, "claude", WORKFLOWS))
+        self.assertEqual((started["config"]["max_reviews"], started["config"]["reviewers"]),
+                         (expected["max_reviews"], expected["reviewers"]))
+        self.assertEqual(started["config"]["max_reviews"], 6)
+        self.assertNotIn("existing_changes", started)  # files mode: no Git status
+        engine = WORKFLOWS["implement"].engine(self.project, host="claude")
+        markdown = engine.cancel(started["run_id"], self.session, "test")["review_summary_markdown"]
+        self.assertIn(f"- Chained from Plan run {self.run_id} by flow (published plan `{publication['path']}`, "
+                      f"SHA-256 {plan['plan_hash']})", markdown)
+        self.assertNotIn("Existing changes", markdown)
+
+    def test_a_completed_flow_plan_chains(self):
+        self.assert_chains("completed")
+
+    def test_an_accepted_flow_plan_chains(self):
+        self.assert_chains("accepted")
+
+    def test_an_auto_accepted_flow_plan_chains(self):
+        self.assert_chains("auto_accepted")
+
+    def test_the_published_files_are_existing_changes_of_a_git_workspace(self):
+        if not shutil.which("git"):
+            self.skipTest("Git is not installed")
+        self.ended(publish=False)
+        self.settings({}, mode="git")
+        self.git_baseline()
+        publication = self.engine.publish(self.run_id)["publication"]
+        started = self.start_chained()
+        self.assertEqual((started["status"], started["escalation"]), ("implementing", None))
+        changes = started["existing_changes"]
+        self.assertEqual(sorted(changes["paths"]), sorted([publication["path"], publication["approval_path"]]))
+        for path in (publication["path"], publication["approval_path"]):
+            self.assertIn(f"`{path}`", changes["warning"])
+        engine = WORKFLOWS["implement"].engine(self.project, host="claude")
+        markdown = engine.cancel(started["run_id"], self.session, "test")["review_summary_markdown"]
+        self.assertIn("- Existing changes at start: 2 touching the snapshot scope (part of the baseline, not "
+                      "reviewed): ", markdown)
+
+    # -- test 3: refusals --------------------------------------------------------------------
+    def test_only_the_owning_conversation_chains(self):
+        self.ended()
+        self.assertRefused("not owned by this conversation", session="another-conversation")
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "forked-conversation"}):
+            self.assertRefused("not this conversation's session")
+
+    def test_a_resume_after_the_end_refuses_even_in_the_same_second(self):
+        for session in (self.session, "another-conversation"):
+            with self.subTest(session=session):
+                self.time = self.BEFORE
+                self.ended(request=self.FLOW + session)
+                self.resume(session)  # In the ending's second.
+                self.assertRefused("resumed after it ended", session=session)
+                self.engine.cancel(self.run_id)
+                self.hook(self.event(prompt="next", session=session))
+
+    def test_a_plan_run_already_chained_refuses_after_its_implement_run_ends(self):
+        self.ended()
+        started = self.start_chained()
+        WORKFLOWS["implement"].engine(self.project, host="claude").cancel(started["run_id"], self.session, "test")
+        self.assertRefused(f"already chained to Implement run {started['run_id']}")
+
+    def test_a_plan_without_the_flow_marker_refuses(self):
+        self.ended(request="/devflow:plan 移行計画を作る。")
+        self.assertRefused("was not started by /devflow:flow")
+
+    def test_endings_without_an_approved_plan_refuse(self):
+        self.ready(request=self.FLOW)
+        self.assertRefused("ended ready, not completed")
+        self.engine.cancel(self.run_id)
+        self.assertRefused("ended cancelled")
+        self.hook(self.event(prompt="next"))
+        self.ready(request=self.FLOW + " 2")
+        stored = read_json(self.run / "state.json")
+        atomic_json(self.run / "state.json", dict(stored, review_count=98, review_limit=98))
+        self.assertEqual(self.ask_at_limit()["status"], "exhausted")
+        self.assertRefused("ended exhausted")
+
+    def test_an_unpublished_plan_refuses(self):
+        self.ended(publish=False)
+        self.assertRefused(r"not published \(pending\)")
+        directory = self.project / "docs" / "plans"
+        directory.mkdir(parents=True)
+        for name in (f"plan-{self.run_id}.md", f"plan-{self.run_id}-{self.run_id}.md"):
+            (directory / name).write_bytes(b"existing\n")
+        with self.assertRaisesRegex(DevFlowError, "already exist"):
+            self.engine.publish(self.run_id)
+        self.assertRefused(r"not published \(error\)")
+
+    def test_disabled_publication_refuses(self):
+        self.settings({"publish": {"enabled": False}})
+        self.ended(publish=False)
+        self.assertRefused(r"not published \(disabled\)")
+
+    def test_a_rewritten_published_plan_refuses(self):
+        plan = self.ended()
+        published = self.project / plan["publication"]["path"]
+        published.write_text(published.read_text(encoding="utf-8") + "Changed.\n", encoding="utf-8")
+        self.assertRefused("no longer matches")
+
+    def test_a_held_plan_lock_refuses_without_waiting(self):
+        self.ended()
+        with RunStore(self.project, WORKFLOWS["plan"], host="claude").lock(self.run_id):
+            started = time.monotonic()
+            with self.assertRaisesRegex(DevFlowError, "Run is locked"):
+                self.start_chained()
+            # Well under the prompt hook's wait for the dispatch lock (HOOK_WAIT, 5 s).
+            self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(self.implement_runs(), [])
+
+    def test_a_changed_plan_event_refuses(self):
+        self.ended()
+        last = RunStore(self.project, WORKFLOWS["plan"], host="claude").read(self.run_id)["event_ids"][-1]
+        event = self.project / ".devflow" / "runs" / "plan" / self.run_id / "events" / f"{last}.json"
+        event.write_text(json.dumps(json.loads(event.read_text(encoding="utf-8")), indent=2), encoding="utf-8")
+        self.assertRefused("Immutable artifact changed")
+
+    def test_a_plan_rewritten_before_the_preparation_reads_it_refuses(self):
+        plan = self.ended()
+        published = self.project / plan["publication"]["path"]
+        original = runtime.read_project_settings
+
+        def rewrite_then_read(*args, **kwargs):
+            published.write_text("# Replaced after the publication check\n", encoding="utf-8")
+            return original(*args, **kwargs)
+
+        with patch.object(runtime, "read_project_settings", side_effect=rewrite_then_read):
+            self.assertRefused("no longer matches Plan run")
+        # The start written for the chained start is not a manual start's pending start.
+        published.write_text("# Feature\n", encoding="utf-8")
+        with self.assertRaisesRegex(DevFlowError, "explicit /devflow:implement"):
+            runtime.runner_start(self.project, self.session, "implement", plan["publication"]["path"], host="claude")
+        self.hook(self.event(prompt="next"))
+        self.assertIsNone(self.pending())
+
+    def test_an_unfinished_implement_run_in_the_workspace_refuses(self):
+        plan = self.ended()
+        other = "another-implementer"
+        self.hook(self.event(prompt=f"/devflow:implement {plan['publication']['path']}", session=other))
+        runtime.runner_start(self.project, other, "implement", plan["publication"]["path"], host="claude")
+        self.assertRefused("unfinished")
+
+    def test_an_unfinished_run_bound_to_this_conversation_refuses(self):
+        self.ended()
+        self.hook(self.event(prompt="/devflow:plan another plan"))
+        self.assertRefused("Finish or cancel")
+
+    def test_the_command_takes_exactly_one_of_plan_and_from_plan(self):
+        for args in (("--plan", "feature.md", "--from-plan", "20261101T123456Z-123456abcdef"), (),
+                     ("--from-plan", "")):
+            with self.subTest(args=args):
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    code = cli.main(["--host", "claude", "--project", str(self.project), "--session", self.session,
+                                     "implement", "start", *args])
+                self.assertNotEqual(code, 0)
+                self.assertEqual(self.implement_runs(), [])
+                if args == ("--from-plan", ""):
+                    # An empty value reaches the run ID check, not the manual start's refusal.
+                    self.assertIn("run ID", out.getvalue() + err.getvalue())
+
+    def blocked_chain(self):
+        """Run the chained start in a thread, held inside its preparation (no lock held)."""
+        entered, release, result = threading.Event(), threading.Event(), {}
+        original = WORKFLOWS["implement"].build_start
+
+        def build_start(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(10))
+            return original(*args, **kwargs)
+
+        def start():
+            try:
+                result["status"] = self.start_chained()
+            except Exception as exc:  # noqa: BLE001 - examined by each test
+                result["error"] = exc
+
+        patcher = patch.object(WORKFLOWS["implement"], "build_start", side_effect=build_start)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        thread = threading.Thread(target=start)
+        thread.start()
+        self.assertTrue(entered.wait(10))
+
+        def finish():
+            release.set()
+            thread.join(10)
+            patcher.stop()
+            return result
+        return finish
+
+    def test_a_human_prompt_during_the_preparation_cancels_the_chained_start(self):
+        self.ended()
+        finish = self.blocked_chain()
+        self.hook(self.event(prompt="Actually, wait."))
+        self.assertRegex(str(finish()["error"]), "superseded")
+        self.assertEqual(self.implement_runs(), [])
+        self.assertIsNone(self.pending())
+
+    def test_a_publication_error_during_the_preparation_refuses_before_creation(self):
+        self.ended()
+        finish = self.blocked_chain()
+        stored = read_json(self.run / "state.json")
+        atomic_json(self.run / "state.json",
+                    dict(stored, publication=dict(stored["publication"], status="error")))
+        self.assertRegex(str(finish()["error"]), r"not published \(error\)")
+        self.assertEqual(self.implement_runs(), [])
+
+    # -- test 3a: calling again ----------------------------------------------------------------
+    def interrupted(self, stop_on):
+        """A chained start that stopped at ``stop_on`` ("binding" or "creation")."""
+        original_write, original_commit = sessions.write_record, runtime._commit
+
+        def fail_on_binding(project, record, workflows):
+            if record["run"] is not None and record["run"]["flow"] == "implement":
+                raise OSError("simulated stop after the run was created")
+            return original_write(project, record, workflows)
+
+        def fail_before_creation(*args, **kwargs):
+            raise OSError("simulated stop before the run was created")
+
+        target = (patch.object(sessions, "write_record", side_effect=fail_on_binding) if stop_on == "binding"
+                  else patch.object(runtime, "_commit", side_effect=fail_before_creation))
+        with target, self.assertRaisesRegex(OSError, "simulated stop"):
+            self.start_chained()
+
+    def test_calling_again_returns_the_chained_run(self):
+        if not shutil.which("git"):
+            self.skipTest("Git is not installed")
+        for stop_on in ("binding", None):
+            with self.subTest(stop_on=stop_on):
+                self.time = self.BEFORE
+                self.ended(request=self.FLOW + str(stop_on), publish=False)
+                self.settings({}, mode="git")
+                self.git_baseline()
+                publication = self.engine.publish(self.run_id)["publication"]
+                if stop_on:
+                    self.interrupted(stop_on)
+                    created = self.implement_runs()[-1]
+                    first = None
+                else:
+                    first = self.start_chained()
+                    created = first["run_id"]
+                runs = self.implement_runs()
+                original = runtime._start_result
+
+                def assembled_without_the_dispatch_lock(*args, **kwargs):
+                    with runtime.dispatch_lock(self.project, 0):  # Free for other conversations' prompts.
+                        pass
+                    return original(*args, **kwargs)
+
+                with patch.object(runtime, "_start_result", side_effect=assembled_without_the_dispatch_lock):
+                    again = self.start_chained()
+                self.assertEqual(self.implement_runs(), runs)
+                self.assertEqual((again["run_id"], again["already_started"]), (created, True))
+                self.assertEqual(sorted(again["existing_changes"]["paths"]),
+                                 sorted([publication["path"], publication["approval_path"]]))
+                if first:
+                    self.assertEqual(again["existing_changes"], first["existing_changes"])
+                self.assertEqual(self.bound_run(), created)
+                self.assertIsNone(self.pending())
+                WORKFLOWS["implement"].engine(self.project, host="claude").cancel(created, self.session, "test")
+                self.hook(self.event(prompt="next"))
+
+    def test_calling_again_after_another_conversation_resumed_the_plan_run(self):
+        self.ended()
+        self.interrupted("binding")
+        created = self.implement_runs()[-1]
+        self.resume("another-conversation")
+        self.assertEqual(self.start_chained()["run_id"], created)
+
+    def test_a_start_stopped_before_creation_is_pending_until_the_next_prompt(self):
+        self.ended()
+        self.interrupted("creation")
+        self.assertRefused("already pending")
+        # Implement doctor reports the settings the chained start uses, not the flow command's Plan options.
+        out = io.StringIO()
+        with patch("devflow_core.implement.commands.readiness", return_value={"id": "x", "ready": True}), \
+                redirect_stdout(out):
+            code = cli.main(["--host", "claude", "--project", str(self.project), "--session", self.session,
+                             "implement", "doctor"])
+        self.assertEqual(code, 0, out.getvalue())
+        report = json.loads(out.getvalue())
+        self.assertEqual((report["configuration_source"], report["config"]["max_reviews"]), ("project_settings", 6))
+        self.hook(self.event(prompt="next"))
+        self.assertIsNone(self.pending())
+        self.assertEqual(self.implement_runs(), [])
+
+    def test_calling_again_while_bound_to_another_run_names_the_chained_run(self):
+        self.ended()
+        self.interrupted("binding")
+        created = self.implement_runs()[-1]
+        # The next prompt would bind the created run; here the binding was lost and another run started.
+        sessions.write_record(self.project, sessions.empty_record(self.session, "claude"), WORKFLOWS)
+        self.hook(self.event(prompt="/devflow:plan another plan"))
+        self.assertRefused(f"already chained to Implement run {created}, but this conversation is bound")
+
+    def test_only_the_plan_events_from_the_last_prompt_on_are_read(self):
+        self.ended()
+        store = RunStore(self.project, WORKFLOWS["plan"], host="claude")
+        kinds = [event["kind"] for event in store.events(store.read(self.run_id))]
+        tail = len(kinds) - max(index for index, kind in enumerate(kinds) if kind == "prompt")
+        self.assertGreater(len(kinds), tail)
+        original, reads = RunStore.record, []
+
+        def counted(store, state, relative, **kwargs):
+            if relative.startswith("events/"):
+                reads.append(relative)
+            return original(store, state, relative, **kwargs)
+
+        with patch.object(RunStore, "record", counted):
+            self.assertEqual(self.start_chained()["status"], "implementing")
+        self.assertEqual(len(reads), tail)
+
+    def test_a_human_prompt_during_the_plan_event_read_cancels_the_chained_start(self):
+        self.ended()
+        original_read, original_prepared = runtime._last_prompt, runtime._prepared
+        prompt = threading.Thread(target=lambda: self.hook(self.event(prompt="Actually, wait.")))
+
+        def read_while_the_human_types(*args, **kwargs):
+            prompt.start()  # Its hook waits for the dispatch lock this read runs under.
+            return original_read(*args, **kwargs)
+
+        def prepare_after_the_prompt(*args, **kwargs):
+            prompt.join(10)
+            return original_prepared(*args, **kwargs)
+
+        with patch.object(runtime, "_last_prompt", side_effect=read_while_the_human_types), \
+                patch.object(runtime, "_prepared", side_effect=prepare_after_the_prompt):
+            self.assertRefused("superseded")
+        self.assertIsNone(self.pending())
+
+    def test_a_plan_event_committed_after_the_read_refuses(self):
+        self.ended()
+        original, calls = runtime.resolve_run, []
+
+        def with_an_added_event(*args, **kwargs):
+            flow, info = original(*args, **kwargs)
+            calls.append(flow)
+            if len(calls) > 1:  # The final check under the locks.
+                state = {**info.state, "event_ids": [*info.state["event_ids"], "e" * 32],
+                         "artifacts": {**info.state["artifacts"], f"events/{'e' * 32}.json": "0" * 64}}
+                info = dataclasses.replace(info, state=state)
+            return flow, info
+
+        with patch.object(runtime, "resolve_run", side_effect=with_an_added_event):
+            self.assertRefused("events changed during the start")
+
+    def test_two_concurrent_calls_create_one_run(self):
+        self.ended()
+        entered, release, results = threading.Event(), threading.Event(), {}
+        original = runtime._commit
+
+        def held_commit(*args, **kwargs):
+            if threading.current_thread().name == "first":
+                entered.set()
+                self.assertTrue(release.wait(10))
+            return original(*args, **kwargs)
+
+        def call(name):
+            try:
+                results[name] = self.start_chained()
+            except Exception as exc:  # noqa: BLE001 - examined below
+                results[name] = exc
+
+        with patch.object(runtime, "_commit", side_effect=held_commit):
+            first = threading.Thread(target=call, args=("first",), name="first")
+            first.start()
+            self.assertTrue(entered.wait(10))
+            second = threading.Thread(target=call, args=("second",), name="second")
+            second.start()
+            second.join(0.3)
+            self.assertTrue(second.is_alive())  # Waiting for the dispatch lock.
+            release.set()
+            first.join(10)
+            second.join(10)
+        self.assertEqual(results["first"]["status"], "implementing")
+        self.assertEqual((results["second"]["run_id"], results["second"]["already_started"]),
+                         (results["first"]["run_id"], True))
+        self.assertEqual(len([run for run in self.implement_runs() if run.endswith("c23456abcdef") is False]), 1)
+        self.assertIsNone(self.pending())
 
 if __name__ == "__main__":
     unittest.main()

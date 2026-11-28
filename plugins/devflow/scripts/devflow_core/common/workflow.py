@@ -72,6 +72,9 @@ class Workflow:
     #: Runner option of the ``start`` action that must match the pending
     #: request; ``None`` when the run is created inside the prompt hook.
     start_option: str | None = None
+    #: ``start`` option, exclusive with ``start_option``, that chains the run from a
+    #: finished flow Plan run instead of the user's pending command (``None``: no chaining).
+    from_plan_option: str | None = None
     #: Further ``start`` options, chosen by Claude rather than the user's
     #: command; never compared with the pending request.
     extra_start_options: tuple[Option, ...] = ()
@@ -112,6 +115,10 @@ class Workflow:
         """Values of ``extra_start_options`` from parsed runner arguments (absent ones are None)."""
         return {option_name(option.flag): getattr(args, option_name(option.flag), None)
                 for option in self.extra_start_options}
+
+    def start_fields(self, store: Any, state: dict) -> dict:
+        """Facts added to the result of starting this new run (optional)."""
+        return {}
 
     def workspace(self, state: dict) -> str:
         """The workspace path an unfinished run occupies (only when ``occupies_workspace``)."""
@@ -191,7 +198,12 @@ class Workflow:
                     parser.add_argument(option.flag, type=kind, required=option.required)
         if self.start_option:
             start = parsers.add_parser("start", help="Create the run requested by the user's pending command")
-            start.add_argument(self.start_option, dest="start_value", required=True)
+            if self.from_plan_option:
+                source = start.add_mutually_exclusive_group(required=True)
+                source.add_argument(self.start_option, dest="start_value")
+                source.add_argument(self.from_plan_option, dest="from_plan")
+            else:
+                start.add_argument(self.start_option, dest="start_value", required=True)
             for option in self.extra_start_options:
                 start.add_argument(option.flag, dest=option_name(option.flag), required=option.required)
 

@@ -1,4 +1,4 @@
-# DevFlow 0.13.0 の検証範囲
+# DevFlow 0.14.0 の検証範囲
 
 ## 再実行方法
 
@@ -2319,3 +2319,136 @@ Claude（この実装のホスト）が tmux の上で各ホストの対話の�
   v0.12.15 と devin-playbooks）と `trusted_workspaces.json` は変わっていません。
 - Claude Code のセッションの記録（`~/.claude/projects/-tmp-devflow-verify-limit-auto-0-13-0-*` の
   10 個）と、`~/.claude.json` にある 10 個の検証用フォルダーの信頼の記録は残しています。
+
+## 0.14.0 の検証（2026-11-28）
+
+0.14.0 は、Plan から Implement まで同じ会話で続ける `/devflow:flow`（Codex は `$devflow:flow`）と、
+そのつなぎ開始 `implement start --from-plan PLAN_RUN_ID` を加えました。あわせて、Implement の開始で
+作業ツリーにあった変更を質問で止めずに `existing_changes` の警告として伝える形にし、`allow_dirty` を
+廃止しました。また、自動で続けてよい回数を使い切った上限で、設定が受け入れて終える
+`review_limit_auto_final`（`ask`・`accept`。既定は `ask`）を加えました。
+
+自動テスト（1290 件、skip 2 件）と配布物の検査（`python tools/package.py --validate-only`）を
+通しました。実装は DevFlow の Implement の run `20261127T165833Z-f3802f14c087` で行いました。
+
+### 実機の確かめ
+
+Linux / WSL2 で、devflow の外の `/tmp/devflow-verify-flow-0.14.0`（所有者だけが使える）に、
+使い捨ての Git のプロジェクトを場面とホストごとに作りました。中身は 0.13.0 の検証と同じです
+（`textstats.py`、`test_textstats.py`、偽のレビュアー 2 つ `a`・`b`）。偽のレビュアーは場面ごとに
+決めた指摘を返します。Plan の上限は `/devflow:flow --max-reviews 2 -- …` の起動オプション、Implement の
+上限は設定ファイルの `implement.max_reviews: 2` です。人間役は、Claude（この実装のホスト）が tmux の
+上で各ホストの対話の画面を操作して務めました。
+
+ホストに作業ツリーのプラグイン（0.14.0）を読み込ませた方法は、0.13.0 の検証と同じです。
+
+- Claude Code 2.1.332（Opus 5.5、high）：`--plugin-dir` と、入れてある devflow を止める
+  `--settings`。
+- Codex CLI 0.172.0（GPT-6.2-Sol、high）：検証用の `CODEX_HOME` に作業ツリーから 0.14.0 を
+  入れた。ホストが呼んだランナーのパスが `.../devflow/0.14.0/` だったことで版を確かめた。
+- Devin CLI 3000.15.14（SWE-2 High）：検証用の `XDG_DATA_HOME` に
+  `devin plugins install --local -y <作業ツリー>/plugins/devflow`（`devin plugins list` は
+  `devflow v0.14.0` と `devin-playbooks`）。
+
+場面の設定と確かめることは、プランの 7 節のとおりです（A：続けて進む、B：開始時の警告と上限の
+前置き、C：つながない、D：使い切った後の自動の受け入れ）。
+
+| 場面 | Claude Code | Codex | Devin |
+|---|---|---|---|
+| A（`continue_accept`、チェックあり、1 回目 medium・2 回目承認） | Plan `20261127T172821Z-ae12d2be858c`・Implement `20261127T173217Z-3a1df58496f9`、どちらも `auto_accepted` | Plan `20261127T172839Z-62cd5788e6f5`・Implement `20261127T173227Z-ca778e9101d6`、同じ | Plan `20261127T172822Z-3a052603dd71`・Implement `20261127T173252Z-6bcbcafb0c9c`、同じ |
+| B（Plan `ask`、チェックなし、毎回 medium） | Plan `20261127T173741Z-ca207055fe00`・Implement `20261127T174323Z-315705b5f39c`、どちらも `accepted`（下の注） | Plan `20261127T173742Z-7853d24950cd`・Implement `20261127T174234Z-1c2279b7bc77`、どちらも `accepted` | Plan `20261127T173741Z-618a271f5172`・Implement `20261127T174324Z-360ec378309c`、どちらも `accepted` |
+| B4（Codex だけ。インタビューの途中にふつうのチャット） | — | Plan `20261127T180131Z-ddcfff8f9252`・Implement `20261127T180501Z-324a587440d4`、どちらも `accepted` | — |
+| C1（上限で stop） | `20261127T181620Z-5b46ead82e4c` `exhausted` | `20261127T181844Z-dedb2a716cb8` `exhausted` | `20261127T181936Z-8a6b29766517` `exhausted` |
+| C2（`/devflow:plan` の run からつながせる） | `20261127T183243Z-3626c2a20ee3` `accepted`、つなぎ開始は断られた | `20261127T183244Z-453bcd6dd2c7` 同じ | `20261127T183245Z-16b6d74ca132` 同じ |
+| C3（公開が無効） | `20261127T181726Z-1a674158ec90` `accepted`、つながない | `20261127T181856Z-508a4023abbd` 同じ | `20261127T181937Z-bb4b766bcbc9` 同じ |
+| C4（人間の答えがプランにない終わり方） | 作れなかった（下の注） | 同じ | 同じ |
+| D（`review_limit_auto_final: "accept"`、毎回同じ high） | Plan `20261127T184030Z-c4397b3d0d5b`・Implement `20261127T185348Z-879329f0e2be`、どちらも `auto_accepted`（上限 2 → 4） | Plan `20261127T184149Z-034f5b91c08a`・Implement `20261127T184634Z-c4dadde17da9`、同じ | Plan `20261127T184223Z-07566bfd556e`・Implement `20261127T184636Z-db9b636eeaf2`、同じ |
+| D5（`review_limit_auto_final: "ask"`、Plan だけ） | `20261127T184135Z-77319b340a26`、4 回目の後に質問、stop で `exhausted` | `20261127T184202Z-c201a467b7f9` 同じ | `20261127T184225Z-379e63feb0d2` 同じ |
+| D6（D の設定で、インタビューで「受け入れて終えるかは自分で決める」、Plan だけ） | `20261127T185930Z-9af50cbe4322`、4 回目の後に質問、stop で `exhausted` | `20261127T185944Z-6e3d04ecae59` 同じ | `20261127T185959Z-cd4627ed6f2c` 同じ |
+
+- A：3 つのホストとも、インタビューの答えのほかに人間の入力なしに、Plan が `auto_accepted`
+  （公開の根拠は `config_recommendation`）で終わって公開し、同じ会話で Implement につながって
+  `auto_accepted` で終わりました。Implement の `request.json` の `intent` は `start_from_plan` です。
+  会話の記録で、つなぐ前に `references/implement-workflow.md` とそのホストの implement スキルを読み、
+  その後に `implement start --from-plan` を呼んだ順序を確かめました。既存の変更の質問は出ず、
+  `existing_changes` は公開したプランと承認記録の 2 ファイルで、要約に `Chained from Plan run …` と
+  `Existing changes at start: 2 …` の行がありました。
+- 開始の警告の表示：Codex と Devin は `existing_changes` の警告と `flow_warnings` をそのまま
+  画面に出しました。Claude Code は、どちらも内容を言い換えて出しました（例：「作業ツリーに計画
+  ファイル 2 件の未コミット変更があるが、ベースラインの一部なので触れない」）。ファイル名と
+  「レビューの対象にならない」は省くことがありました。Claude Code のこれらの文は会話の記録では
+  考え（thinking）のブロックですが、画面には `●` のメッセージとして出ていました（tmux の画面で
+  確かめました）。ファイル名を含む全文は、要約の `Existing changes at start` の行で人間が読めます。
+  手引きの「in visible text」を、上限の前置きで使っている「in the visible text of a message you send
+  before …」の書き方に変えて Claude Code の B をやり直しました（B2：Plan `20261127T180954Z-1b9b556e3815`、
+  Implement `20261127T181405Z-73bb2d31d001`）。出し方は変わらなかったので、手引きは元に戻しました。
+- B：3 つのホストとも、開始時に `flow_warnings`（チェックがない、Plan と Implement の上限は人間を
+  待つ）を伝え、Plan の上限の質問の前に「受け入れて終えると、公開と照合が通ればそのまま
+  Implement に進む」ことを一文で伝えました。質問の文と選択肢は変わりませんでした。人間役が受け入れて
+  終えると、公開してつながりました。つないだ Implement の checkpoint ごとに手動検証の質問
+  （`manual_validation`）が開き、ネイティブの質問ツール（Claude `AskUserQuestion`、Codex
+  `request_user_input`、Devin `ask_user_question`。Devin は選択肢の既定が取り消しだったので、
+  人間役は「Other」に検証の内容を書いた）で答えると、`human_events` の答えとして記録され、
+  `resolve` で続きました。
+- B の注：Claude Code の Implement では、検証の道具の判定の誤りで、人間役が上限の質問に既定の
+  continue を 5 回答えました（上限 2 → 12）。最後に受け入れて終えました。ホストとランナーの動きは
+  どの上限でも同じでした。
+- B4：Codex で、インタビューの最初の質問を中断し、ふつうのチャットで補足を送ってターンを切り
+  替えました。ホストはインタビューを続けて、答えをネイティブの質問ツールで得ました。B と同じく
+  受け入れて終えるとつながり、手動検証の 3 つの答えと上限の答えが `human_events` の答えとして
+  記録されました。
+- C1：3 つのホストとも、stop で `exhausted` になり、つながず、実装のコマンドも案内しませんでした。
+- C2：C1 と同じ会話で `/devflow:plan` を受け入れて終え、公開したあと、人間役がチャットで
+  「`implement start --from-plan <その run>` を呼んで」と頼みました。3 つのホストとも呼び、ランナーが
+  「/devflow:flow で始めた run ではない」として断りました。ホストは手で入力する
+  `/devflow:implement <公開したプランのパス>` を案内しました。
+- C3：3 つのホストとも、開始時の警告に公開が無効の文があり、上限の質問の前の文は「受け入れても
+  Plan で止まり、Implement には進まない」でした。受け入れて終えるとつながず、内部の最終プラン
+  （`plans/plan-v000.md`）のパスで手で始める実装のコマンドだけを案内しました。
+- C4 は作れませんでした。偽のレビュアーの指摘は「公開する関数の名前を `count_words` のままに
+  するか `count_tokens` に変えるかは人間の選択」でしたが、3 つのホストとも人間に聞かず、依頼文が
+  `count_words` を直すと言っていることを根拠に名前は変えないと決め、プランの本文に書きました。
+  答えがプランにあるので、受け入れて終えると Implement につながりました（どれも `completed`）。
+  つながない条件はホストの判断の決まりで、偽の指摘では起こせませんでした。
+- D：3 つのホストとも、Plan が上限 2 で自動で続け（記録 1、`2 -> 4`）、4 回目の後に「続ける」を
+  勧めて `limit-auto --decision continue` を呼び、`review_limit_auto_final` が受け入れて
+  `auto_accepted` で終わりました。記録 2（`schema_version` 2、`recommended: "continue"`、
+  `review_limit_auto_final: "accept"`）、承認記録の `Approval: config_final` と
+  `Critical/high in the latest succeeded reviews: a (review 3: A3-1 high), b (review 4: B4-1 high)`
+  を確かめました。つないだ Implement も同じ流れで `auto_accepted` になり、保存したレポートの警告に
+  残った high がありました。Codex と Devin は 4.10 の一文（設定が受け入れた、おすすめは「続ける」、
+  残った high のレビュアーと回）を自分の文で伝えました。Claude Code は「設定が受け入れた、おすすめは
+  続ける」を自分の文で伝え、レビュアーと回は、そのまま見せた要約の `- Auto-accepted …` の行で
+  示しました。
+- D5：3 つのホストとも、4 回目の後に、ランナーが自動で続けるのを断った理由（新しい上限が自動で
+  続けてよい回数を超える）を一文で伝えてから、上限の質問を出しました。
+- D6：3 つのホストとも、上限 2 では自動で続け、4 回目の後は `limit-auto` を呼ばず（記録は 1 つだけ）、
+  「呼ぶと設定が受け入れて終えてしまい、受け入れて終えるかは自分で決めるという人間の決定に反する」
+  ことを一文で伝えて、上限の質問をそのまま出しました。
+- Claude Code は、インタビューの質問を `AskUserQuestion` ではなくふつうの文で書くことがあり
+  （C1・C3・D・D6）、人間役はチャットで答えました。ホストはその答えでインタビューを進めました。
+  これは 0.14.0 で変えていないインタビューの部分の動きです。
+
+### 確かめられなかったこと
+
+- C4（人間の答えがプランの本文に入っていない終わり方で、つながないこと）は、上の注のとおり
+  作れませんでした。ランナーの試験はなく、手引きの決まり（0.12.15 の Handoff）に頼っています。
+- Claude Code が `existing_changes` の警告と `flow_warnings` を、手引きのとおり「そのまま」出すことは
+  ありませんでした（内容の言い換えは出ました）。
+- 長い会話の要約の後にホストが手引きを読み直すかは、要約が起きる長さの run を動かしていないので
+  確かめていません。
+
+### 片付け
+
+- 43 の run のうち 42 は終わっていました（`auto_accepted` 12 件、`accepted` 18 件、`completed` 3 件、
+  `exhausted` 9 件。B2 の Implement の 1 件は手動検証の質問で止めたまま、プロジェクトごと消しました）。
+- 各ホストのセッションを終えたあと、偽のレビュアーとチェックの子プロセスが残っていないことを
+  `ps` で確かめました。検証用の `CODEX_HOME` から起動していた Codex の app-server のプロセス
+  （2 つ）を止めました。
+- `/tmp/devflow-verify-flow-0.14.0`（使い捨てのプロジェクト、偽のレビュアー、検証用の
+  `CODEX_HOME` と写した `auth.json`、Devin の検証用のデータディレクトリと写した
+  `credentials.toml`）を消しました。
+- Devin は検証用のデータディレクトリだけを使ったので、利用者の `devin plugins list`（devflow
+  v0.13.0 と devin-playbooks）と `trusted_workspaces.json` は変わっていません。
+- Claude Code のセッションの記録（`~/.claude/projects/-tmp-devflow-verify-flow-0-14-0-*` の
+  9 個）と、`~/.claude.json` にある 9 個の検証用フォルダーの信頼の記録は残しています。

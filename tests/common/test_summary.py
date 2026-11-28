@@ -176,6 +176,42 @@ class RenderTests(unittest.TestCase):
             "    Host's recommendation:\n"
             "    > Accept.\n"))
 
+    def test_an_accept_by_review_limit_auto_final_renders_its_setting_and_serious_findings(self):
+        record = "limit-auto/0123456789abcdef0123456789abcdef-accept.json"
+        reviews = [review(7, "codex", findings=[finding("F2", "medium"), finding("F3", "high"),
+                                                finding("F5", "critical")]),
+                   review(8, "opencode", findings=[finding("F2", "high", action="reject")])]
+        text = self.render(status="auto_accepted", reviews=reviews, auto_acceptance={
+            "record": record, "source": "review_limit_auto", "version": "hash9",
+            "accepted_at": "2026-11-05T03:05:44+00:00", "version_reviewed": True, "recommendation": "Continue.",
+            "recommended": "continue", "extra_reviews": 6}, automatic_decisions=[
+                {"at": "2026-11-05T03:05:44+00:00", "review_number": 8, "decision": "accept",
+                 "setting": "continue_accept", "review_limit_before": 8, "review_limit_after": 8,
+                 "recommendation": "Continue.", "record": record, "recommended": "continue", "extra_reviews": 6}])
+        serious = "codex (review 7: F3 high, F5 critical), opencode (review 8: F2 high)"
+        self.assertIn("- Status: auto_accepted — accepted at the review limit by the run's review_limit_auto_final "
+                      "setting because another round would exceed review_limit_auto_extra_reviews 6, not approved by "
+                      "every reviewer\n", text)
+        self.assertIn("- Auto-accepted by the review_limit_auto_final setting because another round would exceed "
+                      "review_limit_auto_extra_reviews 6; the host recommended continue; critical/high in the latest "
+                      f"succeeded reviews: {serious} (record: {record}; accepted version reviewed)\n", text)
+        # The same reviewers as the serious findings line.
+        self.assertIn("- Latest succeeded review with critical/high: codex (review 7), opencode (review 8); ", text)
+        self.assertTrue(text.endswith(
+            "- Automatic decisions (review_limit_auto, not human answers):\n"
+            "  - After 8 reviews, review_budget: accept by setting continue_accept with review_limit_auto_final "
+            "accept (another round would exceed review_limit_auto_extra_reviews 6; the host recommended continue) "
+            "(2026-11-05T03:05:44+00:00)\n"
+            "    Host's recommendation:\n"
+            "    > Continue.\n"))
+        # Without critical/high the list reads none.
+        text = self.render(status="auto_accepted", reviews=[review(8, "opencode", findings=[finding("F1")])],
+                           auto_acceptance={"record": record, "source": "review_limit_auto", "version": "hash9",
+                                            "accepted_at": "2026-11-05T03:05:44+00:00", "version_reviewed": False,
+                                            "recommendation": "Accept.", "recommended": "accept", "extra_reviews": 2})
+        self.assertIn("review_limit_auto_extra_reviews 2; the host recommended accept; critical/high in the latest "
+                      f"succeeded reviews: none (record: {record}; accepted version not reviewed)\n", text)
+
     def test_the_serious_findings_line(self):
         data = summary.build(source([review(1, "codex", findings=[finding("F1", "high", action="reject")]),
                                      review(2, "opencode", status="failed", error="timed out")]), "now")
@@ -208,6 +244,23 @@ class RenderTests(unittest.TestCase):
             "- Latest succeeded review with critical/high: codex (review 1); never succeeded: opencode",
             "- Human decisions:",
             "  - After 2 reviews, review_budget: accept (2026-11-05T03:05:44+00:00)"]) + "\n")
+
+    def test_a_chained_run_and_its_existing_changes_follow_the_status(self):
+        chained = {"plan_run_id": "20261104T000000Z-111111111111", "plan_path": "docs/_plans_/X.md",
+                   "plan_hash": "ab" * 32}
+        lines = self.render(flow="implement", chained_from=chained,
+                            existing_changes=["`a.py`", "`old.txt` -> `new.txt`"]).splitlines()
+        self.assertEqual(lines[3:5], [
+            f"- Chained from Plan run 20261104T000000Z-111111111111 by flow (published plan `docs/_plans_/X.md`, "
+            f"SHA-256 {'ab' * 32})",
+            "- Existing changes at start: 2 touching the snapshot scope (part of the baseline, not reviewed): "
+            "`a.py`, `old.txt` -> `new.txt`"])
+        for empty in (None, []):
+            with self.subTest(empty=empty):
+                text = self.render(flow="implement", chained_from=None, existing_changes=empty)
+                self.assertNotIn("Chained from", text)
+                self.assertNotIn("Existing changes", text)
+        self.assertEqual(self.render(), self.render(chained_from=None, existing_changes=None))
 
     def test_what_stays_in_the_data(self):
         text = self.render(status="accepted", human_acceptance={

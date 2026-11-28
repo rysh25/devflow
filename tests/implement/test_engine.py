@@ -2173,17 +2173,21 @@ class DirtyGitProjectTests(EngineFixture):
         self.source.write_text("VALUE = 41  # Existing user edit\n", encoding="utf-8")
         (self.project / "user-notes.txt").write_text("Do not discard my work.\n", encoding="utf-8")
 
-    def test_existing_dirty_tree_is_retained_and_requires_acknowledgment(self):
+    def test_existing_dirty_tree_is_retained_and_reported_without_a_question(self):
         self.initialize_git()
         previous_head = self.git("rev-parse", "HEAD").strip()
         original = self.source.read_bytes()
         result = self.start()
-        self.assertEqual(result["status"], "awaiting_human")
-        self.assertEqual(result["escalation"]["detail"]["kind"], "dirty_worktree")
-        # Asked before any review (0.7.2: every question records the number of reviews).
-        self.assertEqual(result["escalation"]["detail"]["review_number"], 0)
-        self.assertEqual(result["escalation"]["boundary"], 1)
-        self.assertEqual(result["escalation"]["session_id"], self.session)
+        self.assertEqual(result["status"], "implementing")
+        self.assertEqual((result["escalation"], result["escalations"]), (None, []))
+        changes = result["existing_changes"]
+        self.assertIn("module.py", changes["paths"])
+        self.assertIn("user-notes.txt", changes["paths"])
+        self.assertEqual(changes["count"], len(changes["paths"]))
+        self.assertIn(f"The workspace had {changes['count']} uncommitted changes touching the snapshot scope at "
+                      "start: ", changes["warning"])
+        self.assertIn("`module.py`", changes["warning"])
+        self.assertIn("DevFlow never discards or commits them.", changes["warning"])
         baseline = read_json(self.run / "baseline.json")
         self.assertTrue(baseline["git"]["dirty"])
         # The edit made before the run is kept once, as a copy; the record holds no contents.
@@ -2192,13 +2196,46 @@ class DirtyGitProjectTests(EngineFixture):
         self.assertEqual((self.run / copy).read_bytes(), original)
         self.assertNotIn(original.decode("utf-8").strip(), (self.run / "baseline.json").read_text(encoding="utf-8"))
         self.assertEqual(self.source.read_bytes(), original)
-        event = self.answer("Preserve the existing edits and use them as the implementation baseline.")
-        result = self.engine.resolve(self.run_id, self.session, event, "continue", "The user acknowledged the dirty baseline.")
-        self.assertEqual(result["status"], "implementing")
-        self.assertEqual(self.source.read_bytes(), original)
         self.assertEqual((self.project / "user-notes.txt").read_text(encoding="utf-8"), "Do not discard my work.\n")
         self.assertEqual(self.git("rev-parse", "HEAD").strip(), previous_head)
         self.assertEqual(self.git("diff", "--cached", "--name-only"), "")
+
+    def test_a_files_mode_start_reports_no_existing_changes(self):
+        self.assertEqual(self.config["snapshot"]["mode"], "files")
+        result = self.start()
+        self.assertEqual(result["status"], "implementing")
+        self.assertNotIn("existing_changes", result)
+
+    def test_an_old_run_waiting_on_the_dirty_worktree_question_still_resolves(self):
+        """A run as 0.13.0's build_start left it at its dirty_worktree question (plan test 6)."""
+        self.initialize_git()
+        workflow = WORKFLOWS["implement"]
+        original = workflow.build_start
+
+        def build_start_0_13_0(*args, **kwargs):
+            fields, artifacts = original(*args, **kwargs)
+            config = dict(fields["config"], allow_dirty=False)
+            escalation = {"id": "E001", "reason": "Existing changes require explicit acknowledgement",
+                          "questions": ["The worktree has existing changes. Preserve them and continue from "
+                                        "this captured baseline?"],
+                          "return_status": "implementing",
+                          "detail": {"kind": "dirty_worktree", "snapshot_id": None, "review_number": 0}}
+            artifacts.update({"config.json": json_bytes(config), "escalations/001.json": json_bytes(
+                {**escalation, "boundary": 1, "created_at": "2026-11-27T00:00:00+00:00"})})
+            fields.update(config=config, status="awaiting_human", escalation=escalation,
+                          escalations=["escalations/001.json"])
+            return fields, artifacts
+
+        with patch.object(workflow, "build_start", side_effect=build_start_0_13_0):
+            result = self.start()
+        self.assertEqual((result["status"], result["escalation"]["detail"]["kind"]),
+                         ("awaiting_human", "dirty_worktree"))
+        self.assertFalse(self.engine.status(self.run_id)["config"]["allow_dirty"])
+        event = self.answer("Preserve the existing edits and use them as the implementation baseline.")
+        self.assertEqual([item["event_id"] for item in self.engine.status(self.run_id)["human_events"]], [event])
+        result = self.engine.resolve(self.run_id, self.session, event, "continue",
+                                     "The user acknowledged the dirty baseline.")
+        self.assertEqual(result["status"], "implementing")
 
     def clean_git(self, **files):
         """A clean committed repository holding module.py and ``files``."""
@@ -2234,16 +2271,6 @@ class DirtyGitProjectTests(EngineFixture):
         large = [path.relative_to(self.run).as_posix() for path in self.run.rglob("*")
                  if path.is_file() and path.stat().st_size > 1_000_000]
         self.assertEqual(large, ["snapshots/001.diff"])
-
-    def test_explicit_allow_dirty_keeps_same_baseline_without_question(self):
-        self.config["allow_dirty"] = True
-        self.initialize_git()
-        original = self.source.read_bytes()
-        result = self.start()
-        self.assertEqual(result["status"], "implementing")
-        self.assertEqual(result["escalations"], [])
-        self.assertIsNone(result["escalation"])
-        self.assertEqual(self.source.read_bytes(), original)
 
     def test_an_interrupt_wrapped_by_post_check_git_cleanup_stays_in_checking(self):
         self.clean_git()

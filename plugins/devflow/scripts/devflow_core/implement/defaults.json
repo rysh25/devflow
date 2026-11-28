@@ -3,9 +3,9 @@
   "max_reviews": 6,
   "review_limit_auto": "ask",
   "review_limit_auto_extra_reviews": 6,
+  "review_limit_auto_final": "ask",
   "max_check_attempts": 3,
   "max_plan_bytes": 1048576,
-  "allow_dirty": false,
   "snapshot": {
     "mode": "git",
     "include": ["**"],

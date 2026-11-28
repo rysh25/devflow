@@ -55,11 +55,11 @@ class DowngradeTests(RuntimeFixture):
         del state['owner_host']
         # A simulated 0.7.3 run carries only the settings a 0.7.3 runner could
         # freeze: the newer review_limit_auto keys go from both copies.
-        for key in ('review_limit_auto','review_limit_auto_extra_reviews'):
+        for key in ('review_limit_auto','review_limit_auto_extra_reviews','review_limit_auto_final'):
             state['config'].pop(key,None)
         atomic_json(self.run_dir('plan',run)/'state.json',state)
         config=read_json(self.run_dir('plan',run)/'config.json')
-        for key in ('review_limit_auto','review_limit_auto_extra_reviews'):
+        for key in ('review_limit_auto','review_limit_auto_extra_reviews','review_limit_auto_final'):
             config.pop(key,None)
         atomic_json(self.run_dir('plan',run)/'config.json',config)
         code,result=self.run_old('--run',run,'plan','doctor')

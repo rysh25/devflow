@@ -17,12 +17,15 @@ REVIEWER_KINDS = frozenset({"codex", "opencode", "claude", "devin"})
 REVIEWER_FIELDS = frozenset({"id", "kind", "command", "model", "effort", "timeout_seconds"})
 REVIEWER_REQUIRED = REVIEWER_FIELDS
 CONFIG_FILES = ("devflow.config.json", "devflow.config.local.json")
-SHARED_SETTINGS = ("reviewers", "max_reviews", "review_limit_auto", "review_limit_auto_extra_reviews")
+SHARED_SETTINGS = ("reviewers", "max_reviews", "review_limit_auto", "review_limit_auto_extra_reviews",
+                   "review_limit_auto_final")
 #: Settings that no longer exist, with the guidance their error gives.
 REMOVED_SETTINGS = {
     "auto_accept_at_review_limit": ("auto_accept_at_review_limit was removed in DevFlow 0.13.0; use review_limit_auto "
                                     '("continue_accept" continues and accepts at the review limit following the '
                                     "host's recommendation; see the README update notes)"),
+    "allow_dirty": ("allow_dirty was removed in DevFlow 0.14.0; Implement no longer asks about existing changes "
+                    "and shows them as a warning and in the review summary instead (see the README update notes)"),
 }
 HOSTS_KEY = "hosts"
 

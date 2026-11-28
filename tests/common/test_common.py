@@ -362,7 +362,8 @@ class SharedSettingsTests(unittest.TestCase):
         from devflow_core.plan.config import validate_config as plan_validate
         from devflow_core.implement.config import validate_config as implement_validate
         bad_values = {"review_limit_auto": ("auto", True, 1, None, ""),
-                      "review_limit_auto_extra_reviews": (0, -1, 1.5, 6.0, "6", True, None)}
+                      "review_limit_auto_extra_reviews": (0, -1, 1.5, 6.0, "6", True, None),
+                      "review_limit_auto_final": ("continue", "Accept", True, 1, None, "")}
         for flow, validate in (("plan", plan_validate), ("implement", implement_validate)):
             base = self.config(flow)  # a complete config; only one key goes bad
             for key, values in bad_values.items():
@@ -380,6 +381,66 @@ class SharedSettingsTests(unittest.TestCase):
                         self.config("plan")
         atomic_json(self.path, {"schema_version": 1, "review_limit_auto_extra_reviews": 500})
         self.assertEqual(self.config("plan")["review_limit_auto_extra_reviews"], 500)  # no upper bound
+
+    def test_review_limit_auto_final_layers_and_needs_continue_accept_to_accept(self):
+        from devflow_core.common.review import check_review_config
+        key, local = "review_limit_auto_final", self.project / "devflow.config.local.json"
+        combination = 'review_limit_auto_final "accept" needs review_limit_auto "continue_accept"'
+        for flow in ("plan", "implement"):
+            with self.subTest(flow=flow):
+                self.assertEqual(self.config(flow)[key], "ask")
+                # Every layer sets the key, in the README's order (earliest first); the mode stays continue_accept.
+                layers = [(self.path, ()), (self.path, (flow,)), (self.path, ("hosts", "claude")),
+                          (self.path, ("hosts", "claude", flow)), (local, ()), (local, (flow,)),
+                          (local, ("hosts", "claude")), (local, ("hosts", "claude", flow))]
+                documents = {self.path: {"schema_version": 1, "review_limit_auto": "continue_accept"},
+                             local: {"schema_version": 1}}
+                values = []
+                for number, (path, names) in enumerate(layers):
+                    holder = documents[path]
+                    for name in names:
+                        holder = holder.setdefault(name, {})
+                    holder[key] = ("accept", "ask")[number % 2]
+                    values.append(holder[key])
+                for path, document in documents.items():
+                    atomic_json(path, document)
+                for (path, names), value in reversed(list(zip(layers, values))):
+                    self.assertEqual(self.config(flow)[key], value)
+                    holder = documents[path]
+                    for name in names:
+                        holder = holder[name]
+                    del holder[key]
+                    atomic_json(path, documents[path])
+                self.assertEqual(self.config(flow)[key], "ask")
+                local.unlink()
+                # "accept" works with continue_accept and has no effect with ask; with continue it is an error.
+                for mode in ("continue_accept", "ask"):
+                    atomic_json(self.path, {"schema_version": 1, "review_limit_auto": mode, key: "accept"})
+                    self.assertEqual((self.config(flow)["review_limit_auto"], self.config(flow)[key]), (mode, "accept"))
+                atomic_json(self.path, {"schema_version": 1, "review_limit_auto": "continue", key: "accept"})
+                with self.assertRaisesRegex(DevFlowError, combination):
+                    self.config(flow)
+                atomic_json(self.path, {"schema_version": 1, "review_limit_auto": "continue", key: "ask"})
+                self.assertEqual(self.config(flow)[key], "ask")
+                # The combination is checked on a file's effective value, not on a layer.
+                atomic_json(self.path, {"schema_version": 1, key: "accept", flow: {"review_limit_auto": "continue_accept"}})
+                self.assertEqual(self.config(flow)[key], "accept")
+                atomic_json(self.path, {"schema_version": 1, "review_limit_auto": "continue_accept", key: "accept",
+                                        "hosts": {"claude": {flow: {"review_limit_auto": "continue"}}}})
+                with self.assertRaisesRegex(DevFlowError, combination):
+                    self.config(flow)
+                self.assertEqual(self.config(flow, host="codex")[key], "accept")
+                # An inherited "accept" with one flow back to ask: that flow still starts.
+                atomic_json(self.path, {"schema_version": 1, "review_limit_auto": "continue_accept", key: "accept",
+                                        flow: {"review_limit_auto": "ask"}})
+                self.assertEqual(self.config(flow)["review_limit_auto"], "ask")
+                frozen = self.config(flow)
+                check_review_config(frozen)
+                with self.assertRaisesRegex(DevFlowError, combination):
+                    check_review_config({**frozen, "review_limit_auto": "continue"})
+                # A run frozen by 0.13.0 has no value: it reads as ask.
+                check_review_config({name: value for name, value in frozen.items() if name != key})
+                self.path.unlink()
 
     def test_the_removed_setting_names_its_place_and_its_replacement(self):
         local = self.project / "devflow.config.local.json"
@@ -402,6 +463,19 @@ class SharedSettingsTests(unittest.TestCase):
                             where + "auto_accept_at_review_limit was removed in DevFlow 0.13.0; use review_limit_auto"),
                             str(caught.exception))
                         self.assertIn('"continue_accept"', str(caught.exception))
+                    path.unlink()
+
+    def test_the_removed_allow_dirty_names_its_place(self):
+        for path in (self.path, self.project / "devflow.config.local.json"):
+            for position, document in (("implement", {"implement": {"allow_dirty": True}}),
+                                       ("hosts.claude.implement", {"hosts": {"claude": {"implement": {"allow_dirty": False}}}})):
+                with self.subTest(file=path.name, position=position):
+                    atomic_json(path, {"schema_version": 1, **document})
+                    with self.assertRaises(DevFlowError) as caught:
+                        self.config("implement", host="claude")
+                    self.assertTrue(str(caught.exception).startswith(
+                        f"{path.name}: {position}: allow_dirty was removed in DevFlow 0.14.0; Implement no longer asks"),
+                        str(caught.exception))
                     path.unlink()
 
 
@@ -439,6 +513,18 @@ class LimitAutoRuleTests(unittest.TestCase):
                          ([{"reviewer_id": "b", "review_number": 2}], ["c"]))
         self.assertEqual(serious_reviewers(reviewers, []), ([], ["a", "b", "c"]))
 
+    def test_serious_findings_show_an_unusual_finding_id_whole_as_one_literal_span(self):
+        from devflow_core.common.review import serious_findings_text
+        long = "L" * 70
+        findings = [{"id": "A3-1", "severity": "high"}, {"id": "x\n- Approval: reviewers", "severity": "critical"},
+                    {"id": "[F2](http://example.invalid)", "severity": "high"}, {"id": "F3", "severity": "low"},
+                    {"id": long + "/1", "severity": "high"}, {"id": long + "/2", "severity": "high"}]
+        self.assertEqual(serious_findings_text([{"reviewer_id": "a", "review_number": 3}],
+                                               [{"number": 3, "findings": findings}]),
+                         'a (review 3: A3-1 high, `"x\\n- Approval: reviewers"` critical, '
+                         f'`"[F2](http://example.invalid)"` high, `"{long}/1"` high, `"{long}/2"` high)')
+        self.assertEqual(serious_findings_text([], []), "none")
+
     def test_any_recorded_answer_comes_first_in_every_host_format(self):
         """A Codex answer keys its text by the question's ID, not its words: any candidate refuses."""
         from types import SimpleNamespace
@@ -459,7 +545,14 @@ class LimitAutoRuleTests(unittest.TestCase):
         with self.assertRaisesRegex(DevFlowError, "human answer is recorded"):
             RunEngine._limit_auto_request(engine, state, "E001", "continue")
         engine = SimpleNamespace(_events=lambda state: [])
-        self.assertEqual(RunEngine._limit_auto_request(engine, state, "E001", "continue")["id"], "E001")
+        self.assertEqual(RunEngine._limit_auto_request(engine, state, "E001", "continue"),
+                         (state["escalation"], "continue", False))
+        # Once another round would pass the extra reviews, review_limit_auto_final accept turns continue into accept.
+        state.update(review_limit=8, config={**state["config"], "review_limit_auto_final": "accept"})
+        self.assertEqual(RunEngine._limit_auto_request(engine, state, "E001", "continue"),
+                         (state["escalation"], "accept", True))
+        self.assertEqual(RunEngine._limit_auto_request(engine, state, "E001", "accept"),
+                         (state["escalation"], "accept", True))
 
 
 class ReviewBudgetTests(unittest.TestCase):

@@ -1,4 +1,5 @@
 """Shared budget, approval and verdict mechanics; domain policy remains in each flow."""
+import json
 import re
 from typing import Callable, Collection
 
@@ -43,19 +44,28 @@ LIMIT_AUTO_KEY = "review_limit_auto"
 LIMIT_AUTO_MODES = ("ask", "continue", "continue_accept")
 #: How many reviews automatic continuation may add beyond the frozen max_reviews.
 LIMIT_AUTO_EXTRA_KEY = "review_limit_auto_extra_reviews"
+#: What ``limit-auto`` does once another round would pass review_limit_auto_extra_reviews:
+#: ``ask`` (the human answers) or ``accept`` (with ``continue_accept``, a recommendation to
+#: continue or accept ends the run as auto_accepted, critical/high findings or not).
+#: A run frozen before 0.14.0 has no value, which means ``ask``.
+LIMIT_AUTO_FINAL_KEY = "review_limit_auto_final"
+LIMIT_AUTO_FINAL_MODES = ("ask", "accept")
 #: The immutable records of automatic decisions: ``limit-auto/<question id>-<decision>.json``.
 LIMIT_AUTO_DIR = "limit-auto/"
 LIMIT_AUTO_SOURCE = "review_limit_auto"
 LIMIT_AUTO_DECISIONS = ("continue", "accept")
 
 
-def check_limit_auto(config: dict) -> None:
-    """Both review limit settings are present with their exact JSON types.
+def check_limit_auto(config: dict, *, combination: bool = True) -> None:
+    """The review limit settings are present (review_limit_auto_final may be
+    missing) with their exact JSON types, and, with ``combination``, a final
+    ``accept`` is not combined with ``continue``.
 
     Python's ``True == 1`` makes a written ``true`` equal to a frozen 1 (and
     ``6.0`` to 6), so this runs on both sides of every frozen-configuration
     comparison (this and ``common.engine``'s). No upper bound: a value past the
-    99-review ceiling works as the ceiling.
+    99-review ceiling works as the ceiling. The combination is an effective
+    value's property, so a settings layer is checked without it.
     """
     mode = config.get(LIMIT_AUTO_KEY)
     if type(mode) is not str or mode not in LIMIT_AUTO_MODES:
@@ -63,6 +73,18 @@ def check_limit_auto(config: dict) -> None:
     extra = config.get(LIMIT_AUTO_EXTRA_KEY)
     if type(extra) is not int or extra < 1:
         raise DevFlowError("review_limit_auto_extra_reviews must be an integer of at least 1")
+    final = config.get(LIMIT_AUTO_FINAL_KEY, "ask")
+    if type(final) is not str or final not in LIMIT_AUTO_FINAL_MODES:
+        raise DevFlowError('review_limit_auto_final must be "ask" or "accept"')
+    if combination and final == "accept" and mode == "continue":
+        raise DevFlowError('review_limit_auto_final "accept" needs review_limit_auto "continue_accept": with '
+                           '"continue" the host\'s recommendation to accept is asked to the human, so accepting '
+                           "after the extra reviews would invert it")
+
+
+def limit_auto_final(config: dict) -> str:
+    """The frozen review_limit_auto_final (``ask`` for a run frozen without it)."""
+    return config.get(LIMIT_AUTO_FINAL_KEY, "ask")
 
 
 def limit_auto_allows(config: dict, decision: str) -> bool:
@@ -117,21 +139,82 @@ def check_no_serious_reviewers(source: dict) -> None:
                            "Ask the human the review limit question.")
 
 
+def check_auto_accept(source: dict, recommended: str, final_eligible: bool) -> str | None:
+    """The last check of an automatic accept, after the flow's own checks.
+
+    ``recommended`` is the host's ``--decision``. Returns it when the run's
+    review_limit_auto_final accepts (record 2): a recommendation to continue that
+    ``_limit_auto_request`` turned into accept, or one to accept while a latest
+    succeeded review holds a critical or high finding at the exhausted limit.
+    Otherwise ``check_no_serious_reviewers`` applies and None means record 1.
+    """
+    if recommended == "continue" or (final_eligible and serious_reviewers(source["reviewers"], source["reviews"])[0]):
+        return recommended
+    check_no_serious_reviewers(source)
+    return None
+
+
+def code_span(text: str) -> str:
+    """``text`` as one CommonMark code span, so a path's commas, brackets or asterisks
+    never read as separators or formatting: fenced by one backtick more than its longest
+    backtick run, padded with a space when it starts or ends with a backtick."""
+    fence = "`" * (max((len(run) for run in re.findall(r"`+", text)), default=0) + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
+def serious_findings_text(serious: list[dict], reviews: list) -> str:
+    """``a (review 7: F3 high, F5 critical), b (review 8: F2 high)``, or ``none``:
+    each ``serious_reviewers`` entry with the critical and high findings of that
+    review (``reviews``: the summary source's or data's entries). A reviewer-chosen
+    ID other than letters, digits, dots and hyphens is shown whole, JSON-escaped in a
+    code span, so it stays one literal line in the approval record and the summary."""
+    def shown(identifier: str) -> str:
+        return identifier if re.fullmatch(r"[A-Za-z0-9.-]+", identifier) else code_span(json.dumps(identifier))
+
+    findings = {entry["number"]: entry["findings"] for entry in reviews}
+    return ", ".join(
+        f"{item['reviewer_id']} (review {item['review_number']}: "
+        + ", ".join(f"{shown(finding['id'])} {finding['severity']}" for finding in findings[item["review_number"]]
+                    if finding["severity"] in ("critical", "high")) + ")"
+        for item in serious) or "none"
+
+
+def final_accept_warning(auto: dict, data: dict | None) -> str:
+    """The report warning of an acceptance by review_limit_auto_final (``auto``: an
+    acceptance entry with ``recommended``; ``data``: the run's summary, None when
+    it cannot be built)."""
+    serious = ("unknown (the review summary cannot be built)" if data is None
+               else serious_findings_text(data["serious_findings"]["reviewers"], data["reviews"]))
+    return ("Accepted at the review limit by the run's review_limit_auto_final setting because another round "
+            "would exceed review_limit_auto_extra_reviews, without approval from every reviewer; the host "
+            f"recommended {auto['recommended']} (its recommendation and reasons: {auto['record']}). Critical or "
+            f"high findings in the latest succeeded reviews: {serious}. Inspect remaining findings and whether the "
+            "final revision was reviewed.")
+
+
 def limit_auto_name(escalation_id: str, decision: str) -> str:
     return f"{LIMIT_AUTO_DIR}{escalation_id}-{decision}.json"
 
 
 def limit_auto_record(state: dict, escalation: dict, decision: str, recommendation: str,
-                      version: str, version_reviewed: bool, session: str) -> dict:
-    """The immutable record of one automatic decision, made before the state changes."""
+                      version: str, version_reviewed: bool, session: str, recommended: str | None = None) -> dict:
+    """The immutable record of one automatic decision, made before the state changes.
+
+    With ``recommended`` (the host's ``--decision`` when review_limit_auto_final
+    accepts) it is record 2: record 1's fields, ``recommended`` and the setting."""
     config, before = state["config"], state["review_limit"]
-    return {"schema_version": 1, "source": LIMIT_AUTO_SOURCE, "escalation_id": escalation["id"],
-            "decision": decision, LIMIT_AUTO_KEY: config[LIMIT_AUTO_KEY],
-            LIMIT_AUTO_EXTRA_KEY: config[LIMIT_AUTO_EXTRA_KEY],
-            "review_number": escalation["detail"]["review_number"], "review_limit_before": before,
-            "review_limit_after": before + len(config["reviewers"]) if decision == "continue" else before,
-            "version": version, "version_reviewed": bool(version_reviewed), "recommendation": recommendation,
-            "decided_at": now(), "host": state["owner_host"], "session": session}
+    record = {"schema_version": 1, "source": LIMIT_AUTO_SOURCE, "escalation_id": escalation["id"],
+              "decision": decision, LIMIT_AUTO_KEY: config[LIMIT_AUTO_KEY],
+              LIMIT_AUTO_EXTRA_KEY: config[LIMIT_AUTO_EXTRA_KEY],
+              "review_number": escalation["detail"]["review_number"], "review_limit_before": before,
+              "review_limit_after": before + len(config["reviewers"]) if decision == "continue" else before,
+              "version": version, "version_reviewed": bool(version_reviewed), "recommendation": recommendation,
+              "decided_at": now(), "host": state["owner_host"], "session": session}
+    if recommended is not None:
+        record.update({"schema_version": 2, "recommended": recommended,
+                       LIMIT_AUTO_FINAL_KEY: limit_auto_final(config)})
+    return record
 
 
 def check_limit_auto_names(state: dict, id_pattern: str) -> None:
@@ -168,14 +251,16 @@ def check_limit_auto_record(state: dict, record: object, name: str, read, workfl
     match = re.fullmatch(re.escape(LIMIT_AUTO_DIR) + r"(.+)-(continue|accept)\.json", name)
     config = state["config"]
     try:
-        if not match or not isinstance(record, dict) or set(record) != LIMIT_AUTO_FIELDS:
+        final = isinstance(record, dict) and type(record.get("schema_version")) is int and record["schema_version"] == 2
+        if not match or not isinstance(record, dict) or set(record) != (LIMIT_AUTO_FINAL_FIELDS if final
+                                                                        else LIMIT_AUTO_FIELDS):
             raise DevFlowError("fields")
         escalation_id, decision = match.groups()
         question = read(workflow.limit_auto_question(state, escalation_id))
         detail = question.get("detail") if isinstance(question, dict) else None
         before, after, number = (record["review_limit_before"], record["review_limit_after"],
                                  record["review_number"])
-        if (type(record["schema_version"]) is not int or record["schema_version"] != 1
+        if (type(record["schema_version"]) is not int or record["schema_version"] not in (1, 2)
                 or record["source"] != LIMIT_AUTO_SOURCE
                 or record["decision"] != decision or record["escalation_id"] != escalation_id
                 or question.get("id") != escalation_id or not isinstance(detail, dict)
@@ -198,6 +283,15 @@ def check_limit_auto_record(state: dict, record: object, name: str, read, workfl
         elif (before != after or after != state["review_limit"]
               or number != workflow.summary(state)["review_count"]):
             raise DevFlowError("limit")
+        # Record 2: review_limit_auto_final accepted once another round would pass
+        # review_limit_auto_extra_reviews (the limit before is the run's limit here).
+        if final and (decision != "accept" or type(record["recommended"]) is not str
+                      or record["recommended"] not in LIMIT_AUTO_DECISIONS
+                      or record[LIMIT_AUTO_FINAL_KEY] != "accept" or limit_auto_final(config) != "accept"
+                      or config[LIMIT_AUTO_KEY] != "continue_accept"):
+            raise DevFlowError("final")
+        if final and auto_continue_fits(state):
+            raise DevFlowError("another round still fitted review_limit_auto_extra_reviews")
     except (DevFlowError, KeyError, TypeError, AttributeError, ValueError) as exc:
         raise DevFlowError(f"Invalid or mismatched automatic decision record: {name}: {exc}") from exc
     return record
@@ -207,6 +301,7 @@ LIMIT_AUTO_FIELDS = frozenset({"schema_version", "source", "escalation_id", "dec
                                LIMIT_AUTO_EXTRA_KEY, "review_number", "review_limit_before",
                                "review_limit_after", "version", "version_reviewed", "recommendation",
                                "decided_at", "host", "session"})
+LIMIT_AUTO_FINAL_FIELDS = LIMIT_AUTO_FIELDS | {"recommended", LIMIT_AUTO_FINAL_KEY}
 
 
 def limit_auto_records(state: dict, store) -> list[tuple[str, dict]]:
@@ -220,10 +315,18 @@ def limit_auto_records(state: dict, store) -> list[tuple[str, dict]]:
     return sorted(entries, key=lambda item: item[1]["review_number"])
 
 
+def final_fields(record: dict) -> dict:
+    """What a view adds for record 2 (``recommended`` and ``extra_reviews``); record 1
+    adds nothing, so the views saved by 0.13.0 keep their exact shape."""
+    if record["schema_version"] != 2:
+        return {}
+    return {"recommended": record["recommended"], "extra_reviews": record[LIMIT_AUTO_EXTRA_KEY]}
+
+
 def limit_auto_decisions(entries: list[tuple[str, dict]]) -> list[dict]:
     """The ``status`` view of the automatic decisions."""
     return [{"escalation_id": record["escalation_id"], "review_number": record["review_number"],
-             "decision": record["decision"], "record": name} for name, record in entries]
+             "decision": record["decision"], "record": name, **final_fields(record)} for name, record in entries]
 
 
 def automatic_decisions(entries: list[tuple[str, dict]]) -> list[dict]:
@@ -231,7 +334,7 @@ def automatic_decisions(entries: list[tuple[str, dict]]) -> list[dict]:
     return [{"at": record["decided_at"], "review_number": record["review_number"], "decision": record["decision"],
              "setting": record[LIMIT_AUTO_KEY], "review_limit_before": record["review_limit_before"],
              "review_limit_after": record["review_limit_after"], "recommendation": record["recommendation"],
-             "record": name} for name, record in entries]
+             "record": name, **final_fields(record)} for name, record in entries]
 
 
 def accept_entry(entries: list[tuple[str, dict]]) -> tuple[str, dict] | None:
