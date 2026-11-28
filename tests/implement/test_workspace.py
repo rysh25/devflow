@@ -330,13 +330,13 @@ class IdentityTests(unittest.TestCase):
 
 
 class DirtyStartTests(WorkspaceFixture):
-    def test_writes_before_the_start_are_caught_by_the_dirty_check(self):
-        # S1: nothing records writes before the start; allow_dirty=false asks the human.
+    def test_writes_before_the_start_are_reported_as_existing_changes(self):
+        # S1: nothing records writes before the start; the start reports them without a question.
         self.prompt(f'/devflow:implement "{self.plan}"')
         (self.project / "module.py").write_text("VALUE = 5\n", encoding="utf-8")
         status = router.runner_start(self.project, self.session, "implement", str(self.plan), {}, host="claude")
-        self.assertEqual(status["status"], "awaiting_human")
-        self.assertEqual(status["escalation"]["detail"]["kind"], "dirty_worktree")
+        self.assertEqual((status["status"], status["escalation"]), ("implementing", None))
+        self.assertIn("module.py", status["existing_changes"]["paths"])
 
 
 

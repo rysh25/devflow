@@ -157,6 +157,69 @@ class CliTests(unittest.TestCase):
         self.assertIn("ready", value)
         self.assertEqual(value["run_id"], state["run_id"])
 
+    def flow_doctor(self, prompt, settings):
+        """``plan doctor`` of a run started by ``prompt``, both as the host calls it (the session's
+        binding) and with ``--run``; the two reports must agree."""
+        (self.project / "devflow.config.json").write_text(json.dumps({"schema_version": 1, **settings}),
+                                                          encoding="utf-8")
+        self.flow_runs = getattr(self, "flow_runs", 0) + 1
+        session = f"flow-{self.flow_runs}"
+        code, _, err = self.cli("hook", stdin=json.dumps(self.payload(session=session, prompt=prompt)))
+        self.assertEqual(code, 0, err)
+        run_id = sessions.read_record(self.project, session, WORKFLOWS, "claude")["run"]["run_id"]
+        return lambda after=None: self.flow_reports(session, run_id, after)
+
+    def flow_reports(self, session, run_id, settings=None):
+        if settings is not None:
+            (self.project / "devflow.config.json").write_text(json.dumps({"schema_version": 1, **settings}),
+                                                              encoding="utf-8")
+        reports = []
+        for args in (("--session", session, "plan", "doctor"), ("--run", run_id, "plan", "doctor")):
+            with patch("devflow_core.common.reviewers.preflight", return_value={"probe": "test"}):
+                code, out, err = self.cli(*args)
+            self.assertEqual((code, err), (0, ""), out)
+            reports.append(json.loads(out))
+        self.assertEqual(reports[0].get("flow_warnings"), reports[1].get("flow_warnings"))
+        return reports[0].get("flow_warnings")
+
+    def test_plan_doctor_of_a_flow_run_warns_where_the_flow_will_wait_or_stop(self):
+        checks = [{"id": "verify", "argv": [sys.executable, "-c", "pass"], "timeout_seconds": 10}]
+        quiet = {"review_limit_auto": "continue_accept", "implement": {"checks": checks}}
+        reports = self.flow_doctor("/devflow:flow -- request", quiet)
+        self.assertEqual(reports(), [])
+        self.assertEqual(reports({}), [
+            "Implement has no checks configured: every checkpoint will wait for human validation.",
+            'Implement review_limit_auto is "ask": the Implement review limit waits for the human.'])
+        broken = reports({"review_limit_auto": "continue_accept", "implement": {"checks": "not a list"}})
+        self.assertEqual(len(broken), 1)
+        self.assertTrue(broken[0].startswith("Implement settings cannot be read ("), broken)
+        self.assertTrue(broken[0].endswith("the chained Implement start will fail until they are fixed."))
+        # Settings that load but fail Implement doctor's own check (an unsafe snapshot pattern) also warn.
+        unsafe = reports({**quiet, "implement": {"checks": checks, "snapshot": {"include": ["../outside"]}}})
+        self.assertEqual(len(unsafe), 1)
+        self.assertTrue(unsafe[0].startswith("Implement settings cannot be read ("), unsafe)
+        # Plan's own warnings come from its frozen settings.
+        reports = self.flow_doctor("/devflow:flow -- second request",
+                                   {"implement": {"checks": checks, "review_limit_auto": "continue_accept"},
+                                    "plan": {"publish": {"enabled": False}}})
+        self.assertEqual(reports(), [
+            'Plan review_limit_auto is "ask": the Plan review limit waits for the human.',
+            "Plan publication is disabled: the flow stops after Plan and does not start Implement."])
+        # A /devflow:plan run has none.
+        self.assertIsNone(self.flow_doctor("/devflow:plan third request", {})())
+        # Implement's warnings use the owner host's settings, also when another host inspects the run.
+        reports = self.flow_doctor("/devflow:flow -- fourth request",
+                                   {"review_limit_auto": "continue_accept",
+                                    "hosts": {"claude": {"implement": {"checks": checks}}}})
+        self.assertEqual(reports(), [])
+        out = io.StringIO()
+        with patch("devflow_core.common.reviewers.preflight", return_value={"probe": "test"}), redirect_stdout(out):
+            code = cli.main(["--host", "codex", "--project", str(self.project), "--run",
+                             sessions.read_record(self.project, f"flow-{self.flow_runs}", WORKFLOWS, "claude")["run"]["run_id"],
+                             "plan", "doctor"])
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertEqual(json.loads(out.getvalue())["flow_warnings"], [])
+
     def test_doctor_carries_runner_fields(self):
         with patch("devflow_core.common.reviewers.preflight", return_value={"probe": "test"}), \
                 patch("devflow_core.cli.host_version", return_value={"version": "0.0.0", "supported": True}):

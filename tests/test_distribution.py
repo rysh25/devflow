@@ -107,11 +107,11 @@ class DistributionTests(unittest.TestCase):
     def test_static_validate_current_bundle(self):
         result = package.validate(self.clone())
         self.assertEqual(result["marketplace"], "devflow-marketplace")
-        self.assertEqual(result["plugins"], {"devflow": "0.13.0"})
+        self.assertEqual(result["plugins"], {"devflow": "0.14.0"})
 
     def test_release_versions_are_consistent(self):
         manifest = json.loads((ROOT / "plugins/devflow/.claude-plugin/plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.13.0")
+        self.assertEqual(manifest["version"], "0.14.0")
         package = ROOT / "plugins/devflow/scripts/devflow_core"
         defining = []
         for source in sorted(package.rglob("*.py")):
@@ -382,8 +382,41 @@ class DistributionTests(unittest.TestCase):
                 with self.assertRaisesRegex(package.PackagingError, message):
                     package.validate(cloned)
 
+    def test_each_host_ships_six_human_only_skills_including_flow(self):
+        plugin = Path("plugins") / "devflow"
+        package.validate(self.clone())
+
+        def edit(relative, old, new):
+            def apply(root):
+                path = root / plugin / relative
+                text = path.read_text(encoding="utf-8")
+                self.assertIn(old, text)
+                path.write_text(text.replace(old, new), encoding="utf-8", newline="")
+            return apply
+
+        def remove(relative):
+            return lambda root: shutil.rmtree(root / plugin / relative)
+
+        cases = (
+            ("Claude model invocation", edit("skills/flow/SKILL.md", "disable-model-invocation: true\n", ""),
+             "must require manual invocation"),
+            ("Codex implicit invocation", edit("codex-skills/flow/agents/openai.yaml", "false", "true"),
+             "disable implicit invocation"),
+            ("Devin model trigger", edit("devin-skills/flow/SKILL.md", "triggers: [user]", "triggers: [user, model]"),
+             "invoked by the human only"),
+            ("Claude without flow", remove("skills/flow"), "Claude must ship exactly six manual skills"),
+            ("Codex without flow", remove("codex-skills/flow"), "Codex must ship exactly six manual skills"),
+            ("Devin without flow", remove("devin-skills/flow"), "Devin must ship exactly six manual skills"),
+        )
+        for name, change, message in cases:
+            with self.subTest(case=name):
+                cloned = self.clone()
+                change(cloned)
+                with self.assertRaisesRegex(package.PackagingError, message):
+                    package.validate(cloned)
+
     def test_devin_layout_and_skills_are_checked(self):
-        """Devin: the root hooks.json in the measured form, a local-only manifest, and five
+        """Devin: the root hooks.json in the measured form, a local-only manifest, and six
         human-only skills that pre-approve nothing (Devin expands no plugin path in a
         permission rule, so any rule would allow more than the runner)."""
         plugin = Path("plugins") / "devflow"
@@ -546,14 +579,14 @@ class DistributionTests(unittest.TestCase):
             # All paths were generated and checked in this test, not untrusted ZIP input.
             archive.extractall(extracted)
         release = extracted / "devflow"
-        self.assertEqual(package.validate(release)["version"], "0.13.0")
+        self.assertEqual(package.validate(release)["version"], "0.14.0")
         independent = self.base / "devflow-only"
         shutil.copytree(release / "plugins" / "devflow", independent)
         self.assertFalse((independent / "shared").exists())
         result = subprocess.run([sys.executable, "-B", str(independent / "scripts" / "devflow.py"), "--version"],
             cwd=self.base, capture_output=True, encoding="utf-8", timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("0.13.0", result.stdout)
+        self.assertIn("0.14.0", result.stdout)
         for flow in ("plan", "implement"):
             with self.subTest(flow=flow):
                 result = subprocess.run([sys.executable, "-B", str(independent / "scripts" / "devflow.py"), flow, "--help"],

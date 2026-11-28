@@ -64,7 +64,7 @@ COMMANDS = (
             "(and decision continue/stop/accept for the review limit question)",
             lambda e, a, run, s: e.resolve(run, a.answer_file, s), (Option("--answer-file", "draft"),)),
     Command("limit-auto", "At the review limit, apply the host's recommendation (continue or accept) when the "
-            "run's review_limit_auto setting allows it; never a human answer",
+            "run's review_limit_auto settings allow it; never a human answer",
             lambda e, a, run, s: e.limit_auto(run, a.escalation_id, a.decision, a.recommendation_file, s),
             (Option("--escalation-id", "text"), Option("--decision", "decision"),
              Option("--recommendation-file", "draft"))),

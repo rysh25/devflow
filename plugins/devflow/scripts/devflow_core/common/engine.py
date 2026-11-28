@@ -11,9 +11,9 @@ from typing import Any, Callable
 
 from . import summary
 from .errors import DevFlowError
-from .review import (REVIEW_BUDGET, auto_continue_fits, check_limit_auto, check_limit_auto_record, decide_at_limit,
-                     limit_auto_allows, limit_auto_decisions, limit_auto_name, limit_auto_record,
-                     limit_auto_records)
+from .review import (LIMIT_AUTO_KEY, REVIEW_BUDGET, auto_continue_fits, check_limit_auto, check_limit_auto_record,
+                     decide_at_limit, limit_auto_allows, limit_auto_decisions, limit_auto_final, limit_auto_name,
+                     limit_auto_record, limit_auto_records)
 from .runs import RUNNER_WAIT, TERMINAL, RunStore
 from .sessions import approval_evidence, prefilled_question_events
 from .storage import json_bytes, now, read_json, writable_text
@@ -87,13 +87,17 @@ class RunEngine:
         self._check_frozen_config(state)
 
     # -- automatic decisions at the review limit -------------------------------------------
-    def _limit_auto_request(self, state: dict, escalation_id: str, decision: str) -> dict:
-        """The checks of ``limit-auto`` that read no records, in order; returns the question.
+    def _limit_auto_request(self, state: dict, escalation_id: str, decision: str) -> tuple[dict, str, bool]:
+        """The checks of ``limit-auto`` that read no records, in order; returns the
+        question, the decision to apply and whether review_limit_auto_final may accept.
 
         The open question must be this review limit question, no human answer may
         be recorded after it (a human answer always comes first, whatever question
         it answers), the frozen setting must allow the decision, and an automatic
-        continuation must stay within review_limit_auto_extra_reviews.
+        continuation must stay within review_limit_auto_extra_reviews. Once another
+        round would pass it, ``continue_accept`` with review_limit_auto_final
+        ``accept`` makes the run eligible, and a continue becomes accept (the flow
+        then records it as record 2).
         """
         escalation = state["escalation"] or {}
         if (state["status"] != "awaiting_human" or (escalation.get("detail") or {}).get("kind") != REVIEW_BUDGET
@@ -107,19 +111,25 @@ class RunEngine:
         if not limit_auto_allows(config, decision):
             raise DevFlowError(f'The run\'s review_limit_auto is "{config["review_limit_auto"]}"; it does not '
                                f"{decision} automatically. Ask the human the review limit question.")
+        final_eligible = (not auto_continue_fits(state) and config[LIMIT_AUTO_KEY] == "continue_accept"
+                          and limit_auto_final(config) == "accept")
         if decision == "continue" and not auto_continue_fits(state):
+            if final_eligible:
+                return escalation, "accept", True
             limit = state["review_limit"] + len(config["reviewers"])
             raise DevFlowError(f"Continuing automatically would make the limit {limit}, "
                                f"{limit - config['max_reviews']} over max_reviews {config['max_reviews']}, beyond "
                                f"review_limit_auto_extra_reviews {config['review_limit_auto_extra_reviews']}. "
                                "Ask the human the review limit question.")
-        return escalation
+        return escalation, decision, final_eligible
 
     def _apply_limit_auto(self, state: dict, escalation: dict, decision: str, recommendation: str,
-                          version: str, version_reviewed: bool, session: str) -> None:
+                          version: str, version_reviewed: bool, session: str, recommended: str | None = None) -> None:
         """Record the automatic decision and apply it as the human's answer would be
-        applied, without recording a human answer (the caller saves once)."""
-        record = limit_auto_record(state, escalation, decision, recommendation, version, version_reviewed, session)
+        applied, without recording a human answer (the caller saves once).
+        ``recommended`` marks an accept by review_limit_auto_final (record 2)."""
+        record = limit_auto_record(state, escalation, decision, recommendation, version, version_reviewed, session,
+                                   recommended)
         name = limit_auto_name(escalation["id"], decision)
         # The record passes the same check that presents it later, before anything changes.
         check_limit_auto_record(state, record, name, lambda relative: self.store.record_json(state, relative),

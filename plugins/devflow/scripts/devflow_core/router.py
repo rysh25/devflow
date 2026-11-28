@@ -19,19 +19,25 @@ from .common import notices, sessions
 from .common.paths import hook_project, project_root, same_path
 from .common.errors import DevFlowError
 from .common.hosts import host_profile, question_context, question_tool_name
-from .common.operations import public_command as detect_command
+from .common.operations import CHAIN_STATUSES, CHAINED, FLOW, flow_requested, public_command as detect_command
 from .common.startup import parse_start
-from .common.runs import (HOOK_WAIT, RUN_ID, RUNNER_WAIT, TERMINAL, RunStore, data_root, ensure_data_root,
-                          event_bytes, make_event, new_run_id, unsupported_message, validate_run_id)
+from .common.runs import (HOOK_WAIT, MAX_EVENT_BYTES, RUN_ID, RUNNER_WAIT, TERMINAL, RunStore, data_root,
+                          ensure_data_root, event_bytes, make_event, new_run_id, unsupported_message,
+                          validate_event, validate_run_id)
 from .common.settings import read_project_settings
-from .common.storage import file_lock, now
+from .common.storage import file_lock, now, parse_json
 from .workflows import WORKFLOWS
 
 RESUME = "resume"
 
 
 def public_command(prompt: str, host: str) -> tuple[str | None, str]:
-    return detect_command(prompt, host, (*WORKFLOWS, RESUME, "status", "doctor"))
+    return detect_command(prompt, host, (*WORKFLOWS, FLOW, RESUME, "status", "doctor"))
+
+
+def _started_workflow(command: str | None) -> str | None:
+    """The workflow a human command starts: flow starts a Plan run (its Implement is chained later)."""
+    return "plan" if command == FLOW else command if command in WORKFLOWS else None
 
 
 def _entry_context(operation: str, host: str, session: str, project: Path, plugin_root: Path) -> dict | None:
@@ -252,7 +258,10 @@ def runner_start(project: Path, session: str | None, flow: str, raw: str, option
     with dispatch_lock(project, RUNNER_WAIT):
         record = sessions.read_record(project, session, WORKFLOWS, host)
         pending = record and record["pending_start"]
-        if not pending or pending["flow"] != flow:
+        # A chained start's pending start copies a Plan prompt, never the human's own command;
+        # only a workflow that can be chained (``from_plan_option``) has such pending starts.
+        if (not pending or pending["flow"] != flow
+                or (workflow.from_plan_option and pending["event"]["payload"].get("operation") != flow)):
             raise DevFlowError(refusal)
         if workflow.normalize_args(raw, project) != pending["args"]:
             raise DevFlowError(f"The {workflow.start_option} value does not match the user's explicit start command")
@@ -267,7 +276,212 @@ def runner_start(project: Path, session: str | None, flow: str, raw: str, option
                 raise DevFlowError(refusal)
             state = _commit(session, pending, all_stores, prepared)
             sessions.write_record(project, _bound(record, flow, state["run_id"]), WORKFLOWS)
-    return workflow.engine(project, host=host).status(state["run_id"])
+    return _start_result(project, flow, state["run_id"], all_stores, host)
+
+
+def _start_result(project: Path, flow: str, run_id: str, all_stores: dict[str, RunStore], host: str) -> dict:
+    store = all_stores[flow]
+    return {**WORKFLOWS[flow].engine(project, host=host).status(run_id),
+            **WORKFLOWS[flow].start_fields(store, store.read(run_id))}
+
+
+def _chained_run(all_stores: dict[str, RunStore], plan_run_id: str, plan_hash: str) -> dict | None:
+    """The Implement run chained from this Plan run (check 7): only current-format runs
+    whose frozen plan has the Plan's hash have their ``request.json`` read."""
+    store = all_stores["implement"]
+    for info in store.scan()[0]:
+        if info.format != "current" or info.state["source_digest"] != plan_hash:
+            continue
+        intent = store.record_json(info.state, "request.json").get("intent") or {}
+        if intent.get("action") == CHAINED and intent.get("plan_run_id") == plan_run_id:
+            return info.state
+    return None
+
+
+def _chain_source(project: Path, session: str, plan_run_id: str, all_stores: dict[str, RunStore],
+                  host: str, history: dict | None = None) -> tuple[dict, dict, dict | None, dict | None]:
+    """The Plan run, its publication record, the run already chained from it, and the
+    Plan run's verified history (None when a chained run is returned): its committed
+    event digests and its last prompt event.
+
+    Checks 2–6 (ownership, the flow marker, the ending, the publication, no resume since
+    the end) apply only when nothing was chained yet: a chained run is returned as it is.
+    Every Plan record it uses (request, publication receipt, events) is read
+    digest-checked. Of the events only the tail from the last prompt on is read, when
+    ``history`` is None; a later check passes that history back, and it still holds only
+    while the run's committed event IDs and digests are unchanged.
+    """
+    flow, info = resolve_run(project, plan_run_id, all_stores)
+    if flow != "plan" or info.format != "current":
+        raise DevFlowError(f"Run {plan_run_id} is not a current Plan run")
+    state, store = info.state, all_stores["plan"]
+    chained = _chained_run(all_stores, plan_run_id, state["plan_hash"]) if state["plan_hash"] else None
+    if chained is not None:
+        return state, {}, chained, None
+    manual = f"start Implement with {host_profile(host).command_prefix}implement PATH"
+    if (state["owner_host"], state["owner_session"]) != (host, session):
+        raise DevFlowError(f"Plan run {plan_run_id} is not owned by this conversation; {manual}")
+    if not flow_requested(store.record_json(state, "request.json"), state["owner_host"]):
+        raise DevFlowError(f"Plan run {plan_run_id} was not started by {host_profile(host).command_prefix}flow; {manual}")
+    if state["status"] not in CHAIN_STATUSES:
+        raise DevFlowError(f"Plan run {plan_run_id} ended {state['status']}, not completed, accepted or "
+                           "auto_accepted; there is no approved plan to chain")
+    if state["publication"]["status"] != "published":
+        raise DevFlowError(f"Plan run {plan_run_id}'s plan is not published ({state['publication']['status']})")
+    publication = store.record_json(state, "publication.json")
+    if publication.get("plan_hash") != state["plan_hash"]:
+        raise DevFlowError(f"The published plan no longer matches Plan run {plan_run_id}'s approved hash")
+    digests = [(identifier, state["artifacts"].get(f"events/{identifier}.json")) for identifier in state["event_ids"]]
+    if history is not None:
+        if history["digests"] != digests:
+            raise DevFlowError(f"Plan run {plan_run_id}'s events changed during the start; no run was created")
+        return state, publication, None, history
+    prompt = _last_prompt(store, state)
+    if prompt is None:
+        raise DevFlowError(f"Plan run {plan_run_id} has no recorded prompt to continue from; {manual}")
+    # Events are appended in order, so the last prompt is the latest. Both are now()'s
+    # second-precision UTC strings; a resume in the same second also refuses.
+    if prompt["recorded_at"] >= state["finished_at"]:
+        raise DevFlowError(f"Plan run {plan_run_id} was resumed after it ended; {manual}")
+    return state, publication, None, {"digests": digests, "prompt": prompt}
+
+
+def _last_prompt(store: RunStore, state: dict) -> dict | None:
+    """The run's last prompt event, reading each event from the newest back to it once,
+    against its recorded digest (the questions of the final turn and that prompt)."""
+    for identifier in reversed(state["event_ids"]):
+        relative = f"events/{identifier}.json"
+        event = validate_event(parse_json(store.record(state, relative, limit=MAX_EVENT_BYTES + 4096), relative))
+        if event["event_id"] != identifier:
+            raise DevFlowError("Human event record does not match its ID")
+        if event["kind"] == "prompt":
+            return event
+    return None
+
+
+def _rejoin(project: Path, session: str, plan_run_id: str, chained: dict, all_stores: dict[str, RunStore],
+            host: str, record: dict | None) -> str:
+    """A repeated chain start: binds the run already chained from this Plan run, when it is
+    this conversation's unfinished run and nothing else holds the session (inside
+    ``dispatch_lock``), and returns its ID; the caller builds the result after the lock."""
+    run_id = chained["run_id"]
+    taken = f"Plan run {plan_run_id} already chained to Implement run {run_id}"
+    if chained["status"] in TERMINAL or (chained["owner_host"], chained["owner_session"]) != (host, session):
+        raise DevFlowError(taken)
+    record = record or sessions.empty_record(session, host)
+    target = {"flow": "implement", "run_id": run_id}
+    pending = record["pending_start"]
+    current = sessions.binding(project, record, all_stores)
+    free = current is None or current.terminal or record["run"] == target
+    if not free or (pending and (pending["flow"], pending["run_id"]) != ("implement", run_id)):
+        raise DevFlowError(f"{taken}, but this conversation is bound to another run")
+    sessions.write_record(project, _bound(record, "implement", run_id), WORKFLOWS)
+    return run_id
+
+
+def runner_start_from_plan(project: Path, session: str | None, plan_run_id: str, options: dict | None = None,
+                           *, host: str) -> dict:
+    """``implement start --from-plan``: the Implement run of a human's flow command, chained
+    from its finished, published Plan run in the conversation that owns it.
+
+    It uses the same pending start, preparation, re-check and creation as a manual start;
+    the Plan run is checked again under its lock right before the run is created. Calling
+    again returns the run already chained from the Plan run (``already_started``).
+    """
+    if not session:
+        raise DevFlowError("start requires the actual current host session ID")
+    sessions.require_caller(host, session, flow="implement")
+    plan_run_id = validate_run_id(plan_run_id)
+    workflow = WORKFLOWS["implement"]
+    all_stores = stores(project, host=host)
+    rejoined = None
+    with dispatch_lock(project, RUNNER_WAIT):
+        # Finding a chained run, reading the Plan's last prompt and writing this start's
+        # pending start share one section: two calls cannot both find none, and a newer
+        # prompt in this session clears the pending start.
+        record = sessions.read_record(project, session, WORKFLOWS, host)
+        plan, publication, chained, history = _chain_source(project, session, plan_run_id, all_stores, host)
+        if chained is not None:
+            rejoined = _rejoin(project, session, plan_run_id, chained, all_stores, host, record)
+        else:
+            record = record or sessions.empty_record(session, host)
+            current = sessions.binding(project, record, all_stores)
+            if current is not None and not current.terminal:
+                raise DevFlowError("Finish or cancel this session's active workflow before starting another")
+            if record["pending_start"]:
+                raise DevFlowError("A start is already pending in this session; it is cleared by your next prompt "
+                                   "when it created no run")
+            pending = {"flow": "implement", "run_id": new_run_id(),
+                       "args": workflow.normalize_args(publication["path"], project),
+                       "event": history["prompt"],
+                       "created_at": now()}
+            record = dict(record, run=None, pending_start=pending)
+            sessions.write_record(project, record, WORKFLOWS)
+            documents = read_project_settings(project, host, WORKFLOWS)
+    if rejoined is not None:
+        return {**_start_result(project, "implement", rejoined, all_stores, host), "already_started": True}
+    chain = {"plan_run_id": plan_run_id, "plan_hash": plan["plan_hash"], "plan_path": publication["path"],
+             "approval_path": publication["approval_path"]}
+    with _prepared(project, pending, all_stores, documents, {**(options or {}), "chain": chain}) as prepared:
+        # The Plan run's lock is tried once: waiting for it while holding the project-wide
+        # dispatch lock would hold up every other conversation's prompt hook.
+        with dispatch_lock(project, RUNNER_WAIT), all_stores["plan"].lock(plan_run_id, wait=0):
+            record = sessions.read_record(project, session, WORKFLOWS, host)
+            if not record or record["pending_start"] != pending:
+                raise DevFlowError("The chained start was superseded by a newer prompt in this session; "
+                                   "no run was created")
+            plan, publication, chained, _ = _chain_source(project, session, plan_run_id, all_stores, host, history)
+            if chained is not None:
+                record = dict(record, pending_start=None)
+                sessions.write_record(project, record, WORKFLOWS)
+                rejoined = _rejoin(project, session, plan_run_id, chained, all_stores, host, record)
+            else:
+                if publication["path"] != chain["plan_path"] or plan["plan_hash"] != chain["plan_hash"]:
+                    raise DevFlowError(f"Plan run {plan_run_id}'s publication changed during the start; "
+                                       "no run was created")
+                state = _commit(session, pending, all_stores, prepared)
+                sessions.write_record(project, _bound(record, "implement", state["run_id"]), WORKFLOWS)
+    if rejoined is not None:
+        return {**_start_result(project, "implement", rejoined, all_stores, host), "already_started": True}
+    return _start_result(project, "implement", state["run_id"], all_stores, host)
+
+
+def flow_warnings(project: Path, host: str, plan_state: dict) -> list[str]:
+    """What a flow run will wait for or stop at: Plan from its frozen settings, Implement
+    from the current project settings (as the chained start resolves them). Never raises."""
+    config = plan_state["config"]
+    try:
+        implement, problem = WORKFLOWS["implement"].load_config(read_project_settings(project, host, WORKFLOWS)), None
+        # The same settings diagnostic as implement doctor (for example an unsafe snapshot pattern).
+        WORKFLOWS["implement"].doctor(project, implement, host=host)
+    except (DevFlowError, OSError, ValueError) as exc:
+        implement, problem = None, exc
+    warnings = []
+    if implement is not None and not implement["checks"]:
+        warnings.append("Implement has no checks configured: every checkpoint will wait for human validation.")
+    if config.get("review_limit_auto") == "ask":
+        warnings.append('Plan review_limit_auto is "ask": the Plan review limit waits for the human.')
+    if implement is not None and implement["review_limit_auto"] == "ask":
+        warnings.append('Implement review_limit_auto is "ask": the Implement review limit waits for the human.')
+    if not config["publish"]["enabled"]:
+        warnings.append("Plan publication is disabled: the flow stops after Plan and does not start Implement.")
+    if problem is not None:
+        warnings.append(f"Implement settings cannot be read ({problem}): the chained Implement start will fail "
+                        "until they are fixed.")
+    return warnings
+
+
+def flow_doctor(project: Path, run_id: str, *, host: str) -> dict:
+    """``flow_warnings`` for a Plan run started by the flow command (none for another Plan run),
+    or ``flow_marker_error`` when that cannot be verified. Implement's settings are read for
+    the Plan run's owner host, the only host that can chain from it."""
+    store = stores(project, host=host)["plan"]
+    state = store.read(run_id)
+    marker = WORKFLOWS["plan"].flow_marker(store, state)
+    if marker["continues_to_implement"] is None:
+        return {"flow_marker_error": marker["flow_marker_error"]}
+    return ({"flow_warnings": flow_warnings(project, state["owner_host"], state)}
+            if marker["continues_to_implement"] else {})
 
 
 def selected_run(project: Path, session: str | None, flow: str, explicit: str | None,
@@ -334,8 +548,8 @@ def handle_hook(payload: dict, plugin_root: Path, environ=None, *, host: str) ->
         try:
             if command == RESUME:
                 validate_run_id(argument.strip())
-            elif command in WORKFLOWS:
-                WORKFLOWS[command].normalize_args(parse_start(argument).body, project)
+            elif _started_workflow(command):
+                WORKFLOWS[_started_workflow(command)].normalize_args(parse_start(argument).body, project)
                 event_bytes(make_event(payload, "prompt"))
             return _submit(project, session, command, argument, payload, all_stores, plugin_root)
         except (DevFlowError, OSError, ValueError) as exc:
@@ -385,8 +599,9 @@ def _submit(project: Path, session: str, command: str | None, argument: str, pay
             sessions.write_record(project, record, WORKFLOWS)
         if command == RESUME:
             return _resume(project, session, argument, payload, record, all_stores, plugin_root)
-        if command in WORKFLOWS:
-            return _start(project, session, command, argument, payload, record, all_stores, plugin_root)
+        if _started_workflow(command):
+            return _start(project, session, _started_workflow(command), argument, payload, record, all_stores,
+                          plugin_root)
         sessions.write_record(project, record, WORKFLOWS)
         current = sessions.binding(project, record, all_stores)
         if current is None:

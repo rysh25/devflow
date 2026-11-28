@@ -169,9 +169,9 @@ def _validate_files(files: dict[str, bytes]) -> dict:
                 _require(hook.get("onFailure") != "block", f"Hook must never block on failure: {event}")
     skill_prefix = plugin + "/skills/"
     skills = [path for path in files if path.startswith(skill_prefix) and path.endswith("/SKILL.md")]
-    operations = {"plan", "implement", "resume", "status", "doctor"}
+    operations = {"plan", "implement", "flow", "resume", "status", "doctor"}
     _require(set(skills) == {skill_prefix + name + "/SKILL.md" for name in operations},
-             "Claude must ship exactly five manual skills")
+             "Claude must ship exactly six manual skills")
     for required in operations:
         _require(skill_prefix + required + "/SKILL.md" in files, f"Missing root skill: {required}")
     for path in skills:
@@ -211,7 +211,7 @@ def _validate_files(files: dict[str, bytes]) -> dict:
     codex_prefix = plugin + "/codex-skills/"
     codex_skills = [path for path in files if path.startswith(codex_prefix) and path.endswith("/SKILL.md")]
     _require(set(codex_skills) == {codex_prefix + name + "/SKILL.md" for name in operations},
-             "Codex must ship exactly five manual skills")
+             "Codex must ship exactly six manual skills")
     contract_path = plugin + "/references/codex-runner.md"
     _require(contract_path in files, "Missing shared Codex runner contract")
     contract = files[contract_path].decode("utf-8")
@@ -297,7 +297,7 @@ def _validate_devin(files: dict[str, bytes], plugin: str, version: str, events: 
     prefix = plugin + "/devin-skills/"
     skills = [path for path in files if path.startswith(prefix) and path.endswith("/SKILL.md")]
     _require(set(skills) == {prefix + name + "/SKILL.md" for name in operations},
-             "Devin must ship exactly five manual skills")
+             "Devin must ship exactly six manual skills")
     contract_path = plugin + "/references/devin-runner.md"
     _require(contract_path in files, "Missing shared Devin runner contract")
     contract = files[contract_path].decode("utf-8")

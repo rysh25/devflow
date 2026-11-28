@@ -29,7 +29,8 @@ class ConfigLayeringTests(EngineFixture):
 
     def test_defaults(self):
         config = self.load()
-        self.assertEqual((config["review_limit_auto"], config["review_limit_auto_extra_reviews"]), ("ask", 6))
+        self.assertEqual((config["review_limit_auto"], config["review_limit_auto_extra_reviews"],
+                          config["review_limit_auto_final"]), ("ask", 6, "ask"))
 
     def test_shared_top_level_and_flow_overrides(self):
         atomic_write_json(self.project / "devflow.config.json",
@@ -53,7 +54,10 @@ class ConfigLayeringTests(EngineFixture):
                                   ("review_limit_auto_extra_reviews", -1, "at least 1"),
                                   ("review_limit_auto_extra_reviews", 1.5, "at least 1"),
                                   ("review_limit_auto_extra_reviews", "6", "at least 1"),
-                                  ("review_limit_auto_extra_reviews", True, "at least 1")):
+                                  ("review_limit_auto_extra_reviews", True, "at least 1"),
+                                  ("review_limit_auto_final", "continue", '"ask" or "accept"'),
+                                  ("review_limit_auto_final", True, '"ask" or "accept"'),
+                                  ("review_limit_auto_final", None, '"ask" or "accept"')):
             with self.subTest(key=key, value=bad):
                 with self.assertRaisesRegex(DevFlowError, message):
                     validate_config({**self.load(), key: bad})
@@ -326,6 +330,101 @@ class LimitAutoTests(EngineFixture):
         self.assertEqual(self.review()["status"], "exhausted")
         self.assertRefusedUnchanged(lambda: self.limit_auto("accept", escalation_id="E001"),
                                     "no pending review limit question")
+
+    # review_limit_auto_final: extra 1 with two reviewers, so the first question is already exhausted.
+
+    def final_config(self, final="accept"):
+        self.config.update(review_limit_auto_extra_reviews=1, review_limit_auto_final=final)
+        self.write_config()
+
+    def test_final_accept_ends_auto_accepted_with_high_findings(self):
+        from devflow_core.common import summary as summary_module
+        self.final_config()
+        self.severity = "high"
+        self.to_limit()
+        self.question()
+        result = self.limit_auto("continue", "Recommendation: continue; both high findings need another review.")
+        self.assertEqual(result["status"], "auto_accepted")
+        self.assertEqual(self.records(), ["limit-auto/E001-accept.json"])
+        record = read_json(self.run / "limit-auto/E001-accept.json")
+        self.assertEqual((record["schema_version"], record["decision"], record["recommended"],
+                          record["review_limit_auto_final"], record["version_reviewed"]),
+                         (2, "accept", "continue", "accept", True))
+        self.assertEqual(result["limit_auto_decisions"],
+                         [{"escalation_id": "E001", "review_number": 2, "decision": "accept",
+                           "record": "limit-auto/E001-accept.json", "recommended": "continue", "extra_reviews": 1}])
+        self.assertFinalReportSaved(result)
+        report = result["report"]
+        serious = "codex (review 1: F1 high), opencode (review 2: F1 high)"
+        self.assertEqual(report["warning"],
+                         "Accepted at the review limit by the run's review_limit_auto_final setting because another "
+                         "round would exceed review_limit_auto_extra_reviews, without approval from every reviewer; "
+                         "the host recommended continue (its recommendation and reasons: limit-auto/E001-accept.json). "
+                         f"Critical or high findings in the latest succeeded reviews: {serious}. Inspect remaining "
+                         "findings and whether the final revision was reviewed.")
+        self.assertEqual((report["auto_acceptance"]["recommended"], report["auto_acceptance"]["extra_reviews"]),
+                         ("continue", 1))
+        self.assertIsNone(report["review_summary_error"])  # the saved summary is shown, not hidden
+        text = summary_module.render(report["review_summary"])
+        self.assertIn("- Status: auto_accepted — accepted at the review limit by the run's review_limit_auto_final "
+                      "setting because another round would exceed review_limit_auto_extra_reviews 1, not approved by "
+                      "every reviewer\n", text)
+        self.assertIn("- Auto-accepted by the review_limit_auto_final setting because another round would exceed "
+                      "review_limit_auto_extra_reviews 1; the host recommended continue; critical/high in the latest "
+                      f"succeeded reviews: {serious} (record: limit-auto/E001-accept.json; accepted version "
+                      "reviewed)\n", text)
+        self.assertIn("  - After 2 reviews, review_budget: accept by setting continue_accept with "
+                      "review_limit_auto_final accept (another round would exceed review_limit_auto_extra_reviews 1; "
+                      "the host recommended continue) (", text)
+        self.assertEqual(text, result["review_summary_markdown"])
+
+    def test_final_accept_keeps_the_validation_and_checkpoint_checks(self):
+        self.final_config()
+        self.severity = "high"
+        self.to_limit()
+        self.question()
+        self.source.write_text("VALUE = 99\n", encoding="utf-8")  # the workspace left the checkpoint
+        self.assertRefusedUnchanged(lambda: self.limit_auto("continue"), "Cannot accept: Code changed")
+        self.source.write_text("VALUE = 1\n", encoding="utf-8")
+        state = self.engine.store.read(self.run_id)
+        state["validation"] = None
+        atomic_write_json(self.run / "state.json", state)
+        self.assertRefusedUnchanged(lambda: self.limit_auto("continue"), "no passing checks or human validation")
+        self.assertEqual(self.records(), [])
+
+    def test_a_record_1_report_keeps_its_saved_summary(self):
+        # An accept without critical/high writes record 1, whose views keep the 0.13.0 shape.
+        self.final_config()
+        self.to_limit()
+        self.question()
+        self.limit_auto("accept")
+        self.assertEqual(read_json(self.run / "limit-auto/E001-accept.json")["schema_version"], 1)
+        report = self.engine.status(self.run_id)["report"]
+        self.assertIsNone(report["review_summary_error"])
+        self.assertEqual(set(report["review_summary"]["automatic_decisions"][0]),
+                         {"at", "review_number", "decision", "setting", "review_limit_before", "review_limit_after",
+                          "recommendation", "record"})
+        self.assertEqual(set(report["auto_acceptance"]), {"record", "source", "version", "accepted_at",
+                                                         "version_reviewed", "recommendation"})
+        self.assertIn("review_limit_auto setting following the host's recommendation", report["warning"])
+        # One changed item of the saved summary still hides it.
+        path = self.state()["report_path"]
+        self.tamper(path, lambda saved: saved["review_summary"]["automatic_decisions"][0].update(setting="continue"))
+        report = self.engine.status(self.run_id)["report"]
+        self.assertIsNone(report["review_summary"])
+        self.assertIn("differ from the run's verified records", report["review_summary_error"])
+
+    def test_the_ceiling_ends_exhausted_without_a_question_with_final_accept(self):
+        self.final_config()
+        self.to_limit()
+        state = self.engine.store.read(self.run_id)
+        template = state["attempts"][-1]
+        while len(state["attempts"]) < 98:
+            state["attempts"].append(dict(template, number=len(state["attempts"]) + 1))
+        state["review_limit"] = 98
+        atomic_write_json(self.run / "state.json", state)
+        self.assertEqual(self.review()["status"], "exhausted")
+        self.assertEqual(self.records(), [])
 
     def test_resume_keeps_the_saved_report_after_a_workspace_edit(self):
         self.to_limit()

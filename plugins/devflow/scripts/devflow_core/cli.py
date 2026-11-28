@@ -146,6 +146,13 @@ def doctor(project: Path, host: str) -> dict:
                      "installation, or implicit fallback")}
 
 
+def _with_flow_warnings(result, project: Path, flow: str, run_id: str | None, host: str):
+    """The doctor of a Plan run started by the flow command also gives the flow's start warnings."""
+    if flow != "plan" or not run_id or not isinstance(result, dict):
+        return result
+    return {**result, **router.flow_doctor(project, run_id, host=host)}
+
+
 def _hook() -> dict | None:
     raw = sys.stdin.read(MAX_HOOK_BYTES + 1)
     if len(raw.encode("utf-8")) > MAX_HOOK_BYTES:
@@ -182,14 +189,18 @@ def main(argv=None) -> int:
                     emit_result({"ready": False, **info.public()})
                 else:
                     args.action = "doctor"
-                    emit_result(WORKFLOWS[flow].run_command(args, project, args.run, args.session, host))
+                    result = WORKFLOWS[flow].run_command(args, project, args.run, args.session, host)
+                    emit_result(_with_flow_warnings(result, project, flow, args.run, host))
             else:
                 emit_result(doctor(project, host))
         elif args.action == "start":
             if args.run:
                 raise DevFlowError("A new start cannot target an existing run")
             options = WORKFLOWS[command].start_options(args)
-            emit_result(router.runner_start(project, args.session, command, args.start_value, options, host=host))
+            if getattr(args, "from_plan", None) is not None:
+                emit_result(router.runner_start_from_plan(project, args.session, args.from_plan, options, host=host))
+            else:
+                emit_result(router.runner_start(project, args.session, command, args.start_value, options, host=host))
         else:
             args.pending_start = None
             if args.action == "doctor" and args.session:
@@ -207,7 +218,10 @@ def main(argv=None) -> int:
             if run_id is None:
                 # Without a run, an action reads the current project settings.
                 args.settings_documents = read_project_settings(project, host, WORKFLOWS)
-            emit_result(WORKFLOWS[command].run_command(args, project, run_id, args.session, host))
+            result = WORKFLOWS[command].run_command(args, project, run_id, args.session, host)
+            if args.action == "doctor":
+                result = _with_flow_warnings(result, project, command, run_id, host)
+            emit_result(result)
         return 0
     except Exception as exc:  # noqa: BLE001 - every failure is reported, never retried
         if command == "hook":

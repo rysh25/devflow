@@ -95,7 +95,9 @@ def review_value(verdict="pass", *, human=False, severity="medium"):
     }
 
 
-class EngineTests(unittest.TestCase):
+class PlanRunFixture(unittest.TestCase):
+    """A disposable project with the hooks and runner steps that take a Plan run through its states."""
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="devflow plan integration ")
         self.addCleanup(self.temp.cleanup)
@@ -256,17 +258,6 @@ class EngineTests(unittest.TestCase):
         })
         return self.engine.seal(self.run_id, decisions)
 
-    def test_a_rewound_transcript_stops_the_seal_without_saving(self):
-        self.start_interview()
-        # A rewind after the interview started: the new branch reparents over ca1, a reply.
-        self.chain("user", "cu1", parent="")
-        self.chain("assistant", "ca1")
-        self.chain("user", "cu2", parent="cu1")
-        with self.assertRaisesRegex(DevFlowError, "rewound.*cancel this run"):
-            self.seal()
-        self.assertEqual(self.engine.status(self.run_id)["status"], "interview")
-        self.assertFalse((self.run / "interview.json").exists())
-
     def ready(self, request=None):
         self.start_interview(request=request)
         self.seal()
@@ -298,6 +289,19 @@ class EngineTests(unittest.TestCase):
             }],
         })
         return self.engine.apply(self.run_id, plan, reflection, expected_hash or state["plan_hash"])
+
+
+class EngineTests(PlanRunFixture):
+    def test_a_rewound_transcript_stops_the_seal_without_saving(self):
+        self.start_interview()
+        # A rewind after the interview started: the new branch reparents over ca1, a reply.
+        self.chain("user", "cu1", parent="")
+        self.chain("assistant", "ca1")
+        self.chain("user", "cu2", parent="cu1")
+        with self.assertRaisesRegex(DevFlowError, "rewound.*cancel this run"):
+            self.seal()
+        self.assertEqual(self.engine.status(self.run_id)["status"], "interview")
+        self.assertFalse((self.run / "interview.json").exists())
 
     def test_two_independent_passes_same_hash_complete(self):
         initial = self.ready()
@@ -2461,12 +2465,14 @@ class EngineTests(unittest.TestCase):
 
     # review_limit_auto: the host's recommendation applied at the review limit by limit-auto.
 
-    def limit_config(self, mode=None, extra=None, max_reviews=2, reviewers=None, plan=None):
+    def limit_config(self, mode=None, extra=None, max_reviews=2, reviewers=None, plan=None, final=None):
         document = {"schema_version": 1, "max_reviews": max_reviews}
         if mode is not None:
             document["review_limit_auto"] = mode
         if extra is not None:
             document["review_limit_auto_extra_reviews"] = extra
+        if final is not None:
+            document["review_limit_auto_final"] = final
         if reviewers is not None:
             document["reviewers"] = reviewers
         if plan is not None:
@@ -3005,6 +3011,184 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(recovered["publication"]["path"], "docs/plans/REVIEW-10.md")
         self.assertEqual((target.read_bytes(), approval.read_bytes()), (before, before_approval))
         self.assertEqual(read_json(self.run / "publication.json")["approval"], "config_recommendation")
+
+    # review_limit_auto_final: the exhausted limit (another round would pass the extra reviews).
+
+    def final_question(self, last=("medium", "high"), final="accept"):
+        """continue_accept with extra 2: 2 → 4 automatically, then the exhausted question
+        after ``last`` (codex's review 3 and opencode's review 4)."""
+        self.limit_config("continue_accept", extra=2, final=final)
+        self.limit_to_question()
+        self.assertEqual(self.limit_auto("continue")["review_limit"], 4)
+        for severity in last:
+            self.handled(severity)
+        return self.ask_at_limit()
+
+    def test_final_accept_turns_continue_into_an_accept_with_record_2(self):
+        asked = self.final_question()
+        first, name = self.limit_records()[0], f"limit-auto/{asked['escalation']['id']}-accept.json"
+        result = self.limit_auto("continue")
+        self.assertEqual(result["status"], "auto_accepted")
+        self.assertEqual(self.limit_records(), sorted([first, name]))
+        record = read_json(self.run / name)
+        self.assertEqual({key: record[key] for key in ("schema_version", "decision", "recommended",
+                                                       "review_limit_auto_final", "review_limit_auto",
+                                                       "review_limit_before", "review_limit_after")},
+                         {"schema_version": 2, "decision": "accept", "recommended": "continue",
+                          "review_limit_auto_final": "accept", "review_limit_auto": "continue_accept",
+                          "review_limit_before": 4, "review_limit_after": 4})
+        self.assertEqual(read_json(self.run / first)["schema_version"], 1)
+        self.assertEqual(result["limit_auto_decisions"],
+                         [{"escalation_id": read_json(self.run / first)["escalation_id"], "review_number": 2,
+                           "decision": "continue", "record": first},
+                          {"escalation_id": asked["escalation"]["id"], "review_number": 4, "decision": "accept",
+                           "record": name, "recommended": "continue", "extra_reviews": 2}])
+        serious = "opencode (review 4: F1 high)"
+        published = self.engine.publish(self.run_id)["publication"]
+        receipt = read_json(self.run / "publication.json")
+        self.assertEqual((receipt["approval"], receipt["version_reviewed"]), ("config_final", False))
+        approval = (self.project / published["approval_path"]).read_text(encoding="utf-8")
+        self.assertIn("- Approval: config_final\n", approval)
+        self.assertIn("- Approved by: config (review_limit_auto: continue_accept, review_limit_auto_final: accept) "
+                      "because another round would exceed review_limit_auto_extra_reviews 2; the host recommended "
+                      f"continue (record {name})\n", approval)
+        self.assertIn(f"- Critical/high in the latest succeeded reviews: {serious}\n", approval)
+        self.assertIn("- Note: accepted at the review limit by the run's review_limit_auto_final setting after the "
+                      "automatic extra reviews were used up; not approved by every reviewer. The host's "
+                      "recommendation, with its reasons (such as fixes no later review saw), is in the record named "
+                      "above.\n", approval)
+        report = self.engine.report(self.run_id)
+        self.assertEqual(report["auto_acceptance"]["recommended"], "continue")
+        self.assertEqual(report["warning"],
+                         "Accepted at the review limit by the run's review_limit_auto_final setting because another "
+                         "round would exceed review_limit_auto_extra_reviews, without approval from every reviewer; "
+                         f"the host recommended continue (its recommendation and reasons: {name}). Critical or high "
+                         f"findings in the latest succeeded reviews: {serious}. Inspect remaining findings and whether "
+                         "the final revision was reviewed. The accepted version was never reviewed.")
+        text = report["review_summary_markdown"]
+        self.assertIn("- Status: auto_accepted — accepted at the review limit by the run's review_limit_auto_final "
+                      "setting because another round would exceed review_limit_auto_extra_reviews 2, not approved by "
+                      "every reviewer\n", text)
+        self.assertIn("- Auto-accepted by the review_limit_auto_final setting because another round would exceed "
+                      "review_limit_auto_extra_reviews 2; the host recommended continue; critical/high in the latest "
+                      f"succeeded reviews: {serious} (record: {name}; accepted version not reviewed)\n", text)
+        self.assertIn("  - After 2 reviews, review_budget: continue by setting continue_accept (limit 2 → 4) (", text)
+        self.assertIn("  - After 4 reviews, review_budget: accept by setting continue_accept with "
+                      "review_limit_auto_final accept (another round would exceed review_limit_auto_extra_reviews 2; "
+                      "the host recommended continue) (", text)
+        # A resumed run publishes again against the same receipt.
+        self.resume("another-session")
+        self.assertEqual(self.engine.publish(self.run_id)["publication"]["path"], published["path"])
+
+    def test_final_accept_takes_a_recommendation_to_accept_and_keeps_record_1_without_serious_findings(self):
+        for last, recommended in ((("medium", "high"), "accept"), (("medium", "medium"), None)):
+            with self.subTest(last=last):
+                asked = self.final_question(last)
+                result = self.limit_auto("accept", "Recommendation: accept and finish.")
+                self.assertEqual(result["status"], "auto_accepted")
+                record = read_json(self.run / f"limit-auto/{asked['escalation']['id']}-accept.json")
+                self.assertEqual(record["schema_version"], 2 if recommended else 1)
+                self.assertEqual(record.get("recommended"), recommended)
+                self.assertEqual("recommended" in result["limit_auto_decisions"][-1], bool(recommended))
+                self.engine.publish(self.run_id)
+                self.assertEqual(read_json(self.run / "publication.json")["approval"],
+                                 "config_final" if recommended else "config_recommendation")
+                warning = self.engine.report(self.run_id)["warning"]
+                self.assertTrue(warning.startswith("Accepted at the review limit by the run's "
+                                                   + ("review_limit_auto_final setting" if recommended
+                                                      else "review_limit_auto setting following")), warning)
+
+    def test_final_accept_keeps_the_other_accept_checks(self):
+        self.limit_config("continue_accept", extra=1, final="accept")  # the first question is already exhausted
+        self.ready()
+        with patch(RUN_REVIEW, side_effect=RuntimeError("provider down")):
+            self.engine.review(self.run_id)
+            self.engine.review(self.run_id)
+        identifier = self.ask_at_limit()["escalation"]["id"]
+        for decision in ("continue", "accept"):
+            self.assertRefusedUnchanged(lambda: self.limit_auto(decision), "no review succeeded")
+        self.assertEqual(self.engine.status(self.run_id)["escalation"]["id"], identifier)
+        self.engine.cancel(self.run_id)
+        self.limit_config("continue_accept", extra=1, final="accept")
+        self.limit_to_question(("medium", "high"))
+        state = read_json(self.run / "state.json")
+        state["plan_hash"] = "0" * 64  # The registered plan no longer is what the hash names.
+        atomic_write_json(self.run / "state.json", state)
+        with self.assertRaisesRegex(DevFlowError, "current plan record"):
+            self.limit_auto("continue")
+        self.assertEqual(read_json(self.run / "state.json")["status"], "awaiting_human")
+        self.assertEqual(self.limit_records(), [])
+
+    def test_final_ask_and_a_limit_with_reviews_left_keep_todays_checks(self):
+        self.final_question(final="ask")
+        self.assertRefusedUnchanged(lambda: self.limit_auto("continue"), "beyond review_limit_auto_extra_reviews 2")
+        self.assertRefusedUnchanged(lambda: self.limit_auto("accept"), "has a critical or high finding")
+        self.engine.cancel(self.run_id)
+        # Another round still fits: accept needs no critical/high, and continue writes record 1.
+        self.limit_config("continue_accept", extra=2, final="accept")
+        asked = self.limit_to_question(("medium", "high"))
+        self.assertRefusedUnchanged(lambda: self.limit_auto("accept"), "has a critical or high finding")
+        result = self.limit_auto("continue")
+        self.assertEqual((result["status"], result["review_limit"]), ("ready", 4))
+        self.assertEqual(read_json(self.run / f"limit-auto/{asked['escalation']['id']}-continue.json")
+                         ["schema_version"], 1)
+        self.engine.cancel(self.run_id)
+        # An inherited "accept" with the flow back to ask: the run starts and the human is asked.
+        self.limit_config("continue_accept", final="accept", plan={"review_limit_auto": "ask"})
+        self.limit_to_question()
+        for decision in ("continue", "accept"):
+            self.assertRefusedUnchanged(lambda: self.limit_auto(decision), 'review_limit_auto is "ask"')
+
+    def test_a_run_frozen_without_the_final_setting_reads_as_ask(self):
+        self.limit_config("continue_accept", extra=1)
+        self.limit_to_question(("medium", "high"))
+        self.tamper("config.json", lambda config: config.pop("review_limit_auto_final"))  # as 0.13.0 froze it
+        state = read_json(self.run / "state.json")
+        del state["config"]["review_limit_auto_final"]
+        atomic_write_json(self.run / "state.json", state)
+        self.assertEqual(self.engine.status(self.run_id)["limit_auto_decisions"], [])
+        self.assertRefusedUnchanged(lambda: self.limit_auto("continue"), "beyond review_limit_auto_extra_reviews 1")
+        self.assertRefusedUnchanged(lambda: self.limit_auto("accept"), "has a critical or high finding")
+        self.assertEqual(self.at_limit("accept")["status"], "accepted")
+
+    def test_a_changed_record_2_is_detected(self):
+        for label, change in (("recommended", lambda record: record.update(recommended="stop")),
+                              ("setting", lambda record: record.update(review_limit_auto_final="ask"))):
+            with self.subTest(change=label):
+                asked = self.final_question()
+                self.limit_auto("continue")
+                self.tamper(f"limit-auto/{asked['escalation']['id']}-accept.json", change)
+                status = self.engine.status(self.run_id)
+                self.assertIsNone(status["limit_auto_decisions"])
+                self.assertIn("Invalid or mismatched automatic decision record", status["limit_auto_decisions_error"])
+                with self.assertRaises(DevFlowError):
+                    self.engine.publish(self.run_id)
+
+    def test_record_2_needs_the_extra_reviews_used_up(self):
+        from devflow_core.common.review import check_limit_auto_record
+        self.limit_config("continue_accept", final="accept")  # extra 6: another round still fits
+        asked = self.limit_to_question()
+        self.limit_auto("accept")
+        name = f"limit-auto/{asked['escalation']['id']}-accept.json"
+        record = dict(read_json(self.run / name), schema_version=2, recommended="continue",
+                      review_limit_auto_final="accept")
+        state = self.engine.store.read(self.run_id)
+        read = lambda relative: self.engine.store.record_json(state, relative)
+        with self.assertRaisesRegex(DevFlowError, "another round still fitted review_limit_auto_extra_reviews"):
+            check_limit_auto_record(state, record, name, read, self.engine.workflow)
+        # Every other check passes: the same record at an exhausted limit is accepted.
+        state["config"]["review_limit_auto_extra_reviews"] = 1
+        record["review_limit_auto_extra_reviews"] = 1
+        self.assertEqual(check_limit_auto_record(state, record, name, read, self.engine.workflow), record)
+
+    def test_the_ceiling_ends_the_run_before_any_question_with_final_accept(self):
+        self.limit_config("continue_accept", final="accept")
+        self.ready()
+        stored = read_json(self.run / "state.json")
+        atomic_write_json(self.run / "state.json", dict(stored, review_count=98, review_limit=98))
+        ended = self.ask_at_limit()
+        self.assertEqual((ended["status"], ended["escalation"]), ("exhausted", None))
+        self.assertEqual(self.limit_records(), [])
 
 
 class PublishNameTests(unittest.TestCase):

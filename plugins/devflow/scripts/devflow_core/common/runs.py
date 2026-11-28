@@ -36,7 +36,8 @@ def release_name(version: int) -> str:
 #: How a run ends. ``completed`` only when every reviewer approved the same version;
 #: ``accepted`` when the human accepted the current version at the review limit;
 #: ``auto_accepted`` when the run's frozen ``review_limit_auto`` setting applied the
-#: host's recommendation to accept at the review limit (evidence:
+#: host's recommendation to accept at the review limit, or ``review_limit_auto_final``
+#: accepted once the automatic extra reviews were used up (evidence:
 #: ``limit-auto/<question id>-accept.json``).
 TERMINAL = frozenset({"completed", "exhausted", "cancelled", "accepted", "auto_accepted"})
 RUN_ID = re.compile(r"[0-9]{8}T[0-9]{6}Z-[a-f0-9]{12}\Z")

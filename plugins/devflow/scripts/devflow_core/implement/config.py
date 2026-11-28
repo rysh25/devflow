@@ -28,17 +28,16 @@ def validate_stage(value: dict) -> dict:
 
 
 def _validate(value: dict, *, match_reviewer_limit: bool) -> dict:
-    fields = {"schema_version", "max_reviews", "max_check_attempts", "max_plan_bytes", "allow_dirty", "snapshot",
-              "reviewers", "checks", "review_limit_auto", "review_limit_auto_extra_reviews"}
+    fields = {"schema_version", "max_reviews", "max_check_attempts", "max_plan_bytes", "snapshot",
+              "reviewers", "checks", "review_limit_auto", "review_limit_auto_extra_reviews",
+              "review_limit_auto_final"}
     if (not isinstance(value, dict) or set(value) != fields
             or type(value.get("schema_version")) is not int or value.get("schema_version") != 1):
         raise DevFlowError("Invalid configuration fields or schema_version; compare config/defaults.json")
-    check_limit_auto(value)
+    check_limit_auto(value, combination=match_reviewer_limit)
     validate_limit(value["max_reviews"])
     _integer(value["max_check_attempts"], 1, 10, "max_check_attempts")
     _integer(value["max_plan_bytes"], 1024, 8 * 1024 * 1024, "max_plan_bytes")
-    if type(value["allow_dirty"]) is not bool:
-        raise DevFlowError("allow_dirty must be a boolean")
     snapshot = value["snapshot"]
     if not isinstance(snapshot, dict):
         raise DevFlowError("snapshot must be an object")

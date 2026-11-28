@@ -4,14 +4,14 @@ from __future__ import annotations
 from pathlib import Path
 import re
 
-from ..common.errors import UsageError
+from ..common.errors import DevFlowError, UsageError
 from ..common.hosts import host_profile
 from ..common.review import (after_failed_review, check_limit_auto_names, check_review_budget,
                              check_review_config, review_budget)
-from ..common.runs import TERMINAL
+from ..common.runs import TERMINAL, RunStore
 from ..common.settings import SettingsDocument
 from ..common.storage import json_bytes, now
-from ..common.operations import public_command
+from ..common.operations import flow_requested, public_command
 from ..common.startup import apply_startup, parse_start
 from ..common.workflow import Workflow
 from .commands import COMMANDS
@@ -124,7 +124,19 @@ class PlanWorkflow(Workflow):
         return {"review_count": budget["review_count"], "next_reviewer": budget["next_reviewer"],
                 "plan_hash": state["plan_hash"],
                 "current_plan": str(run_dir / state["current_plan"]) if state["current_plan"] else None,
-                "interview_skill": state["config"]["grill_skill"]}
+                "interview_skill": state["config"]["grill_skill"],
+                **self.flow_marker(RunStore(Path(state["project"]), self, host=state["owner_host"]), state)}
+
+    def flow_marker(self, store, state: dict) -> dict:
+        """``continues_to_implement``: whether the human started this run with the flow command,
+        read from its digest-checked ``request.json``. A record that does not verify gives
+        ``None`` and ``flow_marker_error`` instead of failing status, context or doctor."""
+        try:
+            return {"continues_to_implement": flow_requested(store.record_json(state, "request.json"),
+                                                             state["owner_host"])}
+        except (DevFlowError, KeyError, TypeError, AttributeError) as exc:
+            return {"continues_to_implement": None,
+                    "flow_marker_error": f"Whether this run continues to Implement cannot be verified: {exc}"}
 
     def summary(self, state: dict) -> dict:
         return {**review_budget(state, state["review_count"]),

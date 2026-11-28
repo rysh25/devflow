@@ -7,12 +7,12 @@ from pathlib import Path
 from ..common import summary
 from ..common.errors import DevFlowError, UsageError
 from ..common.environment import bash_timeout_ms
-from ..common.review import (after_failed_review, check_limit_auto_names, check_review_budget,
+from ..common.review import (after_failed_review, code_span, check_limit_auto_names, check_review_budget,
                              check_review_config, review_budget)
 from ..common.runs import TERMINAL
 from ..common.sessions import prefilled_question_events
 from ..common.settings import SettingsDocument
-from ..common.operations import public_command
+from ..common.operations import CHAINED, public_command
 from ..common.startup import apply_startup, parse_start
 from ..common.storage import check_json_size, digest, json_bytes, no_symlinks, now
 from ..common.workflow import Option, Workflow
@@ -52,6 +52,7 @@ class ImplementWorkflow(Workflow):
                               "binary_attestation", "last_error", "baseline_id", "report_path", "resume_status",
                               "workspace"})
     start_option = "--plan"
+    from_plan_option = "--from-plan"
     extra_start_options = (Option("--workspace", "text", required=False),)
     occupies_workspace = True
     guidance = ("DevFlow records and verifies this run. Write runner input files "
@@ -77,13 +78,22 @@ class ImplementWorkflow(Workflow):
         plan = Path(pending["args"])
         no_symlinks(plan)
         payload = pending["event"]["payload"]
-        startup = parse_start(public_command(payload["prompt"], payload["host"])[1])
-        config = validate_config(apply_startup(project_config, startup))
+        chain = options.get("chain")
+        if chain:
+            # Chained from a flow's Plan run: the human's flow command held Plan's startup
+            # options, so Implement uses the project settings only.
+            config = validate_config(project_config)
+        else:
+            startup = parse_start(public_command(payload["prompt"], payload["host"])[1])
+            config = validate_config(apply_startup(project_config, startup))
         if plan.suffix.lower() not in {".md", ".markdown"}:
             raise DevFlowError("The input plan must be a UTF-8 Markdown file")
         # The workspace is decided once, before anything is created, and frozen.
         workspace = resolve_workspace(project, options.get("workspace"), config["snapshot"]["mode"])
         data = _plan_bytes(plan, config["max_plan_bytes"])
+        if chain and digest(data) != chain["plan_hash"]:
+            # Compared on the bytes the run keeps, so a later rewrite cannot slip in.
+            raise DevFlowError(f"The published plan no longer matches Plan run {chain['plan_run_id']}'s approved hash")
         # Each reviewer is checked in the workspace before any work starts, so a reviewer that
         # cannot run there (for example Devin in a directory it does not trust) stops the start
         # and creates no run. The results are not kept: each review checks again.
@@ -111,24 +121,41 @@ class ImplementWorkflow(Workflow):
             "binary_attestation": None, "last_error": None, "baseline_id": baseline["snapshot_id"],
             "report_path": None, "resume_status": None, "escalation": None, "workspace": workspace,
         }
+        intent = {"action": "start", "args": pending["args"], "workspace": options.get("workspace")}
+        if chain:
+            intent.update(action=CHAINED, **{key: chain[key] for key in
+                                              ("plan_run_id", "plan_hash", "plan_path", "approval_path")})
         artifacts = {
             "plan.md": data, "config.json": json_bytes(config), "baseline.json": baseline_bytes,
-            "request.json": json_bytes({"intent": {"action": "start", "args": pending["args"],
-                                                   "workspace": options.get("workspace")},
-                                        "event": pending["event"]}),
+            "request.json": json_bytes({"intent": intent, "event": pending["event"]}),
         }
         for record in baseline["files"].values():
             copy = (record.get("source") or {}).get("copy")
             if copy:
                 artifacts[copy] = copies / Path(copy).name
-        if baseline.get("git", {}) and baseline["git"].get("dirty") and not config["allow_dirty"]:
-            escalation = {"id": "E001", "reason": "Existing changes require explicit acknowledgement",
-                          "questions": ["The worktree has existing changes. Preserve them and continue from this captured baseline?"],
-                          "return_status": "implementing",
-                          "detail": {"kind": "dirty_worktree", "snapshot_id": None, "review_number": 0}}
-            artifacts["escalations/001.json"] = json_bytes({**escalation, "boundary": 1, "created_at": now()})
-            fields.update(status="awaiting_human", escalation=escalation, escalations=["escalations/001.json"])
         return fields, artifacts
+
+    def existing_changes(self, store, state: dict) -> tuple[list[str], list[str]] | None:
+        """The uncommitted changes touching the snapshot scope at start, from ``baseline.json``:
+        each as Git shows it (``SOURCE -> PATH`` for a rename or copy), and as code spans for
+        text a human reads. None in files mode (no Git status) or when there were none."""
+        status = (store.record_json(state, "baseline.json").get("git") or {}).get("status")
+        if not status:
+            return None
+        paths = [f"{entry['source']} -> {entry['path']}" if entry["source"] else entry["path"] for entry in status]
+        shown = [f"{code_span(entry['source'])} -> {code_span(entry['path'])}" if entry["source"]
+                 else code_span(entry["path"]) for entry in status]
+        return paths, shown
+
+    def start_fields(self, store, state: dict) -> dict:
+        changes = self.existing_changes(store, state)
+        if not changes:
+            return {}
+        paths, shown = changes
+        return {"existing_changes": {"count": len(paths), "paths": paths, "warning": (
+            f"The workspace had {len(paths)} uncommitted changes touching the snapshot scope at start: "
+            f"{', '.join(shown)}. They are part of the baseline: reviews do not cover them and they sit "
+            "beside the implementation's changes. DevFlow never discards or commits them.")}}
 
     def workspace(self, state: dict) -> str:
         """The workspace frozen at start (the project or a worktree of its repository)."""

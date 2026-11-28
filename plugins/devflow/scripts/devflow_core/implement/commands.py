@@ -25,7 +25,9 @@ def doctor(engine, args, run_id, session) -> dict:
         from ..common.operations import public_command
         from .config import validate_config
         pending = getattr(args, "pending_start", None)
-        if pending and pending["flow"] == workflow.name:
+        # Only the human's own implement command carries startup options; a chained
+        # start's pending start copies a Plan prompt, whose options are Plan's.
+        if pending and pending["flow"] == workflow.name and pending["event"]["payload"].get("operation") == workflow.name:
             prompt = pending["event"]["payload"]["prompt"]
             config = validate_config(apply_startup(config, parse_start(public_command(prompt, engine.host)[1])))
             source = "pending_start"
@@ -85,7 +87,7 @@ COMMANDS = (
             lambda e, a, run, s: e.resolve(run, s, a.event_id, a.decision, a.reason),
             (Option("--event-id", "event"), Option("--decision", "decision"), Option("--reason", "text"))),
     Command("limit-auto", "At the review limit, apply the host's recommendation (continue or accept) when the "
-            "run's review_limit_auto setting allows it; never a human answer",
+            "run's review_limit_auto settings allow it; never a human answer",
             lambda e, a, run, s: e.limit_auto(run, s, a.escalation_id, a.decision, a.recommendation_file),
             (Option("--escalation-id", "text"), Option("--decision", "decision"),
              Option("--recommendation-file", "draft"))),
